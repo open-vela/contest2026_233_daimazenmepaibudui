@@ -661,8 +661,8 @@ static void show_confirm_dialog(const char *title, const char *content,
     lv_obj_t *mbox = lv_msgbox_create(NULL);
     if (mbox == NULL) return;
 
-    lv_msgbox_set_text(mbox, content);
-    lv_msgbox_set_title(mbox, title);
+    lv_label_set_text(lv_msgbox_get_title(mbox), title);
+    lv_msgbox_add_text(mbox, content);
 
     /* 添加确认和取消按钮 */
     lv_obj_t *btn_confirm = lv_msgbox_add_footer_button(mbox, "OK");
@@ -728,8 +728,8 @@ void touch_ui_show_setting_detail(const char *title, const char *content)
     lv_obj_t *mbox = lv_msgbox_create(NULL);
     if (mbox == NULL) return;
 
-    lv_msgbox_set_text(mbox, content);
-    lv_msgbox_set_title(mbox, title);
+    lv_label_set_text(lv_msgbox_get_title(mbox), title);
+    lv_msgbox_add_text(mbox, content);
     lv_msgbox_add_close_button(mbox);
     lv_obj_center(mbox);
     lv_obj_set_style_bg_color(mbox, lv_color_hex(0x2D2D44), 0);

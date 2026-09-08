@@ -14,10 +14,11 @@
 #include <sys/ioctl.h>
 #include <net/if.h>
 #include <arpa/inet.h>
+#include <netdb.h> /* gethostbyname / struct hostent（DNS 解析） */
 #include <unistd.h>
 
 /* cJSON 用于 JSON 解析 */
-#include <cjson/cJSON.h>
+#include <netutils/cJSON.h>
 
 /* ==================== 全局变量 ==================== */
 static wifi_config_t wifi_config = {0};

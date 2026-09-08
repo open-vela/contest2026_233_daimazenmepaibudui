@@ -6,12 +6,13 @@
 #include <nuttx/config.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <lvgl/lvgl.h>
 
 /* 头文件 */
 #include "robot_ui.h"
 #include "touch_ui.h"
 #include "network_comm.h"
-#include <cjson/cJSON.h>
+#include <netutils/cJSON.h>
 #include <string.h>
 
 /* LVGL 定时器 */
@@ -113,6 +114,18 @@ static void on_mqtt_message_received(const char *topic, const char *payload)
 int main(int argc, char *argv[])
 {
     printf("ZhiAi Companion starting...\n");
+
+    /* ===== 初始化 LVGL 与显示设备（必须在 UI 创建之前） ===== */
+    lv_init();
+    lv_nuttx_dsc_t lv_info = {0};
+    lv_nuttx_result_t lv_result = {0};
+    lv_nuttx_dsc_init(&lv_info);
+    lv_nuttx_init(&lv_info, &lv_result);
+    if (lv_result.disp == NULL)
+    {
+        printf("LVGL display init failed!\n");
+        return 1;
+    }
 
     /* ===== 初始化网络通信 ===== */
     network_comm_init();
