@@ -34,6 +34,19 @@
 
 **环境准备**:openvela 工作区(`dev-ai-contest-2026` 分支),含 vendor_sifli 板级支持;`repo sync` 后需确认 manifest 链接存在(`packages/demos/contest2026_233_hello_app`、`contest2026_233_robot_ui`、`vendor/openvela/boards/contest2026_233_board`)。
 
+**应用 vendor 补丁**(openvela 工作区同步后必须,按顺序):
+
+```bash
+cd <openvela 工作区>/vendor/sifli
+git apply <本仓库>/patches/vendor_sifli-boot-fixes.patch       # 上游 5 处编译/启动 bug
+git apply <本仓库>/patches/vendor_sifli-audio-driver.patch      # /dev/audio0 音频驱动(依赖前者)
+```
+
+> `patches/vendor_sifli-boot-fixes.patch`: 上游 vendor_sifli 的编译/启动 bug 修复,详见 `patches/README.md`(建议提交上游 PR)。
+> `patches/vendor_sifli-audio-driver.patch`: SF32LB52-DevKit-LCD 音频驱动(播放+录音,DAC/ADC+AUDPRC+DMA),注册 `/dev/audio0`。
+
+> app 命令(`robot_ui`/`hello_app`/`audio_test`/`zhi_ai`)由 CMake 配置时自动注册,无需手动改 builtin 表;若 nsh 下 `command not found`,删除 `cmake_out/<board>/.config` 后重新 `cmake -B` 即可。
+
 **编译**:
 
 ```bash
