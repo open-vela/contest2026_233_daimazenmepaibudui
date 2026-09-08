@@ -144,6 +144,66 @@ int report_health_data(int heart_rate, int blood_oxy);
  */
 int send_device_command(const char *device_id, const char *command);
 
+/* ==================== 手机推送接口 ==================== */
+
+/* 推送服务类型 */
+typedef enum {
+    PUSH_SERVICE_BARK,      // Bark (iOS)
+    PUSH_SERVICE_PUSHPLUS,  // PushPlus (Android/iOS, 微信推送)
+    PUSH_SERVICE_MAX
+} push_service_t;
+
+/* 推送配置 */
+typedef struct {
+    push_service_t service;     // 推送服务类型
+    char push_key[128];         // 推送 key
+    bool enabled;               // 推送开关
+} push_config_t;
+
+/**
+ * 初始化推送服务
+ * @param service  推送服务类型
+ * @param key      推送 key (从 Bark/PushPlus 获取)
+ * @return 0 成功, -1 失败
+ */
+int push_init(push_service_t service, const char *key);
+
+/**
+ * 发送推送通知
+ * @param title    通知标题
+ * @param content  通知内容
+ * @param group    分组 (可选，用于分类通知)
+ * @return 0 成功, -1 失败
+ */
+int push_send_notification(const char *title, const char *content, const char *group);
+
+/**
+ * 发送紧急报警推送
+ * @param alarm_type  报警类型
+ * @param details     详细信息
+ * @return 0 成功, -1 失败
+ */
+int push_send_alarm(const char *alarm_type, const char *details);
+
+/**
+ * 发送健康提醒推送
+ * @param title   提醒标题
+ * @param content 提醒内容
+ * @return 0 成功, -1 失败
+ */
+int push_send_health_reminder(const char *title, const char *content);
+
+/**
+ * 开关推送功能
+ * @param enabled  true 开启, false 关闭
+ */
+void push_set_enabled(bool enabled);
+
+/**
+ * 检查推送功能是否开启
+ */
+bool push_is_enabled(void);
+
 /* ==================== 网络后台任务 ==================== */
 void network_task(void *arg);
 

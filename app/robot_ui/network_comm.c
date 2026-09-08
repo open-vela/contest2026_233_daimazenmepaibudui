@@ -98,9 +98,73 @@ int wifi_connect(const char *ssid, const char *password)
     strncpy(wifi_config.ssid, ssid, sizeof(wifi_config.ssid) - 1);
     strncpy(wifi_config.password, password, sizeof(wifi_config.password) - 1);
 
-    /* TODO: 调用 NuttX WiFi API 连接 */
+    /* NuttX WiFi 连接实现 */
+    #ifdef CONFIG_NETINET_WIRELESS
+    #include <nuttx/wireless/wireless.h>
 
-    /* 模拟连接成功 */
+    /* 打开网络设备 */
+    int fd = open("/dev/wlan0", O_RDWR);
+    if (fd < 0) {
+        printf("WiFi: open /dev/wlan0 failed: %d\n", errno);
+        return -1;
+    }
+
+    /* 设置 WiFi 模式为 Station */
+    struct wireless_config_s wconfig;
+    memset(&wconfig, 0, sizeof(wconfig));
+    strncpy(wconfig.essid, ssid, sizeof(wconfig.essid) - 1);
+    wconfig.has_essid = true;
+    wconfig.mode = IW_MODE_INFRA;
+
+    int ret = ioctl(fd, SIOCSIWLCFG, &wconfig);
+    if (ret < 0) {
+        printf("WiFi: set mode failed: %d\n", errno);
+        close(fd);
+        return -1;
+    }
+
+    /* 设置密码（WPA2） */
+    struct iwreq wr;
+    memset(&wr, 0, sizeof(wr));
+    strncpy(wr.ifr_name, "wlan0", IFNAMSIZ);
+
+    struct iw_encode_ext *ext = malloc(sizeof(struct iw_encode_ext) + strlen(password));
+    if (ext) {
+        memset(ext, 0, sizeof(*ext));
+        ext->alg = SIOCSIWENCODEEXT;
+        ext->key_len = strlen(password);
+        ext->ext_flags |= IW_ENCODE_EXT_SET_CRYPT_KEY;
+        memcpy(ext->key, password, strlen(password));
+
+        wr.u.data.pointer = ext;
+        wr.u.data.length = sizeof(*ext) + strlen(password);
+
+        ret = ioctl(fd, SIOCSIWENCODEEXT, &wr);
+        free(ext);
+
+        if (ret < 0) {
+            printf("WiFi: set password failed: %d\n", errno);
+            close(fd);
+            return -1;
+        }
+    }
+
+    /* 连接网络 */
+    memset(&wconfig, 0, sizeof(wconfig));
+    strncpy(wconfig.essid, ssid, sizeof(wconfig.essid) - 1);
+    wconfig.has_essid = true;
+
+    ret = ioctl(fd, SIOCSIWESSID, &wconfig);
+    if (ret < 0) {
+        printf("WiFi: connect failed: %d\n", errno);
+        close(fd);
+        return -1;
+    }
+
+    close(fd);
+    #endif
+
+    /* 模拟连接成功（如果上面的驱动不可用） */
     wifi_config.connected = true;
     wifi_config.rssi = -50;
 
@@ -117,6 +181,20 @@ int wifi_connect(const char *ssid, const char *password)
 /* ==================== WiFi 断开 ==================== */
 int wifi_disconnect(void)
 {
+    /* NuttX WiFi 断开实现 */
+    #ifdef CONFIG_NETINET_WIRELESS
+    int fd = open("/dev/wlan0", O_RDWR);
+    if (fd >= 0) {
+        /* 断开连接 */
+        struct wireless_config_s wconfig;
+        memset(&wconfig, 0, sizeof(wconfig));
+        wconfig.has_essid = true;
+
+        ioctl(fd, SIOCSIWESSID, &wconfig);
+        close(fd);
+    }
+    #endif
+
     wifi_config.connected = false;
     printf("WiFi disconnected\n");
 
@@ -136,6 +214,21 @@ bool wifi_is_connected(void)
 /* ==================== 获取信号强度 ==================== */
 int wifi_get_rssi(void)
 {
+    /* NuttX WiFi 获取信号强度 */
+    #ifdef CONFIG_NETINET_WIRELESS
+    int fd = open("/dev/wlan0", O_RDWR);
+    if (fd >= 0) {
+        struct iwreq wr;
+        memset(&wr, 0, sizeof(wr));
+        strncpy(wr.ifr_name, "wlan0", IFNAMSIZ);
+
+        if (ioctl(fd, SIOCSIWRATE, &wr) == 0) {
+            wifi_config.rssi = wr.u.bitrate.value;
+        }
+        close(fd);
+    }
+    #endif
+
     return wifi_config.rssi;
 }
 
@@ -284,6 +377,9 @@ int report_alarm(const char *alarm_type, const char *details)
         alarm_callback(alarm_type, details);
     }
 
+    /* 发送手机推送通知 */
+    push_send_alarm(alarm_type, details);
+
     return ret;
 }
 
@@ -354,6 +450,189 @@ void network_set_alarm_callback(alarm_callback_t callback)
 void network_set_ai_command_callback(ai_command_callback_t callback)
 {
     ai_command_callback = callback;
+}
+
+/* ==================== 手机推送接口 ==================== */
+
+/* 推送配置 */
+static push_config_t push_config = {0};
+
+/* Bark API 地址 */
+#define BARK_API_URL "https://api.day.app"
+
+/* PushPlus API 地址 */
+#define PUSHPLUS_API_URL "https://www.pushplus.plus/send"
+
+/* HTTP 请求缓冲区大小 */
+#define HTTP_BUFFER_SIZE 2048
+
+/* 初始化推送服务 */
+int push_init(push_service_t service, const char *key)
+{
+    if (!key || key[0] == '\0') {
+        printf("push_init: invalid key\n");
+        return -1;
+    }
+
+    push_config.service = service;
+    strncpy(push_config.push_key, key, sizeof(push_config.push_key) - 1);
+    push_config.enabled = true;
+
+    printf("push_init: service=%d, key=%s\n", service, key);
+    return 0;
+}
+
+/* 发送 HTTP POST 请求 */
+static int http_post(const char *url, const char *body)
+{
+    char host[128] = {0};
+    char path[256] = {0};
+    int port = 443;
+
+    /* 解析 URL */
+    if (sscanf(url, "https://%127[^/]/%255s", host, path) != 2) {
+        if (sscanf(url, "http://%127[^/]/%255s", host, path) != 2) {
+            printf("http_post: invalid URL: %s\n", url);
+            return -1;
+        }
+        port = 80;
+    }
+
+    printf("http_post: host=%s, path=%s, port=%d\n", host, path, port);
+
+    /* 创建 TCP 连接 */
+    int sockfd = create_tcp_socket(host, port);
+    if (sockfd < 0) {
+        printf("http_post: TCP connect failed\n");
+        return -1;
+    }
+
+    /* 构建 HTTP 请求 */
+    char request[HTTP_BUFFER_SIZE];
+    int body_len = strlen(body);
+    snprintf(request, sizeof(request),
+        "POST /%s HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "Content-Type: application/json; charset=utf-8\r\n"
+        "Content-Length: %d\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "%s",
+        path, host, body_len, body);
+
+    /* 发送请求 */
+    int ret = send(sockfd, request, strlen(request), 0);
+    if (ret < 0) {
+        printf("http_post: send failed\n");
+        close(sockfd);
+        return -1;
+    }
+
+    /* 接收响应 */
+    char response[1024];
+    int len = recv(sockfd, response, sizeof(response) - 1, 0);
+    if (len > 0) {
+        response[len] = '\0';
+        printf("http_post: response=%s\n", response);
+    }
+
+    close(sockfd);
+    return 0;
+}
+
+/* 发送推送通知 */
+int push_send_notification(const char *title, const char *content, const char *group)
+{
+    if (!push_config.enabled || push_config.push_key[0] == '\0') {
+        printf("push_send_notification: push not enabled\n");
+        return -1;
+    }
+
+    char url[256] = {0};
+    char body[HTTP_BUFFER_SIZE] = {0};
+
+    /* 构建 JSON 请求体 */
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "title", title);
+    cJSON_AddStringToObject(root, "body", content);
+    if (group) {
+        cJSON_AddStringToObject(root, "group", group);
+    }
+    cJSON_AddStringToObject(root, "device", "ZhiAi-Companion");
+
+    char *json_body = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+
+    if (!json_body) {
+        return -1;
+    }
+
+    /* 根据服务类型构建 URL */
+    switch (push_config.service) {
+        case PUSH_SERVICE_BARK:
+            snprintf(url, sizeof(url), "%s/%s/ZhiAi",
+                    BARK_API_URL, push_config.push_key);
+            break;
+
+        case PUSH_SERVICE_PUSHPLUS:
+            /* PushPlus 使用 POST 请求，token 放在 JSON 里 */
+            {
+                cJSON *pp_root = cJSON_Parse(json_body);
+                cJSON_AddStringToObject(pp_root, "token", push_config.push_key);
+                free(json_body);
+                json_body = cJSON_PrintUnformatted(pp_root);
+                cJSON_Delete(pp_root);
+                snprintf(url, sizeof(url), "%s", PUSHPLUS_API_URL);
+            }
+            break;
+
+        default:
+            free(json_body);
+            return -1;
+    }
+
+    /* 发送 HTTP 请求 */
+    int ret = http_post(url, json_body);
+    free(json_body);
+
+    printf("push_send_notification: title=%s, ret=%d\n", title, ret);
+    return ret;
+}
+
+/* 发送紧急报警推送 */
+int push_send_alarm(const char *alarm_type, const char *details)
+{
+    char title[128] = {0};
+    char content[256] = {0};
+
+    snprintf(title, sizeof(title), "[ALARM] %s", alarm_type);
+    snprintf(content, sizeof(content),
+            "Device detected: %s\nDetails: %s\nPlease check immediately!",
+            alarm_type, details);
+
+    return push_send_notification(title, content, "alarm");
+}
+
+/* 发送健康提醒推送 */
+int push_send_health_reminder(const char *title, const char *content)
+{
+    char push_title[128] = {0};
+    snprintf(push_title, sizeof(push_title), "[Health] %s", title);
+
+    return push_send_notification(push_title, content, "health");
+}
+
+/* 开关推送功能 */
+void push_set_enabled(bool enabled)
+{
+    push_config.enabled = enabled;
+    printf("push_set_enabled: %s\n", enabled ? "true" : "false");
+}
+
+/* 检查推送功能是否开启 */
+bool push_is_enabled(void)
+{
+    return push_config.enabled;
 }
 
 /* ==================== AI 语音交互接口 ==================== */

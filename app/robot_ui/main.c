@@ -117,6 +117,15 @@ int main(int argc, char *argv[])
     /* ===== 初始化网络通信 ===== */
     network_comm_init();
 
+    /* ===== 连接 WiFi ===== */
+    wifi_connect("魔王城", "sjmbahczdszjj");
+
+    /* ===== 初始化手机推送服务 ===== */
+    /* PushPlus (Android 微信推送) */
+    push_init(PUSH_SERVICE_PUSHPLUS, "1043ad84f9ba4dbb921756173d36277a");
+    /* Bark (iPad iOS 推送) */
+    push_init(PUSH_SERVICE_BARK, "726d1da9c292efcf947a85897c38310f6200a45c60ec8683813ae4d06fe67be9");
+
     /* ===== 注册回调函数 ===== */
     network_set_mqtt_callback(on_mqtt_message_received);
     network_set_ai_command_callback(on_ai_command_received);

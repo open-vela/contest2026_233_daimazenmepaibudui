@@ -3,7 +3,7 @@
   "team_id": "contest2026_233_daimazenmepaibudui",
   "github_login": "gaoxiaoying0207",
   "generator": "claude-code-collector@1.3.0",
-  "updated_at": "2026-08-21T06:06:16.046Z",
+  "updated_at": "2026-08-30T13:20:20.885Z",
   "sessions": [
     {
       "session_id": "16efbec6-e3b3-45ec-bf73-2ae0e2f26035",
@@ -21,13 +21,25 @@
       "session_id": "7b5954e6-f504-4969-a7a0-bd1fe66b1f8c",
       "tool": "claude-code",
       "started_at": "2026-08-20T13:11:32.630Z",
-      "last_event_at": "2026-08-21T06:06:16.033Z",
-      "event_count": 347,
-      "raw_event_count": 468,
-      "file_path": "logs/gaoxiaoying0207/2026-08-20/claude-code__7b5954e6-f504-4969-a7a0-bd1fe66b1f8c.jsonl",
+      "last_event_at": "2026-08-30T11:12:28.297Z",
+      "event_count": 120,
+      "raw_event_count": 1706,
+      "file_path": "logs/gaoxiaoying0207/2026-08-30/claude-code__7b5954e6-f504-4969-a7a0-bd1fe66b1f8c.jsonl",
       "collection_mode": "cli",
       "health": "ok",
       "model": "mimo-v2.5"
+    },
+    {
+      "session_id": "3db08d5b-17b6-4d79-b936-826b0b2d2dbc",
+      "tool": "claude-code",
+      "started_at": "2026-08-30T11:14:57.280Z",
+      "last_event_at": "2026-08-30T13:20:20.877Z",
+      "event_count": 1600,
+      "raw_event_count": 2503,
+      "file_path": "logs/gaoxiaoying0207/2026-08-30/claude-code__3db08d5b-17b6-4d79-b936-826b0b2d2dbc.jsonl",
+      "collection_mode": "cli",
+      "health": "ok",
+      "model": "<synthetic>"
     }
   ]
 }
