@@ -472,7 +472,9 @@ void robot_ui_show_alarm(const char *content)
 void robot_ui_close_alarm(void)
 {
     /* 停止闪烁动画 */
-    lv_anim_del(&anim_blink, anim_blink_update);
+    /* v9 语义: lv_anim_delete(var, exec_cb) 第一个参数是动画绑定的对象
+     * (anim_blink.var == scr_alarm), 不是 lv_anim_t 结构体地址 */
+    lv_anim_delete(anim_blink.var, anim_blink_update);
 
     /* 返回主界面 */
     lv_scr_load(scr_main);

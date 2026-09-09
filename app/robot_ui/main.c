@@ -143,11 +143,11 @@ int main(int argc, char *argv[])
     network_set_mqtt_callback(on_mqtt_message_received);
     network_set_ai_command_callback(on_ai_command_received);
 
-    /* ===== 初始化触摸交互 UI（先初始化） ===== */
-    touch_ui_init();
-
-    /* ===== 初始化机器人 UI ===== */
+    /* ===== 初始化机器人 UI（先创建主屏并 lv_scr_load，成为活动屏） ===== */
     robot_ui_init();
+
+    /* ===== 初始化触摸交互 UI（须在活动屏 = 主屏之后, 菜单才可见） ===== */
+    touch_ui_init();
 
     /* ===== 添加默认提醒 ===== */
     touch_ui_add_reminder("Medicine", "08:00");
