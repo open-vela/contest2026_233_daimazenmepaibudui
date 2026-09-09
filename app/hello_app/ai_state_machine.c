@@ -444,6 +444,14 @@ int sm_init(sm_context_t *ctx)
 
   memset(ctx, 0, sizeof(sm_context_t));
 
+  /* 初始化递归互斥锁: 允许多线程并发调用 sm_handle_event()/sm_run(),
+   * 且同一线程内 sm_run() 可再调用 sm_handle_event() 而不自锁 */
+  pthread_mutexattr_t attr;
+  pthread_mutexattr_init(&attr);
+  pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+  pthread_mutex_init(&ctx->lock, &attr);
+  pthread_mutexattr_destroy(&attr);
+
   /* 设置默认状态 */
 
   ctx->current_state = SM_STATE_IDLE;
@@ -484,12 +492,14 @@ int sm_init(sm_context_t *ctx)
 
 void sm_deinit(sm_context_t *ctx)
 {
-  if (ctx == NULL)
+  if (ctx == NULL || !ctx->initialized)
     {
       return;
     }
 
   SM_DEBUG("反初始化状态机");
+
+  pthread_mutex_lock(&ctx->lock);
 
   /* 退出当前状态 */
 
@@ -499,6 +509,10 @@ void sm_deinit(sm_context_t *ctx)
     }
 
   ctx->initialized = false;
+
+  pthread_mutex_unlock(&ctx->lock);
+
+  pthread_mutex_destroy(&ctx->lock);
 }
 
 /**
@@ -507,6 +521,9 @@ void sm_deinit(sm_context_t *ctx)
 
 int sm_handle_event(sm_context_t *ctx, sm_event_t event)
 {
+  int ret = OK;
+  sm_transition_handler_t handler;
+
   if (ctx == NULL || !ctx->initialized)
     {
       return -EINVAL;
@@ -516,6 +533,10 @@ int sm_handle_event(sm_context_t *ctx, sm_event_t event)
     {
       return -EINVAL;
     }
+
+  /* 串行化: 多个线程(录音VAD/声音检测/主动关怀/LLM/主循环)可能
+   * 同时调用本函数, 必须保证状态切换的原子性 */
+  pthread_mutex_lock(&ctx->lock);
 
   SM_DEBUG("处理事件: %s (当前状态: %s)",
            g_event_names[event],
@@ -527,8 +548,7 @@ int sm_handle_event(sm_context_t *ctx, sm_event_t event)
 
   /* 调用当前状态的转换处理函数 */
 
-  sm_transition_handler_t handler =
-    ctx->state_table[ctx->current_state].transition_func;
+  handler = ctx->state_table[ctx->current_state].transition_func;
 
   if (handler != NULL)
     {
@@ -538,7 +558,7 @@ int sm_handle_event(sm_context_t *ctx, sm_event_t event)
 
       if (next_state != ctx->current_state)
         {
-          return sm_switch_state(ctx, next_state);
+          ret = sm_switch_state(ctx, next_state);
         }
     }
   else
@@ -547,7 +567,9 @@ int sm_handle_event(sm_context_t *ctx, sm_event_t event)
                g_state_names[ctx->current_state]);
     }
 
-  return OK;
+  pthread_mutex_unlock(&ctx->lock);
+
+  return ret;
 }
 
 /**
@@ -561,7 +583,9 @@ void sm_run(sm_context_t *ctx)
       return;
     }
 
-  /* 检查超时 */
+  /* 持递归锁检查超时, 锁内 sm_handle_event() 可重入 */
+
+  pthread_mutex_lock(&ctx->lock);
 
   if (ctx->timeout_ms > 0)
     {
@@ -579,6 +603,8 @@ void sm_run(sm_context_t *ctx)
           sm_handle_event(ctx, SM_EVENT_TIMEOUT);
         }
     }
+
+  pthread_mutex_unlock(&ctx->lock);
 }
 
 /**
@@ -659,6 +685,9 @@ void sm_set_timeout(sm_context_t *ctx, sm_state_t state,
       return;
     }
 
+  /* 与 sm_run() 并发读改, 需持锁 */
+  pthread_mutex_lock(&ctx->lock);
+
   g_default_timeouts[state] = timeout_ms;
 
   /* 如果是当前状态, 立即更新 */
@@ -667,6 +696,8 @@ void sm_set_timeout(sm_context_t *ctx, sm_state_t state,
     {
       ctx->timeout_ms = timeout_ms;
     }
+
+  pthread_mutex_unlock(&ctx->lock);
 
   SM_DEBUG("设置状态 %s 超时: %lu ms",
            g_state_names[state], (unsigned long)timeout_ms);
@@ -687,7 +718,9 @@ void sm_force_state(sm_context_t *ctx, sm_state_t new_state)
            g_state_names[ctx->current_state],
            g_state_names[new_state]);
 
+  pthread_mutex_lock(&ctx->lock);
   sm_switch_state(ctx, new_state);
+  pthread_mutex_unlock(&ctx->lock);
 }
 
 /**

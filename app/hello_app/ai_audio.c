@@ -177,34 +177,41 @@ static void audio_close_play_device(audio_context_t *ctx)
 static void *audio_record_thread(void *arg)
 {
   audio_context_t *ctx = (audio_context_t *)arg;
+  size_t frame_bytes;
+  size_t buf_frames;
   size_t frames_per_read;
+  size_t frames_read;
   ssize_t nbytes;
 
   AUDIO_DEBUG("录音线程启动");
 
-  /* 每次读取的帧数 */
+  /* 每帧期望读取的帧数, 但不能超过缓冲区容量 */
+  frame_bytes = ctx->config.channels *
+                (ctx->config.format == AUDIO_FORMAT_S16_LE ? 2 : 1);
+  buf_frames = ctx->record_buf_size / frame_bytes;
 
   frames_per_read = ctx->config.sample_rate * ctx->config.frame_ms / 1000;
+  if (frames_per_read > buf_frames)
+    {
+      frames_per_read = buf_frames;
+    }
 
   ctx->record_stop = false;
 
   while (!ctx->record_stop && ctx->recording)
     {
-      /* 从设备读取音频数据 */
+      /* TODO: 真正从设备读取音频数据 */
+      /* nbytes = read(ctx->record_fd, ctx->record_buf,  */
+      /*               frames_per_read * frame_bytes); */
 
-      nbytes = frames_per_read * ctx->config.channels *
-               (ctx->config.format == AUDIO_FORMAT_S16_LE ? 2 : 1);
-
-      /* TODO: 实际读取音频数据 */
-      /* nbytes = read(ctx->record_fd, ctx->record_buf, nbytes); */
-
-      /* 模拟读取成功 */
-
-      nbytes = frames_per_read * 2; /* 16bit mono */
+      /* 音频驱动尚未接入: 先填充静音(0), 避免把堆上未初始化的
+       * 残留数据当成语音, 导致VAD被垃圾能量反复误触发 */
+      nbytes = frames_per_read * frame_bytes;
+      memset(ctx->record_buf, 0, nbytes);
 
       if (nbytes > 0)
         {
-          size_t frames_read = nbytes / 2; /* 16bit = 2 bytes */
+          frames_read = nbytes / frame_bytes; /* 实际读到的帧数 */
 
           /* VAD检测 */
 
@@ -264,6 +271,9 @@ static void *audio_record_thread(void *arg)
                                             frames_read,
                                             ctx->record_cfg.user_data);
             }
+
+          /* 按帧周期节流, 避免忙等空转占用CPU */
+          usleep(frames_read * 1000000ULL / ctx->config.sample_rate);
         }
       else
         {

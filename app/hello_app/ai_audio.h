@@ -34,7 +34,8 @@
 #define AUDIO_DEFAULT_FRAME_MS       20      /* 20ms每帧 */
 
 /* 音频缓冲区大小 */
-#define AUDIO_RECORD_BUF_FRAMES      160     /* 录音缓冲帧数 (160*20ms=3.2秒) */
+/* 注意: 16000Hz * 20ms = 320 帧, 缓冲必须能容纳一个帧周期的数据 */
+#define AUDIO_RECORD_BUF_FRAMES      640     /* 录音缓冲帧数 (640=40ms@16kHz, 留余量) */
 #define AUDIO_PLAY_BUF_FRAMES        80      /* 播放缓冲帧数 (80*20ms=1.6秒) */
 
 /* VAD (Voice Activity Detection) 参数 */
