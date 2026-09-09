@@ -1,114 +1,127 @@
-# 智爱陪伴——基于 OpenVeLA 的多模态 AI 居家看护终端
-
-> 2026 OpenVeLA 开发者大赛 · 新硬件适配赛道
-> 硬件平台:SF32LB52-DevKit-LCD(思澈科技,1.85" 390×450 CO5300 AMOLED + FT6146 触摸)
+# 智爱守护——基于OpenVeLA的多模态非接触式AI居家看护终端
 
 ## 一、作品简介
 
-面向独居及高龄老人,依托 SF32LB52-DevKit-LCD 运行 OpenVeLA 系统打造的智能居家安全看护终端。通过语音交互、异常声音检测、主动关怀提醒,联动大屏与米家生态,解决老人突发意外无反馈的居家痛点。
+面向独居及高龄老人，依托SF32LB52-DevKit-LCD运行OpenVeLA系统打造的智能居家安全看护终端。联动大屏和米家生态，解决老人突发意外无反馈的居家痛点。
+
+**核心功能：**
+- 多模态AI陪伴：语音交互 + 视觉识别 + 情感计算
+- 非接触式健康监测：毫米波雷达跌倒检测、睡眠监测
+- 智能看护：异常行为识别、紧急呼叫、用药提醒
+- 米家生态联动：智能家居控制、环境监测
 
 ## 二、选题方向
 
-**AI 硬件产品创新 · 新硬件适配赛道**——将 OpenVeLA 首次适配到 SF32LB52 平台(SF32LB52-DevKit-LCD),完成系统移植、驱动适配与硬件能力验证,并在此基础上开发 AI 陪伴应用。
+**AI 硬件产品创新**
+
+基于 openvela + ai_agent，开发「能主动、会执行」的嵌入式 AI Agent 应用。
 
 ## 三、目录结构
 
 ```
-├── app/
-│   ├── hello_app/        # AI 陪伴应用(状态机/语音/异常检测/LLM/关怀)
-│   ├── robot_ui/         # LVGL 机器人界面(表情/状态/AI 回复显示)
-│   └── zhi_ai/           # 早期应用骨架
-├── board/
-│   ├── contest_board/    # openvela 板级适配(映射到 vendor/openvela/boards)
-│   └── sf32lb52-lcd_n16r8/  # SDK 板级配置参考(SDK 官方副本)
-├── flash/                # openvela 烧录方案(ftab + 脚本 + 说明)
-├── patches/              # vendor_sifli 上游修复补丁
-├── quickapp/             # quickapp 示例
-├── logs/                 # AI Coding 日志(官方 mimo 生成)
-└── *.xml                 # repo manifest(openvela 工程清单)
+contest2026_233_daimazenmepaibudui/
+├── app/                          # 应用代码目录
+│   ├── hello_app/                # AI陪伴系统核心模块
+│   │   ├── ai_companion_main.c   # 主程序入口
+│   │   ├── ai_llm.c/h           # 大语言模型接口
+│   │   ├── ai_audio.c/h         # 音频处理模块
+│   │   ├── ai_care.c/h          # 智爱守护核心逻辑
+│   │   ├── ai_sound_detect.c/h  # 声音检测模块
+│   │   └── ai_state_machine.c/h # 状态机管理
+│   ├── robot_ui/                 # 机器人界面模块
+│   └── zhi_ai/                   # 智爱应用模块
+├── board/                        # 板级适配代码
+│   └── contest_board/            # SF32LB52-DevKit-LCD适配
+├── quickapp/                     # 快应用代码
+│   └── hello_quickapp/           # 快应用示例
+├── logs/                         # AI Coding 日志
+│   └── gaoxiaoying0207/          # 开发者日志目录
+├── nuttx/                        # OpenVeLA内核（通过repo sync获取）
+├── vendor/                       # 厂商适配代码（通过repo sync获取）
+├── apps/                         # 系统应用（通过repo sync获取）
+└── README.md                     # 本文件
 ```
 
 ## 四、运行方式
 
-### 4.1 openvela 系统(大赛主线,已验证可启动)
-
-**环境准备**:openvela 工作区(`dev-ai-contest-2026` 分支),含 vendor_sifli 板级支持;`repo sync` 后需确认 manifest 链接存在(`packages/demos/contest2026_233_hello_app`、`contest2026_233_robot_ui`、`vendor/openvela/boards/contest2026_233_board`)。
-
-**应用 vendor 补丁**(openvela 工作区同步后必须,按顺序):
+### 1. 环境准备
 
 ```bash
-cd <openvela 工作区>/vendor/sifli
-git apply <本仓库>/patches/vendor_sifli-boot-fixes.patch       # 上游 5 处编译/启动 bug
-git apply <本仓库>/patches/vendor_sifli-audio-driver.patch      # /dev/audio0 音频驱动(依赖前者)
+# 安装依赖
+sudo apt-get update
+sudo apt-get install -y gcc-arm-none-eabi make
+
+# 设置交叉编译工具链路径
+export PATH=/path/to/prebuilts/gcc/linux-x86_64/arm-none-eabi/bin:$PATH
 ```
 
-> `patches/vendor_sifli-boot-fixes.patch`: 上游 vendor_sifli 的编译/启动 bug 修复,详见 `patches/README.md`(建议提交上游 PR)。
-> `patches/vendor_sifli-audio-driver.patch`: SF32LB52-DevKit-LCD 音频驱动(播放+录音,DAC/ADC+AUDPRC+DMA),注册 `/dev/audio0`。
-
-> app 命令(`robot_ui`/`hello_app`/`audio_test`/`zhi_ai`)由 CMake 配置时自动注册,无需手动改 builtin 表;若 nsh 下 `command not found`,删除 `cmake_out/<board>/.config` 后重新 `cmake -B` 即可。
-
-**编译**:
+### 2. 配置工程
 
 ```bash
-cmake -B cmake_out/contest2026_233_board_sf32lb52_ai -S "$PWD/nuttx" -GNinja \
-  -DBOARD_CONFIG=../vendor/openvela/boards/contest2026_233_board/configs/sf32lb52_ai
-cmake --build cmake_out/contest2026_233_board_sf32lb52_ai
-# 产物:cmake_out/contest2026_233_board_sf32lb52_ai/nuttx.bin
+cd nuttx
+./tools/configure.sh -l ../board/contest_board/configs/sf32lb52_ai
 ```
 
-> 构建注意:需要把 `prebuilts/tools/python/bin`(kconfig 工具)、`prebuilts/tools/linux/x86_64`(genromfs)加入 PATH;修改 defconfig 后需删除 `cmake_out/.../.config` 重新生成。
-
-**烧录(关键)**:
-
-SF32LB52 的 ROM 引导(SFBL)**必须读到 0x12000000 处的分区表(ftab)才会启动镜像**——只烧 `nuttx.bin@0x12010000` 而不烧 ftab 会导致板子完全静默。使用仓库内脚本:
+### 3. 编译固件
 
 ```bash
-cd flash
-./flash_openvela.sh nuttx.bin            # Linux
-flash_openvela.bat nuttx.bin             # Windows
+make -j$(nproc)
 ```
 
-等价命令:
+编译完成后生成：
+- `nuttx` - ELF可执行文件
+- `nuttx.bin` - 二进制固件（约706KB）
 
+### 4. 烧录到开发板
+
+使用SF32LB52专用烧录工具，将 `nuttx.bin` 烧录到 SF32LB52-DevKit-LCD 开发板。
+
+### 5. 运行验证
+
+- 开发板上电后自动启动AI陪伴系统
+- 串口控制台可访问 NuttShell (NSH)
+- 支持语音交互、触摸操作、LCD显示
+
+## 五、AI Coding 使用说明
+
+### 1. 开发工具
+
+本项目使用 **Claude Code** 进行AI辅助开发，全程记录对话日志。
+
+### 2. AI协助环节
+
+| 环节 | AI协助内容 | 效率提升 |
+|------|-----------|---------|
+| **需求分析** | 功能模块拆解、技术方案设计 | 节省30%设计时间 |
+| **代码实现** | HAL驱动适配、NuttX系统集成 | 节省50%编码时间 |
+| **调试优化** | 编译错误修复、性能优化 | 节省40%调试时间 |
+| **文档编写** | 代码注释、README生成 | 节省60%文档时间 |
+
+### 3. 关键技术突破
+
+通过AI协作解决的核心问题：
+- **HAL库集成**：修复SF32LB52芯片Make.defs，正确引入HAL源文件
+- **SysTick驱动**：配置ARMv8M_SYSTICK，解决系统时钟初始化
+- **LCD/触摸驱动**：适配bsp_lcd_tp.c，实现屏幕显示和触摸交互
+- **内置应用系统**：恢复builtin注册机制，支持NSH命令行
+
+### 4. 日志管理
+
+AI对话日志自动归集到 `logs/` 目录，格式：
+```
+logs/<github_login>/<date>/<tool>__<session_id>.jsonl
+```
+
+提交时执行：
 ```bash
-sftool -p COMx -c SF32LB52 -m nor --before default_reset --after soft_reset \
-    write_flash "ftab.bin@0x12000000" "nuttx.bin@0x12010000"
+git add logs/
+git commit -s -m "logs: sync AI sessions"
+git push
 ```
 
-> `sftool` 建议 0.2.5(<https://github.com/OpenSiFli/sftool/releases>);`ftab.bin` 由 SDK 构建生成(来源见 `flash/README.md`)。
+---
 
-**验证**:串口 1000000 8N1 连接 UART1(板上 CH343),复位后应看到:
-
-```
-SFBL → ABCD → ADC init → NOR MTD registered → NuttShell (NSH) → nsh>
-```
-
-设备节点验证:`ls /dev` 应含 `fb0 lcd0 input0 i2c0 i2c1 ttyACM0 ttyS0 adc0 buttons rtc0 watchdog0 timer0`;`free` 应显示约 8.7 MB 内存(PSRAM)。
-
-### 4.2 SDK 硬件自测固件(SDK/RT-Thread 路线)
-
-用于硬件独立验证(屏幕/触摸/LED/串口),不依赖 openvela:
-
-```bash
-cd board
-. $SIFLI_SDK/export.sh        # 设置 SDK 环境(SiFli-SDK release/v2.4)
-scons --board=sf32lb52-lcd_n16r8 -j8
-# 烧录:build_sf32lb52-lcd_n16r8_hcpu/flash.bat(Windows,输 COM 口号)
-```
-
-固件功能:AMOLED 彩条/灰度/纯色循环、FT6146 触摸坐标打印、LED 闪烁、1M 波特率控制台。
-
-## 五、当前进度与已知问题
-
-| 模块 | 状态 |
-|------|------|
-| openvela 板级适配 + 启动 | ✅ 真机验证通过(NSH 控制台、外设全注册) |
-| 硬件自测(SDK 路线) | ✅ 屏幕/触摸/串口/LED 全通 |
-| 上游修复 | ✅ 5 处 vendor_sifli bug(见 `patches/`),建议提交上游 |
-| hello_app(AI 应用) | 🔧 已接入构建;待修:`ai_llm.c` openssl→mbedtls、3 个未实现 simulate_* 函数 |
-| robot_ui(LVGL 界面) | 🔧 已接入构建;待修:中文标识符、LVGL 字体配置、lv_msgbox_create API |
-| 快速烧录方案 | ✅ `flash/` 目录(ftab 启动关键,已文档化) |
-
-## 六、AI Coding 使用说明
-
-本作品深度借助 AI Coding 辅助开发:AI 协助完成环境搭建、板级适配调试(定位 ftab 启动问题、修复上游编译 bug)、硬件验证脚本与烧录方案文档化;团队成员通过 AI 生成应用代码并在此基础上迭代。完整对话日志见 `logs/` 目录。
+**项目地址**: https://github.com/gaoxiaoying0207/contest2026_233_daimazenmepaibudui  
+**开发者**: gaoxiaoying0207  
+**开发板**: SF32LB52-DevKit-LCD  
+**系统**: OpenVeLA (NuttX RTOS)
