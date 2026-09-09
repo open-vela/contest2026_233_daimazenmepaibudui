@@ -4,6 +4,7 @@
  */
 
 #include "robot_ui.h"
+#include "touch_ui.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -275,7 +276,7 @@ static void btn_event_handler(lv_event_t *e)
                 robot_ui_show_reminder("Health", "Time to take medicine!");
                 break;
             case UI_VIEW_SETTING:
-                // TODO: 打开设置界面
+                touch_ui_show_menu(MENU_TYPE_SETTING);
                 break;
             case UI_VIEW_ALARM:
                 robot_ui_show_alarm("Abnormal detected!\nPlease confirm if help is needed.");
@@ -446,7 +447,7 @@ void robot_ui_show_reminder(const char *title, const char *content)
     lv_obj_t *mbox = lv_msgbox_create(NULL);
     if (mbox == NULL) return;
 
-    lv_label_set_text(lv_msgbox_get_title(mbox), title);
+    lv_msgbox_add_title(mbox, title);
     lv_msgbox_add_text(mbox, content);
     lv_msgbox_add_close_button(mbox);
     lv_obj_center(mbox);

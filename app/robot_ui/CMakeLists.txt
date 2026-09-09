@@ -7,7 +7,7 @@ if(CONFIG_LVX_USE_CONTEST2026_233_ZHI_AI)
   nuttx_add_application(
     NAME robot_ui
     SRCS main.c robot_ui.c touch_ui.c network_comm.c
-    STACKSIZE ${CONFIG_DEFAULT_TASK_STACKSIZE}
+    STACKSIZE 32768
     PRIORITY 100
   )
 

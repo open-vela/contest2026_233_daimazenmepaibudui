@@ -271,8 +271,8 @@ static void create_menu_panel(menu_type_t type)
 static void create_menu_item(lv_obj_t *parent, const char *icon_text,
                             const char *subtitle, int index)
 {
-    /* 菜单项容器 */
-    lv_obj_t *item = lv_obj_create(parent);
+    /* 菜单项按钮 - 用 lv_btn 确保触摸事件可响应 */
+    lv_obj_t *item = lv_btn_create(parent);
     lv_obj_set_size(item, LV_PCT(100), 80);
     lv_obj_add_style(item, &style_menu_item, 0);
     lv_obj_set_flex_flow(item, LV_FLEX_FLOW_ROW);
@@ -322,7 +322,7 @@ static void create_reminder_list_items(lv_obj_t *parent)
 static void create_reminder_item(lv_obj_t *parent, const char *title,
                                 const char *time_str, int index)
 {
-    lv_obj_t *item = lv_obj_create(parent);
+    lv_obj_t *item = lv_btn_create(parent);
     lv_obj_set_size(item, LV_PCT(100), 70);
     lv_obj_add_style(item, &style_menu_item, 0);
     lv_obj_set_flex_flow(item, LV_FLEX_FLOW_ROW);
@@ -678,7 +678,7 @@ static void show_confirm_dialog(const char *title, const char *content,
     lv_obj_t *mbox = lv_msgbox_create(NULL);
     if (mbox == NULL) return;
 
-    lv_label_set_text(lv_msgbox_get_title(mbox), title);
+    lv_msgbox_add_title(mbox, title);
     lv_msgbox_add_text(mbox, content);
 
     /* 添加确认和取消按钮 */
@@ -745,7 +745,7 @@ void touch_ui_show_setting_detail(const char *title, const char *content)
     lv_obj_t *mbox = lv_msgbox_create(NULL);
     if (mbox == NULL) return;
 
-    lv_label_set_text(lv_msgbox_get_title(mbox), title);
+    lv_msgbox_add_title(mbox, title);
     lv_msgbox_add_text(mbox, content);
     lv_msgbox_add_close_button(mbox);
     lv_obj_center(mbox);
