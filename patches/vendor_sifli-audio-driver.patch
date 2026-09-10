@@ -1,8 +1,22 @@
+diff --git a/boards/sf32lb52/sf32lb52_devkit_lcd/src/CMakeLists.txt b/boards/sf32lb52/sf32lb52_devkit_lcd/src/CMakeLists.txt
+index 9074a55..2eb3650 100644
+--- a/boards/sf32lb52/sf32lb52_devkit_lcd/src/CMakeLists.txt
++++ b/boards/sf32lb52/sf32lb52_devkit_lcd/src/CMakeLists.txt
+@@ -18,7 +18,7 @@
+ #
+ # ##############################################################################
+ 
+-set(SRCS sifli_ap.c sifli_gpio.c sf32lb52_buttons.c bsp_init.c bsp_lcd_tp.c bsp_pinmux.c bsp_power.c )
++set(SRCS sifli_ap.c sifli_gpio.c sf32lb52_buttons.c bsp_init.c bsp_lcd_tp.c bsp_pinmux.c bsp_power.c sf32lb52_audio.c )
+ 
+ nuttx_add_romfs(
+   NAME
 diff --git a/boards/sf32lb52/sf32lb52_devkit_lcd/src/sf32lb52_audio.c b/boards/sf32lb52/sf32lb52_devkit_lcd/src/sf32lb52_audio.c
 new file mode 100644
+index 0000000..7ac4c39
 --- /dev/null
 +++ b/boards/sf32lb52/sf32lb52_devkit_lcd/src/sf32lb52_audio.c
-@@ -0,0 +1,1095 @@
+@@ -0,0 +1,1188 @@
 +/****************************************************************************
 + * boards/sf32lb52/sf32lb52_devkit_lcd/src/sf32lb52_audio.c
 + *
@@ -36,6 +50,7 @@ new file mode 100644
 +#include <errno.h>
 +#include <debug.h>
 +#include <syslog.h>
++#include <math.h>
 +
 +#include <nuttx/kmalloc.h>
 +#include <nuttx/audio/audio.h>
@@ -79,7 +94,7 @@ new file mode 100644
 +
 +/* 默认音量（dB） */
 +
-+#define SF32LB52_AUDIO_DEFAULT_VOL  (-18)
++#define SF32LB52_AUDIO_DEFAULT_VOL  (-6)
 +
 +/****************************************************************************
 + * Private Types
@@ -101,8 +116,6 @@ new file mode 100644
 +  bool                    wr_busy;      /* write() DMA 进行中 */
 +  sem_t                   rx_sem;       /* read() 同步信号量 */
 +  bool                    rx_busy;      /* read() DMA 进行中 */
-+  int                     irq_attach_ret; /* irq_attach 返回值（调试） */
-+  volatile int            irq_count;    /* DMA 中断触发计数（调试） */
 +};
 +
 +/****************************************************************************
@@ -325,6 +338,9 @@ new file mode 100644
 +  HAL_RCC_EnableModule(RCC_MOD_AUDCODEC_HP);
 +  HAL_RCC_EnableModule(RCC_MOD_AUDCODEC_LP);
 +  HAL_RCC_EnableModule(RCC_MOD_AUDPRC);
++  /* DMAC1 时钟：AUDPRC TX0/RX0 DMA 走 DMAC1，必须先开时钟，否则
++   * HAL_AUDPRC_Transmit_DMA 返回 OK 但 DMA 永不传输/无完成中断 */
++  HAL_RCC_EnableModule(RCC_MOD_DMAC1);
 +  syslog(LOG_ERR, "AUDIO: clocks ok\n");
 +
 +  /* codec 基本配置（模拟前端） */
@@ -333,6 +349,9 @@ new file mode 100644
 +  priv->codec.Init.dac_cfg.opmode  = 1;
 +  priv->codec.Init.adc_cfg.opmode  = 1;
 +  priv->codec.Init.samplerate_index = 3;   /* 默认 16k，configure 时更新 */
++
++  /* codec 自带 DMA 播放通路的 DMA 句柄延迟到第一次播放时再挂（见 hw_start）——
++   * 在板级 bringup 阶段做会让启动挂住（实测黑屏） */
 +
 +  syslog(LOG_ERR, "AUDIO: codec init...\n");
 +  res = HAL_AUDCODEC_Init(&priv->codec);
@@ -348,15 +367,10 @@ new file mode 100644
 +  priv->aprc.Init.adc_div = 1;
 +  priv->aprc.Init.dac_div = 1;
 +
-+  syslog(LOG_ERR, "AUDIO: aprc init...\n");
-+  res = HAL_AUDPRC_Init(&priv->aprc);
-+  syslog(LOG_ERR, "AUDIO: aprc init res=%d\n", res);
-+  if (res != HAL_OK)
-+    {
-+      return -EIO;
-+    }
-+
-+  /* AUDPRC TX0（播放）/ RX0（录音）DMA 句柄 */
++  /* DMA 句柄必须在 HAL_AUDPRC_Init() 之前分配并填好 Instance/Request：
++   * HAL 会用音频正确的参数初始化它们（WORD 对齐 + DMA_CIRCULAR + 高优先级）。
++   * 若在 Init 之后才分配（或自己配成 HALFWORD/NORMAL），AUDPRC 的 32bit FIFO
++   * 收不到正确数据字，表现为播放只有开关爆音、无实际音频。 */
 +
 +  priv->aprc.hdma[HAL_AUDPRC_TX_CH0] = kmm_zalloc(sizeof(DMA_HandleTypeDef));
 +  priv->aprc.hdma[HAL_AUDPRC_RX_CH0] = kmm_zalloc(sizeof(DMA_HandleTypeDef));
@@ -369,27 +383,30 @@ new file mode 100644
 +
 +  priv->aprc.hdma[HAL_AUDPRC_TX_CH0]->Instance     = AUDPRC_TX0_DMA_INSTANCE;
 +  priv->aprc.hdma[HAL_AUDPRC_TX_CH0]->Init.Request = AUDPRC_TX0_DMA_REQUEST;
-+  priv->aprc.hdma[HAL_AUDPRC_TX_CH0]->Parent       = &priv->aprc;
-+  priv->aprc.hdma[HAL_AUDPRC_TX_CH0]->Init.Direction = DMA_MEMORY_TO_PERIPH;
-+  priv->aprc.hdma[HAL_AUDPRC_TX_CH0]->Init.PeriphInc = DMA_PINC_DISABLE;
-+  priv->aprc.hdma[HAL_AUDPRC_TX_CH0]->Init.MemInc    = DMA_MINC_ENABLE;
-+  priv->aprc.hdma[HAL_AUDPRC_TX_CH0]->Init.PeriphDataAlignment = DMA_PDATAALIGN_HALFWORD;
-+  priv->aprc.hdma[HAL_AUDPRC_TX_CH0]->Init.MemDataAlignment    = DMA_MDATAALIGN_HALFWORD;
-+  priv->aprc.hdma[HAL_AUDPRC_TX_CH0]->Init.Mode      = DMA_NORMAL;
-+  priv->aprc.hdma[HAL_AUDPRC_TX_CH0]->Init.Priority  = DMA_PRIORITY_LOW;
-+  HAL_DMA_Init(priv->aprc.hdma[HAL_AUDPRC_TX_CH0]);
-+
 +  priv->aprc.hdma[HAL_AUDPRC_RX_CH0]->Instance     = AUDPRC_RX0_DMA_INSTANCE;
 +  priv->aprc.hdma[HAL_AUDPRC_RX_CH0]->Init.Request = AUDPRC_RX0_DMA_REQUEST;
-+  priv->aprc.hdma[HAL_AUDPRC_RX_CH0]->Parent       = &priv->aprc;
-+  priv->aprc.hdma[HAL_AUDPRC_RX_CH0]->Init.Direction = DMA_PERIPH_TO_MEMORY;
-+  priv->aprc.hdma[HAL_AUDPRC_RX_CH0]->Init.PeriphInc = DMA_PINC_DISABLE;
-+  priv->aprc.hdma[HAL_AUDPRC_RX_CH0]->Init.MemInc    = DMA_MINC_ENABLE;
-+  priv->aprc.hdma[HAL_AUDPRC_RX_CH0]->Init.PeriphDataAlignment = DMA_PDATAALIGN_HALFWORD;
-+  priv->aprc.hdma[HAL_AUDPRC_RX_CH0]->Init.MemDataAlignment    = DMA_MDATAALIGN_HALFWORD;
-+  priv->aprc.hdma[HAL_AUDPRC_RX_CH0]->Init.Mode      = DMA_NORMAL;
-+  priv->aprc.hdma[HAL_AUDPRC_RX_CH0]->Init.Priority  = DMA_PRIORITY_LOW;
-+  HAL_DMA_Init(priv->aprc.hdma[HAL_AUDPRC_RX_CH0]);
++
++  syslog(LOG_ERR, "AUDIO: aprc init...\n");
++  res = HAL_AUDPRC_Init(&priv->aprc);
++  syslog(LOG_ERR, "AUDIO: aprc init res=%d\n", res);
++  if (res != HAL_OK)
++    {
++      return -EIO;
++    }
++
++  /* 功放使能引脚 PA10(AUDIO_PA_CTRL)：必须先 HAL_GPIO_Init 设为输出，
++   * 否则 WritePin 无效、AW8155 功放始终关闭（参照板级 BSP_GPIO_Set） */
++
++  {
++    GPIO_InitTypeDef pa_init;
++
++    pa_init.Mode = GPIO_MODE_OUTPUT;
++    pa_init.Pin  = SF32LB52_AUDIO_PA_PIN;
++    pa_init.Pull = GPIO_NOPULL;
++    HAL_GPIO_Init(SF32LB52_AUDIO_PA_GPIO, &pa_init);
++    HAL_GPIO_WritePin(SF32LB52_AUDIO_PA_GPIO, SF32LB52_AUDIO_PA_PIN,
++                      GPIO_PIN_RESET);
++  }
 +
 +  /* 注册 DMA1 通道中断（AUDPRC TX/RX 数据传输完成依赖 DMA 中断） */
 +
@@ -550,55 +567,94 @@ new file mode 100644
 +
 +  /* 音频 PLL 时钟配置（播放/录音前必调，参考 SDK bf0_audio_pll_config） */
 +
-+  bf0_enable_pll(priv->samplerate, 1);
 +
-+  if (playback)
++  /* 参考源/带隙基准（含 BG_CFG0 VREF_SEL、REFGEN 使能）：SDK 的 bf0_enable_pll
++   * 内部会调用 HAL_TURN_ON_PLL，openvela 的 weak 版本没有 → 必须显式补齐，
++   * 否则 DAC 模拟级无参考源，播放静音（录音通路的 ADCPath 自带这一步） */
++
++  HAL_TURN_ON_PLL();
++
++  /* SDK 的 52X 参考序列（codec_hp_sin1k_test）在此板上用 VREF_SEL=0xc（AVDD 3.3V，
++   * AVDD_V18_ENABLE 未定义走 #else 分支）；openvela 的 HAL_TURN_ON_PLL 写的是 4，
++   * 带隙基准不正确 → DAC 模拟级无输出（只有通路开关爆音）。这里按 SDK 值纠正。 */
++
++  codec->Instance->BG_CFG0 &= ~AUDCODEC_BG_CFG0_VREF_SEL_Msk;
++  codec->Instance->BG_CFG0 |= (0xcUL << AUDCODEC_BG_CFG0_VREF_SEL_Pos);
++  up_mdelay(2);
++
++
++  /* 音频 PLL 是否真的锁定：UNLOCK=1 表示未锁定 → DAC 无模拟时钟 → 静音 */
++
++  /* 播放与录音通路一起使能：播放走 codec 自带 DMA（AUDCODEC DAC_CH0，
++   * 见 write()），录音走 AUDPRC RX0；两者可独立使用 */
++
++  /* 注意：播放数据不再经 AUDPRC（改走 codec 自带 DMA，
++   * HAL_AUDCODEC_Transmit_DMA），避免 AUDPRC 的 DAC 通路与 codec DMA
++   * 争抢 codec 的 DAC 数据源；AUDPRC 现在只负责录音(RX)。 */
++
++  /* AUDPRC：ADC 输入来自 codec */
++
++  __HAL_AUDPRC_ADC_SRC_CODEC(aprc);
++
++  __HAL_AUDPRC_ENABLE(aprc);
++
++  /* 首次播放时挂上 codec 自带 DMA 句柄（SDK 52X 的播放路径，小智固件实测有声），
++   * 并让 HAL 重新初始化（它会用音频参数配置句柄并动态分配 DMA 通道） */
++
++  if (priv->codec.hdma[HAL_AUDCODEC_DAC_CH0] == NULL)
 +    {
-+      /* AUDPRC：DAC 输出到 codec，配置 MUX/MIX 通路（0x5050） */
++      int cret;
 +
-+      __HAL_AUDPRC_DAC_DST_CODEC(aprc);
++      priv->codec.hdma[HAL_AUDCODEC_DAC_CH0] = kmm_zalloc(sizeof(DMA_HandleTypeDef));
++      priv->codec.hdma[HAL_AUDCODEC_DAC_CH1] = kmm_zalloc(sizeof(DMA_HandleTypeDef));
 +
-+      aprc->Init.dac_cfg.muxrsrc1 = (SF32LB52_AUDIO_OUT_SEL >> 12) & 0xF;
-+      aprc->Init.dac_cfg.muxrsrc0 = (SF32LB52_AUDIO_OUT_SEL >> 8) & 0xF;
-+      aprc->Init.dac_cfg.muxlsrc1 = (SF32LB52_AUDIO_OUT_SEL >> 4) & 0xF;
-+      aprc->Init.dac_cfg.muxlsrc0 = SF32LB52_AUDIO_OUT_SEL & 0xF;
++      if (priv->codec.hdma[HAL_AUDCODEC_DAC_CH0] != NULL)
++        {
++          /* Instance 必须是某个合法 DMAC 通道：DMA_AllocChannel() 用它定位通道池，
++           * 为 NULL 会进 HAL_ASSERT(0)（while(1)）死循环。若该通道已被占用，
++           * 分配器会自动改选池里空闲的通道。 */
++          priv->codec.hdma[HAL_AUDCODEC_DAC_CH0]->Instance     = DMA1_Channel2;
++          priv->codec.hdma[HAL_AUDCODEC_DAC_CH0]->Init.Request = AUDCODEC_DAC0_DMA_REQUEST;
++          priv->codec.hdma[HAL_AUDCODEC_DAC_CH0]->Parent       = &priv->codec;
++        }
 +
-+      aprc->Init.dac_cfg.mixrsrc1 = (SF32LB52_AUDIO_OUT_SEL >> 12) & 0xF;
-+      aprc->Init.dac_cfg.mixrsrc0 = (SF32LB52_AUDIO_OUT_SEL >> 8) & 0xF;
-+      aprc->Init.dac_cfg.mixlsrc1 = (SF32LB52_AUDIO_OUT_SEL >> 4) & 0xF;
-+      aprc->Init.dac_cfg.mixlsrc0 = SF32LB52_AUDIO_OUT_SEL & 0xF;
++      if (priv->codec.hdma[HAL_AUDCODEC_DAC_CH1] != NULL)
++        {
++          priv->codec.hdma[HAL_AUDCODEC_DAC_CH1]->Instance     = DMA1_Channel3;
++          priv->codec.hdma[HAL_AUDCODEC_DAC_CH1]->Init.Request = AUDCODEC_DAC1_DMA_REQUEST;
++          priv->codec.hdma[HAL_AUDCODEC_DAC_CH1]->Parent       = &priv->codec;
++        }
 +
-+      HAL_AUDPRC_Config_DACPath(aprc, &aprc->Init.dac_cfg);
-+      __HAL_AUDPRC_ENABLE(aprc);
-+
-+      /* codec：DAC 模拟通路输出 */
-+
-+      __HAL_AUDCODEC_DAC_ENABLE(codec);
-+      HAL_AUDCODEC_Config_Analog_DACPath(codec->Init.dac_cfg.dac_clk);
-+      HAL_AUDCODEC_Config_DACPath(codec, 0);
-+      HAL_AUDCODEC_Config_DACPath_Volume(codec, SF32LB52_AUDIO_DAC_CH,
-+                                         SF32LB52_AUDIO_DEFAULT_VOL);
-+
-+      /* 打开功放 */
-+
-+      sf32lb52_audio_pa_enable(true);
-+      audinfo("DAC path started\n");
++      cret = HAL_AUDCODEC_Init(&priv->codec);
 +    }
-+  else
-+    {
-+      /* AUDPRC：ADC 输入来自 codec（整体使能放到 DMA 启动后，
-+       * 参考 SDK audprc start：配置+启动 DMA → __HAL_AUDPRC_ENABLE） */
 +
-+      __HAL_AUDPRC_ADC_SRC_CODEC(aprc);
++  /* codec：DAC 模拟通路输出（SF32LB52X 无独立 HP 块，主 Instance 使能 DAC；
++   * 参考 SDK 播放序列 Config_DACPath(bypass=1) → 模拟通路 → bypass=0） */
 +
-+      /* codec：ADC 通道重配 + 模拟通路（参考 SDK codec start） */
++  __HAL_AUDCODEC_DAC_ENABLE(codec);
++  HAL_AUDCODEC_Config_DACPath(codec, 1);
++  HAL_AUDCODEC_Config_Analog_DACPath(codec->Init.dac_cfg.dac_clk);
++  HAL_AUDCODEC_Config_DACPath(codec, 0);
++  HAL_AUDCODEC_Config_DACPath_Volume(codec, 0, SF32LB52_AUDIO_DEFAULT_VOL);
++  HAL_AUDCODEC_Config_DACPath_Volume(codec, 1, SF32LB52_AUDIO_DEFAULT_VOL);
 +
-+      HAL_AUDCODEC_Config_RChanel(codec, SF32LB52_AUDIO_ADC_CH,
-+                                  &codec->Init.adc_cfg);
-+      HAL_AUDCODEC_Config_Analog_ADCPath(codec->Init.adc_cfg.adc_clk);
-+      __HAL_AUDCODEC_ADC_ENABLE(codec);
-+      audinfo("ADC path started\n");
-+    }
++  /* 回读 codec 寄存器确认通路状态（调试） */
++
++  /* codec：ADC 模拟通路 */
++
++  HAL_AUDCODEC_Config_RChanel(codec, SF32LB52_AUDIO_ADC_CH,
++                              &codec->Init.adc_cfg);
++  HAL_AUDCODEC_Config_Analog_ADCPath(codec->Init.adc_cfg.adc_clk);
++  __HAL_AUDCODEC_ADC_ENABLE(codec);
++
++  /* 打开功放（测试：按 START 次数交替极性） */
++
++  sf32lb52_audio_pa_enable(true);
++  up_mdelay(20);   /* 等功放上电稳定 */
++
++  audinfo("DAC+ADC path started\n");
++
++  /* 模拟块寄存器全量 dump（调试） */
 +
 +  priv->playback = playback;
 +  priv->running  = true;
@@ -618,15 +674,13 @@ new file mode 100644
 +  HAL_AUDPRC_DMAStop(&priv->aprc, HAL_AUDPRC_RX_CH0);
 +  __HAL_AUDPRC_DISABLE(&priv->aprc);
 +
-+  if (priv->playback)
-+    {
-+      HAL_AUDCODEC_Close_Analog_DACPath();
-+      sf32lb52_audio_pa_enable(false);
-+    }
-+  else
-+    {
-+      HAL_AUDCODEC_Close_Analog_ADCPath();
-+    }
++  /* 清掉 HAL 的通道状态，否则下一次 Transmit/Receive DMA 会返回 HAL_BUSY */
++  priv->aprc.State[HAL_AUDPRC_TX_CH0] = HAL_AUDPRC_STATE_READY;
++  priv->aprc.State[HAL_AUDPRC_RX_CH0] = HAL_AUDPRC_STATE_READY;
++
++  HAL_AUDCODEC_Close_Analog_DACPath();
++  HAL_AUDCODEC_Close_Analog_ADCPath();
++  sf32lb52_audio_pa_enable(false);
 +
 +  priv->running = false;
 +  audinfo("audio stopped\n");
@@ -907,25 +961,58 @@ new file mode 100644
 +    }
 +
 +  priv->wr_busy = true;
-+  res = HAL_AUDPRC_Transmit_DMA(&priv->aprc, (FAR uint8_t *)buffer, buflen,
-+                                SF32LB52_AUDIO_PRC_TX_CH);
++
++  /* 数据体检：样本是否为空/异常（全 0 会让 DAC 只输出直流，只有开关爆音） */
++  {
++    FAR const int16_t *p = (FAR const int16_t *)buffer;
++    int i;
++    int mx = 0;
++
++    for (i = 0; i < 256; i++)
++      {
++        int v = p[i];
++
++        if (v < 0)
++          {
++            v = -v;
++          }
++
++        if (v > mx)
++          {
++            mx = v;
++          }
++      }
++
++  }
++
++
++  clock_t t0 = clock_systime_ticks();
++
++  res = HAL_AUDCODEC_Transmit_DMA(&priv->codec, (FAR uint8_t *)buffer, buflen,
++                                  HAL_AUDCODEC_DAC_CH0);
 +  if (res != HAL_OK)
 +    {
 +      priv->wr_busy = false;
-+      auderr("ERROR: write DMA start failed: %d\n", res);
 +      return 0;
 +    }
 +
-+  ret = nxsem_tickwait_uninterruptible(&priv->wr_sem, MSEC2TICK(5000));
++  {
++    /* 按实际采样率算等待上限（ms），再加 500ms 余量 */
++    uint32_t wait_ms = (uint32_t)(((uint32_t)(buflen / 2) * 1000U) /
++                       (uint32_t)(priv->samplerate ? priv->samplerate : 16000)) + 500U;
++
++    ret = nxsem_tickwait_uninterruptible(&priv->wr_sem, MSEC2TICK(wait_ms));
++  }
++
 +  priv->wr_busy = false;
 +
-+  /* 停止循环 DMA 传输（单次播放完成） */
++  /* 停止 DMA 传输（单次播放完成） */
 +
-+  HAL_AUDPRC_DMAStop(&priv->aprc, SF32LB52_AUDIO_PRC_TX_CH);
++  HAL_AUDCODEC_DMAStop(&priv->codec, HAL_AUDCODEC_DAC_CH0);
++  priv->codec.State[HAL_AUDCODEC_DAC_CH0] = HAL_AUDCODEC_STATE_READY;
 +
 +  if (ret < 0)
 +    {
-+      auderr("ERROR: write DMA wait failed: %d\n", ret);
 +      return 0;
 +    }
 +
@@ -1076,6 +1163,26 @@ new file mode 100644
 +    }
 +}
 +
++void HAL_AUDCODEC_TxCpltCallback(AUDCODEC_HandleTypeDef *hacodec, int cid)
++{
++  FAR struct sf32lb52_audio_s *priv;
++
++  (void)cid;
++  if (hacodec == NULL)
++    {
++      return;
++    }
++
++  priv = (FAR struct sf32lb52_audio_s *)
++         ((FAR char *)hacodec - offsetof(struct sf32lb52_audio_s, codec));
++
++  if (priv->wr_busy)
++    {
++      priv->wr_busy = false;
++      nxsem_post(&priv->wr_sem);
++    }
++}
++
 +void HAL_AUDPRC_RxCpltCallback(AUDPRC_HandleTypeDef *haprc, int cid)
 +{
 +  FAR struct sf32lb52_audio_s *priv;
@@ -1100,6 +1207,7 @@ new file mode 100644
 +}
 diff --git a/boards/sf32lb52/sf32lb52_devkit_lcd/src/sf32lb52_audio.h b/boards/sf32lb52/sf32lb52_devkit_lcd/src/sf32lb52_audio.h
 new file mode 100644
+index 0000000..7febd7d
 --- /dev/null
 +++ b/boards/sf32lb52/sf32lb52_devkit_lcd/src/sf32lb52_audio.h
 @@ -0,0 +1,42 @@
@@ -1145,34 +1253,45 @@ new file mode 100644
 +int sf32lb52_audio_initialize(void);
 +
 +#endif /* __BOARDS_SF32LB52_SF32LB52_DEVTKIT_LCD_SRC_SF32LB52_AUDIO_H */
-diff --git a/boards/sf32lb52/sf32lb52_devkit_lcd/src/CMakeLists.txt b/boards/sf32lb52/sf32lb52_devkit_lcd/src/CMakeLists.txt
---- a/boards/sf32lb52/sf32lb52_devkit_lcd/src/CMakeLists.txt
-+++ b/boards/sf32lb52/sf32lb52_devkit_lcd/src/CMakeLists.txt
-@@ -18,7 +18,7 @@
- #
- # ##############################################################################
- 
--set(SRCS sifli_ap.c sifli_gpio.c sf32lb52_buttons.c bsp_init.c bsp_lcd_tp.c bsp_pinmux.c bsp_power.c )
-+set(SRCS sifli_ap.c sifli_gpio.c sf32lb52_buttons.c bsp_init.c bsp_lcd_tp.c bsp_pinmux.c bsp_power.c sf32lb52_audio.c )
- 
- nuttx_add_romfs(
-   NAME
 diff --git a/boards/sf32lb52/sf32lb52_devkit_lcd/src/sifli_ap.c b/boards/sf32lb52/sf32lb52_devkit_lcd/src/sifli_ap.c
+index 32be34b..2bd72e0 100644
 --- a/boards/sf32lb52/sf32lb52_devkit_lcd/src/sifli_ap.c
 +++ b/boards/sf32lb52/sf32lb52_devkit_lcd/src/sifli_ap.c
-@@ -40,6 +40,7 @@
+@@ -30,6 +30,7 @@
+ #include <sys/mount.h>
+ #include <sys/stat.h>
+ #include <debug.h>
++#include <unistd.h>
+ 
+ #if defined(CONFIG_RTC) && defined(CONFIG_RTC_DRIVER)
+ #  include <nuttx/timers/rtc.h>
+@@ -40,13 +41,22 @@
  #include "bf0_hal.h"
  #include "drv_io.h"
  #include "sifli_gpio.h"
 +#include "sf32lb52_audio.h"
++
++/* sifli_i2cbus_initialize is defined in chips/sf32lb52/sifli_i2c.c
++ * (no public header exists yet in vendor_sifli)
++ */
++extern struct i2c_master_s *sifli_i2cbus_initialize(int port);
  
- /* sifli_i2cbus_initialize is defined in chips/sf32lb52/sifli_i2c.c
-  * (no public header exists yet in vendor_sifli)
-@@ -400,6 +401,15 @@
-       return ret;
+ #include <nuttx/arch.h>
+ #include <nuttx/board.h>
++#include <nuttx/i2c/i2c_master.h>
+ #include <nuttx/lcd/lcd.h>
+ #include <nuttx/lcd/lcd_dev.h>
++#include <nuttx/sched.h>
+ #include <nuttx/timers/pwm.h>
+ #include <nuttx/timers/timer.h>
++#include <nuttx/usb/rndis.h>
+ #include <nuttx/video/fb.h>
+ #if defined(CONFIG_I2C) && defined(CONFIG_SENSORS_LSM6DSL)
+ #  include <nuttx/sensors/lsm6dsl.h>
+@@ -395,6 +405,15 @@ int sf32lb52_lchspi_ulp_bringup(void)
      }
  #endif
-+
+ 
 +#ifdef CONFIG_AUDIO
 +  ret = sf32lb52_audio_initialize();
 +  if (ret < 0)
@@ -1181,6 +1300,126 @@ diff --git a/boards/sf32lb52/sf32lb52_devkit_lcd/src/sifli_ap.c b/boards/sf32lb5
 +      return ret;
 +    }
 +#endif
- 
++
  #ifdef CONFIG_DEV_GPIO
    ret = sifli_gpio_initialize();
+   if (ret < 0)
+@@ -463,12 +482,11 @@ int sf32lb52_lchspi_ulp_bringup(void)
+ #endif
+ 
+ #ifdef CONFIG_I2C
+-  /* Initialize I2C bus 0 on the touch panel pins. */
++  /* Initialize I2C bus 0 on the touch panel pins.
++   * Pinmux for I2C1 (SCL=PA30, SDA=PA33) is done in bsp_pinmux.c.
++   */
+   struct i2c_master_s *i2c0 = NULL;
+ 
+-  HAL_PIN_Set(PAD_PA37, I2C1_SCL, PIN_PULLUP, 1);
+-  HAL_PIN_Set(PAD_PA33, I2C1_SDA, PIN_PULLUP, 1);
+-
+   i2c0 = sifli_i2cbus_initialize(0);
+   if (i2c0 == NULL)
+     {
+@@ -647,11 +665,102 @@ void board_early_initialize(void)
+  ****************************************************************************/
+ 
+ #ifdef CONFIG_BOARD_LATE_INITIALIZE
++static int usbdbg_counter_increment(void)
++{
++  static int c;
++  return ++c;
++}
++
+ void board_late_initialize(void)
+ {
+   /* Perform board-specific initialization */
+ 
+   sf32lb52_lchspi_ulp_bringup();
++
++#ifdef CONFIG_RNDIS
++  /* Bring up the USB RNDIS Ethernet-over-USB gadget: the host (PC)
++   * enumerates this board as a virtual Ethernet adapter. The RNDIS
++   * class driver registers the netdev itself; configure it afterwards
++   * via ifconfig / netmgr (static or DHCP from the host).
++   */
++  {
++    static const uint8_t rndis_mac[6] =
++    {
++      0x00, 0xe0, 0x4c, 0x53, 0x42, 0x31
++    };
++
++    syslog(LOG_ERR, "[usbdbg] BOARD: calling usbdev_rndis_initialize (once)\n");
++    int rndis_ret = usbdbg_counter_increment();
++    syslog(LOG_ERR, "[usbdbg] BOARD: call #%d pre\n", rndis_ret);
++    rndis_ret = usbdev_rndis_initialize(rndis_mac);
++    syslog(LOG_ERR, "[usbdbg] BOARD: usbdev_rndis_initialize ret=%d\n", rndis_ret);
++    if (rndis_ret == 0)
++      {
++        /* The host only enumerates a USB port once after it sees the
++         * D+ pullup; if the port already failed (e.g. during early
++         * boot before the class driver was bound) it will not retry.
++         * Drop the pullup briefly to force a fresh bus reset.
++         */
++        /* Full disconnect: release D+, pull D- low so the host
++         * unambiguously sees a detach, then reconnect.  Repeat a
++         * few times in case the host needs a full bus-idle window.
++         */
++        for (int p = 0; p < 3; p++)
++          {
++            hwp_hpsys_cfg->USBCR &= ~HPSYS_CFG_USBCR_DP_EN;
++            hwp_hpsys_cfg->USBCR |= HPSYS_CFG_USBCR_DM_PD;
++            hwp_usbc->power &= ~USB_POWER_SOFTCONN;
++            usleep(1000 * 1000);
++            hwp_hpsys_cfg->USBCR &= ~HPSYS_CFG_USBCR_DM_PD;
++            hwp_hpsys_cfg->USBCR |= HPSYS_CFG_USBCR_DP_EN;
++            hwp_usbc->power |= USB_POWER_SOFTCONN;
++            syslog(LOG_ERR, "[usbdbg] BOARD: re-enum pulse #%d\n", p + 1);
++            if (p < 2)
++              {
++                usleep(2000 * 1000);
++              }
++          }
++      }
++  }
++#endif
++
++#ifdef CONFIG_LVX_USE_CONTEST2026_233_ZHI_AI
++  /* Autostart the ZhiAi companion UI (robot_ui) so the device boots
++   * straight into the touch UI, while NSH stays available on the serial
++   * console for debugging. Give the async LCD/touch probe a moment to
++   * finish before LVGL opens /dev/lcd0 and /dev/input0.
++   * robot_ui also brings up WiFi (wifi_connect) during its init.
++   */
++  {
++    extern int robot_ui_main(int argc, FAR char *argv[]);
++    int ret;
++
++    usleep(2 * 1000 * 1000);
++    ret = task_create("robot_ui", 100, 16384, robot_ui_main, NULL);
++    if (ret < 0)
++      {
++        syslog(LOG_ERR, "ERROR: robot_ui autostart failed: %d\n", ret);
++      }
++  }
++#endif
++
++#ifdef CONFIG_LVX_USE_DEMO_CONTEST2026_000_HELLO_APP
++  /* Autostart the AI companion logic (hello_app: state machine, care
++   * timers, voice/sound detection). Started after robot_ui so the WiFi
++   * link is already up if the LLM path is ever exercised.
++   */
++  {
++    extern int hello_app_main(int argc, FAR char *argv[]);
++    int ret;
++
++    usleep(500 * 1000);
++    ret = task_create("hello_app", 100, 16384, hello_app_main, NULL);
++    if (ret < 0)
++      {
++        syslog(LOG_ERR, "ERROR: hello_app autostart failed: %d\n", ret);
++      }
++  }
++#endif
+ }
+ #endif
+ 
