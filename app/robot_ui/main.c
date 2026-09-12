@@ -6,6 +6,7 @@
 #include <nuttx/config.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <sched.h>
 #include <lvgl/lvgl.h>
 
 /* 头文件 */
@@ -133,6 +134,15 @@ int main(int argc, char *argv[])
     /* ===== 连接 WiFi ===== */
     wifi_connect("魔王城", "sjmbahczdszjj");
 
+    /* ===== 启动网络后台任务 =====
+     * 负责 MQTT 连接 broker.emqx.io:1883、收消息、发心跳。
+     * network_task() 一直存在但从来没被创建过，所以 MQTT 一次都没连上过。
+     * 它自己会轮询 wifi_config.connected，所以放在 wifi_connect() 之后创建。
+     */
+    if (task_create("net_task", 100, 12288, (main_t)network_task, NULL) < 0) {
+        printf("net_task create failed\n");
+    }
+
     /* ===== 初始化手机推送服务 ===== */
     /* PushPlus (Android 微信推送) */
     push_init(PUSH_SERVICE_PUSHPLUS, "1043ad84f9ba4dbb921756173d36277a");
@@ -166,7 +176,25 @@ int main(int argc, char *argv[])
 
     /* 主循环 */
     while (1) {
+        static int  net_tick = 0;
+        static bool net_ok   = false;
+
         lvgl_timer_handler();
+
+        /* 每 ~200ms 刷新一次状态栏上的网络状态。
+         * LVGL 不是线程安全的，所以只在这个任务里改控件；network_task 那边
+         * 只维护 mqtt_config.connected，由这里轮询。
+         */
+        if (++net_tick >= 40) {
+            bool ok = mqtt_is_connected();
+
+            net_tick = 0;
+            if (ok != net_ok) {
+                net_ok = ok;
+                robot_ui_set_net_status(ok ? "NET OK" : "NET --");
+            }
+        }
+
         usleep(5000); // 5ms 刷新周期
     }
 

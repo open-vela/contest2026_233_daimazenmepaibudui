@@ -50,6 +50,11 @@ void robot_ui_set_ai_reply(const char *text);
 /* 更新状态 */
 void robot_ui_set_status(robot_status_t status);
 
+/* 更新状态栏上的网络状态（ASCII，如 "NET OK" / "NET --"）。
+ * 必须从 LVGL 所在的任务调用（main 的主循环），不要从 network_task 直接调。
+ */
+void robot_ui_set_net_status(const char *text);
+
 /* 显示提醒 */
 void robot_ui_show_reminder(const char *title, const char *content);
 

@@ -15,6 +15,7 @@ static lv_obj_t *scr_alarm = NULL;     // 报警屏幕
 /* 主界面组件 */
 static lv_obj_t *lbl_status = NULL;    // 状态标签
 static lv_obj_t *lbl_time = NULL;      // 时间标签
+static lv_obj_t *lbl_net = NULL;       // 网络状态标签（RNDIS/MQTT）
 static lv_obj_t *lbl_face = NULL;      // 表情标签
 static lv_obj_t *lbl_ai_reply = NULL;  // AI回复标签
 static lv_obj_t *lbl_reminder = NULL;  // 提醒标签
@@ -151,6 +152,34 @@ static void create_status_bar(lv_obj_t *parent)
     lv_label_set_text(lbl_signal, "WiFi 100%");
     lv_obj_set_style_text_color(lbl_signal, lv_color_hex(0xFFFFFF), 0);
     lv_obj_set_style_text_font(lbl_signal, &lv_font_montserrat_14, 0);
+
+    /* 网络状态：由 main 的主循环轮询 network_is_connected() 后刷新，
+     * 不在 network_task 里直接改，避免跨任务操作 LVGL。
+     * 注意字体是 montserrat，不带中文字形，所以这里只能用 ASCII。
+     */
+    lbl_net = lv_label_create(bar);
+    lv_label_set_text(lbl_net, "NET --");
+    lv_obj_set_style_text_color(lbl_net, lv_color_hex(0xFFC107), 0);
+    lv_obj_set_style_text_font(lbl_net, &lv_font_montserrat_14, 0);
+}
+
+/* ==================== 更新网络状态 ==================== */
+void robot_ui_set_net_status(const char *text)
+{
+    if (lbl_net == NULL || text == NULL) {
+        return;
+    }
+
+    if (strcmp(lv_label_get_text(lbl_net), text) == 0) {
+        return;     /* 没变就不动，省一次重绘 */
+    }
+
+    lv_label_set_text(lbl_net, text);
+    lv_obj_set_style_text_color(lbl_net,
+                                strncmp(text, "NET OK", 6) == 0
+                                    ? lv_color_hex(0x4CAF50)
+                                    : lv_color_hex(0xFFC107),
+                                0);
 }
 
 /* ==================== 创建表情区域 ==================== */

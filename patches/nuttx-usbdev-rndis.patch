@@ -1,0 +1,387 @@
+diff --git a/drivers/usbdev/rndis.c b/drivers/usbdev/rndis.c
+index 867447942f6..3209b54accf 100644
+--- a/drivers/usbdev/rndis.c
++++ b/drivers/usbdev/rndis.c
+@@ -31,6 +31,7 @@
+ 
+ #include <assert.h>
+ #include <debug.h>
++#include <syslog.h>
+ #include <errno.h>
+ #include <inttypes.h>
+ #include <string.h>
+@@ -45,6 +46,8 @@
+ #include <nuttx/net/netdev.h>
+ #include <nuttx/kmalloc.h>
+ #include <nuttx/arch.h>
++#include <nuttx/irq.h>
++#include <nuttx/spinlock.h>
+ #include <nuttx/usb/usb.h>
+ #include <nuttx/usb/cdc.h>
+ #include <nuttx/usb/usbdev.h>
+@@ -117,7 +120,7 @@ static_assert((CONFIG_NET_LL_GUARDSIZE % 4) == 2,
+ #define RNDIS_MXDESCLEN         (128)
+ #define RNDIS_MAXSTRLEN         (RNDIS_MXDESCLEN-2)
+ #define RNDIS_CTRLREQ_LEN       (256)
+-#define RNDIS_RESP_QUEUE_WORDS  (64)
++#define RNDIS_RESP_QUEUE_WORDS  (256)
+ 
+ #define RNDIS_BUFFER_SIZE       CONFIG_NET_ETH_PKTSIZE
+ #define RNDIS_BUFFER_COUNT      4
+@@ -274,9 +277,9 @@ static const struct usb_devdesc_s g_devdesc =
+   USB_SIZEOF_DEVDESC,                           /* len */
+   USB_DESC_TYPE_DEVICE,                         /* type */
+   {LSBYTE(0x0200), MSBYTE(0x0200)},             /* usb */
+-  0,                                            /* classid */
+-  0,                                            /* subclass */
+-  0,                                            /* protocol */
++  USB_CLASS_MISC,                               /* classid 0xef */
++  0x02,                                         /* subclass: IAD device */
++  0x01,                                         /* protocol */
+   CONFIG_RNDIS_EP0MAXPACKET,                    /* maxpacketsize */
+   { LSBYTE(CONFIG_RNDIS_VENDORID),              /* vendor */
+     MSBYTE(CONFIG_RNDIS_VENDORID) },
+@@ -324,6 +327,39 @@ static const struct usb_iaddesc_s g_rndis_assoc_desc =
+   .protocol     = 0x01,
+   .ifunction    = 0
+ };
++#endif
++
++#ifndef CONFIG_RNDIS_COMPOSITE
++  /* Interface Association Descriptor: binds the two interfaces (comm+data)
++   * into one RNDIS function.  0xef/0x04/0x01 is the class coding that
++   * Windows' inbox rndiscmp.inf matches (USB\Class_EF&SubClass_04&Prot_01),
++   * which is what makes Windows load the Remote NDIS driver instead of
++   * leaving the function with no driver at all.
++   */
++
++static const uint8_t g_rndis_iad_rndis[] =
++{
++  0x08,                                       /* bLength */
++  USB_DESC_TYPE_INTERFACEASSOCIATION,         /* bDescriptorType 0x0b */
++  0x00,                                       /* bFirstInterface */
++  RNDIS_NINTERFACES,                          /* bInterfaceCount */
++  USB_CLASS_MISC,                             /* bFunctionClass 0xef */
++  0x04,                                       /* bFunctionSubClass */
++  0x01,                                       /* bFunctionProtocol */
++  0x00                                        /* iFunction */
++};
++
++  /* CDC functional descriptors for the RNDIS communication interface:
++   * Header(1.10) + CallMgmt(data if 1) + ACM + Union(master 0, slave 1)
++   */
++
++static const uint8_t g_rndis_func_descs[] =
++{
++  0x05, 0x24, 0x00, 0x10, 0x01,               /* header, bcdCDC 0x0110 */
++  0x05, 0x24, 0x01, 0x00, 0x01,               /* call mgmt -> data if 1 */
++  0x04, 0x24, 0x02, 0x00,                     /* ACM */
++  0x05, 0x24, 0x06, 0x00, 0x01                /* union: master 0 slave 1 */
++};
+ #endif
+ 
+   /* Communication interface descriptor */
+@@ -478,6 +514,19 @@ static uint8_t g_rndis_default_mac_addr[6] =
+   0x02, 0x00, 0x00, 0x11, 0x22, 0x33
+ };
+ 
++/* MAC address of our (device) side of the interface.  The netdev must carry a
++ * real unicast address: with d_mac left at zero every frame the board sends
++ * (ARP requests, IP packets) has 00:00:00:00:00:00 as its source address,
++ * which is not a valid unicast address.  RNDIS is a point-to-point link, so
++ * this happens to work with Windows, but the frames are malformed and break
++ * as soon as they reach anything that actually checks them.
++ */
++
++static uint8_t g_rndis_device_mac_addr[6] =
++{
++  0x02, 0x00, 0x00, 0x11, 0x22, 0x34
++};
++
+ /* These lists give dummy responses to be returned to PC. The values are
+  * chosen so that Windows is happy - other operating systems don't really
+  * care much.
+@@ -592,17 +641,29 @@ static int rndis_submit_rdreq(FAR struct rndis_dev_s *priv)
+ 
+   if (!priv->rdreq_submitted && !priv->rx_blocked)
+     {
+-      priv->rdreq->len = priv->epbulkout->maxpacket;
++      /* Set the flag *before* handing the request to the UDC.  A UDC is
++       * allowed to complete a request synchronously from submit(): it may
++       * already have a packet parked in the endpoint FIFO, in which case
++       * EP_SUBMIT() reads it, runs the completion callback, and that
++       * callback calls rndis_submit_rdreq() again before EP_SUBMIT()
++       * returns.  Setting rdreq_submitted afterwards overwrote the "not
++       * submitted" state which the nested completion had just established,
++       * so the driver believed a request was outstanding while the endpoint
++       * queue was in fact empty.  Nothing ever re-armed the bulk OUT pipe
++       * again: no further read completion, no further RX, permanently.
++       */
++
++      priv->rdreq->len      = priv->epbulkout->maxpacket;
++      priv->rdreq_submitted = true;
++
+       ret = EP_SUBMIT(priv->epbulkout, priv->rdreq);
+       if (ret != OK)
+         {
++          priv->rdreq_submitted = false;
++
+           usbtrace(TRACE_CLSERROR(USBSER_TRACEERR_RDSUBMIT),
+                    (uint16_t)-priv->rdreq->result);
+         }
+-      else
+-        {
+-          priv->rdreq_submitted = true;
+-        }
+     }
+ 
+   return ret;
+@@ -1088,6 +1149,18 @@ static void rndis_rxdispatch(FAR void *arg)
+   priv->current_rx_datagram_size = 0;
+   rndis_unblock_rx(priv);
+ 
++  /* Re-arm the bulk OUT pipe unconditionally.
++   *
++   * Unblocking reception is only half the job: the endpoint also needs a
++   * read request queued again.  Until now that happened only as a side
++   * effect of rndis_freewrreq(), i.e. when a bulk IN write completed or a
++   * network request was released -- so a received frame that produced no
++   * reply (an ARP frame not addressed to us, a duplicate, a packet the
++   * stack silently dropped) left the pipe unarmed and RX stopped for good.
++   */
++
++  rndis_submit_rdreq(priv);
++
+   if (priv->net_req != NULL)
+     {
+       rndis_freenetreq(priv);
+@@ -1430,8 +1503,27 @@ static int rndis_send_encapsulated_response(FAR struct rndis_dev_s *priv,
+   notif->reserved = 0;
+   priv->epintin_req->len = sizeof(struct rndis_notification);
+ 
+-  EP_CANCEL(priv->epintin, priv->epintin_req);
+-  EP_SUBMIT(priv->epintin, priv->epintin_req);
++  uinfo("rndis: notif=%08lx qwords=%d maxpkt=%d\n",
++        (unsigned long)((struct rndis_notification *)priv->epintin_req->buf)
++          ->notification,
++        priv->response_queue_words, priv->epintin->maxpacket);
++
++  /* Only cancel an outstanding notification; if the previous one already
++   * completed (the host read it), just re-arm the request.  Cancelling a
++   * completed request re-runs its callback and can make the host see the
++   * notification out of step with the response it belongs to.
++   */
++
++  if (priv->epintin_req->result == -EINPROGRESS)
++    {
++      uinfo("rndis: intin still pending, cancel first\n");
++      EP_CANCEL(priv->epintin, priv->epintin_req);
++    }
++
++  {
++    int nret = EP_SUBMIT(priv->epintin, priv->epintin_req);
++    uinfo("rndis: intin notify submit ret=%d\n", nret);
++  }
+ 
+   return OK;
+ }
+@@ -1454,8 +1546,20 @@ static int rndis_handle_control_message(FAR struct rndis_dev_s *priv,
+                                         FAR uint8_t *dataout,
+                                         uint16_t outlen)
+ {
+-  FAR struct rndis_command_header *cmd_hdr =
+-    (FAR struct rndis_command_header *)dataout;
++  FAR struct rndis_command_header *cmd_hdr;
++
++  /* The data stage of SEND_ENCAPSULATED_COMMAND must carry at least the
++   * message header; a NULL/short buffer used to be dereferenced blindly.
++   */
++
++  if (dataout == NULL || outlen < sizeof(struct rndis_command_header))
++    {
++      uerr("RNDIS control message without data stage (%u bytes)\n",
++           (unsigned)outlen);
++      return -EINVAL;
++    }
++
++  cmd_hdr = (FAR struct rndis_command_header *)dataout;
+ 
+   switch (cmd_hdr->msgtype)
+     {
+@@ -1845,6 +1949,9 @@ static void usbclass_ep0incomplete(FAR struct usbdev_ep_s *ep,
+ static void usbclass_epintin_complete(FAR struct usbdev_ep_s *ep,
+                                       FAR struct usbdev_req_s *req)
+ {
++  uinfo("rndis: intin complete result=%d xfrd=%d len=%d\n",
++        req->result, req->xfrd, req->len);
++
+   if (req->result || req->xfrd != req->len)
+     {
+       usbtrace(TRACE_CLSERROR(USBSER_TRACEERR_REQRESULT),
+@@ -1972,6 +2079,17 @@ static int16_t usbclass_mkcfgdesc(FAR uint8_t *buf,
+ 
+   totallen += sizeof(struct usb_cfgdesc_s);
+ 
++  /* Interface Association Descriptor (non-composite RNDIS needs it so that
++   * Windows sees one RNDIS function rather than a stray CDC-ACM port) */
++
++  if (buf != NULL)
++    {
++      memcpy(buf, g_rndis_iad_rndis, sizeof(g_rndis_iad_rndis));
++      buf += sizeof(g_rndis_iad_rndis);
++    }
++
++  totallen += sizeof(g_rndis_iad_rndis);
++
+ #elif defined(CONFIG_COMPOSITE_IAD)
+   /* Interface association descriptor */
+ 
+@@ -2001,6 +2119,18 @@ static int16_t usbclass_mkcfgdesc(FAR uint8_t *buf,
+ 
+   totallen += sizeof(struct usb_ifdesc_s);
+ 
++#ifndef CONFIG_RNDIS_COMPOSITE
++  /* CDC functional descriptors (header/call-mgmt/acm/union) */
++
++  if (buf != NULL)
++    {
++      memcpy(buf, g_rndis_func_descs, sizeof(g_rndis_func_descs));
++      buf += sizeof(g_rndis_func_descs);
++    }
++
++  totallen += sizeof(g_rndis_func_descs);
++#endif
++
+   epno = devinfo ? devinfo->epno[RNDIS_EP_INTIN_IDX] : 0;
+   ret = usbdev_copy_epdesc((struct usb_epdesc_s *)buf,
+                            epno,
+@@ -2502,8 +2632,22 @@ static int usbclass_setup(FAR struct usbdevclass_driver_s *driver,
+ #  endif /* CONFIG_USBDEV_DUALSPEED */
+                 case USB_DESC_TYPE_CONFIG:
+                   {
++                    int i;
+                     ret = usbclass_mkcfgdesc(ctrlreq->buf, &priv->devinfo,
+                                              dev->speed, ctrl->value[1]);
++                    for (i = 0; i + 16 <= ret; i += 16)
++                      {
++                        uinfo("cfg[%02d] %02x %02x %02x %02x %02x %02x %02x %02x"
++                              " %02x %02x %02x %02x %02x %02x %02x %02x\n",
++                              i, ctrlreq->buf[i], ctrlreq->buf[i + 1],
++                              ctrlreq->buf[i + 2], ctrlreq->buf[i + 3],
++                              ctrlreq->buf[i + 4], ctrlreq->buf[i + 5],
++                              ctrlreq->buf[i + 6], ctrlreq->buf[i + 7],
++                              ctrlreq->buf[i + 8], ctrlreq->buf[i + 9],
++                              ctrlreq->buf[i + 10], ctrlreq->buf[i + 11],
++                              ctrlreq->buf[i + 12], ctrlreq->buf[i + 13],
++                              ctrlreq->buf[i + 14], ctrlreq->buf[i + 15]);
++                      }
+                   }
+                   break;
+ #endif
+@@ -2751,11 +2895,45 @@ static int usbclass_setconfig(FAR struct rndis_dev_s *priv, uint8_t config)
+     }
+ #endif
+ 
++  /* A new configuration means a new RNDIS session: drop any responses
++   * left over from the previous one.  Without this the response queue
++   * fills up across re-enumerations and every INITIALIZE_MSG is dropped
++   * ("RNDIS response queue full"), because the host never got a chance to
++   * read them.  usbclass_resetconfig() used to do this from the
++   * disconnect path, which we had to remove (it takes a mutex and runs in
++   * interrupt context).
++   */
++
++  priv->response_queue_words = 0;
++  priv->connected            = false;
++
+   if (config == priv->config)
+     {
+-      /* Already configured -- Do nothing */
++      /* Already configured -- Do nothing except re-arm the bulk OUT read.
++       *
++       * A bus reset cancels every queued request (the UDC's reset branch
++       * calls cancelrequests() on all endpoints) but leaves priv->config
++       * set, so on re-enumeration the host's SET_CONFIGURATION lands here.
++       * Returning without re-submitting leaves the bulk OUT pipe with no
++       * read request for the rest of the session: the controller then NAKs
++       * every packet and not a single frame is received again.  That is
++       * exactly what happened after a port swap.
++       */
+ 
+       usbtrace(TRACE_CLSERROR(USBSER_TRACEERR_ALREADYCONFIGURED), 0);
++
++      if (priv->epbulkout != NULL && priv->rdreq != NULL)
++        {
++          irqstate_t flags = enter_critical_section();
++
++          priv->rdreq->callback = rndis_rdcomplete;
++          priv->rx_blocked      = false;
++          priv->rdreq_submitted = false;
++          (void)rndis_submit_rdreq(priv);
++
++          leave_critical_section(flags);
++        }
++
+       return 0;
+     }
+ 
+@@ -2824,12 +3002,20 @@ static int usbclass_setconfig(FAR struct rndis_dev_s *priv, uint8_t config)
+ 
+   priv->epbulkout->priv = priv;
+ 
+-  /* Queue read requests in the bulk OUT endpoint */
++  /* Queue read requests in the bulk OUT endpoint.
++   *
++   * usbclass_setconfig() runs in interrupt context (EP0 SET_CONFIGURATION),
++   * so nxmutex_lock() must not be used here: when the mutex happens to be
++   * held it calls nxmutex_wait(), whose DEBUGASSERT(!up_interrupt_context())
++   * panics the board.  That is exactly what killed the board once the RNDIS
++   * session started and the network side began taking priv->lock.  A
++   * critical section is enough on this single-core target.
++   */
+ 
+-  while (nxmutex_lock(&priv->lock) < 0);
++  irqstate_t flags = enter_critical_section();
+   priv->rdreq->callback = rndis_rdcomplete;
+   ret = rndis_submit_rdreq(priv);
+-  nxmutex_unlock(&priv->lock);
++  leave_critical_section(flags);
+   if (ret != OK)
+     {
+       usbtrace(TRACE_CLSERROR(USBSER_TRACEERR_RDSUBMIT), (uint16_t)-ret);
+@@ -2898,6 +3084,8 @@ static int usbclass_classobject(int minor,
+ 
+   sq_init(&priv->reqlist);
+   memcpy(priv->host_mac_address, g_rndis_default_mac_addr, 6);
++  memcpy(priv->netdev.d_mac.ether.ether_addr_octet,
++         g_rndis_device_mac_addr, 6);
+   priv->netdev.d_private = priv;
+   priv->netdev.d_ifup = &rndis_ifup;
+   priv->netdev.d_ifdown = &rndis_ifdown;
+@@ -2925,7 +3113,7 @@ static int usbclass_classobject(int minor,
+   ret = netdev_register(&priv->netdev, NET_LL_ETHERNET);
+   if (ret)
+     {
+-      uerr("Failed to register net device");
++      syslog(LOG_ERR, "[rndis] netdev_register failed: %d\n", ret);
+     }
+ 
+   return ret;
+@@ -2980,7 +3168,7 @@ int usbdev_rndis_initialize(FAR const uint8_t *mac_address)
+   ret = usbclass_classobject(0, &devinfo, &classdev);
+   if (ret)
+     {
+-      nerr("usbclass_classobject failed: %d\n", ret);
++      syslog(LOG_ERR, "[rndis] classobject failed: %d\n", ret);
+       return ret;
+     }
+ 
+@@ -2994,7 +3182,7 @@ int usbdev_rndis_initialize(FAR const uint8_t *mac_address)
+   ret = usbdev_register(&drvr->drvr);
+   if (ret)
+     {
+-      nerr("usbdev_register failed: %d\n", ret);
++      syslog(LOG_ERR, "[rndis] usbdev_register failed: %d\n", ret);
+       usbtrace(TRACE_CLSERROR(USBSER_TRACEERR_DEVREGISTER), (uint16_t)-ret);
+       usbclass_uninitialize(classdev);
+       return ret;
