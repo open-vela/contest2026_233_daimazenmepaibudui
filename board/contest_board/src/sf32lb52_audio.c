@@ -149,6 +149,7 @@ static int  sf32lb52_audio_hw_configure(FAR struct sf32lb52_audio_s *priv,
 static int  sf32lb52_audio_hw_start(FAR struct sf32lb52_audio_s *priv,
                                     bool playback);
 static int  sf32lb52_audio_hw_stop(FAR struct sf32lb52_audio_s *priv);
+static int  sf32lb52_audio_hw_shutdown(FAR struct sf32lb52_audio_s *priv);
 static void sf32lb52_audio_pa_enable(bool enable);
 static void sf32lb52_audio_tx_complete(FAR struct sf32lb52_audio_s *priv);
 static void sf32lb52_audio_rx_complete(FAR struct sf32lb52_audio_s *priv);
@@ -683,6 +684,21 @@ static int sf32lb52_audio_hw_start(FAR struct sf32lb52_audio_s *priv,
 
 static int sf32lb52_audio_hw_stop(FAR struct sf32lb52_audio_s *priv)
 {
+  /* 幂等：已经停干净就不要再关一遍。
+   *
+   * 最后一个 fd 被 close() 时，上层 shutdown() 会紧跟在上层的
+   * AUDIOIOC_STOP 之后进来，重复关一次已经关掉的模拟通路会卡死
+   * （见 sf32lb52_audio_hw_shutdown 的注释）。
+   * 判据里除了 running 还要看 rx_busy/rx_aborted/rx_apb/tx_apb：
+   * 这些都是"还没收尾"的状态，有一样没清就走完整流程，别漏掉 buffer。
+   */
+
+  if (!priv->running && !priv->rx_busy && !priv->rx_aborted &&
+      priv->rx_apb == NULL && priv->tx_apb == NULL)
+    {
+      return OK;
+    }
+
   HAL_AUDPRC_DMAStop(&priv->aprc, HAL_AUDPRC_TX_CH0);
   HAL_AUDPRC_DMAStop(&priv->aprc, HAL_AUDPRC_RX_CH0);
   __HAL_AUDPRC_DISABLE(&priv->aprc);
@@ -753,6 +769,50 @@ static int sf32lb52_audio_hw_stop(FAR struct sf32lb52_audio_s *priv)
 
   priv->running = false;
   audinfo("audio stopped\n");
+  return OK;
+}
+
+/****************************************************************************
+ * Name: sf32lb52_audio_hw_shutdown
+ *
+ * Description:
+ *   给 close() / shutdown() 用的最小化停止。
+ *
+ *   为什么不能照搬 hw_stop()：
+ *   1. 上层 audio_close() 在关最后一个 fd 时是
+ *      nxmutex_lock(upper->lock) → spin_lock_irqsave(upper->spinlock)
+ *      （非 SMP 下等于关中断）之后，才在持锁关中断的状态里调
+ *      lower->ops->shutdown()。所以这里既不能回调上层
+ *      （upper 的锁被自己拿着），也不该做耗时的模拟级操作。
+ *   2. 同一次会话里 AUDIOIOC_STOP 已经关过一次模拟通路，重复调
+ *      HAL_AUDCODEC_Close_Analog_DACPath()/ADCPath() 关已经关掉的模拟级
+ *      会整机卡死（实测：STOP 返回 0 后紧接着 close() 静默卡住、不复位、
+ *      无 panic）。这正是 hw_test/audio_test 不犯的原因——它们的 fd 不是
+ *      最后一个，shutdown() 压根没被调到。
+ *
+ ****************************************************************************/
+
+static int sf32lb52_audio_hw_shutdown(FAR struct sf32lb52_audio_s *priv)
+{
+  /* DMAStop / DISABLE 只做寄存器操作，风险低于模拟通路关闭，先保留；
+   * 这两个本身在关中断上下文里是否安全还没有证据，若仍卡死，
+   * 下一步就把这两行也挪出 shutdown。 */
+
+  HAL_AUDPRC_DMAStop(&priv->aprc, HAL_AUDPRC_TX_CH0);
+  HAL_AUDPRC_DMAStop(&priv->aprc, HAL_AUDPRC_RX_CH0);
+  __HAL_AUDPRC_DISABLE(&priv->aprc);
+
+  priv->aprc.State[HAL_AUDPRC_TX_CH0] = HAL_AUDPRC_STATE_READY;
+  priv->aprc.State[HAL_AUDPRC_RX_CH0] = HAL_AUDPRC_STATE_READY;
+
+  /* 关功放是普通 GPIO 写，安全；只有这次确实是播放方向才碰 */
+
+  if (priv->playback)
+    {
+      sf32lb52_audio_pa_enable(false);
+    }
+
+  priv->running = false;
   return OK;
 }
 
@@ -910,11 +970,24 @@ static int sf32lb52_audio_configure(FAR struct audio_lowerhalf_s *dev,
 /****************************************************************************
  * Name: sf32lb52_audio_shutdown
  *
+ * Description:
+ *   最后一个 fd 被 close() 时，上层在**持 upper->lock + 关中断**的状态下
+ *   调到这里。所以只能走最小化停止，不能走完整的 hw_stop()
+ *   （回调上层 + 重复关模拟通路都会卡死，详见 hw_shutdown 的注释）。
+ *
  ****************************************************************************/
 
 static int sf32lb52_audio_shutdown(FAR struct audio_lowerhalf_s *dev)
 {
-  return sf32lb52_audio_hw_stop((FAR struct sf32lb52_audio_s *)dev);
+  FAR struct sf32lb52_audio_s *priv =
+    (FAR struct sf32lb52_audio_s *)dev;
+
+  if (!priv->running)
+    {
+      return OK;
+    }
+
+  return sf32lb52_audio_hw_shutdown(priv);
 }
 
 /****************************************************************************

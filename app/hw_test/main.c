@@ -12,14 +12,17 @@
  *   hw_test imu [帧数]       读 LSM6DS3 加速度/陀螺（默认 10 帧）—— 单独运行
  *   hw_test rtc [秒]         读 RTC 时间 + 设一个 N 秒后的 alarm（默认 3 秒）—— 单独运行
  *   hw_test audio [秒]       录 N 秒到内存，打印 peak/avg（默认 2 秒）—— 单独运行
+ *   hw_test alarm [级别] [秒] 触发报警（1=提示 2=警告 3=紧急，默认 3），
+ *                            持续 N 秒（默认 3）后解除 —— 单独运行
  *
  * 设计约定：
  *   - 每一步失败都只打印 FAIL，不中断后面的步骤，也不会卡死
  *     （所有 open/ioctl/read 都判返回值，read 前先用 poll 等超时）
  *   - 默认（不带参数）不碰屏幕、不拉 GPIO 电平，只做只读自检
- *   - imu / rtc / audio 都会真的开外设（START 转换、设 alarm、开麦克风），
- *     所以放在子命令里；而且它们**不跑**上面那套 5 步自检，只跑自己，
- *     免得每次验 IMU 还要先等 10 秒触摸 + 5 秒按键
+ *   - imu / rtc / audio / alarm 都会真的开外设（START 转换、设 alarm、
+ *     开麦克风、响喇叭），所以放在子命令里；而且它们**不跑**
+ *     上面那套 5 步自检，只跑自己，免得每次验 IMU 还要先等 10 秒触摸
+ *     + 5 秒按键
  *
  ****************************************************************************/
 
@@ -55,6 +58,8 @@
 #include <nuttx/clock.h>               /* clock_systime_ticks() + TICK2MSEC() */
 #include <nuttx/sched.h>               /* task_create() */
 #include <signal.h>                    /* SIGUSR1 + sigaction() */
+
+#include "sf32lb52_alarm.h"            /* 板级报警模块（只出声，不驱灯） */
 
 /* IMU：本板的 LSM6DS3 走的是 NuttX **老式字符驱动**（不是 uORB），
  * 节点是 /dev/lsm6dsl0，接口是 read() + ioctl(SNIOC_*)。
@@ -121,6 +126,13 @@
  */
 #define AUDIO_CHUNK_BYTES     (AUDIO_SAMPLE_RATE * 2)
 
+/* alarm 子命令（设备级报警模块：响喇叭，持续到解除或超时；不驱指示灯） */
+
+#define ALARM_DEFAULT_LEVEL   3     /* 1=NOTICE 2=WARNING 3=EMERGENCY */
+#define ALARM_DEFAULT_SEC     3     /* 默认保持报警的秒数 */
+#define ALARM_POLL_MS         100   /* 等报警结束的轮询间隔 */
+#define ALARM_SETTLE_MS       500   /* 解除后等一小会，让工作线程停音频/灭灯 */
+
 /****************************************************************************
  * Private Types
  ****************************************************************************/
@@ -149,6 +161,11 @@ static volatile ssize_t g_arec_n;
 static int              g_arec_fd;
 static FAR int16_t     *g_arec_buf;
 static int              g_arec_len;
+
+/* alarm 子命令：模块工作线程里回调，这里只累计事件给主任务打印 */
+
+static volatile int g_alarm_events;
+static volatile int g_alarm_last_level;
 
 /* 与本板硬件相关的设备节点（枚举顺序 = 打印顺序） */
 
@@ -213,6 +230,8 @@ static void usage(void)
   printf("  hw_test imu [帧数]   IMU(LSM6DS3) 加速度/陀螺，默认 10 帧（单独运行）\n");
   printf("  hw_test rtc [秒]     RTC 时间 + N 秒后的 alarm，默认 3 秒（单独运行）\n");
   printf("  hw_test audio [秒]   录音电平 peak/avg，默认 2 秒（单独运行）\n");
+  printf("  hw_test alarm [级别] [秒]  报警：1=提示 2=警告 3=紧急(默认)，"
+         "持续秒数默认 3（单独运行）\n");
 }
 
 /****************************************************************************
@@ -1447,6 +1466,158 @@ static int step_audio(int seconds)
 }
 
 /****************************************************************************
+ * Name: alarm_level_name / alarm_event_name
+ ****************************************************************************/
+
+static FAR const char *alarm_level_name(enum alarm_level_e level)
+{
+  switch (level)
+    {
+      case ALARM_LEVEL_NOTICE:    return "NOTICE";
+      case ALARM_LEVEL_WARNING:   return "WARNING";
+      case ALARM_LEVEL_EMERGENCY: return "EMERGENCY";
+      default:                    return "NONE";
+    }
+}
+
+static FAR const char *alarm_event_name(enum alarm_event_e event)
+{
+  switch (event)
+    {
+      case ALARM_EVENT_TRIGGERED: return "TRIGGERED";
+      case ALARM_EVENT_CLEARED:   return "CLEARED";
+      case ALARM_EVENT_TIMEOUT:   return "TIMEOUT";
+      default:                    return "?";
+    }
+}
+
+/****************************************************************************
+ * Name: alarm_test_cb
+ *
+ * Description:
+ *   alarm 子命令的回调。**它在报警模块的工作线程里执行**，
+ *   所以这里只打印 + 计数，绝不做 sleep / 等锁之类的阻塞动作。
+ *
+ ****************************************************************************/
+
+static void alarm_test_cb(enum alarm_event_e event,
+                          FAR const struct alarm_status_s *status,
+                          FAR void *arg)
+{
+  (void)arg;
+
+  g_alarm_events++;
+  if (status != NULL)
+    {
+      g_alarm_last_level = (int)status->level;
+    }
+
+  printf("      [ALARM] event=%s level=%s reason=%s\n",
+         alarm_event_name(event),
+         alarm_level_name(status != NULL ? status->level : ALARM_LEVEL_NONE),
+         status != NULL ? status->reason : "");
+}
+
+/****************************************************************************
+ * Name: step_alarm
+ *
+ * Description:
+ *   alarm 子命令：注册回调 -> 触发报警 -> 保持 N 秒（期间能听到声音）
+ *   -> alarm_clear() -> 打印状态并用 report() 给 PASS/FAIL。
+ *
+ *   计时用 clock_systime_ticks() + TICK2MSEC()，不用"每轮累加固定值"。
+ *
+ ****************************************************************************/
+
+static int step_alarm(int level_num, int seconds)
+{
+  struct alarm_status_s st;
+  enum alarm_level_e    level;
+  clock_t               t0;
+  uint32_t              elapsed_ms;
+
+  switch (level_num)
+    {
+      case 1:  level = ALARM_LEVEL_NOTICE;    break;
+      case 2:  level = ALARM_LEVEL_WARNING;   break;
+      case 3:  level = ALARM_LEVEL_EMERGENCY; break;
+      default: level = ALARM_LEVEL_EMERGENCY; break;
+    }
+
+  if (seconds < 1)
+    {
+      seconds = ALARM_DEFAULT_SEC;
+    }
+
+  printf("[ALARM] 级别=%d(%s) 保持 %d 秒\n",
+         (int)level, alarm_level_name(level), seconds);
+
+  g_alarm_events     = 0;
+  g_alarm_last_level = 0;
+
+  if (alarm_set_callback(alarm_test_cb, NULL) != OK)
+    {
+      report("注册报警回调", 0, "alarm_set_callback 失败");
+      return -1;
+    }
+
+  if (alarm_trigger(level, "hw_test", "hw_test alarm 子命令") != OK)
+    {
+      report("触发报警", 0, "alarm_trigger 失败");
+      alarm_set_callback(NULL, NULL);
+      return -1;
+    }
+
+  report("触发报警", 1, alarm_level_name(level));
+
+  /* 单调时钟计时（同 step_rtc / step_audio，别自己累加固定值） */
+
+  t0 = clock_systime_ticks();
+  elapsed_ms = 0;
+  while (elapsed_ms < (uint32_t)seconds * 1000)
+    {
+      usleep(ALARM_POLL_MS * 1000);
+      elapsed_ms = (uint32_t)TICK2MSEC(clock_systime_ticks() - t0);
+    }
+
+  memset(&st, 0, sizeof(st));
+  if (alarm_get_status(&st) == OK)
+    {
+      printf("      状态: active=%d level=%s repeat=%u reason=%s text=%s\n",
+             (int)st.active, alarm_level_name(st.level),
+             (unsigned)st.repeat_count, st.reason, st.text);
+      report("报警持续", st.active ? 1 : 0,
+             st.active ? "仍在报警中" : "提前结束");
+    }
+  else
+    {
+      report("读报警状态", 0, "alarm_get_status 失败");
+    }
+
+  alarm_clear();
+
+  /* 等一小会，让工作线程把音频 STOP 掉，并回调 CLEARED */
+
+  t0 = clock_systime_ticks();
+  while ((uint32_t)TICK2MSEC(clock_systime_ticks() - t0) < ALARM_SETTLE_MS)
+    {
+      usleep(ALARM_POLL_MS * 1000);
+    }
+
+  memset(&st, 0, sizeof(st));
+  alarm_get_status(&st);
+  printf("      解除后: active=%d level=%s 回调事件=%d 次\n",
+         (int)st.active, alarm_level_name(st.level), g_alarm_events);
+  report("解除报警", st.active ? 0 : 1, st.active ? "仍在报警" : "已解除");
+
+  report("报警回调", g_alarm_events >= 1 ? 1 : 0,
+         g_alarm_events >= 1 ? "收到回调" : "没有收到任何回调");
+
+  alarm_set_callback(NULL, NULL);
+  return OK;
+}
+
+/****************************************************************************
  * Public Functions
  ****************************************************************************/
 
@@ -1457,10 +1628,13 @@ int main(int argc, FAR char *argv[])
   int do_imu        = 0;
   int do_rtc        = 0;
   int do_audio      = 0;
+  int do_alarm      = 0;
   int standalone;
   int imu_frames    = IMU_DEFAULT_FRAMES;
   int rtc_sec       = RTC_DEFAULT_ALARM_SEC;
   int audio_sec     = AUDIO_DEFAULT_SEC;
+  int alarm_level   = ALARM_DEFAULT_LEVEL;
+  int alarm_sec     = ALARM_DEFAULT_SEC;
   int touch_sec     = TOUCH_DEFAULT_SEC;
   int touch_set     = 0;
   int i;
@@ -1498,6 +1672,12 @@ int main(int argc, FAR char *argv[])
           do_audio  = 1;
           audio_sec = (i + 1 < argc) ? atoi(argv[++i]) : AUDIO_DEFAULT_SEC;
         }
+      else if (strcmp(argv[i], "alarm") == 0)
+        {
+          do_alarm    = 1;
+          alarm_level = (i + 1 < argc) ? atoi(argv[++i]) : ALARM_DEFAULT_LEVEL;
+          alarm_sec   = (i + 1 < argc) ? atoi(argv[++i]) : ALARM_DEFAULT_SEC;
+        }
       else
         {
           printf("hw_test: 未知参数 '%s'\n", argv[i]);
@@ -1506,9 +1686,10 @@ int main(int argc, FAR char *argv[])
         }
     }
 
-  /* imu / rtc / audio 是各自独立的外设子命令：只跑自己，不跑那套 5 步自检 */
+  /* imu / rtc / audio / alarm 是各自独立的外设子命令：只跑自己，
+   * 不跑那套 5 步自检 */
 
-  standalone = do_imu || do_rtc || do_audio;
+  standalone = do_imu || do_rtc || do_audio || do_alarm;
 
   /* lcdcolor 只是刷个屏，别让它再干等 10 秒触摸 */
 
@@ -1522,7 +1703,7 @@ int main(int argc, FAR char *argv[])
   printf("   SF32LB52-DevKit-LCD 硬件自检 (hw_test)\n");
   if (standalone)
     {
-      printf("   子命令模式：只跑 imu/rtc/audio，不做 5 步自检\n");
+      printf("   子命令模式：只跑 imu/rtc/audio/alarm，不做 5 步自检\n");
     }
   else
     {
@@ -1548,6 +1729,12 @@ int main(int argc, FAR char *argv[])
       if (do_audio)
         {
           step_audio(audio_sec);
+          printf("\n");
+        }
+
+      if (do_alarm)
+        {
+          step_alarm(alarm_level, alarm_sec);
           printf("\n");
         }
     }

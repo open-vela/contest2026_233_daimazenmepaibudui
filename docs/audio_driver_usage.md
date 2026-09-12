@@ -312,3 +312,72 @@ RECORD peak=1636 avg=43 → RECORD OK（检测到声音）
 ```
 
 寄存器回读（播放启动后）：`PLL_STAT=0`（PLL 已锁）、`CFG=0x1f`、`DAC1_CFG=0x01f78001`（DAC1 内部功放使能）。
+
+---
+
+## 8. 2026-09-13 修复：`close()` 曾会让整机静默卡死
+
+### 现象
+
+`close()` 一个 `/dev/audio/audio0` 的 fd，**整机静默卡死**：无 panic、无 backtrace、
+不复位、串口探活毫无响应，只能重新烧录复位。
+
+### 根因
+
+`nuttx/audio/audio.c` 的 `audio_close()`（`:235` 起）在**最后一个 fd** 被关闭时：
+
+```
+nxmutex_lock(&upper->lock);                       /* :235 */
+flags = spin_lock_irqsave(&upper->spinlock);      /* :241 — 本构建非 SMP，等价 up_irq_save() */
+...
+if (upper->head == NULL)
+    lower->ops->shutdown(lower);                  /* :272 — 在「持锁 + 关中断」下调我们 */
+```
+
+也就是 `shutdown()` 是在**关中断**上下文里被调的。而我们的
+`sf32lb52_audio_shutdown()` 原来又走了一遍**完整的 `hw_stop()`** —— 可
+`AUDIOIOC_STOP` 时已经做过一次了。在关中断的上下文里**重复关闭已经关掉的
+音频模拟通路**（`HAL_AUDCODEC_Close_Analog_DACPath()` / `..._ADCPath()` 等
+HAL 调用）就卡死了。
+
+### 修复
+
+`board/contest_board/src/sf32lb52_audio.c`：
+
+- `hw_stop()` **幂等**：已经停过（`!running` 且没有挂着没收尾的
+  buffer/busy 标志）就直接 `return OK`。
+- 新增 `sf32lb52_audio_hw_shutdown()`：**只做关中断上下文里安全的事** ——
+  停 DMA、禁用 AUDPRC、复位通道状态、关功放（普通 GPIO 写）；
+  **不回调上层**（`AUDIO_CALLBACK_DEQUEUE`）、**不碰模拟通路**。
+- `sf32lb52_audio_shutdown()` 改调这个最小化函数；
+  `sf32lb52_audio_stop()`（`AUDIOIOC_STOP`，中断是开的）保持调完整 `hw_stop()`，
+  所以"STOP 唤醒阻塞 `read()`"的行为不变。
+
+### 为什么现在才发现
+
+只有当 fd 是**最后一个**时上层才调 `shutdown()`。上层应用（`hello_app`）
+通常一直占着同一个设备，所以 `audio_test` / `hw_test audio` 的 `close()`
+从来没走到过这条路。报警模块是"开一次、关一次"的用法，才把它踩出来。
+
+### 回归验证（2026-09-13，真机，同一次烧录）
+
+```
+hw_test audio 2       -> read 返回 64000/64000, 1/1 PASS
+audio_test 2000 1000  -> WRITE done: 64000/64000 / STOP done / audio_test: done
+hw_test rtc 3         -> 2/2 PASS
+hw_test alarm 1|2|3   -> 各 4/4 PASS（见 docs/alarm_usage.md）
+```
+
+### 排查手法（留个记录）
+
+现象是"整机静默无输出"，**先怀疑自旋/死锁，不要先怀疑崩溃**：
+本项目 `HAL_ASSERT()` 展开成 `while(1){}`（`USE_FULL_ASSERT` 是注释掉的），
+而且关中断上下文里的死循环连串口都出不来。定位手段是在可疑函数里
+**逐步打 `syslog(LOG_ERR, ...)`**，最后一条打印就是卡死点
+（本次最后一条是 `close` 之前的 `C3`，直接指到 `close(fd)`）。
+
+### 仍存疑（没验证过）
+
+`HAL_AUDPRC_DMAStop()` / `__HAL_AUDPRC_DISABLE()` 在关中断上下文里是否绝对安全，
+**没有证据**，只是风险低于模拟通路关闭，先保留在新函数里。
+若以后又出现"close 卡死"，下一步就是把这两个也挪出 `shutdown()` 路径。
