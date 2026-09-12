@@ -1,0 +1,11 @@
+#
+# For a description of the syntax of this configuration file,
+# see the file kconfig-language.txt in the NuttX tools repository.
+#
+
+config EXAMPLES_AUDIO_TEST
+	bool "SF32LB52 audio0 playback test"
+	default n
+	---help---
+		Generate a sine tone and play it through /dev/audio/audio0
+		to verify the audio driver DMA path.

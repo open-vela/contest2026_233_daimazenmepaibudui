@@ -16,6 +16,7 @@
 #include <math.h>
 #include <pthread.h>
 #include <time.h>
+#include <errno.h>
 
 /****************************************************************************
  * Pre-processor Definitions
@@ -43,7 +44,10 @@ static int sound_detect_extract_mfcc(const int16_t *data, size_t frames,
                                      float *mfcc, int num_coeffs);
 static void sound_detect_add_result(sound_detect_context_t *ctx,
                                    sound_type_t type, float confidence);
-static int sound_detect_run_model(sound_detect_context_t *ctx);
+static int sound_detect_run_model(sound_detect_context_t *ctx,
+                                  const int16_t *data, size_t frames);
+static int sound_detect_run_fallback(sound_detect_context_t *ctx,
+                                     const int16_t *data, size_t frames);
 
 /****************************************************************************
  * Private Data
@@ -74,6 +78,19 @@ static const char *g_type_names[] =
   [SOUND_TYPE_CUSTOM_2]     = "CUSTOM_2",
   [SOUND_TYPE_CUSTOM_3]     = "CUSTOM_3"
 };
+
+/* Edge Impulse C++部署库可提供同名强符号。弱实现保证未导出模型时仍可构建。 */
+
+__attribute__((weak))
+int edge_impulse_sound_classify(const int16_t *data, size_t frames,
+                                float *results, size_t result_count)
+{
+  (void)data;
+  (void)frames;
+  (void)results;
+  (void)result_count;
+  return -ENOSYS;
+}
 
 /****************************************************************************
  * Private Functions
@@ -205,34 +222,97 @@ static void sound_detect_add_result(sound_detect_context_t *ctx,
  * @brief  执行模型推理 (模拟实现)
  */
 
-static int sound_detect_run_model(sound_detect_context_t *ctx)
+static int sound_detect_run_fallback(sound_detect_context_t *ctx,
+                                     const int16_t *data, size_t frames)
 {
-  if (ctx == NULL)
+  float energy;
+  float rms;
+  float peak = 0.0f;
+  size_t crossings = 0;
+
+  if (ctx == NULL || data == NULL || frames == 0)
     {
       return -EINVAL;
     }
 
-  /* TODO: 集成真实的Edge Impulse模型 */
+  memset(ctx->results, 0, sizeof(ctx->results));
+  energy = sound_detect_calc_energy(data, frames);
+  rms = sqrtf(energy) / 32768.0f;
 
-  /*
-   * 实际实现:
-   * 1. 调用ei_malloc()分配内存
-   * 2. 调用ei_run_classifier()执行推理
-   * 3. 解析输出结果
-   * 4. 释放内存
-   */
+  for (size_t i = 0; i < frames; i++)
+    {
+      float sample = fabsf((float)data[i]) / 32768.0f;
+      if (sample > peak)
+        {
+          peak = sample;
+        }
 
-  /* 模拟推理结果 */
+      if (i > 0 && ((data[i - 1] < 0 && data[i] >= 0) ||
+                    (data[i - 1] >= 0 && data[i] < 0)))
+        {
+          crossings++;
+        }
+    }
+
+  float zcr = (float)crossings / frames;
+  ctx->results[SOUND_TYPE_NONE] = 0.95f;
+
+  /* 这是无模型演示后备：只用于联调，不代替训练模型或医疗判断。 */
+
+  if (peak > 0.75f && rms < 0.20f)
+    {
+      ctx->results[SOUND_TYPE_FALL] = 0.90f;
+      ctx->results[SOUND_TYPE_NONE] = 0.10f;
+    }
+  else if (rms > 0.30f && zcr > 0.08f)
+    {
+      ctx->results[SOUND_TYPE_SCREAM] = 0.86f;
+      ctx->results[SOUND_TYPE_NONE] = 0.14f;
+    }
+  else if (peak > 0.55f && rms < 0.30f)
+    {
+      ctx->results[SOUND_TYPE_KNOCK] = 0.78f;
+      ctx->results[SOUND_TYPE_NONE] = 0.22f;
+    }
+
+  return OK;
+}
+
+static int sound_detect_run_model(sound_detect_context_t *ctx,
+                                  const int16_t *data, size_t frames)
+{
+  int ret;
+
+  if (ctx == NULL || data == NULL || frames == 0)
+    {
+      return -EINVAL;
+    }
+
+#ifdef CONFIG_HELLO_APP_EDGE_IMPULSE
+  ret = edge_impulse_sound_classify(data, frames,
+                                    ctx->results, SOUND_TYPE_MAX);
+  if (ret < 0 && ret != -ENOSYS)
+    {
+      return ret;
+    }
+#else
+  ret = -ENOSYS;
+#endif
+
+  if (ret == -ENOSYS)
+    {
+      ret = sound_detect_run_fallback(ctx, data, frames);
+      if (ret < 0)
+        {
+          return ret;
+        }
+    }
 
   float max_score = 0;
   int max_idx = 0;
 
   for (int i = 0; i < SOUND_TYPE_MAX; i++)
     {
-      /* 模拟随机得分 */
-
-      ctx->results[i] = (float)(rand() % 100) / 100.0f;
-
       if (ctx->results[i] > max_score)
         {
           max_score = ctx->results[i];
@@ -295,7 +375,7 @@ static int sound_detect_process_window(sound_detect_context_t *ctx)
 
   /* 运行模型 */
 
-  ret = sound_detect_run_model(ctx);
+  ret = sound_detect_run_model(ctx, ctx->audio_buffer, ctx->buffer_pos);
   if (ret < 0 && ret != -ENODATA)
     {
       SOUND_DEBUG("模型推理失败: %d", ret);
@@ -315,12 +395,11 @@ static void *sound_detect_thread(void *arg)
 
   SOUND_DEBUG("检测线程启动");
 
-  ctx->detect_stop = false;
-
   while (!ctx->detect_stop)
     {
       /* 检查是否有足够的数据 */
 
+      pthread_mutex_lock(&ctx->buffer_lock);
       if (ctx->buffer_pos >= SOUND_DETECT_FRAMES_PER_WINDOW)
         {
           ctx->state = DETECT_STATE_PROCESSING;
@@ -342,6 +421,7 @@ static void *sound_detect_thread(void *arg)
           ctx->buffer_pos = remaining;
           ctx->state = DETECT_STATE_COLLECTING;
         }
+      pthread_mutex_unlock(&ctx->buffer_lock);
 
       /* 休眠等待 */
 
@@ -411,6 +491,16 @@ int sound_detect_init(sound_detect_context_t *ctx,
       return -ENOMEM;
     }
 
+  int ret = pthread_mutex_init(&ctx->buffer_lock, NULL);
+  if (ret != 0)
+    {
+      free(ctx->feature_buffer);
+      free(ctx->audio_buffer);
+      return -ret;
+    }
+
+  ctx->buffer_lock_valid = true;
+
   /* 初始化默认分类 */
 
   sound_detect_init_default_classes(ctx);
@@ -446,6 +536,12 @@ void sound_detect_deinit(sound_detect_context_t *ctx)
   /* 卸载模型 */
 
   sound_detect_unload_model(ctx);
+
+  if (ctx->buffer_lock_valid)
+    {
+      pthread_mutex_destroy(&ctx->buffer_lock);
+      ctx->buffer_lock_valid = false;
+    }
 
   /* 释放缓冲区 */
 
@@ -531,12 +627,44 @@ int sound_detect_load_model_file(sound_detect_context_t *ctx,
 
   SOUND_DEBUG("从文件加载模型: %s", model_path);
 
-  /* TODO: 读取模型文件 */
+  FILE *file = fopen(model_path, "rb");
+  if (file == NULL)
+    {
+      return -errno;
+    }
 
-  /* 模拟加载 */
+  if (fseek(file, 0, SEEK_END) != 0)
+    {
+      int error = errno;
+      fclose(file);
+      return -error;
+    }
 
-  uint8_t dummy_model[1024];
-  return sound_detect_load_model(ctx, dummy_model, sizeof(dummy_model));
+  long length = ftell(file);
+  if (length <= 0 || fseek(file, 0, SEEK_SET) != 0)
+    {
+      fclose(file);
+      return -EINVAL;
+    }
+
+  void *data = malloc((size_t)length);
+  if (data == NULL)
+    {
+      fclose(file);
+      return -ENOMEM;
+    }
+
+  size_t read_size = fread(data, 1, (size_t)length, file);
+  fclose(file);
+  if (read_size != (size_t)length)
+    {
+      free(data);
+      return -EIO;
+    }
+
+  int ret = sound_detect_load_model(ctx, data, read_size);
+  free(data);
+  return ret;
 }
 
 /**
@@ -581,6 +709,7 @@ int sound_detect_start(sound_detect_context_t *ctx)
   /* 清空缓冲区 */
 
   ctx->buffer_pos = 0;
+  ctx->detect_stop = false;
   memset(&ctx->stats, 0, sizeof(ctx->stats));
 
   /* 启动检测线程 */
@@ -595,6 +724,7 @@ int sound_detect_start(sound_detect_context_t *ctx)
     }
 
   ctx->state = DETECT_STATE_COLLECTING;
+  ctx->detect_thread_valid = true;
 
   return OK;
 }
@@ -605,7 +735,7 @@ int sound_detect_start(sound_detect_context_t *ctx)
 
 void sound_detect_stop(sound_detect_context_t *ctx)
 {
-  if (ctx == NULL || ctx->state != DETECT_STATE_COLLECTING)
+  if (ctx == NULL || !ctx->detect_thread_valid)
     {
       return;
     }
@@ -619,6 +749,7 @@ void sound_detect_stop(sound_detect_context_t *ctx)
   /* 等待线程退出 */
 
   pthread_join(ctx->detect_thread, NULL);
+  ctx->detect_thread_valid = false;
 
   ctx->state = DETECT_STATE_IDLE;
 }
@@ -639,6 +770,14 @@ int sound_detect_feed(sound_detect_context_t *ctx,
     {
       return -EINVAL;
     }
+
+  if (frames > ctx->buffer_size)
+    {
+      data += frames - ctx->buffer_size;
+      frames = ctx->buffer_size;
+    }
+
+  pthread_mutex_lock(&ctx->buffer_lock);
 
   /* 检查缓冲区空间 */
 
@@ -661,6 +800,8 @@ int sound_detect_feed(sound_detect_context_t *ctx,
   ctx->buffer_pos += frames;
 
   ctx->stats.total_frames += frames;
+
+  pthread_mutex_unlock(&ctx->buffer_lock);
 
   return OK;
 }
@@ -701,8 +842,11 @@ int sound_detect_once(sound_detect_context_t *ctx,
 
   /* 运行模型 */
 
-  float results[SOUND_DETECT_MAX_CLASSES];
-  ret = sound_detect_run_model(ctx);
+  ret = sound_detect_run_model(ctx, data, frames);
+  if (ret < 0 && ret != -ENODATA)
+    {
+      return ret;
+    }
 
   /* 找到最高分 */
 
@@ -853,7 +997,7 @@ detect_state_t sound_detect_get_state(sound_detect_context_t *ctx)
 
 const char *sound_detect_get_state_name(detect_state_t state)
 {
-  if (state <= DETECT_STATE_ERROR)
+  if (state >= DETECT_STATE_UNINIT && state <= DETECT_STATE_ERROR)
     {
       return g_state_names[state];
     }
@@ -867,7 +1011,7 @@ const char *sound_detect_get_state_name(detect_state_t state)
 
 const char *sound_detect_get_type_name(sound_type_t type)
 {
-  if (type < SOUND_TYPE_MAX)
+  if (type >= SOUND_TYPE_NONE && type < SOUND_TYPE_MAX)
     {
       return g_type_names[type];
     }
@@ -898,9 +1042,11 @@ int sound_detect_inference(sound_detect_context_t *ctx,
       return -EINVAL;
     }
 
-  /* TODO: 调用真实的模型推理 */
+  (void)feature_size;
 
-  return sound_detect_run_model(ctx);
+  /* 当前适配器接收原始PCM；保留旧API但不伪造推理结果。 */
+
+  return -ENOTSUP;
 }
 
 /**

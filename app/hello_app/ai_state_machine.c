@@ -11,6 +11,7 @@
 #include "ai_state_machine.h"
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
 #include <time.h>
 
 /****************************************************************************
@@ -70,7 +71,7 @@ static const char *g_event_names[SM_EVENT_MAX] =
 };
 
 /* 各状态默认超时时间(毫秒) */
-static uint32_t g_default_timeouts[SM_STATE_MAX] =
+static const uint32_t g_default_timeouts[SM_STATE_MAX] =
 {
   [SM_STATE_IDLE]        = 0,        /* 待机状态不超时 */
   [SM_STATE_LISTENING]   = 10000,    /* 监听10秒超时 */
@@ -100,7 +101,8 @@ static uint32_t sm_get_tick_ms(void)
 
 static int sm_switch_state(sm_context_t *ctx, sm_state_t new_state)
 {
-  if (new_state >= SM_STATE_MAX || ctx == NULL)
+  if (ctx == NULL || (int)new_state < 0 || new_state >= SM_STATE_MAX ||
+      (int)ctx->current_state < 0 || ctx->current_state >= SM_STATE_MAX)
     {
       return -EINVAL;
     }
@@ -120,7 +122,7 @@ static int sm_switch_state(sm_context_t *ctx, sm_state_t new_state)
   ctx->prev_state = old_state;
   ctx->current_state = new_state;
   ctx->state_enter_tick = sm_get_tick_ms();
-  ctx->timeout_ms = g_default_timeouts[new_state];
+  ctx->timeout_ms = ctx->state_timeouts[new_state];
 
   SM_DEBUG("State change: %s -> %s (timeout=%lu ms)",
            g_state_names[old_state],
@@ -148,6 +150,7 @@ static int sm_switch_state(sm_context_t *ctx, sm_state_t new_state)
 
 static void sm_idle_enter(void *ctx)
 {
+  (void)ctx;
   SM_DEBUG("进入待机状态: 低功耗模式");
   /* TODO: 通知成员一降低功耗, 关闭不必要的外设 */
   /* TODO: 通知成员三显示待机动画 */
@@ -162,6 +165,7 @@ static void sm_idle_enter(void *ctx)
 
 static void sm_listening_enter(void *ctx)
 {
+  (void)ctx;
   SM_DEBUG("进入监听状态: 开始采集语音");
   /* TODO: 启动麦克风录音 */
   /* audio_start_recording(); */
@@ -175,6 +179,7 @@ static void sm_listening_enter(void *ctx)
 
 static void sm_ai_talking_enter(void *ctx)
 {
+  (void)ctx;
   SM_DEBUG("进入AI对话状态: 等待云端回复");
   /* TODO: 停止录音, 开始上传音频数据 */
   /* audio_stop_recording(); */
@@ -189,6 +194,7 @@ static void sm_ai_talking_enter(void *ctx)
 
 static void sm_care_remind_enter(void *ctx)
 {
+  (void)ctx;
   SM_DEBUG("进入主动提醒状态: 播放提醒内容");
   /* TODO: 生成提醒语音并播放 */
   /* audio_play_reminder(); */
@@ -202,6 +208,7 @@ static void sm_care_remind_enter(void *ctx)
 
 static void sm_alarm_enter(void *ctx)
 {
+  (void)ctx;
   SM_DEBUG("进入报警状态: 发送异常通知");
   /* TODO: 立即通知家人/护理人员 */
   /* network_send_alarm(); */
@@ -216,11 +223,13 @@ static void sm_alarm_enter(void *ctx)
 
 static void sm_idle_exit(void *ctx)
 {
+  (void)ctx;
   SM_DEBUG("退出待机状态");
 }
 
 static void sm_listening_exit(void *ctx)
 {
+  (void)ctx;
   SM_DEBUG("退出监听状态");
   /* TODO: 停止麦克风录音 */
   /* audio_stop_recording(); */
@@ -228,6 +237,7 @@ static void sm_listening_exit(void *ctx)
 
 static void sm_ai_talking_exit(void *ctx)
 {
+  (void)ctx;
   SM_DEBUG("退出AI对话状态");
   /* TODO: 清理AI请求资源 */
   /* network_cancel_request(); */
@@ -235,6 +245,7 @@ static void sm_ai_talking_exit(void *ctx)
 
 static void sm_care_remind_exit(void *ctx)
 {
+  (void)ctx;
   SM_DEBUG("退出主动提醒状态");
   /* TODO: 停止语音播放 */
   /* audio_stop_playback(); */
@@ -242,6 +253,7 @@ static void sm_care_remind_exit(void *ctx)
 
 static void sm_alarm_exit(void *ctx)
 {
+  (void)ctx;
   SM_DEBUG("退出报警状态");
   /* TODO: 停止报警相关操作 */
 }
@@ -256,6 +268,7 @@ static void sm_alarm_exit(void *ctx)
 
 static sm_state_t sm_idle_transition(void *ctx, sm_event_t event)
 {
+  (void)ctx;
   switch (event)
     {
       case SM_EVENT_WAKEUP:
@@ -290,6 +303,7 @@ static sm_state_t sm_idle_transition(void *ctx, sm_event_t event)
 
 static sm_state_t sm_listening_transition(void *ctx, sm_event_t event)
 {
+  (void)ctx;
   switch (event)
     {
       case SM_EVENT_VOICE_DETECTED:
@@ -325,6 +339,7 @@ static sm_state_t sm_listening_transition(void *ctx, sm_event_t event)
 
 static sm_state_t sm_ai_talking_transition(void *ctx, sm_event_t event)
 {
+  (void)ctx;
   switch (event)
     {
       case SM_EVENT_AI_RESPONSE:
@@ -362,6 +377,7 @@ static sm_state_t sm_ai_talking_transition(void *ctx, sm_event_t event)
 
 static sm_state_t sm_care_remind_transition(void *ctx, sm_event_t event)
 {
+  (void)ctx;
   switch (event)
     {
       case SM_EVENT_VOICE_DETECTED:
@@ -397,6 +413,7 @@ static sm_state_t sm_care_remind_transition(void *ctx, sm_event_t event)
 
 static sm_state_t sm_alarm_transition(void *ctx, sm_event_t event)
 {
+  (void)ctx;
   switch (event)
     {
       case SM_EVENT_ALARM_CLEARED:
@@ -450,7 +467,9 @@ int sm_init(sm_context_t *ctx)
   ctx->prev_state = SM_STATE_IDLE;
   ctx->initialized = true;
   ctx->state_enter_tick = sm_get_tick_ms();
-  ctx->timeout_ms = g_default_timeouts[SM_STATE_IDLE];
+  memcpy(ctx->state_timeouts, g_default_timeouts,
+         sizeof(ctx->state_timeouts));
+  ctx->timeout_ms = ctx->state_timeouts[SM_STATE_IDLE];
 
   /* 注册默认状态处理函数 */
 
@@ -493,7 +512,9 @@ void sm_deinit(sm_context_t *ctx)
 
   /* 退出当前状态 */
 
-  if (ctx->state_table[ctx->current_state].exit_func != NULL)
+  if ((int)ctx->current_state >= 0 &&
+      ctx->current_state < SM_STATE_MAX &&
+      ctx->state_table[ctx->current_state].exit_func != NULL)
     {
       ctx->state_table[ctx->current_state].exit_func(ctx);
     }
@@ -512,7 +533,8 @@ int sm_handle_event(sm_context_t *ctx, sm_event_t event)
       return -EINVAL;
     }
 
-  if (event >= SM_EVENT_MAX)
+  if ((int)event < 0 || event >= SM_EVENT_MAX ||
+      (int)ctx->current_state < 0 || ctx->current_state >= SM_STATE_MAX)
     {
       return -EINVAL;
     }
@@ -601,7 +623,7 @@ sm_state_t sm_get_state(sm_context_t *ctx)
 
 const char *sm_get_state_name(sm_state_t state)
 {
-  if (state < SM_STATE_MAX)
+  if ((int)state >= 0 && state < SM_STATE_MAX)
     {
       return g_state_names[state];
     }
@@ -615,7 +637,7 @@ const char *sm_get_state_name(sm_state_t state)
 
 const char *sm_get_event_name(sm_event_t event)
 {
-  if (event < SM_EVENT_MAX)
+  if ((int)event >= 0 && event < SM_EVENT_MAX)
     {
       return g_event_names[event];
     }
@@ -633,7 +655,7 @@ int sm_register_state(sm_context_t *ctx,
                       sm_state_handler_t exit,
                       sm_transition_handler_t transition)
 {
-  if (ctx == NULL || state >= SM_STATE_MAX)
+  if (ctx == NULL || (int)state < 0 || state >= SM_STATE_MAX)
     {
       return -EINVAL;
     }
@@ -654,12 +676,12 @@ int sm_register_state(sm_context_t *ctx,
 void sm_set_timeout(sm_context_t *ctx, sm_state_t state,
                     uint32_t timeout_ms)
 {
-  if (ctx == NULL || state >= SM_STATE_MAX)
+  if (ctx == NULL || (int)state < 0 || state >= SM_STATE_MAX)
     {
       return;
     }
 
-  g_default_timeouts[state] = timeout_ms;
+  ctx->state_timeouts[state] = timeout_ms;
 
   /* 如果是当前状态, 立即更新 */
 
@@ -678,7 +700,8 @@ void sm_set_timeout(sm_context_t *ctx, sm_state_t state,
 
 void sm_force_state(sm_context_t *ctx, sm_state_t new_state)
 {
-  if (ctx == NULL || new_state >= SM_STATE_MAX)
+  if (ctx == NULL || (int)new_state < 0 || new_state >= SM_STATE_MAX ||
+      (int)ctx->current_state < 0 || ctx->current_state >= SM_STATE_MAX)
     {
       return;
     }

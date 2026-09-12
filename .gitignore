@@ -1,0 +1,11 @@
+# Sifli SDK scons build artifacts
+board/build_*/
+board/.sconsign.dblite
+__pycache__/
+*.pyc
+
+# Windows download/ADS junk
+*:Zone.Identifier
+
+# SDK board copy kept for reference (content identical to SiFli-SDK customer/boards)
+board/sf32lb52-lcd_n16r8/

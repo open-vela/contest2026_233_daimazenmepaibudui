@@ -14,6 +14,8 @@
 #include <unistd.h>
 #include <signal.h>
 #include <pthread.h>
+#include <string.h>
+#include <errno.h>
 
 #include "ai_state_machine.h"
 #include "ai_audio.h"
@@ -30,6 +32,9 @@
 
 /* 程序退出标志 */
 static volatile bool g_running = true;
+static bool g_audio_started;
+static bool g_sound_started;
+static bool g_care_started;
 
 /****************************************************************************
  * Private Data
@@ -49,6 +54,14 @@ static sound_detect_context_t g_sound_ctx;
 
 /* 全局主动关怀上下文 */
 static care_context_t g_care_ctx;
+
+static void print_usage(const char *program)
+{
+  printf("用法: %s [选项]\n", program);
+  printf("  --ask <文本>          启动后向 MiMo/ai_agent 发送文本\n");
+  printf("  --sound-self-test     注入测试冲击声，验证检测链路\n");
+  printf("  --help                显示帮助\n");
+}
 
 /****************************************************************************
  * Private Functions
@@ -86,6 +99,21 @@ static void vad_callback(bool speech_detected, void *user_data)
     }
 }
 
+static void audio_data_callback(const int16_t *data, size_t frames,
+                                void *user_data)
+{
+  (void)user_data;
+
+  if (g_sound_started)
+    {
+      int ret = sound_detect_feed(&g_sound_ctx, data, frames);
+      if (ret < 0 && ret != -ENOSPC)
+        {
+          printf("[安全] 音频送入检测器失败: %d\n", ret);
+        }
+    }
+}
+
 /**
  * @brief  初始化音频并启动VAD监听
  */
@@ -104,7 +132,9 @@ static int start_audio_listening(sm_context_t *ctx)
   {
     .enable_vad = true,
     .silence_timeout_ms = AUDIO_VAD_SILENCE_TIMEOUT_MS,
-    .min_speech_ms = AUDIO_VAD_MIN_SPEECH_MS
+    .min_speech_ms = AUDIO_VAD_MIN_SPEECH_MS,
+    .data_callback = audio_data_callback,
+    .user_data = ctx
   };
 
   ret = audio_record_start(&g_audio_ctx, &record_cfg);
@@ -115,6 +145,7 @@ static int start_audio_listening(sm_context_t *ctx)
     }
 
   printf("[音频] 开始语音监听\n");
+  g_audio_started = true;
   return OK;
 }
 
@@ -124,8 +155,14 @@ static int start_audio_listening(sm_context_t *ctx)
 
 static void stop_audio_listening(void)
 {
+  if (!g_audio_started)
+    {
+      return;
+    }
+
   audio_record_stop(&g_audio_ctx);
   audio_vad_disable(&g_audio_ctx);
+  g_audio_started = false;
   printf("[音频] 停止语音监听\n");
 }
 
@@ -194,6 +231,7 @@ static int start_sound_detection(sm_context_t *ctx)
     }
 
   printf("[安全] 声音检测已启动\n");
+  g_sound_started = true;
   return OK;
 }
 
@@ -203,8 +241,14 @@ static int start_sound_detection(sm_context_t *ctx)
 
 static void stop_sound_detection(void)
 {
+  if (!g_sound_started)
+    {
+      return;
+    }
+
   sound_detect_stop(&g_sound_ctx);
   sound_detect_deinit(&g_sound_ctx);
+  g_sound_started = false;
   printf("[安全] 声音检测已停止\n");
 }
 
@@ -274,10 +318,12 @@ static int start_care(sm_context_t *ctx)
     }
 
   printf("[关怀] 主动关怀已启动\n");
+  g_care_started = true;
 
   /* 打印任务列表 */
-
-  care_task_t tasks[CARE_MAX_TASKS];
+  /* 注意: care_task_t 含 256B message 等, 20 个约 9KB, 放栈上会溢出
+   * hello_app 任务栈(8KB), 因此用 static 一次性缓冲 */
+  static care_task_t tasks[CARE_MAX_TASKS];
   int count = care_get_task_list(&g_care_ctx, tasks, CARE_MAX_TASKS);
   printf("[关怀] 当前关怀任务: %d 个\n", count);
 
@@ -290,8 +336,14 @@ static int start_care(sm_context_t *ctx)
 
 static void stop_care(void)
 {
+  if (!g_care_started)
+    {
+      return;
+    }
+
   care_stop(&g_care_ctx);
   care_deinit(&g_care_ctx);
+  g_care_started = false;
   printf("[关怀] 主动关怀已停止\n");
 }
 
@@ -473,6 +525,31 @@ int main(int argc, char *argv[])
 {
   int ret;
   pthread_t loop_thread;
+  const char *startup_text = NULL;
+  bool sound_self_test = false;
+
+  for (int i = 1; i < argc; i++)
+    {
+      if (strcmp(argv[i], "--help") == 0)
+        {
+          print_usage(argv[0]);
+          return 0;
+        }
+      else if (strcmp(argv[i], "--ask") == 0 && i + 1 < argc)
+        {
+          startup_text = argv[++i];
+        }
+      else if (strcmp(argv[i], "--sound-self-test") == 0)
+        {
+          sound_self_test = true;
+        }
+      else
+        {
+          printf("未知或不完整的参数: %s\n", argv[i]);
+          print_usage(argv[0]);
+          return -EINVAL;
+        }
+    }
 
   printf("\n");
   printf("╔══════════════════════════════════════════╗\n");
@@ -568,6 +645,31 @@ int main(int argc, char *argv[])
     }
 
   printf("[运行] 系统已启动, 按 Ctrl+C 退出\n\n");
+
+  if (startup_text != NULL)
+    {
+      ret = llm_send_text(&g_llm_ctx, startup_text, NULL,
+                          llm_complete_callback, &g_sm_ctx);
+      if (ret < 0)
+        {
+          printf("[LLM] 启动请求失败: %d\n", ret);
+        }
+    }
+
+  if (sound_self_test && g_sound_started)
+    {
+      int16_t test_audio[SOUND_DETECT_FRAMES_PER_WINDOW];
+      memset(test_audio, 0, sizeof(test_audio));
+      for (size_t i = 0; i < SOUND_DETECT_FRAMES_PER_WINDOW; i += 80)
+        {
+          test_audio[i] = (i / 80) % 2 == 0 ? INT16_MAX : INT16_MIN;
+        }
+
+      ret = sound_detect_feed(&g_sound_ctx, test_audio,
+                              SOUND_DETECT_FRAMES_PER_WINDOW);
+      printf("[自检] 声音检测测试数据已注入: %s (%d)\n",
+             ret == OK ? "成功" : "失败", ret);
+    }
 
   /* 3. 主线程等待退出 */
 

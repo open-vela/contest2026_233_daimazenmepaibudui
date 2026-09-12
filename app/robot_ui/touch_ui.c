@@ -135,6 +135,13 @@ void touch_ui_init(void)
     memset(reminders, 0, sizeof(reminders));
     reminder_count = 0;
 
+    /* 面板句柄复位: NuttX builtin 应用重新运行时 .bss 不清零,
+     * 若残留上一次运行的面板指针, 之后 lv_obj_del() 会去删除已
+     * 失效的 LVGL 对象而导致 hardfault */
+    menu_panel = NULL;
+    setting_panel = NULL;
+    reminder_panel = NULL;
+
     /* 获取当前活动屏幕 */
     current_screen = lv_scr_act();
     lv_obj_add_style(current_screen, &style_elder, 0);
@@ -145,10 +152,20 @@ void touch_ui_init(void)
 /* ==================== 显示菜单 ==================== */
 void touch_ui_show_menu(menu_type_t type)
 {
-    /* 清除之前的菜单 */
+    /* 清除所有旧面板. 注意 setting_panel 是活动屏的兄弟节点,
+     * 不挂在 menu_panel 下, 只删 menu_panel 会遗留旧设置面板,
+     * 导致新旧面板重叠且整棵对象树泄漏 */
     if (menu_panel) {
         lv_obj_del(menu_panel);
         menu_panel = NULL;
+    }
+    if (setting_panel) {
+        lv_obj_del(setting_panel);
+        setting_panel = NULL;
+    }
+    if (reminder_panel) {
+        lv_obj_del(reminder_panel);
+        reminder_panel = NULL;
     }
 
     /* 创建菜单面板 */
@@ -254,8 +271,8 @@ static void create_menu_panel(menu_type_t type)
 static void create_menu_item(lv_obj_t *parent, const char *icon_text,
                             const char *subtitle, int index)
 {
-    /* 菜单项容器 */
-    lv_obj_t *item = lv_obj_create(parent);
+    /* 菜单项按钮 - 用 lv_btn 确保触摸事件可响应 */
+    lv_obj_t *item = lv_btn_create(parent);
     lv_obj_set_size(item, LV_PCT(100), 80);
     lv_obj_add_style(item, &style_menu_item, 0);
     lv_obj_set_flex_flow(item, LV_FLEX_FLOW_ROW);
@@ -305,7 +322,7 @@ static void create_reminder_list_items(lv_obj_t *parent)
 static void create_reminder_item(lv_obj_t *parent, const char *title,
                                 const char *time_str, int index)
 {
-    lv_obj_t *item = lv_obj_create(parent);
+    lv_obj_t *item = lv_btn_create(parent);
     lv_obj_set_size(item, LV_PCT(100), 70);
     lv_obj_add_style(item, &style_menu_item, 0);
     lv_obj_set_flex_flow(item, LV_FLEX_FLOW_ROW);
@@ -661,8 +678,8 @@ static void show_confirm_dialog(const char *title, const char *content,
     lv_obj_t *mbox = lv_msgbox_create(NULL);
     if (mbox == NULL) return;
 
-    lv_msgbox_set_text(mbox, content);
-    lv_msgbox_set_title(mbox, title);
+    lv_msgbox_add_title(mbox, title);
+    lv_msgbox_add_text(mbox, content);
 
     /* 添加确认和取消按钮 */
     lv_obj_t *btn_confirm = lv_msgbox_add_footer_button(mbox, "OK");
@@ -728,8 +745,8 @@ void touch_ui_show_setting_detail(const char *title, const char *content)
     lv_obj_t *mbox = lv_msgbox_create(NULL);
     if (mbox == NULL) return;
 
-    lv_msgbox_set_text(mbox, content);
-    lv_msgbox_set_title(mbox, title);
+    lv_msgbox_add_title(mbox, title);
+    lv_msgbox_add_text(mbox, content);
     lv_msgbox_add_close_button(mbox);
     lv_obj_center(mbox);
     lv_obj_set_style_bg_color(mbox, lv_color_hex(0x2D2D44), 0);

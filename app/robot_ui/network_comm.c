@@ -8,16 +8,21 @@
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
+#include <errno.h>
+#include <fcntl.h>
 
 /* NuttX 网络头文件 */
 #include <sys/socket.h>
 #include <sys/ioctl.h>
+#include <sys/select.h>
+#include <sys/time.h>
 #include <net/if.h>
 #include <arpa/inet.h>
+#include <netdb.h> /* gethostbyname / struct hostent（DNS 解析） */
 #include <unistd.h>
 
 /* cJSON 用于 JSON 解析 */
-#include <cjson/cJSON.h>
+#include <netutils/cJSON.h>
 
 /* ==================== 全局变量 ==================== */
 static wifi_config_t wifi_config = {0};
@@ -36,6 +41,16 @@ static ai_command_callback_t ai_command_callback = NULL;
 /* 心跳定时器 */
 static uint32_t last_heartbeat_time = 0;
 #define HEARTBEAT_INTERVAL 30000  // 30秒
+
+/* 可用 broker 列表。公共 broker 会限流甚至直接把连接关掉（实测 broker.emqx.io
+ * 在被高频重连后会连上就 RESET、不给 CONNACK），所以连不上就自动换下一台。
+ */
+static const char *g_mqtt_broker_list[] = {
+    "broker.emqx.io",
+    "test.mosquitto.org",
+    "broker.hivemq.com",
+};
+#define MQTT_NBROKERS ((int)(sizeof(g_mqtt_broker_list) / sizeof(g_mqtt_broker_list[0])))
 
 /* ==================== 内部函数声明 ==================== */
 static int create_tcp_socket(const char *host, uint16_t port);
@@ -834,13 +849,65 @@ static int create_tcp_socket(const char *host, uint16_t port)
     struct hostent *he = gethostbyname(host);
     if (he) {
         memcpy(&server_addr.sin_addr, he->h_addr_list[0], he->h_length);
+        printf("MQTT DNS: %s -> %s\n", host, inet_ntoa(server_addr.sin_addr));
     } else {
         server_addr.sin_addr.s_addr = inet_addr(host);
+        printf("MQTT DNS: %s 解析失败, 当 IP 用\n", host);
     }
 
-    /* 连接服务器 */
-    if (connect(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+    /* 连接服务器。
+     *
+     * 必须用「非阻塞 connect + select 超时」，不能直接用阻塞式 connect：
+     * 对方如果不回 SYN（被限流、网络抖动、IP 过期），内核要等 SYN 重传耗尽
+     * 才返回，在 NuttX 的配置下要 1~3 分钟。而 network_task 是单线程轮询，
+     * 这一个 connect 就会把整个任务卡住——心跳不发、重连不做、串口一行日志
+     * 都没有，看起来像"死机"。5 秒返回不了就当这次失败，下一轮重试。
+     */
+    if (fcntl(sockfd, F_SETFL, O_NONBLOCK) < 0) {
+        perror("fcntl");
+        close(sockfd);
+        return -1;
+    }
+
+    int cret = connect(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr));
+    if (cret < 0 && errno != EINPROGRESS) {
         perror("connect");
+        close(sockfd);
+        return -1;
+    }
+
+    if (cret < 0) {
+        fd_set wset;
+        struct timeval ctimeo;
+        int cerr = 0;
+        socklen_t elen = sizeof(cerr);
+
+        FD_ZERO(&wset);
+        FD_SET(sockfd, &wset);
+        ctimeo.tv_sec  = 5;
+        ctimeo.tv_usec = 0;
+
+        if (select(sockfd + 1, NULL, &wset, NULL, &ctimeo) <= 0 ||
+            getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &cerr, &elen) < 0 ||
+            cerr != 0) {
+            printf("connect timeout/error: %s:%u\n", host, (unsigned)port);
+            close(sockfd);
+            return -1;
+        }
+    }
+
+    /* 保持非阻塞。
+     *
+     * network_task 是单线程轮询，任何一次阻塞都可能把整个循环卡死：
+     * 心跳不发、重连不做、串口一行日志都没有，看起来像"死机"（实测过）。
+     * 原来这里靠 SO_RCVTIMEO 让 recv 5 秒超时返回，但实测不可靠 ——
+     * 循环会永久停在 recv 里。
+     *
+     * 非阻塞之后：没数据时 recv 立刻返回 -1，mqtt_parse_packet() 直接返回，
+     * 循环继续跑，心跳照发、重连照做。
+     */
+    if (fcntl(sockfd, F_SETFL, O_NONBLOCK) < 0) {
+        perror("fcntl");
         close(sockfd);
         return -1;
     }
@@ -861,9 +928,25 @@ static int mqtt_send_connect(void)
     uint8_t variable_header[] = {
         0x00, 0x04, 'M', 'Q', 'T', 'T',  // 协议名
         0x04,  // 协议级别 (MQTT 3.1.1)
-        0xC2,  // 连接标志（用户名+密码+遗嘱+清理会话）
+        0x06,  // 连接标志：下面按实际内容再补（见注释）
         0x00, 0x3C,  // 保持连接时间 60 秒
     };
+
+    /* 连接标志必须和 payload 里真实带了什么字段一致。
+     *
+     * 原来硬编码 0xC2（用户名+密码+遗嘱+清理会话），但下面只在 username /
+     * password 非空时才往 payload 里追加对应字段 —— 两个都为空时，标志声称
+     * "有用户名密码"、payload 里却没有，broker 判定报文非法，直接把连接关掉。
+     * 表现就是「TCP 连得上，但永远收不到 CONNACK」。
+     *
+     * bit1=清理会话(0x02) bit2=遗嘱(0x04) bit7=用户名(0x80) bit6=密码(0x40)
+     */
+    if (mqtt_config.username[0]) {
+        variable_header[7] |= 0x80;
+    }
+    if (mqtt_config.password[0]) {
+        variable_header[7] |= 0x40;
+    }
 
     /* 构建载荷 */
     uint8_t payload[256];
@@ -1116,6 +1199,18 @@ void network_task(void *arg)
 {
     printf("network_task started\n");
 
+    /* MQTT 重连节流 + broker 降级。每次尝试都要先做 DNS 解析再 connect：
+     * - 每 100ms 重来一次会把 CPU 和网络打满；
+     * - 一直 5 秒一次地锤公共 broker 会被限流（broker.emqx.io 就把我们
+     *   限了：连着 20 多分钟后它开始直接关连接、不给 CONNACK）。
+     * 所以前几次快一点（开机后尽快连上），失败多了就放慢到 30 秒；
+     * 连了 5 次还不行就换下一台 broker。
+     */
+    int mqtt_retry_tick = 0;
+    int mqtt_fails = 0;
+    int broker_idx = 0;
+    int broker_switches = 0;
+
     while (1) {
         /* 检查 WiFi 状态 */
         if (!wifi_config.connected) {
@@ -1125,9 +1220,34 @@ void network_task(void *arg)
 
         /* 检查 MQTT 状态 */
         if (wifi_config.connected && !mqtt_config.connected) {
-            /* 尝试连接 MQTT */
-            mqtt_connect(mqtt_config.broker, mqtt_config.port,
-                        mqtt_config.client_id, mqtt_config.username, mqtt_config.password);
+            if (--mqtt_retry_tick <= 0) {
+                /* 只有第一轮（还没换过 broker）才用 5 秒的快节奏，好在开机后
+                 * 尽快连上；一旦开始换 broker 说明网络/公共实例有问题，一律 30 秒，
+                 * 否则会变成"每台试 5 次、15 次一轮"地一直锤公共服务器。
+                 */
+                mqtt_retry_tick =
+                    (broker_switches == 0 && mqtt_fails < 5) ? 50 : 300;
+
+                /* 尝试连接 MQTT */
+                if (mqtt_connect(mqtt_config.broker, mqtt_config.port,
+                                 mqtt_config.client_id, mqtt_config.username,
+                                 mqtt_config.password) < 0) {
+                    mqtt_fails++;
+
+                    if (mqtt_fails >= 5 && MQTT_NBROKERS > 1) {
+                        /* 这台连不上（公共实例限流很常见），换下一台 */
+                        broker_idx = (broker_idx + 1) % MQTT_NBROKERS;
+                        broker_switches++;
+                        strncpy(mqtt_config.broker, g_mqtt_broker_list[broker_idx],
+                                sizeof(mqtt_config.broker) - 1);
+                        mqtt_config.broker[sizeof(mqtt_config.broker) - 1] = '\0';
+                        printf("MQTT broker 切换到 %s\n", mqtt_config.broker);
+                        mqtt_fails = 0;
+                    }
+                } else {
+                    mqtt_fails = 0;
+                }
+            }
         }
 
         /* 接收 MQTT 消息 */

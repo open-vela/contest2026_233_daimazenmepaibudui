@@ -1,0 +1,757 @@
+diff --git a/chips/sf32lb52/sf32lb_usbdev.c b/chips/sf32lb52/sf32lb_usbdev.c
+index a1cf6fc..bbe629b 100644
+--- a/chips/sf32lb52/sf32lb_usbdev.c
++++ b/chips/sf32lb52/sf32lb_usbdev.c
+@@ -67,14 +67,20 @@
+ #define SF32LB52_EP0MAXPACKET       64          /* EP0 max packet size */
+ #define SF32LB52_BULKMAXPACKET      64          /* Bulk endpoint max packet */
+ #define SF32LB52_INTRMAXPACKET      64          /* Interrupt endpoint max packet */
+-#define SF32LB52_NENDPOINTS         4           /* EP0 + 3 IN + .. we use 4 */
++#define SF32LB52_NENDPOINTS         6           /* EP0..EP5 (EP3/EP4 unusable) */
+ 
+-/* Endpoint numbers */
++/* Endpoint numbers.
++ *
++ * NOTE: endpoint index 3 (and 4) cannot be configured on this part -- a
++ * non-zero TXMAXP write simply does not stick, while indices 1, 5, 6 and 7
++ * accept it.  So the interrupt IN endpoint lives on EP5, and EP3/EP4 are
++ * left as placeholders to keep the eplist indexed by endpoint number.
++ */
+ 
+ #define SF32LB52_EP0                0           /* Control endpoint */
+ #define SF32LB52_EPBULKIN           1           /* Bulk EP for send to host */
+ #define SF32LB52_EPBULKOUT          2           /* Bulk EP for recv from host */
+-#define SF32LB52_EPINTRIN           3           /* Intr EP for host poll */
++#define SF32LB52_EPINTRIN           5           /* Intr EP for host poll */
+ 
+ /* FIFO size encoding: log2(size) - 3
+  * 8=0, 16=1, 32=2, 64=3, 128=4, 256=5, 512=6, 1024=7
+@@ -226,9 +232,10 @@ static void sf32lb52_rqenqueue(struct sf32lb52_ep_s *privep,
+ /* Low level data transfers and request operations */
+ 
+ static int  sf32lb52_ep0write(struct sf32lb52_usbdev_s *priv,
+-                              uint8_t *buf, uint16_t nbytes);
++                              uint8_t *buf, uint16_t nbytes, bool last);
+ static int  sf32lb52_epwrite(struct sf32lb52_usbdev_s *priv,
+-                             uint8_t epphy, uint8_t *buf, uint16_t nbytes);
++                             uint8_t epphy, uint8_t *buf, uint16_t nbytes,
++                             bool last);
+ static int  sf32lb52_epread(struct sf32lb52_usbdev_s *priv,
+                             uint8_t epphy, uint8_t *buf, uint16_t nbytes);
+ static inline void sf32lb52_abortrequest(struct sf32lb52_ep_s *privep,
+@@ -341,6 +348,16 @@ static const struct sf32lb52_epinfo_s g_epinfo[SF32LB52_NENDPOINTS] =
+     .attr      = USB_EP_ATTR_XFER_BULK,
+     .maxpacket = SF32LB52_BULKMAXPACKET,
+   },
++  {
++    .addr      = 3,                             /* EP3: unusable on this part */
++    .attr      = USB_EP_ATTR_XFER_BULK,
++    .maxpacket = SF32LB52_BULKMAXPACKET,
++  },
++  {
++    .addr      = 4,                             /* EP4: unusable on this part */
++    .attr      = USB_EP_ATTR_XFER_BULK,
++    .maxpacket = SF32LB52_BULKMAXPACKET,
++  },
+   {
+     .addr      = SF32LB52_EPINTRIN | USB_DIR_IN,
+     .attr      = USB_EP_ATTR_XFER_INT,
+@@ -404,7 +421,7 @@ static void sf32lb52_rqenqueue(struct sf32lb52_ep_s *privep,
+  ****************************************************************************/
+ 
+ static int sf32lb52_ep0write(struct sf32lb52_usbdev_s *priv,
+-                             uint8_t *buf, uint16_t nbytes)
++                             uint8_t *buf, uint16_t nbytes, bool last)
+ {
+   volatile USBC_X_Typedef *hw = priv->hw;
+   uint16_t bytesleft;
+@@ -416,14 +433,18 @@ static int sf32lb52_ep0write(struct sf32lb52_usbdev_s *priv,
+   if (nbytes <= SF32LB52_EP0MAXPACKET)
+     {
+       bytesleft = nbytes;
+-      csr0 = USB_CSR0_TXPKTRDY | USB_CSR0_P_DATAEND;
+     }
+   else
+     {
+       bytesleft = SF32LB52_EP0MAXPACKET;
+-      csr0 = USB_CSR0_TXPKTRDY;
+     }
+ 
++  /* DATAEND 只在控制 IN 数据阶段的**最后一包**置位。
++   * 否则传输会在首包（≤64B）后结束：75B 配置描述符只回 64B，
++   * Windows 报 "Configuration Descriptor Request Failed"。 */
++
++  csr0 = USB_CSR0_TXPKTRDY | (last ? USB_CSR0_P_DATAEND : 0);
++
+   nwritten = bytesleft;
+ 
+   /* Write data to FIFO using 32-bit access when possible */
+@@ -460,10 +481,12 @@ static int sf32lb52_ep0write(struct sf32lb52_usbdev_s *priv,
+  ****************************************************************************/
+ 
+ static int sf32lb52_epwrite(struct sf32lb52_usbdev_s *priv,
+-                            uint8_t epphy, uint8_t *buf, uint16_t nbytes)
++                            uint8_t epphy, uint8_t *buf, uint16_t nbytes,
++                            bool last)
+ {
+   volatile USBC_X_Typedef *hw = priv->hw;
+   uint16_t bytesleft;
++  uint16_t csr;
+   int ret;
+ 
+   if (epphy >= SF32LB52_NENDPOINTS)
+@@ -475,7 +498,7 @@ static int sf32lb52_epwrite(struct sf32lb52_usbdev_s *priv,
+ 
+   if (epphy == 0)
+     {
+-      return sf32lb52_ep0write(priv, buf, nbytes);
++      return sf32lb52_ep0write(priv, buf, nbytes, last);
+     }
+ 
+   bytesleft = SF32LB52_BULKMAXPACKET;
+@@ -516,8 +539,10 @@ static int sf32lb52_epwrite(struct sf32lb52_usbdev_s *priv,
+ 
+   /* Set TXPKTRDY to start transmission */
+ 
+-  hw->csr0_txcsr = (hw->csr0_txcsr & ~USB_TXCSR_P_WZC_BITS)
+-                    | USB_TXCSR_TXPKTRDY;
++  csr = hw->csr0_txcsr;
++
++  hw->csr0_txcsr = (csr & ~USB_TXCSR_P_WZC_BITS) | USB_TXCSR_TXPKTRDY;
++
+   return ret;
+ }
+ 
+@@ -657,6 +682,7 @@ static int sf32lb52_wrrequest(struct sf32lb52_ep_s *privep)
+   int nbytes;
+   int bytesleft;
+   int nbyteswritten;
++  bool last = false;
+ 
+   privreq = sf32lb52_rqpeek(privep);
+   if (!privreq)
+@@ -665,48 +691,61 @@ static int sf32lb52_wrrequest(struct sf32lb52_ep_s *privep)
+       return OK;
+     }
+ 
+-  for (; ; )
+-    {
+-      bytesleft = privreq->req.len - privreq->req.xfrd;
++  bytesleft = privreq->req.len - privreq->req.xfrd;
+ 
+-      usbtrace(TRACE_WRITE(privep->epphy), privreq->req.xfrd);
+-      if (bytesleft > 0 || privep->txnullpkt)
++  usbtrace(TRACE_WRITE(privep->epphy), privreq->req.xfrd);
++
++  /* Transmit at most ONE packet per call.  The MUSB controller requires
++   * the host to drain the FIFO (TXPKTRDY auto-clears -> TX-complete
++   * interrupt) before the next packet may be written.  Chaining packets
++   * here overwrites the FIFO and corrupts multi-packet transfers, e.g.
++   * the 75-byte configuration descriptor on EP0.
++   */
++
++  if (bytesleft > 0 || privep->txnullpkt)
++    {
++      privep->txnullpkt = 0;
++      if (bytesleft > privep->ep.maxpacket)
+         {
+-          privep->txnullpkt = 0;
+-          if (bytesleft > privep->ep.maxpacket)
+-            {
+-              nbytes = privep->ep.maxpacket;
+-            }
+-          else
++          nbytes = privep->ep.maxpacket;
++        }
++      else
++        {
++          nbytes = bytesleft;
++          if ((privreq->req.flags & USBDEV_REQFLAGS_NULLPKT) != 0)
+             {
+-              nbytes = bytesleft;
+-              if ((privreq->req.flags & USBDEV_REQFLAGS_NULLPKT) != 0)
+-                {
+-                  privep->txnullpkt =
+-                    (bytesleft == privep->ep.maxpacket);
+-                }
++              privep->txnullpkt = (bytesleft == privep->ep.maxpacket);
+             }
++        }
+ 
+-          buf = privreq->req.buf + privreq->req.xfrd;
+-          nbyteswritten = sf32lb52_epwrite(privep->dev, privep->epphy,
+-                                           buf, nbytes);
+-          if (nbyteswritten < 0 || nbyteswritten != nbytes)
+-            {
+-              usbtrace(TRACE_DEVERROR(SF32LB52_TRACEERR_EWRITE),
+-                       nbyteswritten);
+-              return ERROR;
+-            }
++      buf = privreq->req.buf + privreq->req.xfrd;
+ 
+-          privreq->req.xfrd += nbytes;
+-        }
++      /* 末包判定：本包发完即发完整个请求，且不欠 ZLP 时才是末包 */
++      last = ((privreq->req.xfrd + nbytes) >= privreq->req.len) &&
++             !privep->txnullpkt;
+ 
+-      if (privreq->req.xfrd >= privreq->req.len && !privep->txnullpkt)
++      nbyteswritten = sf32lb52_epwrite(privep->dev, privep->epphy,
++                                       buf, nbytes, last);
++      if (nbyteswritten < 0 || nbyteswritten != nbytes)
+         {
+-          usbtrace(TRACE_COMPLETE(privep->epphy), privreq->req.xfrd);
+-          privep->txnullpkt = 0;
+-          sf32lb52_reqcomplete(privep, OK);
+-          return OK;
++          usbtrace(TRACE_DEVERROR(SF32LB52_TRACEERR_EWRITE),
++                   nbyteswritten);
++          return ERROR;
+         }
++
++      privreq->req.xfrd += nbytes;
++    }
++
++  /* Transfer is complete only when the whole request fit in this packet
++   * and no zero-length packet is still owed.  Otherwise the TX-complete
++   * interrupt calls us again to send the next packet.
++   */
++
++  if (privreq->req.xfrd >= privreq->req.len && !privep->txnullpkt)
++    {
++      usbtrace(TRACE_COMPLETE(privep->epphy), privreq->req.xfrd);
++      privep->txnullpkt = 0;
++      sf32lb52_reqcomplete(privep, OK);
+     }
+ 
+   return OK;
+@@ -723,6 +762,7 @@ static int sf32lb52_wrrequest(struct sf32lb52_ep_s *privep)
+ static int sf32lb52_rdrequest(struct sf32lb52_ep_s *privep)
+ {
+   struct sf32lb52_req_s *privreq;
++  volatile USBC_X_Typedef *hw = privep->dev->hw;
+   uint8_t *buf;
+   int nbytesread;
+ 
+@@ -733,6 +773,23 @@ static int sf32lb52_rdrequest(struct sf32lb52_ep_s *privep)
+       return OK;
+     }
+ 
++  /* RXCOUNT is only valid while RXPKTRDY is set.  The controller keeps the
++   * FIFO contents and the count after the packet has been read, so reading
++   * again without a fresh packet re-delivers the previous payload: the
++   * request then completes twice and the class driver's reassembly state
++   * (RNDIS current_rx_received/msglen) is corrupted for good.  NAK instead
++   * and let the RX interrupt pick the request up when data really arrives.
++   */
++
++  if (privep->epphy != 0)
++    {
++      hw->index = privep->epphy;
++      if ((hw->rxcsr & USB_RXCSR_RXPKTRDY) == 0)
++        {
++          return OK;
++        }
++    }
++
+   usbtrace(TRACE_READ(privep->epphy), privreq->req.xfrd);
+ 
+   buf = privreq->req.buf + privreq->req.xfrd;
+@@ -801,15 +858,40 @@ static struct sf32lb52_ep_s *sf32lb52_epfindbyaddr(
+  * Name: sf32lb52_dispatchrequest
+  ****************************************************************************/
+ 
++/* Control transfer bookkeeping for the EP0 OUT data stage.
++ *
++ * A USB control transfer with an OUT data stage sends the SETUP packet and
++ * the data in two separate packets.  When the SETUP interrupt fires the data
++ * has not arrived yet (rxcount == 0), so the request must be parked here and
++ * finished by the interrupt that delivers the data.
++ */
++
++static struct usb_ctrlreq_s g_ep0pending_ctrl;
++static bool                 g_ep0pending;
++
++static uint8_t g_ep0outbuf[SF32LB52_EP0MAXPACKET];
++static size_t  g_ep0outlen;
++static bool    g_ep0outdataend;
++
+ static void sf32lb52_dispatchrequest(struct sf32lb52_usbdev_s *priv,
+                                      const struct usb_ctrlreq_s *ctrl)
+ {
++  uint8_t *dataout = NULL;
++  size_t outlen = 0;
+   int ret;
+ 
+   usbtrace(TRACE_INTDECODE(SF32LB52_TRACEINTID_DISPATCH), 0);
++
++  if (g_ep0outlen > 0)
++    {
++      dataout = g_ep0outbuf;
++      outlen  = g_ep0outlen;
++      g_ep0outlen = 0;
++    }
++
+   if (priv && priv->driver)
+     {
+-      ret = CLASS_SETUP(priv->driver, &priv->usbdev, ctrl, NULL, 0);
++      ret = CLASS_SETUP(priv->driver, &priv->usbdev, ctrl, dataout, outlen);
+       if (ret < 0)
+         {
+           usbtrace(TRACE_DEVERROR(SF32LB52_TRACEERR_STALLEDISPATCH),
+@@ -881,6 +963,53 @@ static void sf32lb52_ep0setup(struct sf32lb52_usbdev_s *priv)
+    */
+ 
+   count0 = hw->rxcount & 0x7f;
++
++  if (g_ep0pending)
++    {
++      /* This is the OUT data stage of the class/vendor request whose SETUP
++       * packet we already parsed.  Read the payload and hand it, together
++       * with the saved request, to the class driver.
++       */
++
++      uint16_t got = 0;
++      bool     shortpkt = (count0 < SF32LB52_EP0MAXPACKET);
++
++      if (count0 > 0)
++        {
++          if (count0 > sizeof(g_ep0outbuf))
++            {
++              count0 = sizeof(g_ep0outbuf);
++            }
++
++          got = (uint16_t)sf32lb52_epread(priv, 0, g_ep0outbuf, count0);
++        }
++
++      /* The final (short) OUT packet of a control write must be acknowledged
++       * with DATAEND as well.  Without it the core never considers the data
++       * stage finished: the next SETUP then raises SETUPEND, and because the
++       * SETUPEND branch below used to win the else-if chain, that SETUP was
++       * cleared and dropped -- which is exactly how the RNDIS
++       * GET_ENCAPSULATED_RESPONSE got lost.  Same rule as the vendor HAL,
++       * see bf0_hal_pcd.c:663-669.
++       */
++
++      hw->index = 0;
++      csr0 = USB_CSR0_P_SVDRXPKTRDY;
++      if (shortpkt)
++        {
++          csr0 |= USB_CSR0_P_DATAEND;
++          g_ep0outdataend = true;
++        }
++
++      hw->csr0_txcsr = csr0;
++
++      g_ep0pending = false;
++      g_ep0outlen  = (size_t)got;
++
++      sf32lb52_dispatchrequest(priv, &g_ep0pending_ctrl);
++      return;
++    }
++
+   if (count0 != USB_SIZEOF_CTRLREQ)
+     {
+       if (count0 > 0)
+@@ -910,25 +1039,52 @@ static void sf32lb52_ep0setup(struct sf32lb52_usbdev_s *priv)
+       return;
+     }
+ 
++  /* A real SETUP supersedes any parked class request: the previous data
++   * stage never arrived (host aborted), otherwise this packet would have
++   * been treated as that data stage and the SETUP would be lost.
++   */
++
++  g_ep0pending    = false;
++  g_ep0outdataend = false;
++
+   index = GETUINT16(ctrl.index);
+   value = GETUINT16(ctrl.value);
+   len   = GETUINT16(ctrl.len);
+ 
+-  uinfo("type=%02x req=%02x value=%04x index=%04x len=%04x\n",
+-        ctrl.type, ctrl.req, value, index, len);
++  /* Do not add syslog() here: this runs in interrupt context on the EP0
++   * SETUP path, and writing to the console can block long enough that the
++   * host times out the control request.  Keep this path free of console
++   * output.
++   */
+ 
+   /* Dispatch non-standard requests */
+ 
+-  ep0->in = (ctrl.type & USB_DIR_IN) != 0;
++  ep0->in = (ctrl.type & USB_REQ_DIR_IN) != 0;
+   if ((ctrl.type & USB_REQ_TYPE_MASK) != USB_REQ_TYPE_STANDARD)
+     {
+-      /* For class/vendor requests, only clear RXPKTRDY and let CLASS_SETUP
+-       * submit the proper EP0 response/status stage.
++      /* Class/vendor requests may carry an OUT data stage -- RNDIS sends
++       * its control messages that way (SEND_ENCAPSULATED_COMMAND).
++       *
++       * That data arrives in a LATER packet than this SETUP, so rxcount is
++       * still 0 here.  Park the request and let the data-stage interrupt
++       * finish it; reading now would hand the class driver NULL/garbage
++       * (which is exactly what made RNDIS report "Unsupported control
++       * message" for the very first INITIALIZE_MSG).
+        */
+ 
+       hw->index = 0;
+       hw->csr0_txcsr = USB_CSR0_P_SVDRXPKTRDY;
+ 
++      if (!ep0->in && len > 0)
++        {
++          g_ep0pending_ctrl = ctrl;
++          g_ep0pending      = true;
++          return;
++        }
++
++      /* No data stage -- handle it now. */
++
++      g_ep0outlen = 0;
+       sf32lb52_dispatchrequest(priv, &ctrl);
+       return;
+     }
+@@ -1009,8 +1165,32 @@ static void sf32lb52_ep0setup(struct sf32lb52_usbdev_s *priv)
+           {
+             hw->index = 0;
+             hw->csr0_txcsr = USB_CSR0_P_SVDRXPKTRDY | USB_CSR0_P_DATAEND;
++
+             privep->halted = 0;
+-            sf32lb52_wrrequest(privep);
++
++            if (privep->epphy != 0)
++              {
++                /* CLEAR_FEATURE(ENDPOINT_HALT) must also drop the hardware
++                 * stall and reset the data toggle.  Not done for EP0: the
++                 * resume path rewrites CSR0 from a read-back value, and
++                 * writing DATAEND back can restart the status stage.
++                 */
++
++                sf32lb52_epstall(&privep->ep, true);
++              }
++
++            /* Only re-drive a write request on an IN endpoint.  An OUT
++             * endpoint's queued request is a *read* request; passing it to
++             * wrrequest() transmitted the receive buffer on a receive
++             * endpoint and left req.xfrd at a bogus value, which corrupted
++             * the first incoming bulk packet.  The read request is already
++             * armed, the RX interrupt picks it up.
++             */
++
++            if (privep->epphy == 0 || privep->in)
++              {
++                sf32lb52_wrrequest(privep);
++              }
+           }
+         else
+           {
+@@ -1183,7 +1363,7 @@ static int sf32lb52_interrupt(int irq, void *context, void *arg)
+       /* Re-enable EP0 and USB core interrupts after reset */
+ 
+       hw->intrtxe  = USBC_EP0_INTR_MASK;
+-      hw->intrrxe  = 0;
++      hw->intrrxe  = USBC_EP0_INTR_MASK;
+       hw->intrusbe = USB_INTR_RESET | USB_INTR_RESUME |
+                      USB_INTR_SUSPEND;
+ 
+@@ -1195,12 +1375,13 @@ static int sf32lb52_interrupt(int irq, void *context, void *arg)
+           sf32lb52_epreset(priv, i);
+         }
+ 
+-      /* Notify class driver of reset */
+-
+-      if (priv->driver)
+-        {
+-          CLASS_DISCONNECT(priv->driver, &priv->usbdev);
+-        }
++      /* NOTE: do NOT call CLASS_DISCONNECT here.  A USB bus reset is
++       * not a device detach; class drivers (e.g. rndis) take mutexes
++       * in their disconnect path, which is illegal from interrupt
++       * context and would assert.  Hosts issue a bus reset before
++       * (re-)enumeration; the class driver is re-driven through the
++       * SETUP packets that follow.
++       */
+     }
+ 
+   if (intrusb & USB_INTR_RESUME)
+@@ -1229,10 +1410,17 @@ static int sf32lb52_interrupt(int irq, void *context, void *arg)
+   if (intrusb & USB_INTR_DISCONNECT)
+     {
+       usbtrace(TRACE_INTENTRY(SF32LB52_TRACEINTID_DISCONNECT), 0);
+-      if (priv->driver)
+-        {
+-          CLASS_DISCONNECT(priv->driver, &priv->usbdev);
+-        }
++
++      /* Do NOT call CLASS_DISCONNECT here.  This runs in interrupt
++       * context, and the RNDIS class driver's disconnect path does
++       * `while (nxmutex_lock(&priv->lock) < 0);` and calls
++       * netdev d_ifdown(); mutexes cannot be taken from an interrupt, so
++       * that either asserts or spins forever and wedges the USB
++       * interrupt -- after which the host talks to a controller that
++       * never answers ("device descriptor request failed").  The class
++       * driver is re-driven by the SETUP packets that follow
++       * re-enumeration.  Same reasoning as the reset branch above.
++       */
+     }
+ 
+   /* Handle EP0 (control) interrupt */
+@@ -1252,42 +1440,76 @@ static int sf32lb52_interrupt(int irq, void *context, void *arg)
+ 
+           hw->csr0_txcsr = csr0 & ~USB_CSR0_P_SENTSTALL;
+         }
+-      else if (csr0 & USB_CSR0_P_SETUPEND)
++      else
+         {
+-          usbtrace(TRACE_INTENTRY(SF32LB52_TRACEINTID_TXFIFOSETEND),
+-                   csr0);
++          /* SETUPEND and RXPKTRDY can be set together: the host aborted
++           * (or ended early) the previous control transfer and the next
++           * SETUP is already waiting.  Servicing SETUPEND alone used to win
++           * the else-if chain and swallow that SETUP -- the RNDIS
++           * GET_ENCAPSULATED_RESPONSE was lost exactly this way.  Clear
++           * SETUPEND, then keep servicing whatever is still pending.
++           */
+ 
+-          /* Clear SetupEnd */
++          if (csr0 & USB_CSR0_P_SETUPEND)
++            {
++              int guard;
+ 
+-          hw->csr0_txcsr = USB_CSR0_P_SVDSETUPEND;
+-        }
+-      else if (csr0 & USB_CSR0_RXPKTRDY)
+-        {
+-          usbtrace(TRACE_INTENTRY(SF32LB52_TRACEINTID_RXPKTRDY), csr0);
+-          sf32lb52_ep0setup(priv);
+-        }
+-      else if ((csr0 & USB_CSR0_TXPKTRDY) == 0)
+-        {
+-          /* TXPKTRDY is clear -- either a previous IN transfer completed
+-           * or we're idle after status phase.
+-           */
++              usbtrace(TRACE_INTENTRY(SF32LB52_TRACEINTID_TXFIFOSETEND),
++                       csr0);
++
++              hw->csr0_txcsr = USB_CSR0_P_SVDSETUPEND;
++
++              csr0 = hw->csr0_txcsr;
+ 
+-          /* Set address after status stage completes */
++              /* The core clears SETUPEND asynchronously (see the vendor HAL,
++               * bf0_hal_pcd.c:1307-1309, which polls it as well).
++               */
+ 
+-          if (!priv->paddrset && priv->paddr != 0)
++              for (guard = 0;
++                   guard < 1000 &&
++                   (csr0 & USB_CSR0_P_SETUPEND) != 0;
++                   guard++)
++                {
++                  csr0 = hw->csr0_txcsr;
++                }
++            }
++
++          if (csr0 & USB_CSR0_RXPKTRDY)
+             {
+-              hw->faddr = priv->paddr;
+-              priv->paddrset = 1;
++              /* Service the packet here as well as from the INTRRX EP0 path.
++               * SETUP can be reported through either route; dropping this one
++               * loses control transfers outright (the host then reports
++               * "device descriptor request failed").  Handling a packet that
++               * the other path already serviced is harmless: RXPKTRDY is
++               * cleared by then, so ep0setup() takes its RXCOUNT==0 exit.
++               */
++
++              usbtrace(TRACE_INTENTRY(SF32LB52_TRACEINTID_RXPKTRDY), csr0);
++              sf32lb52_ep0setup(priv);
+             }
++          else if ((csr0 & USB_CSR0_TXPKTRDY) == 0)
++            {
++              /* TXPKTRDY is clear -- either a previous IN transfer completed
++               * or we're idle after status phase.
++               */
+ 
+-          /* Continue any pending EP0 IN transfer */
++              /* Set address after status stage completes */
+ 
+-          privep = &priv->eplist[SF32LB52_EP0];
+-          if (!sf32lb52_rqempty(privep))
+-            {
+-              usbtrace(TRACE_INTENTRY(SF32LB52_TRACEINTID_TXPKTRDY),
+-                       csr0);
+-              sf32lb52_wrrequest(privep);
++              if (!priv->paddrset && priv->paddr != 0)
++                {
++                  hw->faddr = priv->paddr;
++                  priv->paddrset = 1;
++                }
++
++              /* Continue any pending EP0 IN transfer */
++
++              privep = &priv->eplist[SF32LB52_EP0];
++              if (!sf32lb52_rqempty(privep))
++                {
++                  usbtrace(TRACE_INTENTRY(SF32LB52_TRACEINTID_TXPKTRDY),
++                           csr0);
++                  sf32lb52_wrrequest(privep);
++                }
+             }
+         }
+     }
+@@ -1326,9 +1548,16 @@ static int sf32lb52_interrupt(int irq, void *context, void *arg)
+         }
+     }
+ 
+-  /* Handle RX (OUT) endpoint interrupts (EP2) */
++  /* Handle RX (OUT) endpoint interrupts (EP0 SETUP/OUT, EP2 bulk) */
+ 
+-  if (intrrx)
++  if (intrrx & USBC_EP0_INTR_MASK)
++    {
++      usbtrace(TRACE_INTENTRY(SF32LB52_TRACEINTID_RXFIFO), 0);
++      hw->index = 0;
++      sf32lb52_ep0setup(priv);
++    }
++
++  if (intrrx & ~USBC_EP0_INTR_MASK)
+     {
+       int i;
+       for (i = 1; i < SF32LB52_NENDPOINTS; i++)
+@@ -1341,6 +1570,7 @@ static int sf32lb52_interrupt(int irq, void *context, void *arg)
+               if (!sf32lb52_rqempty(privep))
+                 {
+                   sf32lb52_rdrequest(privep);
++                  priv->rxpending = 0;
+                 }
+               else
+                 {
+@@ -1415,7 +1645,7 @@ static void sf32lb52_epinitialize(struct sf32lb52_usbdev_s *priv)
+     {
+       hw->index = g_epinfo[i].addr & 0x0f;
+ 
+-      if (USB_EPIN(g_epinfo[i].addr))
++      if (USB_ISEPIN(g_epinfo[i].addr))
+         {
+           /* Configure TX (IN) endpoint */
+ 
+@@ -1519,9 +1749,12 @@ static void sf32lb52_ctrlinitialize(struct sf32lb52_usbdev_s *priv)
+ 
+   hw->intrtxe = USBC_EP0_INTR_MASK;
+ 
+-  /* Enable RX interrupts for OUT endpoints */
++  /* Enable RX interrupts: EP0 bit is required or SETUP packets
++   * (which arrive as EP0 RX events) are silently dropped and the
++   * host never gets a device descriptor.  Other OUT endpoints get
++   * their bits set when configured by the class driver.  */
+ 
+-  hw->intrrxe = 0;
++  hw->intrrxe = USBC_EP0_INTR_MASK;
+ 
+   /* Initialize endpoints */
+ 
+@@ -1719,8 +1952,24 @@ static int sf32lb52_epsubmit(struct usbdev_ep_s *ep,
+       /* EP0 zero-length status stage */
+ 
+       usbtrace(TRACE_COMPLETE(privep->epphy), privreq->req.xfrd);
+-      priv->hw->index = 0;
+-      priv->hw->csr0_txcsr = USB_CSR0_TXPKTRDY | USB_CSR0_P_DATAEND;
++
++      if (g_ep0outdataend)
++        {
++          /* The class OUT data stage already ended with DATAEND, so the core
++           * completes the status stage itself (vendor HAL switches to
++           * HAL_PCD_EP0_STATUSIN and never writes TXPKTRDY again,
++           * bf0_hal_pcd.c:663-669 / :1283-1290).  Writing another packet here
++           * would put a spurious DATAEND packet on the bus.
++           */
++
++          g_ep0outdataend = false;
++        }
++      else
++        {
++          priv->hw->index = 0;
++          priv->hw->csr0_txcsr = USB_CSR0_TXPKTRDY | USB_CSR0_P_DATAEND;
++        }
++
+       sf32lb52_abortrequest(privep, privreq, OK);
+     }
+   else if (req->len == 0 && (privep->in || privep->epphy == SF32LB52_EPINTRIN))
+@@ -1750,10 +1999,39 @@ static int sf32lb52_epsubmit(struct usbdev_ep_s *ep,
+       sf32lb52_rqenqueue(privep, privreq);
+       usbtrace(TRACE_OUTREQQUEUED(privep->epphy), privreq->req.len);
+ 
+-      if (priv->rxpending)
++      /* Only the data (non-control) OUT endpoints use the receive path.
++       * EP0 is driven entirely from sf32lb52_ep0setup(): rxpending is a
++       * single global flag that EP2 sets, so letting it trigger a read here
++       * made EP0 swallow a control packet and the host then reported
++       * "device descriptor request failed".
++       */
++
++      if (privep->epphy != 0)
+         {
+-          ret = sf32lb52_rdrequest(privep);
+-          priv->rxpending = 0;
++          if (priv->rxpending)
++            {
++              ret = sf32lb52_rdrequest(privep);
++              priv->rxpending = 0;
++            }
++          else
++            {
++              /* The rxpending flag can also be out of step with the
++               * controller: when that happens the packet sits in the FIFO
++               * forever, because the core raises no further RX interrupt
++               * while RXPKTRDY is still set, and the bulk OUT pipe stops for
++               * good.  Ask the hardware instead.
++               */
++
++              uint8_t saved = priv->hw->index;
++
++              priv->hw->index = privep->epphy;
++              if ((priv->hw->rxcsr & USB_RXCSR_RXPKTRDY) != 0)
++                {
++                  ret = sf32lb52_rdrequest(privep);
++                }
++
++              priv->hw->index = saved;
++            }
+         }
+     }
+ 
+@@ -1882,14 +2160,14 @@ static struct usbdev_ep_s *sf32lb52_allocep(struct usbdev_s *dev,
+ 
+       if (in)
+         {
+-          if (!USB_EPIN(g_epinfo[ndx].addr))
++          if (!USB_ISEPIN(g_epinfo[ndx].addr))
+             {
+               continue;
+             }
+         }
+       else
+         {
+-          if (!USB_EPOUT(g_epinfo[ndx].addr))
++          if (!USB_ISEPOUT(g_epinfo[ndx].addr))
+             {
+               continue;
+             }
+@@ -2048,7 +2326,7 @@ void arm_usbinitialize(void)
+       privep->ep.eplog = g_epinfo[i].addr;
+       privep->ep.maxpacket = g_epinfo[i].maxpacket;
+ 
+-      if (USB_EPIN(g_epinfo[i].addr))
++      if (USB_ISEPIN(g_epinfo[i].addr))
+         {
+           privep->in = 1;
+         }
+@@ -2161,6 +2439,7 @@ int usbdev_register(struct usbdevclass_driver_s *driver)
+ 
+   sf32lb52_epreset(&g_usbdev, 0);
+   g_usbdev.hw->intrtxe |= USBC_EP0_INTR_MASK;
++  g_usbdev.hw->intrrxe |= USBC_EP0_INTR_MASK;
+ 
+   /* Enable USB core interrupts */
+ 

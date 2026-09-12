@@ -14,6 +14,7 @@
 #include <nuttx/config.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdio.h>
 
 /****************************************************************************
  * Pre-processor Definitions
@@ -21,9 +22,10 @@
 
 /* 状态机调试日志宏 */
 #ifdef CONFIG_DEBUG_AI_COMPANION
-#  define SM_DEBUG(fmt, ...) printf("[SM] " fmt "\n", ##__VA_ARGS__)
+#  define SM_DEBUG(...) do { printf("[SM] "); printf(__VA_ARGS__); \
+                             printf("\n"); } while (0)
 #else
-#  define SM_DEBUG(fmt, ...)
+#  define SM_DEBUG(...) do { } while (0)
 #endif
 
 /****************************************************************************
@@ -81,6 +83,7 @@ typedef struct
   sm_event_t          last_event;      /* 最后处理的事件 */
   uint32_t            state_enter_tick; /* 进入当前状态的时间戳 */
   uint32_t            timeout_ms;      /* 当前状态超时时间(ms), 0表示不超时 */
+  uint32_t            state_timeouts[SM_STATE_MAX]; /* 每个实例的状态超时 */
   bool                initialized;     /* 状态机是否已初始化 */
   void               *user_data;       /* 用户自定义数据指针 */
 

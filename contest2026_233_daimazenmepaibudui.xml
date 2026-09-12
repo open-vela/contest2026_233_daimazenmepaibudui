@@ -11,6 +11,8 @@
   <project path="contest2026_233_daimazenmepaibudui" name="contest2026_233_daimazenmepaibudui">
     <linkfile src="app/hello_app" dest="packages/demos/contest2026_233_hello_app"/>
     <linkfile src="app/zhi_ai" dest="packages/demos/contest2026_233_zhi_ai"/>
+    <linkfile src="app/robot_ui" dest="packages/demos/contest2026_233_robot_ui"/>
+    <linkfile src="app/audio_test" dest="packages/demos/contest2026_233_audio_test"/>
     <linkfile src="quickapp/hello_quickapp" dest="packages/apps/contest2026_233_hello_quickapp"/>
     <linkfile src="board/contest_board" dest="vendor/openvela/boards/contest2026_233_board"/>
   </project>

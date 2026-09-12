@@ -15,6 +15,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdio.h>
+#include <pthread.h>
 
 /****************************************************************************
  * Pre-processor Definitions
@@ -22,9 +24,10 @@
 
 /* 主动关怀调试日志宏 */
 #ifdef CONFIG_DEBUG_AI_CARE
-#  define CARE_DEBUG(fmt, ...) printf("[CARE] " fmt "\n", ##__VA_ARGS__)
+#  define CARE_DEBUG(...) do { printf("[CARE] "); printf(__VA_ARGS__); \
+                               printf("\n"); } while (0)
 #else
-#  define CARE_DEBUG(fmt, ...)
+#  define CARE_DEBUG(...) do { } while (0)
 #endif
 
 /* 关怀任务配置 */
@@ -168,6 +171,7 @@ typedef struct
   /* 定时器相关 */
   pthread_t           care_thread;      /* 关怀线程 */
   volatile bool       care_stop;        /* 停止标志 */
+  bool                care_thread_valid;
   uint32_t            check_interval_ms; /* 检查间隔(毫秒) */
 
   /* 用户数据 */

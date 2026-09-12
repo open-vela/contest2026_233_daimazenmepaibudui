@@ -1,0 +1,103 @@
+/****************************************************************************
+ * Edge Impulse sound-classifier bridge template
+ *
+ * Usage:
+ * 1. Export an Edge Impulse C++ library into model/edge_impulse/.
+ * 2. Rename this file to edge_impulse_adapter.cpp.
+ * 3. Add it and the exported SDK/model sources to the application build.
+ ****************************************************************************/
+
+#include "ai_sound_detect.h"
+
+#include <errno.h>
+#include <string.h>
+
+#include "edge-impulse-sdk/classifier/ei_run_classifier.h"
+
+static const int16_t *g_pcm;
+static size_t g_pcm_frames;
+
+static int pcm_get_data(size_t offset, size_t length, float *out_ptr)
+{
+  if (out_ptr == nullptr || offset + length > g_pcm_frames)
+    {
+      return EIDSP_PARAMETER_INVALID;
+    }
+
+  for (size_t i = 0; i < length; i++)
+    {
+      out_ptr[i] = static_cast<float>(g_pcm[offset + i]);
+    }
+
+  return EIDSP_OK;
+}
+
+static sound_type_t label_to_type(const char *label)
+{
+  if (strcmp(label, "help") == 0)
+    {
+      return SOUND_TYPE_HELP;
+    }
+  if (strcmp(label, "scream") == 0)
+    {
+      return SOUND_TYPE_SCREAM;
+    }
+  if (strcmp(label, "fall") == 0)
+    {
+      return SOUND_TYPE_FALL;
+    }
+  if (strcmp(label, "knock") == 0)
+    {
+      return SOUND_TYPE_KNOCK;
+    }
+  if (strcmp(label, "glass_break") == 0)
+    {
+      return SOUND_TYPE_GLASS_BREAK;
+    }
+  if (strcmp(label, "door_bang") == 0)
+    {
+      return SOUND_TYPE_DOOR_BANG;
+    }
+
+  return SOUND_TYPE_NONE;
+}
+
+extern "C" int edge_impulse_sound_classify(const int16_t *data,
+                                             size_t frames,
+                                             float *scores,
+                                             size_t score_count)
+{
+  signal_t signal;
+  ei_impulse_result_t result = {};
+
+  if (data == nullptr || scores == nullptr ||
+      score_count < SOUND_TYPE_MAX ||
+      frames != EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE)
+    {
+      return -EINVAL;
+    }
+
+  memset(scores, 0, score_count * sizeof(float));
+  g_pcm = data;
+  g_pcm_frames = frames;
+  signal.total_length = frames;
+  signal.get_data = pcm_get_data;
+
+  EI_IMPULSE_ERROR error = run_classifier(&signal, &result, false);
+  if (error != EI_IMPULSE_OK)
+    {
+      return -EIO;
+    }
+
+  for (size_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++)
+    {
+      sound_type_t type = label_to_type(result.classification[i].label);
+      if (type >= SOUND_TYPE_NONE && type < SOUND_TYPE_MAX &&
+          result.classification[i].value > scores[type])
+        {
+          scores[type] = result.classification[i].value;
+        }
+    }
+
+  return OK;
+}

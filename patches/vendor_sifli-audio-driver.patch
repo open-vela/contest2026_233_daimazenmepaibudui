@@ -1,0 +1,1487 @@
+diff --git a/boards/sf32lb52/sf32lb52_devkit_lcd/src/CMakeLists.txt b/boards/sf32lb52/sf32lb52_devkit_lcd/src/CMakeLists.txt
+index 9074a55..2eb3650 100644
+--- a/boards/sf32lb52/sf32lb52_devkit_lcd/src/CMakeLists.txt
++++ b/boards/sf32lb52/sf32lb52_devkit_lcd/src/CMakeLists.txt
+@@ -18,7 +18,7 @@
+ #
+ # ##############################################################################
+ 
+-set(SRCS sifli_ap.c sifli_gpio.c sf32lb52_buttons.c bsp_init.c bsp_lcd_tp.c bsp_pinmux.c bsp_power.c )
++set(SRCS sifli_ap.c sifli_gpio.c sf32lb52_buttons.c bsp_init.c bsp_lcd_tp.c bsp_pinmux.c bsp_power.c sf32lb52_audio.c )
+ 
+ nuttx_add_romfs(
+   NAME
+diff --git a/boards/sf32lb52/sf32lb52_devkit_lcd/src/sf32lb52_audio.c b/boards/sf32lb52/sf32lb52_devkit_lcd/src/sf32lb52_audio.c
+new file mode 100644
+index 0000000..028afd0
+--- /dev/null
++++ b/boards/sf32lb52/sf32lb52_devkit_lcd/src/sf32lb52_audio.c
+@@ -0,0 +1,1287 @@
++/****************************************************************************
++ * boards/sf32lb52/sf32lb52_devkit_lcd/src/sf32lb52_audio.c
++ *
++ * SF32LB52 音频设备驱动（audio_lowerhalf 实现）
++ *
++ * 架构（参考 SiFli SDK audprc 例程，RT-Thread 侧已验证）：
++ *   - AUDCODEC：模拟前端（DAC/ADC 模拟通路，不走 DMA）
++ *   - AUDPRC  ：数字音频处理器，数据通路（TX0=播放 DMA / RX0=录音 DMA）
++ *
++ * 数据流：
++ *   播放：内存 → AUDPRC TX0 DMA → AUDPRC → codec DAC 模拟 → AW8155 功放 → 喇叭
++ *   录音：麦克风 → codec ADC 模拟 → AUDPRC → AUDPRC RX0 DMA → 内存
++ *
++ * 注册为 NuttX 音频设备 /dev/audio0。
++ *
++ ****************************************************************************/
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <nuttx/config.h>
++
++#include <sys/types.h>
++#include <sys/ioctl.h>
++
++#include <stdint.h>
++#include <stdbool.h>
++#include <string.h>
++#include <assert.h>
++#include <errno.h>
++#include <debug.h>
++#include <syslog.h>
++#include <math.h>
++
++#include <nuttx/kmalloc.h>
++#include <nuttx/audio/audio.h>
++#include <nuttx/semaphore.h>
++#include <nuttx/clock.h>
++#include <nuttx/irq.h>
++#include <nuttx/arch.h>
++
++#include "bf0_hal_audcodec.h"
++#include "bf0_hal_audprc.h"
++#include "bf0_hal_pmu.h"
++#include "bf0_hal_rcc.h"
++#include "bf0_hal_gpio.h"
++#include "register.h"
++#include "dma_config.h"
++#include "sf32lb52_audio.h"
++
++/****************************************************************************
++ * Pre-processor Definitions
++ ****************************************************************************/
++
++#define SF32LB52_AUDIO_CLK_TAB_NUM  9
++
++/* 通道选择：单通道（DAC0 播放 / ADC0 录音；AUDPRC TX0 / RX0）
++ * 注意：codec 的 Config_TChanel/RChanel 用通道索引（0/1），
++ * 不是 HAL_AUDCODEC_*_CHx 枚举（DAC_CH0=0, ADC_CH0=2） */
++
++#define SF32LB52_AUDIO_DAC_CH       0
++#define SF32LB52_AUDIO_ADC_CH       0
++#define SF32LB52_AUDIO_PRC_TX_CH    HAL_AUDPRC_TX_CH0
++#define SF32LB52_AUDIO_PRC_RX_CH    HAL_AUDPRC_RX_CH0
++
++/* 功放使能 GPIO：PA10 = AU_PA_EN（bsp_pinmux 已配置为 GPIO 功能） */
++
++#define SF32LB52_AUDIO_PA_GPIO      ((GPIO_TypeDef *)hwp_gpio1)
++#define SF32LB52_AUDIO_PA_PIN       10
++
++/* AUDPRC 通路选择（MUX/MIX 源），参考 SDK audprc 例程 out_sel=0x5050 */
++
++#define SF32LB52_AUDIO_OUT_SEL      0x5050
++
++/* 默认音量（dB） */
++
++#define SF32LB52_AUDIO_DEFAULT_VOL  (-6)
++
++/* 录音通路数字增益（dB，有效范围 -36 ~ +60）。
++ * 原来设 0dB，实测正常说话只有 peak≈2400/32767 ≈ -23dBFS，回放听着很小、
++ * 对 VAD/ASR 也不利。+18dB 会削顶（peak 打满 32768），所以取 +12dB（约 4 倍）。 */
++#define SF32LB52_AUDIO_ADC_VOL      (12)
++
++/* 标准音量接口把 0~1000 映射到这个 dB 区间（HAL 只接受 -36~+60） */
++#define SF32LB52_AUDIO_VOL_MIN      (-36)
++#define SF32LB52_AUDIO_VOL_MAX      (6)
++
++/****************************************************************************
++ * Private Types
++ ****************************************************************************/
++
++struct sf32lb52_audio_s
++{
++  struct audio_lowerhalf_s dev;         /* NuttX 音频低半部分设备 */
++  AUDCODEC_HandleTypeDef  codec;        /* 音频 codec（模拟前端） */
++  AUDPRC_HandleTypeDef    aprc;         /* 音频处理器（数据通路 DMA） */
++  bool                    running;      /* 设备是否在运行 */
++  bool                    playback;     /* 当前方向：true=播放 false=录音 */
++  int                     playback_db; /* 当前播放音量(dB)，标准接口可改 */
++  int                     samplerate;   /* 当前采样率 */
++  int                     nchannels;    /* 当前通道数 */
++  int                     bpsamp;       /* 当前采样位深 */
++  FAR struct ap_buffer_s *tx_apb;       /* 播放中的 buffer（队列模式） */
++  FAR struct ap_buffer_s *rx_apb;       /* 录音中的 buffer */
++  sem_t                   wr_sem;       /* write() 同步信号量 */
++  bool                    wr_busy;      /* write() DMA 进行中 */
++  sem_t                   rx_sem;       /* read() 同步信号量 */
++  bool                    rx_busy;      /* read() DMA 进行中 */
++  bool                    rx_aborted;   /* stop() 打断了正在等待的 read() */
++};
++
++/****************************************************************************
++ * Private Function Prototypes
++ ****************************************************************************/
++
++static int  sf32lb52_audio_getcaps(FAR struct audio_lowerhalf_s *dev, int type,
++                                   FAR struct audio_caps_s *caps);
++static int  sf32lb52_audio_configure(FAR struct audio_lowerhalf_s *dev,
++                                     FAR const struct audio_caps_s *caps);
++static int  sf32lb52_audio_shutdown(FAR struct audio_lowerhalf_s *dev);
++static int  sf32lb52_audio_start(FAR struct audio_lowerhalf_s *dev);
++#ifndef CONFIG_AUDIO_EXCLUDE_STOP
++static int  sf32lb52_audio_stop(FAR struct audio_lowerhalf_s *dev);
++#endif
++static int  sf32lb52_audio_enqueuebuffer(FAR struct audio_lowerhalf_s *dev,
++                                         FAR struct ap_buffer_s *apb);
++static int  sf32lb52_audio_cancelbuffer(FAR struct audio_lowerhalf_s *dev,
++                                        FAR struct ap_buffer_s *apb);
++static int  sf32lb52_audio_ioctl(FAR struct audio_lowerhalf_s *dev, int cmd,
++                                 unsigned long arg);
++static ssize_t sf32lb52_audio_write(FAR struct audio_lowerhalf_s *dev,
++                                    FAR const char *buffer, size_t buflen);
++static ssize_t sf32lb52_audio_read(FAR struct audio_lowerhalf_s *dev,
++                                   FAR char *buffer, size_t buflen);
++static int  sf32lb52_audio_reserve(FAR struct audio_lowerhalf_s *dev);
++static int  sf32lb52_audio_release(FAR struct audio_lowerhalf_s *dev);
++
++static int  sf32lb52_audio_hw_init(FAR struct sf32lb52_audio_s *priv);
++static int  sf32lb52_audio_hw_configure(FAR struct sf32lb52_audio_s *priv,
++                                        int samplerate, int nchannels,
++                                        int bpsamp);
++static int  sf32lb52_audio_hw_start(FAR struct sf32lb52_audio_s *priv,
++                                    bool playback);
++static int  sf32lb52_audio_hw_stop(FAR struct sf32lb52_audio_s *priv);
++static void sf32lb52_audio_pa_enable(bool enable);
++static void sf32lb52_audio_tx_complete(FAR struct sf32lb52_audio_s *priv);
++static void sf32lb52_audio_rx_complete(FAR struct sf32lb52_audio_s *priv);
++static int  sf32lb52_audio_dma1_irq(int irq, FAR void *context,
++                                    FAR void *arg);
++
++/****************************************************************************
++ * Private Data
++ ****************************************************************************/
++
++/* SF32LB52X codec 时钟配置表（采样率 → 内部 PLL/分频参数，参考 SDK） */
++
++static const AUDCODE_DAC_CLK_CONFIG_TYPE codec_dac_clk_config[SF32LB52_AUDIO_CLK_TAB_NUM] =
++{
++  {48000, 0, 1, 0, 0x14D, 0,  5, 4, 2, 20, 20, 0},
++  {32000, 0, 1, 1, 0x14D, 0,  5, 4, 2, 20, 20, 0},
++  {24000, 0, 1, 5, 0x14D, 0, 10, 2, 2, 10, 10, 1},
++  {16000, 0, 1, 4, 0x14D, 0,  5, 4, 2, 20, 20, 0},
++  {12000, 0, 1, 7, 0x14D, 0, 20, 2, 1,  5,  5, 1},
++  { 8000, 0, 1, 8, 0x14D, 0, 10, 2, 2, 10, 10, 1},
++  {44100, 1, 1, 0, 0x14D, 1,  5, 4, 2, 20, 20, 0},
++  {22050, 1, 1, 5, 0x14D, 1, 10, 2, 2, 10, 10, 1},
++  {11025, 1, 1, 7, 0x14D, 1, 20, 2, 1,  5,  5, 1},
++};
++
++static const AUDCODE_ADC_CLK_CONFIG_TYPE codec_adc_clk_config[SF32LB52_AUDIO_CLK_TAB_NUM] =
++{
++  {48000, 0,  5, 0, 0, 1, 5, 0},
++  {32000, 0,  5, 1, 0, 1, 5, 0},
++  {24000, 0, 10, 0, 0, 0, 5, 2},
++  {16000, 0, 10, 1, 0, 0, 5, 2},
++  {12000, 0, 10, 2, 0, 0, 5, 2},
++  { 8000, 0, 10, 3, 0, 0, 5, 2},
++  {44100, 1,  5, 0, 1, 1, 5, 1},
++  {22050, 1,  5, 2, 1, 1, 5, 1},
++  {11025, 1, 10, 2, 1, 0, 5, 3},
++};
++
++static const struct audio_ops_s g_sf32lb52_audio_ops =
++{
++  sf32lb52_audio_getcaps,       /* getcaps        */
++  sf32lb52_audio_configure,     /* configure      */
++  sf32lb52_audio_shutdown,      /* shutdown       */
++  sf32lb52_audio_start,         /* start          */
++#ifndef CONFIG_AUDIO_EXCLUDE_STOP
++  sf32lb52_audio_stop,          /* stop           */
++#endif
++  NULL,                         /* pause          */
++  NULL,                         /* resume         */
++  NULL,                         /* allocbuffer    */
++  NULL,                         /* freebuffer     */
++  sf32lb52_audio_enqueuebuffer, /* enqueue_buffer */
++  sf32lb52_audio_cancelbuffer,  /* cancel_buffer  */
++  sf32lb52_audio_ioctl,         /* ioctl          */
++  sf32lb52_audio_read,          /* read           */
++  sf32lb52_audio_write,         /* write          */
++  sf32lb52_audio_reserve,       /* reserve        */
++  sf32lb52_audio_release        /* release        */
++};
++
++/****************************************************************************
++ * Private Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: sf32lb52_audio_pa_enable
++ *
++ * Description: 控制板上音频功放（AW8155，PA10 = AU_PA_EN）
++ *
++ ****************************************************************************/
++
++static void sf32lb52_audio_pa_enable(bool enable)
++{
++  HAL_GPIO_WritePin(SF32LB52_AUDIO_PA_GPIO, SF32LB52_AUDIO_PA_PIN,
++                    enable ? GPIO_PIN_SET : GPIO_PIN_RESET);
++}
++
++/****************************************************************************
++ * Name: sf32lb52_audio_tx_complete / sf32lb52_audio_rx_complete
++ *
++ * Description:
++ *   DMA 完成处理（HAL 在 DMA 中断里调用，见文件底部 HAL_AUDPRC_*
++ *   CpltCallback 重写），向 NuttX 上层归还 buffer。
++ *
++ ****************************************************************************/
++
++static void sf32lb52_audio_tx_complete(FAR struct sf32lb52_audio_s *priv)
++{
++  FAR struct ap_buffer_s *apb = priv->tx_apb;
++  bool final;
++
++  priv->tx_apb = NULL;
++
++  if (apb == NULL)
++    {
++      return;
++    }
++
++  final = (apb->flags & AUDIO_APB_FINAL) != 0;
++
++  priv->dev.upper(priv->dev.priv, AUDIO_CALLBACK_DEQUEUE, apb, OK);
++  if (final)
++    {
++      priv->dev.upper(priv->dev.priv, AUDIO_CALLBACK_COMPLETE, NULL, OK);
++    }
++}
++
++static void sf32lb52_audio_rx_complete(FAR struct sf32lb52_audio_s *priv)
++{
++  FAR struct ap_buffer_s *apb = priv->rx_apb;
++  bool final;
++
++  priv->rx_apb = NULL;
++
++  if (apb == NULL)
++    {
++      return;
++    }
++
++  final = (apb->flags & AUDIO_APB_FINAL) != 0;
++
++  priv->dev.upper(priv->dev.priv, AUDIO_CALLBACK_DEQUEUE, apb, OK);
++  if (final)
++    {
++      priv->dev.upper(priv->dev.priv, AUDIO_CALLBACK_COMPLETE, NULL, OK);
++    }
++}
++
++/****************************************************************************
++ * Name: sf32lb52_audio_dma1_irq
++ *
++ * Description:
++ *   DMA1 通道中断统一入口（把 NuttX IRQ 转给 HAL 的通道池处理，
++ *   HAL 会调用对应的 XferCpltCallback → 本驱动的 Tx/RxCpltCallback）
++ *
++ ****************************************************************************/
++
++static int sf32lb52_audio_dma1_irq(int irq, FAR void *context,
++                                   FAR void *arg)
++{
++  int idx = irq - NVIC_IRQ_FIRST - DMAC1_CH1_IRQn;
++
++  switch (idx)
++    {
++      case 0:  HAL_DMAC1_CH1_IRQHandler();  break;
++      case 1:  HAL_DMAC1_CH2_IRQHandler();  break;
++      case 2:  HAL_DMAC1_CH3_IRQHandler();  break;
++      case 3:  HAL_DMAC1_CH4_IRQHandler();  break;
++      case 4:  HAL_DMAC1_CH5_IRQHandler();  break;
++      case 5:  HAL_DMAC1_CH6_IRQHandler();  break;
++      case 6:  HAL_DMAC1_CH7_IRQHandler();  break;
++      case 7:  HAL_DMAC1_CH8_IRQHandler();  break;
++      default: break;
++    }
++
++  return OK;
++}
++
++/****************************************************************************
++ * Name: sf32lb52_audio_hw_init
++ *
++ * Description:
++ *   codec + AUDPRC 硬件初始化：
++ *   电源/时钟使能 → HAL Init → AUDPRC TX/RX DMA 句柄配置 → DMA 中断注册
++ *
++ ****************************************************************************/
++
++static int sf32lb52_audio_hw_init(FAR struct sf32lb52_audio_s *priv)
++{
++  HAL_StatusTypeDef res;
++  int i;
++
++  memset(&priv->codec, 0, sizeof(priv->codec));
++  memset(&priv->aprc, 0, sizeof(priv->aprc));
++
++  /* 寄存器基址（HAL 初始化会直接访问 Instance） */
++
++  priv->codec.Instance = (AUDCODEC_TypeDef *)AUDCODEC_BASE;
++  priv->aprc.Instance  = (AUDPRC_TypeDef *)AUDPRC_BASE;
++
++  /* 打开音频电源和 codec/AUDPRC 时钟 */
++
++  syslog(LOG_ERR, "AUDIO: PMU enable\n");
++  HAL_PMU_EnableAudio(1);
++  HAL_RCC_EnableModule(RCC_MOD_AUDCODEC_HP);
++  HAL_RCC_EnableModule(RCC_MOD_AUDCODEC_LP);
++  HAL_RCC_EnableModule(RCC_MOD_AUDPRC);
++  /* DMAC1 时钟：AUDPRC TX0/RX0 DMA 走 DMAC1，必须先开时钟，否则
++   * HAL_AUDPRC_Transmit_DMA 返回 OK 但 DMA 永不传输/无完成中断 */
++  HAL_RCC_EnableModule(RCC_MOD_DMAC1);
++  syslog(LOG_ERR, "AUDIO: clocks ok\n");
++
++  /* codec 基本配置（模拟前端） */
++
++  priv->codec.Init.en_dly_sel      = 0;
++  priv->codec.Init.dac_cfg.opmode  = 1;
++  priv->codec.Init.adc_cfg.opmode  = 1;
++  priv->codec.Init.samplerate_index = 3;   /* 默认 16k，configure 时更新 */
++
++  /* codec 自带 DMA 播放通路的 DMA 句柄延迟到第一次播放时再挂（见 hw_start）——
++   * 在板级 bringup 阶段做会让启动挂住（实测黑屏） */
++
++  syslog(LOG_ERR, "AUDIO: codec init...\n");
++  res = HAL_AUDCODEC_Init(&priv->codec);
++  syslog(LOG_ERR, "AUDIO: codec init res=%d\n", res);
++  if (res != HAL_OK)
++    {
++      return -EIO;
++    }
++
++  /* AUDPRC 初始化（数据通路） */
++
++  priv->aprc.Init.clk_div = 1;   /* 音频主时钟分频（非 ASIC 芯片） */
++  priv->aprc.Init.adc_div = 1;
++  priv->aprc.Init.dac_div = 1;
++
++  /* DMA 句柄必须在 HAL_AUDPRC_Init() 之前分配并填好 Instance/Request：
++   * HAL 会用音频正确的参数初始化它们（WORD 对齐 + DMA_CIRCULAR + 高优先级）。
++   * 若在 Init 之后才分配（或自己配成 HALFWORD/NORMAL），AUDPRC 的 32bit FIFO
++   * 收不到正确数据字，表现为播放只有开关爆音、无实际音频。 */
++
++  priv->aprc.hdma[HAL_AUDPRC_TX_CH0] = kmm_zalloc(sizeof(DMA_HandleTypeDef));
++  priv->aprc.hdma[HAL_AUDPRC_RX_CH0] = kmm_zalloc(sizeof(DMA_HandleTypeDef));
++  if (priv->aprc.hdma[HAL_AUDPRC_TX_CH0] == NULL ||
++      priv->aprc.hdma[HAL_AUDPRC_RX_CH0] == NULL)
++    {
++      auderr("ERROR: Failed to alloc DMA handle\n");
++      return -ENOMEM;
++    }
++
++  priv->aprc.hdma[HAL_AUDPRC_TX_CH0]->Instance     = AUDPRC_TX0_DMA_INSTANCE;
++  priv->aprc.hdma[HAL_AUDPRC_TX_CH0]->Init.Request = AUDPRC_TX0_DMA_REQUEST;
++  priv->aprc.hdma[HAL_AUDPRC_RX_CH0]->Instance     = AUDPRC_RX0_DMA_INSTANCE;
++  priv->aprc.hdma[HAL_AUDPRC_RX_CH0]->Init.Request = AUDPRC_RX0_DMA_REQUEST;
++
++  syslog(LOG_ERR, "AUDIO: aprc init...\n");
++  res = HAL_AUDPRC_Init(&priv->aprc);
++  syslog(LOG_ERR, "AUDIO: aprc init res=%d\n", res);
++  if (res != HAL_OK)
++    {
++      return -EIO;
++    }
++
++  /* 功放使能引脚 PA10(AUDIO_PA_CTRL)：必须先 HAL_GPIO_Init 设为输出，
++   * 否则 WritePin 无效、AW8155 功放始终关闭（参照板级 BSP_GPIO_Set） */
++
++  {
++    GPIO_InitTypeDef pa_init;
++
++    pa_init.Mode = GPIO_MODE_OUTPUT;
++    pa_init.Pin  = SF32LB52_AUDIO_PA_PIN;
++    pa_init.Pull = GPIO_NOPULL;
++    HAL_GPIO_Init(SF32LB52_AUDIO_PA_GPIO, &pa_init);
++    HAL_GPIO_WritePin(SF32LB52_AUDIO_PA_GPIO, SF32LB52_AUDIO_PA_PIN,
++                      GPIO_PIN_RESET);
++  }
++
++  /* 注册 DMA1 通道中断（AUDPRC TX/RX 数据传输完成依赖 DMA 中断） */
++
++  for (i = 0; i < 8; i++)
++    {
++      int irq = DMAC1_CH1_IRQn + i + NVIC_IRQ_FIRST;
++      int r1;
++
++      r1 = irq_attach(irq, sf32lb52_audio_dma1_irq, priv);
++      up_enable_irq(irq);
++    }
++
++  audinfo("SF32LB52 audio hw initialized\n");
++  return OK;
++}
++
++/****************************************************************************
++ * Name: sf32lb52_audio_hw_configure
++ *
++ * Description: 按采样率/通道/位深配置 codec 通路（参考 SDK bf0_audio_configure）
++ *
++ ****************************************************************************/
++
++static int sf32lb52_audio_hw_configure(FAR struct sf32lb52_audio_s *priv,
++                                       int samplerate, int nchannels,
++                                       int bpsamp)
++{
++  AUDCODEC_HandleTypeDef *codec = &priv->codec;
++  int i;
++
++  for (i = 0; i < SF32LB52_AUDIO_CLK_TAB_NUM; i++)
++    {
++      if (samplerate == codec_dac_clk_config[i].samplerate)
++        {
++          codec->Init.samplerate_index = i;
++          codec->Init.dac_cfg.dac_clk = (FAR AUDCODE_DAC_CLK_CONFIG_TYPE *)
++                                        &codec_dac_clk_config[i];
++          codec->Init.adc_cfg.adc_clk = (FAR AUDCODE_ADC_CLK_CONFIG_TYPE *)
++                                        &codec_adc_clk_config[i];
++          break;
++        }
++    }
++
++  if (i >= SF32LB52_AUDIO_CLK_TAB_NUM)
++    {
++      auderr("ERROR: Unsupported samplerate %d\n", samplerate);
++      return -EINVAL;
++    }
++
++  /* 配置 codec 的 DAC（播放）和 ADC（录音）通道 */
++
++  HAL_AUDCODEC_Config_TChanel(codec, SF32LB52_AUDIO_DAC_CH,
++                              &codec->Init.dac_cfg);
++  HAL_AUDCODEC_Config_RChanel(codec, SF32LB52_AUDIO_ADC_CH,
++                              &codec->Init.adc_cfg);
++
++  /* 配置 AUDPRC 的 TX（播放）和 RX（录音）数据通道
++   * （参考 SDK drv_audprc configure：使能通道 + 数据格式）
++   */
++
++  {
++    AUDPRC_ChnlCfgTypeDef cfg;
++
++    memset(&cfg, 0, sizeof(cfg));
++    cfg.dma_mask = 0;
++    cfg.en       = 1;
++    cfg.format   = (bpsamp == 16) ? 0 : 1;
++    cfg.mode     = (nchannels == 1) ? 0 : 1;
++
++    HAL_AUDPRC_Config_TChanel(&priv->aprc, SF32LB52_AUDIO_PRC_TX_CH, &cfg);
++    HAL_AUDPRC_Config_RChanel(&priv->aprc, SF32LB52_AUDIO_PRC_RX_CH, &cfg);
++  }
++
++  /* AUDPRC 采样时钟分频（参考 SDK bf0_audprc_src：按采样率查表，
++   * 16k → clk_div 3000，xtal 时钟源）
++   */
++
++  priv->aprc.Init.adc_div = 3000;
++  priv->aprc.Init.dac_div = 3000;
++  priv->aprc.Init.clk_sel = 0;
++  __HAL_AUDPRC_CLK_XTAL(&priv->aprc);
++  __HAL_AUDPRC_STB_DIV_CLK(&priv->aprc, priv->aprc.Init.adc_div,
++                           priv->aprc.Init.dac_div);
++
++  /* AUDPRC 通路初始化（参考 SDK bf0_adc_dac_path_cfg_init：
++   * Init.adc_cfg / Init.dac_cfg 字段 → Config_ADCPath/DACPath 写寄存器）
++   */
++
++  priv->aprc.Init.adc_cfg.src_hbf3_mode = 0;
++  priv->aprc.Init.adc_cfg.src_hbf3_en   = 0;
++  priv->aprc.Init.adc_cfg.src_hbf2_mode = 0;
++  priv->aprc.Init.adc_cfg.src_hbf2_en   = 0;
++  priv->aprc.Init.adc_cfg.src_hbf1_mode = 0;
++  priv->aprc.Init.adc_cfg.src_hbf1_en   = 0;
++  priv->aprc.Init.adc_cfg.src_ch_en     = 0;
++  priv->aprc.Init.adc_cfg.rx2tx_loopback = 0;
++  priv->aprc.Init.adc_cfg.data_swap     = 0;
++  priv->aprc.Init.adc_cfg.src_sel       = 0;
++  priv->aprc.Init.adc_cfg.vol_l         = SF32LB52_AUDIO_ADC_VOL;
++  priv->aprc.Init.adc_cfg.vol_r         = SF32LB52_AUDIO_ADC_VOL;
++
++  priv->playback_db                     = SF32LB52_AUDIO_DEFAULT_VOL;
++  priv->aprc.Init.adc_cfg.src_sinc_en   = 0;
++  priv->aprc.Init.adc_cfg.sinc_ratio    = 0;
++
++  priv->aprc.Init.dac_cfg.dst_sel       = 0;
++  priv->aprc.Init.dac_cfg.vol_l         = 0;
++  priv->aprc.Init.dac_cfg.vol_r         = 0;
++  priv->aprc.Init.dac_cfg.src_hbf3_mode = 0;
++  priv->aprc.Init.dac_cfg.src_hbf3_en   = 0;
++  priv->aprc.Init.dac_cfg.src_hbf2_mode = 0;
++  priv->aprc.Init.dac_cfg.src_hbf2_en   = 0;
++  priv->aprc.Init.dac_cfg.src_hbf1_mode = 0;
++  priv->aprc.Init.dac_cfg.src_hbf1_en   = 0;
++  priv->aprc.Init.dac_cfg.src_ch_en     = 0;
++  priv->aprc.Init.dac_cfg.eq_clr        = 0;
++  priv->aprc.Init.dac_cfg.eq_stage      = 1;
++  priv->aprc.Init.dac_cfg.eq_ch_en      = 0;
++  priv->aprc.Init.dac_cfg.src_sinc_en   = 0;
++  priv->aprc.Init.dac_cfg.sinc_ratio    = 0;
++
++  /* MUX/MIX 源选择（播放输出选择，参考例程 out_sel=0x5050） */
++
++  priv->aprc.Init.dac_cfg.muxrsrc1 = (SF32LB52_AUDIO_OUT_SEL >> 12) & 0xF;
++  priv->aprc.Init.dac_cfg.muxrsrc0 = (SF32LB52_AUDIO_OUT_SEL >> 8) & 0xF;
++  priv->aprc.Init.dac_cfg.muxlsrc1 = (SF32LB52_AUDIO_OUT_SEL >> 4) & 0xF;
++  priv->aprc.Init.dac_cfg.muxlsrc0 = SF32LB52_AUDIO_OUT_SEL & 0xF;
++  priv->aprc.Init.dac_cfg.mixrsrc1 = (SF32LB52_AUDIO_OUT_SEL >> 12) & 0xF;
++  priv->aprc.Init.dac_cfg.mixrsrc0 = (SF32LB52_AUDIO_OUT_SEL >> 8) & 0xF;
++  priv->aprc.Init.dac_cfg.mixlsrc1 = (SF32LB52_AUDIO_OUT_SEL >> 4) & 0xF;
++  priv->aprc.Init.dac_cfg.mixlsrc0 = SF32LB52_AUDIO_OUT_SEL & 0xF;
++
++  HAL_AUDPRC_Config_ADCPath(&priv->aprc, &priv->aprc.Init.adc_cfg);
++  HAL_AUDPRC_Config_DACPath(&priv->aprc, &priv->aprc.Init.dac_cfg);
++
++  priv->samplerate = samplerate;
++  priv->nchannels  = nchannels;
++  priv->bpsamp     = bpsamp;
++
++  audinfo("codec configured: %d Hz %d ch %d bit\n",
++          samplerate, nchannels, bpsamp);
++  return OK;
++}
++
++/****************************************************************************
++ * Name: sf32lb52_audio_hw_start
++ *
++ * Description:
++ *   启动播放或录音通路（参考 SDK audprc 例程 start_tx/start_rx）：
++ *   播放：codec DAC 模拟 → AUDPRC TX 通路 → 功放
++ *   录音：codec ADC 模拟 → AUDPRC RX 通路
++ *
++ ****************************************************************************/
++
++static int sf32lb52_audio_hw_start(FAR struct sf32lb52_audio_s *priv,
++                                   bool playback)
++{
++  AUDCODEC_HandleTypeDef *codec = &priv->codec;
++  AUDPRC_HandleTypeDef   *aprc  = &priv->aprc;
++
++  /* 音频 PLL 时钟配置（播放/录音前必调，参考 SDK bf0_audio_pll_config） */
++
++
++  /* 参考源/带隙基准（含 BG_CFG0 VREF_SEL、REFGEN 使能）：SDK 的 bf0_enable_pll
++   * 内部会调用 HAL_TURN_ON_PLL，openvela 的 weak 版本没有 → 必须显式补齐，
++   * 否则 DAC 模拟级无参考源，播放静音（录音通路的 ADCPath 自带这一步） */
++
++  HAL_TURN_ON_PLL();
++
++  /* SDK 的 52X 参考序列（codec_hp_sin1k_test）在此板上用 VREF_SEL=0xc（AVDD 3.3V，
++   * AVDD_V18_ENABLE 未定义走 #else 分支）；openvela 的 HAL_TURN_ON_PLL 写的是 4，
++   * 带隙基准不正确 → DAC 模拟级无输出（只有通路开关爆音）。这里按 SDK 值纠正。 */
++
++  codec->Instance->BG_CFG0 &= ~AUDCODEC_BG_CFG0_VREF_SEL_Msk;
++  codec->Instance->BG_CFG0 |= (0xcUL << AUDCODEC_BG_CFG0_VREF_SEL_Pos);
++  up_mdelay(2);
++
++
++  /* 音频 PLL 是否真的锁定：UNLOCK=1 表示未锁定 → DAC 无模拟时钟 → 静音 */
++
++  /* 播放与录音通路一起使能：播放走 codec 自带 DMA（AUDCODEC DAC_CH0，
++   * 见 write()），录音走 AUDPRC RX0；两者可独立使用 */
++
++  /* 注意：播放数据不再经 AUDPRC（改走 codec 自带 DMA，
++   * HAL_AUDCODEC_Transmit_DMA），避免 AUDPRC 的 DAC 通路与 codec DMA
++   * 争抢 codec 的 DAC 数据源；AUDPRC 现在只负责录音(RX)。 */
++
++  /* AUDPRC：ADC 输入来自 codec */
++
++  __HAL_AUDPRC_ADC_SRC_CODEC(aprc);
++
++  __HAL_AUDPRC_ENABLE(aprc);
++
++  /* 首次播放时挂上 codec 自带 DMA 句柄（SDK 52X 的播放路径，小智固件实测有声），
++   * 并让 HAL 重新初始化（它会用音频参数配置句柄并动态分配 DMA 通道） */
++
++  if (priv->codec.hdma[HAL_AUDCODEC_DAC_CH0] == NULL)
++    {
++      int cret;
++
++      priv->codec.hdma[HAL_AUDCODEC_DAC_CH0] = kmm_zalloc(sizeof(DMA_HandleTypeDef));
++      priv->codec.hdma[HAL_AUDCODEC_DAC_CH1] = kmm_zalloc(sizeof(DMA_HandleTypeDef));
++
++      if (priv->codec.hdma[HAL_AUDCODEC_DAC_CH0] != NULL)
++        {
++          /* Instance 必须是某个合法 DMAC 通道：DMA_AllocChannel() 用它定位通道池，
++           * 为 NULL 会进 HAL_ASSERT(0)（while(1)）死循环。若该通道已被占用，
++           * 分配器会自动改选池里空闲的通道。 */
++          priv->codec.hdma[HAL_AUDCODEC_DAC_CH0]->Instance     = DMA1_Channel2;
++          priv->codec.hdma[HAL_AUDCODEC_DAC_CH0]->Init.Request = AUDCODEC_DAC0_DMA_REQUEST;
++          priv->codec.hdma[HAL_AUDCODEC_DAC_CH0]->Parent       = &priv->codec;
++        }
++
++      if (priv->codec.hdma[HAL_AUDCODEC_DAC_CH1] != NULL)
++        {
++          priv->codec.hdma[HAL_AUDCODEC_DAC_CH1]->Instance     = DMA1_Channel3;
++          priv->codec.hdma[HAL_AUDCODEC_DAC_CH1]->Init.Request = AUDCODEC_DAC1_DMA_REQUEST;
++          priv->codec.hdma[HAL_AUDCODEC_DAC_CH1]->Parent       = &priv->codec;
++        }
++
++      cret = HAL_AUDCODEC_Init(&priv->codec);
++    }
++
++  /* codec：DAC 模拟通路输出（SF32LB52X 无独立 HP 块，主 Instance 使能 DAC；
++   * 参考 SDK 播放序列 Config_DACPath(bypass=1) → 模拟通路 → bypass=0） */
++
++  __HAL_AUDCODEC_DAC_ENABLE(codec);
++  HAL_AUDCODEC_Config_DACPath(codec, 1);
++  HAL_AUDCODEC_Config_Analog_DACPath(codec->Init.dac_cfg.dac_clk);
++  HAL_AUDCODEC_Config_DACPath(codec, 0);
++  HAL_AUDCODEC_Config_DACPath_Volume(codec, 0, priv->playback_db);
++  HAL_AUDCODEC_Config_DACPath_Volume(codec, 1, priv->playback_db);
++
++  /* 回读 codec 寄存器确认通路状态（调试） */
++
++  /* codec：ADC 模拟通路 */
++
++  HAL_AUDCODEC_Config_RChanel(codec, SF32LB52_AUDIO_ADC_CH,
++                              &codec->Init.adc_cfg);
++  HAL_AUDCODEC_Config_Analog_ADCPath(codec->Init.adc_cfg.adc_clk);
++  __HAL_AUDCODEC_ADC_ENABLE(codec);
++
++  /* 打开功放（测试：按 START 次数交替极性） */
++
++  sf32lb52_audio_pa_enable(true);
++  up_mdelay(20);   /* 等功放上电稳定 */
++
++  audinfo("DAC+ADC path started\n");
++
++  /* 模拟块寄存器全量 dump（调试） */
++
++  priv->playback = playback;
++  priv->running  = true;
++  return OK;
++}
++
++/****************************************************************************
++ * Name: sf32lb52_audio_hw_stop
++ *
++ * Description: 停止播放/录音，关闭通路和功放
++ *
++ ****************************************************************************/
++
++static int sf32lb52_audio_hw_stop(FAR struct sf32lb52_audio_s *priv)
++{
++  HAL_AUDPRC_DMAStop(&priv->aprc, HAL_AUDPRC_TX_CH0);
++  HAL_AUDPRC_DMAStop(&priv->aprc, HAL_AUDPRC_RX_CH0);
++  __HAL_AUDPRC_DISABLE(&priv->aprc);
++
++  /* 清掉 HAL 的通道状态，否则下一次 Transmit/Receive DMA 会返回 HAL_BUSY */
++  priv->aprc.State[HAL_AUDPRC_TX_CH0] = HAL_AUDPRC_STATE_READY;
++  priv->aprc.State[HAL_AUDPRC_RX_CH0] = HAL_AUDPRC_STATE_READY;
++
++  /* 唤醒可能正阻塞在 read() 里的任务。
++   *
++   * read() 等的是 priv->rx_sem，而它只在 DMA 完成中断
++   * (HAL_AUDPRC_RxCpltCallback) 里被 post；stop 时 DMA 被停掉，
++   * 中断不会再来 —— 于是 read() 只能干等它自己的 5 秒超时。
++   * （实测：录音阻塞中发 STOP，3 秒后 read 仍未返回）
++   */
++
++  if (priv->rx_busy)
++    {
++      priv->rx_aborted = true;
++      nxsem_post(&priv->rx_sem);
++    }
++
++  /* 把还挂着的 buffer 归还给上层。
++   *
++   * 上层（NuttX audio 框架）的 read()/write() 是靠下层回调
++   * AUDIO_CALLBACK_DEQUEUE 来唤醒的。如果 stop 时 buffer 还挂在 DMA 上
++   * 却不归还，正在阻塞的 read() 永远等不到回调 —— 线程就此卡死。
++   * 实测：录音 read 阻塞中发 AUDIOIOC_STOP，3 秒都不返回。
++   * （DMA 已经停了，这时归还 buffer 是安全的）
++   */
++
++  if (priv->rx_apb != NULL)
++    {
++      FAR struct ap_buffer_s *apb = priv->rx_apb;
++
++      priv->rx_apb = NULL;
++      priv->dev.upper(priv->dev.priv, AUDIO_CALLBACK_DEQUEUE, apb, OK);
++    }
++
++  if (priv->tx_apb != NULL)
++    {
++      FAR struct ap_buffer_s *apb = priv->tx_apb;
++
++      priv->tx_apb = NULL;
++      priv->dev.upper(priv->dev.priv, AUDIO_CALLBACK_DEQUEUE, apb, OK);
++    }
++
++  HAL_AUDCODEC_Close_Analog_DACPath();
++  HAL_AUDCODEC_Close_Analog_ADCPath();
++  sf32lb52_audio_pa_enable(false);
++
++  priv->running = false;
++  audinfo("audio stopped\n");
++  return OK;
++}
++
++/****************************************************************************
++ * Name: sf32lb52_audio_getcaps
++ *
++ * Description: 上报设备能力（输入+输出、PCM、采样率）
++ *
++ ****************************************************************************/
++
++static int sf32lb52_audio_getcaps(FAR struct audio_lowerhalf_s *dev, int type,
++                                  FAR struct audio_caps_s *caps)
++{
++  DEBUGASSERT(caps && caps->ac_len >= sizeof(struct audio_caps_s));
++
++  caps->ac_format.hw  = 0;
++  caps->ac_controls.w = 0;
++
++  switch (caps->ac_type)
++    {
++      case AUDIO_TYPE_QUERY:
++        if (caps->ac_subtype == AUDIO_TYPE_QUERY)
++          {
++            /* 支持输入（麦克风）和输出（喇叭），PCM 格式 */
++
++            caps->ac_controls.b[0] = AUDIO_TYPE_INPUT |
++                                     AUDIO_TYPE_OUTPUT;
++            caps->ac_format.hw     = 1 << (AUDIO_FMT_PCM - 1);
++          }
++        else
++          {
++            caps->ac_controls.b[0] = AUDIO_SUBFMT_END;
++          }
++        break;
++
++      case AUDIO_TYPE_INPUT:
++      case AUDIO_TYPE_OUTPUT:
++        if (caps->ac_subtype == AUDIO_TYPE_QUERY)
++          {
++            caps->ac_controls.hw[0] = AUDIO_SAMP_RATE_8K |
++                                      AUDIO_SAMP_RATE_16K |
++                                      AUDIO_SAMP_RATE_44K |
++                                      AUDIO_SAMP_RATE_48K;
++            caps->ac_channels = 1;
++          }
++        else
++          {
++            caps->ac_controls.b[0] = AUDIO_SUBFMT_END;
++          }
++        break;
++
++      case AUDIO_TYPE_FEATURE:
++        if (caps->ac_subtype == AUDIO_FU_UNDEF)
++          {
++            caps->ac_controls.b[0] = AUDIO_FU_VOLUME;
++          }
++        break;
++
++      default:
++        caps->ac_subtype = 0;
++        caps->ac_channels = 0;
++        break;
++    }
++
++  return caps->ac_len;
++}
++
++/****************************************************************************
++ * Name: sf32lb52_audio_configure
++ *
++ * Description: 处理上层 AUDIOIOC_CONFIGURE
++ *
++ ****************************************************************************/
++
++static int sf32lb52_audio_configure(FAR struct audio_lowerhalf_s *dev,
++                                    FAR const struct audio_caps_s *caps)
++{
++  FAR struct sf32lb52_audio_s *priv =
++    (FAR struct sf32lb52_audio_s *)dev;
++  int ret = OK;
++
++  switch (caps->ac_type)
++    {
++      case AUDIO_TYPE_INPUT:
++        priv->playback = false;
++        ret = sf32lb52_audio_hw_configure(priv,
++                                          caps->ac_controls.hw[0] |
++                                          (caps->ac_controls.b[3] << 16),
++                                          caps->ac_channels,
++                                          caps->ac_controls.b[2]);
++        break;
++
++      case AUDIO_TYPE_OUTPUT:
++        priv->playback = true;
++        ret = sf32lb52_audio_hw_configure(priv,
++                                          caps->ac_controls.hw[0] |
++                                          (caps->ac_controls.b[3] << 16),
++                                          caps->ac_channels,
++                                          caps->ac_controls.b[2]);
++        break;
++
++      case AUDIO_TYPE_FEATURE:
++        if (caps->ac_format.hw == AUDIO_FU_VOLUME)
++          {
++            /* 标准音量接口：AUDIOIOC_SETPARAMTER + AUDIO_TYPE_FEATURE +
++             * AUDIO_FU_VOLUME，值域 0..AUDIO_VOLUME_MAX(1000)。
++             *
++             * HAL 只接受 -36..+60 dB，**必须做映射** —— 原来把 0..1000
++             * 直接当 dB 传进去，大于 60 的一律返回 HAL_ERROR，
++             * 等于上层设音量根本没生效。
++             *
++             * 按当前方向生效：播放改 DAC 音量，录音改 ADC 数字增益
++             * （这套 feature unit 里没有单独的麦克风增益控制，只能这样暴露）。
++             */
++
++            uint16_t volume = caps->ac_controls.hw[0];
++
++            if (volume > AUDIO_VOLUME_MAX)
++              {
++                ret = -EDOM;
++              }
++            else
++              {
++                int db = SF32LB52_AUDIO_VOL_MIN +
++                         (SF32LB52_AUDIO_VOL_MAX - SF32LB52_AUDIO_VOL_MIN) *
++                         (int)volume / AUDIO_VOLUME_MAX;
++
++                if (priv->running && !priv->playback)
++                  {
++                    priv->aprc.Init.adc_cfg.vol_l = db;
++                    priv->aprc.Init.adc_cfg.vol_r = db;
++                    HAL_AUDPRC_Config_ADCPath(&priv->aprc,
++                                              &priv->aprc.Init.adc_cfg);
++                  }
++                else
++                  {
++                    priv->playback_db = db;
++                    HAL_AUDCODEC_Config_DACPath_Volume(&priv->codec, 0, db);
++                    HAL_AUDCODEC_Config_DACPath_Volume(&priv->codec, 1, db);
++                  }
++
++                audinfo("volume %d/1000 -> %d dB\n", volume, db);
++              }
++          }
++        break;
++
++      default:
++        audwarn("WARNING: Unsupported configure type %d\n", caps->ac_type);
++        break;
++    }
++
++  return ret;
++}
++
++/****************************************************************************
++ * Name: sf32lb52_audio_shutdown
++ *
++ ****************************************************************************/
++
++static int sf32lb52_audio_shutdown(FAR struct audio_lowerhalf_s *dev)
++{
++  return sf32lb52_audio_hw_stop((FAR struct sf32lb52_audio_s *)dev);
++}
++
++/****************************************************************************
++ * Name: sf32lb52_audio_start
++ *
++ * Description: 处理上层 AUDIOIOC_START
++ *
++ ****************************************************************************/
++
++static int sf32lb52_audio_start(FAR struct audio_lowerhalf_s *dev)
++{
++  FAR struct sf32lb52_audio_s *priv =
++    (FAR struct sf32lb52_audio_s *)dev;
++
++  if (priv->running)
++    {
++      return OK;
++    }
++
++  return sf32lb52_audio_hw_start(priv, priv->playback);
++}
++
++/****************************************************************************
++ * Name: sf32lb52_audio_stop
++ *
++ ****************************************************************************/
++
++#ifndef CONFIG_AUDIO_EXCLUDE_STOP
++static int sf32lb52_audio_stop(FAR struct audio_lowerhalf_s *dev)
++{
++  return sf32lb52_audio_hw_stop((FAR struct sf32lb52_audio_s *)dev);
++}
++#endif
++
++/****************************************************************************
++ * Name: sf32lb52_audio_enqueuebuffer
++ *
++ * Description:
++ *   上层投递一个 buffer：
++ *   - 播放：数据经 AUDPRC TX0 DMA 送向 DAC
++ *   - 录音：AUDPRC RX0 DMA 把 ADC 数据收进 buffer
++ *   完成由 DMA 中断回调（HAL_AUDPRC_Tx/RxCpltCallback）通知。
++ *
++ ****************************************************************************/
++
++static int sf32lb52_audio_enqueuebuffer(FAR struct audio_lowerhalf_s *dev,
++                                        FAR struct ap_buffer_s *apb)
++{
++  FAR struct sf32lb52_audio_s *priv =
++    (FAR struct sf32lb52_audio_s *)dev;
++  HAL_StatusTypeDef res;
++
++  DEBUGASSERT(priv && apb);
++
++  if (priv->playback)
++    {
++      priv->tx_apb = apb;
++      res = HAL_AUDPRC_Transmit_DMA(&priv->aprc, apb->samp, apb->nbytes,
++                                    SF32LB52_AUDIO_PRC_TX_CH);
++    }
++  else
++    {
++      priv->rx_apb = apb;
++      res = HAL_AUDPRC_Receive_DMA(&priv->aprc, apb->samp, apb->nbytes,
++                                   SF32LB52_AUDIO_PRC_RX_CH);
++    }
++
++  if (res != HAL_OK)
++    {
++      auderr("ERROR: DMA enqueue failed: %d\n", res);
++      priv->tx_apb = NULL;
++      priv->rx_apb = NULL;
++      return -EIO;
++    }
++
++  return OK;
++}
++
++/****************************************************************************
++ * Name: sf32lb52_audio_cancelbuffer
++ *
++ ****************************************************************************/
++
++static int sf32lb52_audio_cancelbuffer(FAR struct audio_lowerhalf_s *dev,
++                                       FAR struct ap_buffer_s *apb)
++{
++  FAR struct sf32lb52_audio_s *priv =
++    (FAR struct sf32lb52_audio_s *)dev;
++
++  if (priv->tx_apb == apb)
++    {
++      HAL_AUDPRC_DMAStop(&priv->aprc, SF32LB52_AUDIO_PRC_TX_CH);
++      priv->tx_apb = NULL;
++    }
++
++  if (priv->rx_apb == apb)
++    {
++      HAL_AUDPRC_DMAStop(&priv->aprc, SF32LB52_AUDIO_PRC_RX_CH);
++      priv->rx_apb = NULL;
++    }
++
++  return OK;
++}
++
++/****************************************************************************
++ * Name: sf32lb52_audio_ioctl
++ *
++ ****************************************************************************/
++
++static int sf32lb52_audio_ioctl(FAR struct audio_lowerhalf_s *dev, int cmd,
++                                unsigned long arg)
++{
++  int ret = OK;
++
++  switch (cmd)
++    {
++      case AUDIOIOC_HWRESET:
++        audinfo("AUDIOIOC_HWRESET\n");
++        break;
++
++      default:
++        ret = -ENOTTY;
++        break;
++    }
++
++  return ret;
++}
++
++/****************************************************************************
++ * Name: sf32lb52_audio_write
++ *
++ * Description:
++ *   直通写入：把应用数据经 AUDPRC TX0 DMA 送出并等待播放完成。
++ *   （NuttX 标准 buffer 队列流程之外的简单同步播放接口）
++ *
++ ****************************************************************************/
++
++static ssize_t sf32lb52_audio_write(FAR struct audio_lowerhalf_s *dev,
++                                    FAR const char *buffer, size_t buflen)
++{
++  FAR struct sf32lb52_audio_s *priv =
++    (FAR struct sf32lb52_audio_s *)dev;
++  HAL_StatusTypeDef res;
++  int ret;
++
++  if (buffer == NULL || buflen == 0 || !priv->running)
++    {
++      return 0;
++    }
++
++  priv->wr_busy = true;
++
++  /* 数据体检：样本是否为空/异常（全 0 会让 DAC 只输出直流，只有开关爆音） */
++  {
++    FAR const int16_t *p = (FAR const int16_t *)buffer;
++    int i;
++    int mx = 0;
++
++    for (i = 0; i < 256; i++)
++      {
++        int v = p[i];
++
++        if (v < 0)
++          {
++            v = -v;
++          }
++
++        if (v > mx)
++          {
++            mx = v;
++          }
++      }
++
++  }
++
++
++  clock_t t0 = clock_systime_ticks();
++
++  res = HAL_AUDCODEC_Transmit_DMA(&priv->codec, (FAR uint8_t *)buffer, buflen,
++                                  HAL_AUDCODEC_DAC_CH0);
++  if (res != HAL_OK)
++    {
++      priv->wr_busy = false;
++      return 0;
++    }
++
++  {
++    /* 按实际采样率算等待上限（ms），再加 500ms 余量 */
++    uint32_t wait_ms = (uint32_t)(((uint32_t)(buflen / 2) * 1000U) /
++                       (uint32_t)(priv->samplerate ? priv->samplerate : 16000)) + 500U;
++
++    ret = nxsem_tickwait_uninterruptible(&priv->wr_sem, MSEC2TICK(wait_ms));
++  }
++
++  priv->wr_busy = false;
++
++  /* 停止 DMA 传输（单次播放完成） */
++
++  HAL_AUDCODEC_DMAStop(&priv->codec, HAL_AUDCODEC_DAC_CH0);
++  priv->codec.State[HAL_AUDCODEC_DAC_CH0] = HAL_AUDCODEC_STATE_READY;
++
++  if (ret < 0)
++    {
++      return 0;
++    }
++
++  return buflen;
++}
++
++/****************************************************************************
++ * Name: sf32lb52_audio_read
++ *
++ * Description:
++ *   直通读取：启动 AUDPRC RX0 DMA 采集麦克风数据并等待完成。
++ *
++ ****************************************************************************/
++
++static ssize_t sf32lb52_audio_read(FAR struct audio_lowerhalf_s *dev,
++                                   FAR char *buffer, size_t buflen)
++{
++  FAR struct sf32lb52_audio_s *priv =
++    (FAR struct sf32lb52_audio_s *)dev;
++  HAL_StatusTypeDef res;
++  int ret;
++
++  if (buffer == NULL || buflen == 0 || !priv->running)
++    {
++      syslog(LOG_ERR, "R: early ret buf=%p len=%zu run=%d\n",
++             buffer, buflen, priv->running);
++      return 0;
++    }
++
++  priv->rx_busy    = true;
++  priv->rx_aborted = false;
++  res = HAL_AUDPRC_Receive_DMA(&priv->aprc, (FAR uint8_t *)buffer, buflen,
++                               SF32LB52_AUDIO_PRC_RX_CH);
++
++  /* 整体使能在 DMA 启动后（参考 SDK audprc start 顺序） */
++
++  __HAL_AUDPRC_ENABLE(&priv->aprc);
++
++  if (res != HAL_OK)
++    {
++      priv->rx_busy = false;
++      auderr("ERROR: read DMA start failed: %d\n", res);
++      return 0;
++    }
++
++  ret = nxsem_tickwait_uninterruptible(&priv->rx_sem, MSEC2TICK(5000));
++  priv->rx_busy = false;
++
++  /* 被 stop() 打断：按 EOF 返回（不能报 buflen，数据并没采满）*/
++
++  if (priv->rx_aborted)
++    {
++      priv->rx_aborted = false;
++      HAL_AUDPRC_DMAStop(&priv->aprc, SF32LB52_AUDIO_PRC_RX_CH);
++      audinfo("read aborted by stop\n");
++      return 0;
++    }
++
++  /* 停止循环 DMA 传输（单次采集完成） */
++
++  HAL_AUDPRC_DMAStop(&priv->aprc, SF32LB52_AUDIO_PRC_RX_CH);
++
++  if (ret < 0)
++    {
++      auderr("ERROR: read DMA wait failed: %d\n", ret);
++      return 0;
++    }
++
++  return buflen;
++}
++
++/****************************************************************************
++ * Name: sf32lb52_audio_reserve / sf32lb52_audio_release
++ *
++ ****************************************************************************/
++
++static int sf32lb52_audio_reserve(FAR struct audio_lowerhalf_s *dev)
++{
++  return OK;
++}
++
++static int sf32lb52_audio_release(FAR struct audio_lowerhalf_s *dev)
++{
++  return OK;
++}
++
++/****************************************************************************
++ * Public Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: sf32lb52_audio_initialize
++ *
++ ****************************************************************************/
++
++int sf32lb52_audio_initialize(void)
++{
++  FAR struct sf32lb52_audio_s *priv;
++  int ret;
++
++  syslog(LOG_ERR, "AUDIO: initialize start\n");
++  priv = kmm_zalloc(sizeof(struct sf32lb52_audio_s));
++  if (priv == NULL)
++    {
++      return -ENOMEM;
++    }
++
++  ret = sf32lb52_audio_hw_init(priv);
++  syslog(LOG_ERR, "AUDIO: hw_init ret=%d\n", ret);
++  if (ret < 0)
++    {
++      kmm_free(priv);
++      return ret;
++    }
++
++  nxsem_init(&priv->wr_sem, 0, 0);
++  nxsem_init(&priv->rx_sem, 0, 0);
++
++  priv->dev.ops = &g_sf32lb52_audio_ops;
++
++  ret = audio_register("audio0", &priv->dev);
++  syslog(LOG_ERR, "AUDIO: register ret=%d\n", ret);
++  if (ret < 0)
++    {
++      auderr("ERROR: audio_register failed: %d\n", ret);
++      kmm_free(priv);
++      return ret;
++    }
++
++  audinfo("/dev/audio0 registered\n");
++  return OK;
++}
++
++/****************************************************************************
++ * HAL 弱符号回调重写（DMA 中断 → 本驱动）
++ *
++ ****************************************************************************/
++
++void HAL_AUDPRC_TxCpltCallback(AUDPRC_HandleTypeDef *haprc, int cid)
++{
++  FAR struct sf32lb52_audio_s *priv;
++
++  if (haprc == NULL)
++    {
++      return;
++    }
++
++  priv = (FAR struct sf32lb52_audio_s *)
++         ((FAR char *)haprc - offsetof(struct sf32lb52_audio_s, aprc));
++
++  if (priv->wr_busy)
++    {
++      priv->wr_busy = false;
++      nxsem_post(&priv->wr_sem);
++    }
++  else
++    {
++      sf32lb52_audio_tx_complete(priv);
++    }
++}
++
++void HAL_AUDCODEC_TxCpltCallback(AUDCODEC_HandleTypeDef *hacodec, int cid)
++{
++  FAR struct sf32lb52_audio_s *priv;
++
++  (void)cid;
++  if (hacodec == NULL)
++    {
++      return;
++    }
++
++  priv = (FAR struct sf32lb52_audio_s *)
++         ((FAR char *)hacodec - offsetof(struct sf32lb52_audio_s, codec));
++
++  if (priv->wr_busy)
++    {
++      priv->wr_busy = false;
++      nxsem_post(&priv->wr_sem);
++    }
++}
++
++void HAL_AUDPRC_RxCpltCallback(AUDPRC_HandleTypeDef *haprc, int cid)
++{
++  FAR struct sf32lb52_audio_s *priv;
++
++  if (haprc == NULL)
++    {
++      return;
++    }
++
++  priv = (FAR struct sf32lb52_audio_s *)
++         ((FAR char *)haprc - offsetof(struct sf32lb52_audio_s, aprc));
++
++  if (priv->rx_busy)
++    {
++      priv->rx_busy = false;
++      nxsem_post(&priv->rx_sem);
++    }
++  else
++    {
++      sf32lb52_audio_rx_complete(priv);
++    }
++}
+diff --git a/boards/sf32lb52/sf32lb52_devkit_lcd/src/sf32lb52_audio.h b/boards/sf32lb52/sf32lb52_devkit_lcd/src/sf32lb52_audio.h
+new file mode 100644
+index 0000000..7febd7d
+--- /dev/null
++++ b/boards/sf32lb52/sf32lb52_devkit_lcd/src/sf32lb52_audio.h
+@@ -0,0 +1,42 @@
++/****************************************************************************
++ * boards/sf32lb52/sf32lb52_devkit_lcd/src/sf32lb52_audio.h
++ *
++ * SF32LB52 音频设备驱动（audio_lowerhalf 实现）
++ * 注册 /dev/audio0，支持：
++ *   - 播放（DAC + DMA）：喇叭/耳机输出
++ *   - 录音（ADC + DMA）：板上 MEMS 麦克风输入
++ *   - 功放（AW8155，PA10 = AU_PA_EN）控制
++ *
++ ****************************************************************************/
++
++#ifndef __BOARDS_SF32LB52_SF32LB52_DEVTKIT_LCD_SRC_SF32LB52_AUDIO_H
++#define __BOARDS_SF32LB52_SF32LB52_DEVTKIT_LCD_SRC_SF32LB52_AUDIO_H
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <nuttx/config.h>
++#include <nuttx/audio/audio.h>
++
++/****************************************************************************
++ * Public Function Prototypes
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: sf32lb52_audio_initialize
++ *
++ * Description:
++ *   初始化 SF32LB52 音频设备（codec + 功放），并注册为 /dev/audio0
++ *
++ * Input Parameters:
++ *   None
++ *
++ * Returned Value:
++ *   OK on success; a negated errno value on failure.
++ *
++ ****************************************************************************/
++
++int sf32lb52_audio_initialize(void);
++
++#endif /* __BOARDS_SF32LB52_SF32LB52_DEVTKIT_LCD_SRC_SF32LB52_AUDIO_H */
+diff --git a/boards/sf32lb52/sf32lb52_devkit_lcd/src/sifli_ap.c b/boards/sf32lb52/sf32lb52_devkit_lcd/src/sifli_ap.c
+index 32be34b..d1e3e8b 100644
+--- a/boards/sf32lb52/sf32lb52_devkit_lcd/src/sifli_ap.c
++++ b/boards/sf32lb52/sf32lb52_devkit_lcd/src/sifli_ap.c
+@@ -30,6 +30,7 @@
+ #include <sys/mount.h>
+ #include <sys/stat.h>
+ #include <debug.h>
++#include <unistd.h>
+ 
+ #if defined(CONFIG_RTC) && defined(CONFIG_RTC_DRIVER)
+ #  include <nuttx/timers/rtc.h>
+@@ -40,13 +41,22 @@
+ #include "bf0_hal.h"
+ #include "drv_io.h"
+ #include "sifli_gpio.h"
++#include "sf32lb52_audio.h"
++
++/* sifli_i2cbus_initialize is defined in chips/sf32lb52/sifli_i2c.c
++ * (no public header exists yet in vendor_sifli)
++ */
++extern struct i2c_master_s *sifli_i2cbus_initialize(int port);
+ 
+ #include <nuttx/arch.h>
+ #include <nuttx/board.h>
++#include <nuttx/i2c/i2c_master.h>
+ #include <nuttx/lcd/lcd.h>
+ #include <nuttx/lcd/lcd_dev.h>
++#include <nuttx/sched.h>
+ #include <nuttx/timers/pwm.h>
+ #include <nuttx/timers/timer.h>
++#include <nuttx/usb/rndis.h>
+ #include <nuttx/video/fb.h>
+ #if defined(CONFIG_I2C) && defined(CONFIG_SENSORS_LSM6DSL)
+ #  include <nuttx/sensors/lsm6dsl.h>
+@@ -395,6 +405,15 @@ int sf32lb52_lchspi_ulp_bringup(void)
+     }
+ #endif
+ 
++#ifdef CONFIG_AUDIO
++  ret = sf32lb52_audio_initialize();
++  if (ret < 0)
++    {
++      serr("ERROR: sf32lb52_audio_initialize failed: %d\n", ret);
++      return ret;
++    }
++#endif
++
+ #ifdef CONFIG_DEV_GPIO
+   ret = sifli_gpio_initialize();
+   if (ret < 0)
+@@ -463,12 +482,11 @@ int sf32lb52_lchspi_ulp_bringup(void)
+ #endif
+ 
+ #ifdef CONFIG_I2C
+-  /* Initialize I2C bus 0 on the touch panel pins. */
++  /* Initialize I2C bus 0 on the touch panel pins.
++   * Pinmux for I2C1 (SCL=PA30, SDA=PA33) is done in bsp_pinmux.c.
++   */
+   struct i2c_master_s *i2c0 = NULL;
+ 
+-  HAL_PIN_Set(PAD_PA37, I2C1_SCL, PIN_PULLUP, 1);
+-  HAL_PIN_Set(PAD_PA33, I2C1_SDA, PIN_PULLUP, 1);
+-
+   i2c0 = sifli_i2cbus_initialize(0);
+   if (i2c0 == NULL)
+     {
+@@ -652,6 +670,65 @@ void board_late_initialize(void)
+   /* Perform board-specific initialization */
+ 
+   sf32lb52_lchspi_ulp_bringup();
++
++#ifdef CONFIG_RNDIS
++  /* Bring up the USB RNDIS Ethernet-over-USB gadget: the host (PC)
++   * enumerates this board as a virtual Ethernet adapter. The RNDIS
++   * class driver registers the netdev itself; configure it afterwards
++   * via ifconfig / netmgr (static or DHCP from the host).
++   */
++  {
++    static const uint8_t rndis_mac[6] =
++    {
++      0x00, 0xe0, 0x4c, 0x53, 0x42, 0x31
++    };
++
++    /* Plain bring-up -- no USB register poking at all.  usbdev_register()
++     * enables the USB clock, configures the PHY and asserts DP_EN via
++     * pullup().
++     */
++
++    (void)usbdev_rndis_initialize(rndis_mac);
++  }
++#endif
++
++#ifdef CONFIG_LVX_USE_CONTEST2026_233_ZHI_AI
++  /* Autostart the ZhiAi companion UI (robot_ui) so the device boots
++   * straight into the touch UI, while NSH stays available on the serial
++   * console for debugging. Give the async LCD/touch probe a moment to
++   * finish before LVGL opens /dev/lcd0 and /dev/input0.
++   * robot_ui also brings up WiFi (wifi_connect) during its init.
++   */
++  {
++    extern int robot_ui_main(int argc, FAR char *argv[]);
++    int ret;
++
++    usleep(2 * 1000 * 1000);
++    ret = task_create("robot_ui", 100, 16384, robot_ui_main, NULL);
++    if (ret < 0)
++      {
++        syslog(LOG_ERR, "ERROR: robot_ui autostart failed: %d\n", ret);
++      }
++  }
++#endif
++
++#ifdef CONFIG_LVX_USE_DEMO_CONTEST2026_000_HELLO_APP
++  /* Autostart the AI companion logic (hello_app: state machine, care
++   * timers, voice/sound detection). Started after robot_ui so the WiFi
++   * link is already up if the LLM path is ever exercised.
++   */
++  {
++    extern int hello_app_main(int argc, FAR char *argv[]);
++    int ret;
++
++    usleep(500 * 1000);
++    ret = task_create("hello_app", 100, 16384, hello_app_main, NULL);
++    if (ret < 0)
++      {
++        syslog(LOG_ERR, "ERROR: hello_app autostart failed: %d\n", ret);
++      }
++  }
++#endif
+ }
+ #endif
+ 

@@ -15,6 +15,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdio.h>
+#include <pthread.h>
 
 /****************************************************************************
  * Pre-processor Definitions
@@ -22,9 +24,10 @@
 
 /* 异常声音检测调试日志宏 */
 #ifdef CONFIG_DEBUG_AI_SOUND_DETECT
-#  define SOUND_DEBUG(fmt, ...) printf("[SOUND] " fmt "\n", ##__VA_ARGS__)
+#  define SOUND_DEBUG(...) do { printf("[SOUND] "); printf(__VA_ARGS__); \
+                                printf("\n"); } while (0)
 #else
-#  define SOUND_DEBUG(fmt, ...)
+#  define SOUND_DEBUG(...) do { } while (0)
 #endif
 
 /* 检测配置默认值 */
@@ -170,6 +173,9 @@ typedef struct
   /* 线程相关 */
   pthread_t           detect_thread;  /* 检测线程 */
   volatile bool       detect_stop;    /* 停止检测标志 */
+  bool                detect_thread_valid;
+  pthread_mutex_t     buffer_lock;
+  bool                buffer_lock_valid;
 
   /* 用户数据 */
   void               *user_data;      /* 用户自定义数据 */
@@ -375,5 +381,12 @@ int sound_detect_inference(sound_detect_context_t *ctx,
  */
 
 void sound_detect_init_default_classes(sound_detect_context_t *ctx);
+
+/**
+ * @brief Edge Impulse适配入口。链接生成模型时提供同名强符号即可覆盖弱实现。
+ */
+
+int edge_impulse_sound_classify(const int16_t *data, size_t frames,
+                                float *results, size_t result_count);
 
 #endif /* __AI_SOUND_DETECT_H */

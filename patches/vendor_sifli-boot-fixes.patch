@@ -1,0 +1,39 @@
+diff --git a/chips/sf32lb52/sf32lb_flash.c b/chips/sf32lb52/sf32lb_flash.c
+index a1f17e9..c51c5fe 100644
+--- a/chips/sf32lb52/sf32lb_flash.c
++++ b/chips/sf32lb52/sf32lb_flash.c
+@@ -474,7 +474,7 @@ static void sf32lb_flash_restore_ahb_read(FAR FLASH_HandleTypeDef *hflash)
+   qmode = hflash->Mode != 0;
+   if (hflash->size > NOR_FLASH_MAX_3B_SIZE)
+     {
+-      HAL_FLASH_CONFIG_FULL_AHB_READ(hflash, qmode);
++      HAL_FLASH_CONFIG_AHB_READ(hflash, qmode);
+     }
+   else
+     {
+diff --git a/chips/sf32lb52/sifli_irq.c b/chips/sf32lb52/sifli_irq.c
+index 99b0d00..23c7877 100644
+--- a/chips/sf32lb52/sifli_irq.c
++++ b/chips/sf32lb52/sifli_irq.c
+@@ -39,6 +39,9 @@
+ 
+ #include "bf0_hal.h"
+ 
++/* arm_lowprintf is implemented in sifli_start.c */
++extern int arm_lowprintf(const char *fmt, ...);
++
+ /* Get a 32-bit version of the default priority */    
+ #define DEFPRIORITY32 \
+       (NVIC_SYSH_PRIORITY_DEFAULT << 24 | \
+diff --git a/chips/sf32lb52/sifli_uart.c b/chips/sf32lb52/sifli_uart.c
+index 12e09d2..ef0c3c7 100644
+--- a/chips/sf32lb52/sifli_uart.c
++++ b/chips/sf32lb52/sifli_uart.c
+@@ -1006,7 +1006,6 @@ void up_putc(int ch)
+ 
+   arm_lowputc(ch);
+ #endif
+-  return ch;
+ }
+ 
+ #endif /* USE_SERIALDRIVER */

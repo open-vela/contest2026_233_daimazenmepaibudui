@@ -4,6 +4,7 @@
  */
 
 #include "robot_ui.h"
+#include "touch_ui.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -14,6 +15,7 @@ static lv_obj_t *scr_alarm = NULL;     // 报警屏幕
 /* 主界面组件 */
 static lv_obj_t *lbl_status = NULL;    // 状态标签
 static lv_obj_t *lbl_time = NULL;      // 时间标签
+static lv_obj_t *lbl_net = NULL;       // 网络状态标签（RNDIS/MQTT）
 static lv_obj_t *lbl_face = NULL;      // 表情标签
 static lv_obj_t *lbl_ai_reply = NULL;  // AI回复标签
 static lv_obj_t *lbl_reminder = NULL;  // 提醒标签
@@ -45,7 +47,7 @@ static const char *face_array[] = {
     "(=_=)",     // 思考
     "(~_~)zZZ", // 困倦
     "(O_O)",     // 惊讶
-    (">_<)",     // 担心
+    "(>_<)",     // 担心
     "(! ! !)",   // 报警
 };
 
@@ -58,7 +60,7 @@ static void create_face_area(lv_obj_t *parent);
 static void create_ai_reply_area(lv_obj_t *parent);
 static void create_bottom_buttons(lv_obj_t *parent);
 static void btn_event_handler(lv_event_t *e);
-static void anim_face_update(void *var, int32_t val);
+static void anim_blink_update(void *var, int32_t val);
 
 /* ==================== 初始化样式 ==================== */
 static void init_styles(void)
@@ -150,6 +152,34 @@ static void create_status_bar(lv_obj_t *parent)
     lv_label_set_text(lbl_signal, "WiFi 100%");
     lv_obj_set_style_text_color(lbl_signal, lv_color_hex(0xFFFFFF), 0);
     lv_obj_set_style_text_font(lbl_signal, &lv_font_montserrat_14, 0);
+
+    /* 网络状态：由 main 的主循环轮询 network_is_connected() 后刷新，
+     * 不在 network_task 里直接改，避免跨任务操作 LVGL。
+     * 注意字体是 montserrat，不带中文字形，所以这里只能用 ASCII。
+     */
+    lbl_net = lv_label_create(bar);
+    lv_label_set_text(lbl_net, "NET --");
+    lv_obj_set_style_text_color(lbl_net, lv_color_hex(0xFFC107), 0);
+    lv_obj_set_style_text_font(lbl_net, &lv_font_montserrat_14, 0);
+}
+
+/* ==================== 更新网络状态 ==================== */
+void robot_ui_set_net_status(const char *text)
+{
+    if (lbl_net == NULL || text == NULL) {
+        return;
+    }
+
+    if (strcmp(lv_label_get_text(lbl_net), text) == 0) {
+        return;     /* 没变就不动，省一次重绘 */
+    }
+
+    lv_label_set_text(lbl_net, text);
+    lv_obj_set_style_text_color(lbl_net,
+                                strncmp(text, "NET OK", 6) == 0
+                                    ? lv_color_hex(0x4CAF50)
+                                    : lv_color_hex(0xFFC107),
+                                0);
 }
 
 /* ==================== 创建表情区域 ==================== */
@@ -275,10 +305,14 @@ static void btn_event_handler(lv_event_t *e)
                 robot_ui_show_reminder("Health", "Time to take medicine!");
                 break;
             case UI_VIEW_SETTING:
-                // TODO: 打开设置界面
+                touch_ui_show_menu(MENU_TYPE_SETTING);
                 break;
             case UI_VIEW_ALARM:
                 robot_ui_show_alarm("Abnormal detected!\nPlease confirm if help is needed.");
+                break;
+            case UI_VIEW_MAIN:
+                /* 报警界面 Back 按钮：关闭报警，返回主界面 */
+                robot_ui_close_alarm();
                 break;
             default:
                 break;
@@ -287,6 +321,15 @@ static void btn_event_handler(lv_event_t *e)
 }
 
 /* ==================== 创建报警屏幕 ==================== */
+
+/* 报警闪烁动画回调：lv_anim 的 exec_cb 只有 (var, val) 两个参数，
+ * 而 lv_obj_set_style_bg_opa 需要 selector 参数，必须包一层显式传 0，
+ * 不能直接强转 3 参函数（否则 selector 为垃圾值导致 assert）。 */
+static void anim_blink_update(void *var, int32_t val)
+{
+    lv_obj_set_style_bg_opa((lv_obj_t *)var, (lv_opa_t)val, 0);
+}
+
 static void create_alarm_screen(void)
 {
     /* 创建报警屏幕 */
@@ -335,7 +378,7 @@ static void create_alarm_screen(void)
     lv_anim_set_time(&anim_blink, 500);
     lv_anim_set_playback_time(&anim_blink, 500);
     lv_anim_set_repeat_count(&anim_blink, LV_ANIM_REPEAT_INFINITE);
-    lv_anim_set_exec_cb(&anim_blink, (lv_anim_exec_xcb_t)lv_obj_set_style_bg_opa);
+    lv_anim_set_exec_cb(&anim_blink, anim_blink_update);
     /* 启动闪烁动画 */
     lv_anim_start(&anim_blink);
 }
@@ -433,8 +476,8 @@ void robot_ui_show_reminder(const char *title, const char *content)
     lv_obj_t *mbox = lv_msgbox_create(NULL);
     if (mbox == NULL) return;
 
-    lv_msgbox_set_text(mbox, content);
-    lv_msgbox_set_title(mbox, title);
+    lv_msgbox_add_title(mbox, title);
+    lv_msgbox_add_text(mbox, content);
     lv_msgbox_add_close_button(mbox);
     lv_obj_center(mbox);
     lv_obj_set_style_bg_color(mbox, lv_color_hex(0x2D2D44), 0);
@@ -459,7 +502,9 @@ void robot_ui_show_alarm(const char *content)
 void robot_ui_close_alarm(void)
 {
     /* 停止闪烁动画 */
-    lv_anim_del(&anim_blink, (lv_anim_exec_xcb_t)lv_obj_set_style_bg_opa);
+    /* v9 语义: lv_anim_delete(var, exec_cb) 第一个参数是动画绑定的对象
+     * (anim_blink.var == scr_alarm), 不是 lv_anim_t 结构体地址 */
+    lv_anim_delete(anim_blink.var, anim_blink_update);
 
     /* 返回主界面 */
     lv_scr_load(scr_main);
