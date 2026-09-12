@@ -128,6 +128,13 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    /* 触摸采样周期：默认跟随 LV_DEF_REFR_PERIOD（33ms ≈ 30Hz），手感偏迟钝。
+     * 这里只把输入设备读取定时器提到 10ms，屏幕刷新节奏不变。 */
+    if (lv_result.indev != NULL)
+    {
+        lv_timer_set_period(lv_indev_get_read_timer(lv_result.indev), 10);
+    }
+
     /* ===== 初始化网络通信 ===== */
     network_comm_init();
 

@@ -25,6 +25,13 @@
 - **功放**：NS4150B（Class-D），使能脚 = **PA10 / AU_PA_EN，高电平有效**
 - 喇叭接 **SPK**（2.0mm HDR 母座），支持 4Ω/3W（4Ω 更响）
 
+> **功放型号说明**：`patches/README.md` 和驱动源码注释
+> （`board/contest_board/src/sf32lb52_audio.c:213,390`）把功放写成了 **AW8155**，
+> 属于早期笔误；**功放型号以板载 NS4150B 为准**（PA10 使能，高有效）。
+>
+> 另外注意节点路径：驱动里是 `audio_register("audio0")`，内核会拼成
+> **`/dev/audio/audio0`**（不是 `/dev/audio0`）。
+
 ## 3. 应用层用法
 
 ```c
