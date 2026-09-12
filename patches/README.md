@@ -127,3 +127,78 @@ CONFIG_NETINIT_DRIPADDR=0xc0a88901          # 192.168.137.1 (ICS 固定网段)
 板子 `192.168.137.2`，PC 侧「以太网 2」由 ICS 自动配成 `192.168.137.1`。
 
 > 复现这一步时如果换了 PC / 换了网络，只要 ICS 还在用，这套地址就不用改。
+
+---
+
+# 板级配置补齐 + hello_app 能编译进固件了（2026-09-12 晚）
+
+## 背景：defconfig 之前是不完整的
+
+工作区真正生效的 `.config` 是**手工维护**的，板上网要用的一堆配置 **defconfig 里一条都没有**。
+后果：一旦重新 configure（`.config` 被从 defconfig 重建），**USB 网络功能会全部丢失**。
+
+现在已补齐。用 NuttX 自带的 `savedefconfig` 从当前 `.config` 反推出最小配置，
+只补了 **12 行**（其余都是默认值，不用写）：
+
+```
+# ==== USB 网络（RNDIS + Windows ICS 共享上网）====
+CONFIG_DEBUG_USB=y
+CONFIG_DEBUG_USB_ERROR=y
+CONFIG_DEBUG_USB_WARN=y
+CONFIG_DEBUG_USB_INFO=y
+CONFIG_RNDIS_EPINTIN=5
+CONFIG_NET_ETH_PKTSIZE=1514
+CONFIG_NET_ICMP_SOCKET=y
+CONFIG_NETDB_DNSSERVER_IPv4ADDR=0xc0a88901
+CONFIG_NETINIT_IPADDR=0xc0a88902
+CONFIG_NETINIT_DRIPADDR=0xc0a88901
+CONFIG_NETUTILS_PING=y
+CONFIG_AI_LLM_MODEL="gpt-3.5-turbo"
+```
+
+> ⚠️ 注意：`vendor/openvela/boards/contest2026_233_board` 是**软链接**指向
+> `board/contest_board`，所以它们其实是同一个文件，改一处即可。
+
+## 重新 configure 必须带 PYTHONPATH（否则报 `No module named 'olddefconfig'`）
+
+`build_audio.sh` 只设了 `PATH`，**少了 PYTHONPATH**。一旦触发重新 configure 就会失败：
+
+```bash
+PB=/home/youdian/openvela/prebuilts/tools/python
+export PATH="$PB/bin:/home/youdian/openvela/prebuilts/tools/linux/x86_64:$PATH"
+export PYTHONPATH="$PB/dist-packages/kconfiglib"     # ← 注意是 kconfiglib 子目录
+cmake --build cmake_out/contest2026_233_board_sf32lb52_ai
+```
+
+（已放在 `/home/youdian/build_full.sh`。）
+
+## hello_app（ai_companion）：两个上游遗漏
+
+队友把 app 的配置符号从 `LVX_USE_DEMO_CONTEST2026_000_HELLO_APP` 改名成
+`LVX_USE_CONTEST2026_233_HELLO_APP`，但：
+
+1. **defconfig 里没跟着改** → 符号不存在 → app 永远不编译。
+   （另外注意 `CMakeLists.txt` 里的 `MODULE ${CONFIG_...}` 展开是 `MODULE y`，
+   而**只有 `MODULE m` 才是可加载模块**，所以它其实就是普通内建 app，不用动。）
+2. 它的代码调用 `velaclaw_client_open / velaclaw_ask / velaclaw_client_close`
+   （来自 ai_agent），但 **ai_agent 的 `CMakeLists.txt` 从来没把
+   `src/sdk/velaclaw_client_local.c` 编进去** —— 光加会链不上。
+   → 已补，见 `patches/apps-ai-agent-velaclaw-sdk.patch`：
+
+```bash
+cd <openvela 工作区>/packages/ai_agent
+git apply <本仓库>/patches/apps-ai-agent-velaclaw-sdk.patch
+```
+
+补齐后 hello_app 正常编入固件，内建命令名是 **`ai_companion`**
+（由 `CONFIG_HELLO_APP_PROGNAME` 决定），不是 `hello_app`。
+
+## 验证结果（全部通过）
+
+```
+config.h: CONFIG_NET_ETH_PKTSIZE 1514 / CONFIG_NETINIT_IPADDR 0xc0a88902
+          CONFIG_NETINIT_DRIPADDR 0xc0a88901 / CONFIG_NET_ICMP_SOCKET 1
+          CONFIG_NETUTILS_PING 1 / CONFIG_NETDB_DNSSERVER_IPv4ADDR 0xc0a88901
+nm nuttx | grep companion_main   → 1   (已链入内核)
+固件内建命令: ai_agent  ai_companion  net_test  robot_ui  zhi_ai
+```
