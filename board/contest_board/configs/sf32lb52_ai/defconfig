@@ -80,6 +80,12 @@ CONFIG_LV_USE_LOG=y
 CONFIG_LV_USE_NUTTX=y
 CONFIG_LV_USE_NUTTX_LCD=y
 CONFIG_LV_USE_NUTTX_TOUCHSCREEN=y
+# 用分块缓冲 + PARTIAL 渲染：只有脏区被重绘/刷屏。
+# 默认的 SINGLE_BUFFER 是整屏缓冲 + FULL 渲染，任意一个像素变化都会
+# 重绘并同步推送 390x450x2=351KB，会把 UI 线程卡住 30ms 量级，
+# 触摸手感明显迟钝。BUFFER_SIZE 单位是行数。
+CONFIG_LV_NUTTX_LCD_CUSTOM_BUFFER=y
+CONFIG_LV_NUTTX_LCD_BUFFER_SIZE=60
 
 # ---- Audio (for voice companion) ----
 CONFIG_AUDIO=y
@@ -175,9 +181,27 @@ CONFIG_DEBUG_ASSERTIONS=y
 CONFIG_DEBUG_FEATURES=y
 CONFIG_DEBUG_SCHED=y
 CONFIG_DEBUG_SYMBOLS=y
-CONFIG_FRAME_POINTER=y
+# NOTE: frame pointers are OFF on purpose.
+# With -O2 (CONFIG_DEBUG_CUSTOMOPT), -fno-omit-frame-pointer reserves r7,
+# and mbedtls' hand-written Thumb-2 asm in bignum_core.c hard-fails with
+#     error: r7 cannot be used in 'asm' here
+# Dropping frame pointers frees r7 and also saves a register for the
+# compiler. CONFIG_DEBUG_SYMBOLS (-g3) is still on, so addr2line/backtrace
+# via DWARF still works; only the frame-pointer chain walking is lost.
+# CONFIG_FRAME_POINTER is not set
 CONFIG_SYSLOG_COLOR_OUTPUT=y
 CONFIG_SYSTEM_DUMPSTACK=y
+# IMPORTANT: keep optimization ON even though debug symbols are enabled.
+# nuttx/Kconfig has this as a *choice*:
+#     default DEBUG_NOOPT  if DEBUG_SYMBOLS
+#     default DEBUG_FULLOPT if !DEBUG_SYMBOLS
+# so simply turning on CONFIG_DEBUG_SYMBOLS silently builds the whole
+# firmware with -O0, which made LVGL's software renderer ~100x slower
+# (~800 CPU cycles per pixel, UI stuck at 12 loops/second) and the touch
+# feel terrible. Keep symbols (readable backtraces) AND optimize.
+# CONFIG_DEBUG_NOOPT is not set
+CONFIG_DEBUG_CUSTOMOPT=y
+CONFIG_DEBUG_OPTLEVEL="-O2"
 
 # ---- NSH Shell ----
 CONFIG_SYSTEM_NSH=y
@@ -213,8 +237,60 @@ CONFIG_AI_AGENT_TLS_CONN_POOL_SIZE=2
 # ==== 智爱陪伴自定义应用 ====
 CONFIG_LVX_USE_CONTEST2026_233_ZHI_AI=y
 CONFIG_LVX_USE_CONTEST2026_233_HELLO_APP=y
+# hello_app stack. The original 16384 was too small because ai_companion_main
+# reserved a 32KB frame in its prologue:
+#     sub.w sp, sp, #32000
+# The real culprit was a 16000-sample (32KB) local test buffer that GCC hoisted
+# into the prologue; it is only used by --sound-self-test. That buffer is now
+# "static" (see app/hello_app/ai_companion_main.c), which brings the entry frame
+# down to 88 bytes:
+#     sub sp, #88
+# 32KB is kept as a comfortable margin for the deeper call chains (the LLM/JSON
+# paths still use 4KB-class locals), instead of the 64KB that was only needed
+# to work around the 32KB entry frame.
+CONFIG_HELLO_APP_STACKSIZE=32768
+# Stack coloration: makes "ps" report each thread's stack high-water mark, which
+# is how we verify that a stack size is actually sufficient instead of guessing.
+# Cheap; can be turned off for the final release build if desired.
+CONFIG_STACK_COLORATION=y
+# LPWORK carries the USB RNDIS send/receive work. The UI task (robot_ui) was
+# raised to 110, which sits right on top of the worker threads at 100 and can
+# starve the RNDIS data path. Put the low-priority work queue above the app
+# threads so USB/network work always wins; hpwork (224, used by the touch
+# driver) is still higher than both.
+CONFIG_SCHED_LPWORKPRIORITY=120
 CONFIG_I2C=y
 CONFIG_EXAMPLES_AUDIO_TEST=y
+# Hardware self-test (display/touch/buttons/GPIO/I2C enumeration + read-only checks)
+# NSH command: hw_test
+# NOTE: no Kconfig symbol here on purpose. nuttx_generate_kconfig() bails out as
+# soon as <build>/apps/Kconfig exists, so a *new* app directory never gets picked
+# up by the auto-generated Kconfig and its symbol stays permanently "not set".
+# hw_test therefore hangs off the team-wide switch instead, same as robot_ui,
+# and app/hw_test/CMakeLists.txt guards on CONFIG_LVX_USE_CONTEST2026_233_ZHI_AI.
+
+# ==== Xiaomi MiMo agent (packages/demos/mimo) ====
+# MiMo is the official openvela demo from Xiaomi Corporation.
+# OpenAI-compatible endpoint: https://api.xiaomimimo.com/v1/chat/completions
+# Model: mimo-v2-flash
+# Depends on CONFIG_NETUTILS_CJSON, CONFIG_NETUTILS_WEBCLIENT, CONFIG_CRYPTO_MBEDTLS.
+# CJSON and MBEDTLS are already enabled on this board; WEBCLIENT is auto-selected.
+# NSH usage: mimo "hello"   (run `mimo` with no args for interactive mode)
+CONFIG_DEMOS_MIMO=y
+CONFIG_MIMO_MODEL="mimo-v2.5"
+# Token Plan endpoint (contest-provided free plan). A "tp-" key MUST use this
+# host; an "sk-" pay-as-you-go key uses https://api.xiaomimimo.com/v1 instead.
+# Both take the same OpenAI-compatible body; model mimo-v2.5.
+CONFIG_MIMO_API_BASE_URL="https://token-plan-cn.xiaomimimo.com/v1/chat/completions"
+# NOTE: the API key is intentionally NOT committed here. Put it in the local
+# build config instead (cmake_out/<build>/.config):
+# CONFIG_MIMO_API_KEY="sk-xxxx"
+# or get one from https://platform.xiaomimimo.com/
+# CONFIG_MIMO_API_KEY is not set
+# WARNING: keep these comment lines ASCII-only. CMake's file(STRINGS) drops
+# non-ASCII bytes, and a CJK comment can collapse into a whitespace-only
+# fragment, which crashes nuttx_kconfig.cmake ("REGEX MATCH needs at least
+# 5 arguments"). That is why this block has no Chinese.
 
 # robot_ui 使用的 LVGL 字体(需在编译期启用)
 CONFIG_LV_FONT_MONTSERRAT_16=y

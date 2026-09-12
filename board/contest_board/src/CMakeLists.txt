@@ -1,9 +1,24 @@
 # ##############################################################################
-# Contest 2026 Team 233 - 智爱陪伴 Board src/CMakeLists.txt
-# Based on sf32lb52_devkit_lcd
+# vendor/sifli/boards/sf32lb52_devkit_lcd/src/CMakeLists.txt
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more contributor
+# license agreements.  See the NOTICE file distributed with this work for
+# additional information regarding copyright ownership.  The ASF licenses this
+# file to you under the Apache License, Version 2.0 (the "License"); you may not
+# use this file except in compliance with the License.  You may obtain a copy of
+# the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+# License for the specific language governing permissions and limitations under
+# the License.
+#
 # ##############################################################################
 
-set(SRCS sifli_ap.c sifli_gpio.c sf32lb52_buttons.c bsp_init.c bsp_lcd_tp.c bsp_pinmux.c bsp_power.c )
+set(SRCS sifli_ap.c sifli_gpio.c sf32lb52_buttons.c bsp_init.c bsp_lcd_tp.c bsp_pinmux.c bsp_power.c sf32lb52_audio.c sf32lb52_alarm.c )
 
 nuttx_add_romfs(
   NAME
@@ -38,3 +53,15 @@ target_include_directories(board PRIVATE ${NUTTX_CHIP_ABS_DIR}/../boards/include
 target_compile_options(board PRIVATE
     $<$<COMPILE_LANGUAGE:C>:-w>
     $<$<COMPILE_LANGUAGE:CXX>:-w>)
+
+if(CONFIG_CRYPTO)
+  nuttx_add_application(
+    NAME
+    md5_test
+    STACKSIZE
+    4096
+    PRIORITY
+    100
+    SRCS
+    md5_test.c)
+endif()

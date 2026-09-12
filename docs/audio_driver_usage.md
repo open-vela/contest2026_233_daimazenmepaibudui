@@ -3,6 +3,8 @@
 > 智爱陪伴 —— openvela 音频输入输出接口（成员一交付物）
 > 硬件：SF32LB52-DevKit-LCD（板载 MEMS 麦克风 + NS4150B Class-D 功放 + 外接喇叭）
 > 状态：**播放与录音均已在真机验证通过**（2026-09-10）
+> 录音的应用层封装见 **3.1 节**（`audio_in_start/read/stop`，可直接照抄），
+> 坑见 **3.2 节**；命令行自检：`audio_test record` / `hw_test audio`
 
 ## 1. 概述
 
@@ -24,6 +26,13 @@
 - **AUDPRC**：数字音频处理器，**仅用于录音 RX0**
 - **功放**：NS4150B（Class-D），使能脚 = **PA10 / AU_PA_EN，高电平有效**
 - 喇叭接 **SPK**（2.0mm HDR 母座），支持 4Ω/3W（4Ω 更响）
+
+> **功放型号说明**：`patches/README.md` 和驱动源码注释
+> （`board/contest_board/src/sf32lb52_audio.c:213,390`）把功放写成了 **AW8155**，
+> 属于早期笔误；**功放型号以板载 NS4150B 为准**（PA10 使能，高有效）。
+>
+> 另外注意节点路径：驱动里是 `audio_register("audio0")`，内核会拼成
+> **`/dev/audio/audio0`**（不是 `/dev/audio0`）。
 
 ## 3. 应用层用法
 
@@ -52,11 +61,7 @@ ioctl(fd, AUDIOIOC_STOP, 0);
 close(fd);
 
 /* ---------- 录音 ---------- */
-fd = open("/dev/audio/audio0", O_RDONLY);
-/* 同样方式 CONFIGURE（ac_type = AUDIO_TYPE_INPUT）+ START */
-read(fd, pcm_buf, want_len);               /* 阻塞直到采满 */
-ioctl(fd, AUDIOIOC_STOP, 0);
-close(fd);
+/* 完整封装见 3.1 节：audio_in_start() / audio_in_read() / audio_in_stop() */
 ```
 
 命令自检（NSH）：
@@ -64,7 +69,196 @@ close(fd);
 ```
 nsh> audio_test 2000 1000      # 播放 1kHz 正弦 2000ms
 nsh> audio_test record         # 录音 1s（打印 peak/avg 与是否有声音）
+nsh> hw_test audio 2           # 录 2 秒，打印 peak/avg 和"是否检测到声音"，不写文件
 ```
+
+## 3.1 录音：三个可直接照抄的函数
+
+成员二的 `app/hello_app/ai_audio.c` 里 open/ioctl/音量**全是注释**、
+`record_fd = 1` 是占位，所以**用不了**。下面这三个函数是能直接抄的版本
+（`app/audio_test/main.c` 是已经在真机跑通的参考实现，
+`app/hw_test/main.c` 的 `hw_test audio` 也用同一套）。
+
+固定参数：**16 kHz / 单声道 / 16bit 小端（s16le）**，设备路径
+**`/dev/audio/audio0`（带 `audio/` 子目录）**。
+
+```c
+/* audio_in.c —— 录音封装 */
+#include <nuttx/audio/audio.h>
+#include <sys/ioctl.h>
+#include <sys/types.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <string.h>
+#include <stdio.h>
+
+#define AUDIO_IN_DEV       "/dev/audio/audio0"   /* 注意：不是 /dev/audio0 */
+#define AUDIO_IN_RATE      16000                 /* Hz */
+#define AUDIO_IN_CHANNELS  1
+#define AUDIO_IN_BITS      16
+#define AUDIO_IN_CHUNK     (AUDIO_IN_RATE * 2)   /* 1 秒 = 32000 字节，见下面说明 */
+
+static int audio_in_fd = -1;
+
+/* 打开 + 配置 + START。返回 0 成功，<0 失败。 */
+int audio_in_start(void)
+{
+  struct audio_caps_desc_s capdesc;
+
+  if (audio_in_fd >= 0)
+    {
+      return 0;                                /* 已经开着 */
+    }
+
+  audio_in_fd = open(AUDIO_IN_DEV, O_RDONLY);
+  if (audio_in_fd < 0)
+    {
+      printf("open %s failed: %d\n", AUDIO_IN_DEV, audio_in_fd);
+      return -1;
+    }
+
+  memset(&capdesc, 0, sizeof(capdesc));
+  capdesc.caps.ac_len            = sizeof(struct audio_caps_s);
+  capdesc.caps.ac_type           = AUDIO_TYPE_INPUT;   /* 录音 */
+  capdesc.caps.ac_channels       = AUDIO_IN_CHANNELS;
+  capdesc.caps.ac_controls.hw[0] = AUDIO_IN_RATE;      /* 采样率 */
+  capdesc.caps.ac_controls.b[2]  = AUDIO_IN_BITS;      /* 位深 */
+
+  if (ioctl(audio_in_fd, AUDIOIOC_CONFIGURE, (unsigned long)&capdesc) < 0)
+    {
+      printf("AUDIOIOC_CONFIGURE failed: %d\n", errno);
+      close(audio_in_fd);
+      audio_in_fd = -1;
+      return -1;
+    }
+
+  if (ioctl(audio_in_fd, AUDIOIOC_START, 0) < 0)
+    {
+      printf("AUDIOIOC_START failed: %d\n", errno);
+      close(audio_in_fd);
+      audio_in_fd = -1;
+      return -1;
+    }
+
+  return 0;
+}
+
+/* 阻塞读 len 字节 PCM。
+ * 返回实际读到的字节数；**返回 0 表示被打断/出错**，不是"读到 0 字节数据"。
+ * 上层要录 N 秒，就循环调用，每次不超过 AUDIO_IN_CHUNK。 */
+ssize_t audio_in_read(void *buf, size_t len)
+{
+  if (audio_in_fd < 0 || buf == NULL || len == 0)
+    {
+      return -1;
+    }
+
+  return read(audio_in_fd, buf, len);
+}
+
+/* STOP + close。read 正阻塞时，这一步能把它唤醒（见 3.2 坑 2）。 */
+void audio_in_stop(void)
+{
+  if (audio_in_fd >= 0)
+    {
+      ioctl(audio_in_fd, AUDIOIOC_STOP, 0);
+      close(audio_in_fd);
+      audio_in_fd = -1;
+    }
+}
+```
+
+### 缓冲区大小怎么算
+
+- 16k 单声道 16bit = **每秒 32000 字节**（`16000 × 1 × 2`）。
+- 要录 N 秒，一次 `malloc(N * 32000)`：
+  2 秒 = 64 KB，10 秒 = 320 KB（板子有 PSRAM，但别一次 malloc 太大，
+  建议**边录边处理**，比如分块送给语音识别）。
+- **单次 `audio_in_read()` 不要超过 1 秒（32000 字节）**，原因见坑 3。
+  正确的循环是：
+
+```c
+int nsamples = 16000 * seconds;
+int16_t *buf = malloc(nsamples * sizeof(int16_t));
+int offset = 0;
+
+audio_in_start();
+while (offset < nsamples * 2)
+  {
+    int chunk = nsamples * 2 - offset;
+    ssize_t n;
+
+    if (chunk > AUDIO_IN_CHUNK)
+      {
+        chunk = AUDIO_IN_CHUNK;               /* 1 秒一块 */
+      }
+
+    n = audio_in_read((char *)buf + offset, chunk);
+    if (n <= 0)                               /* 0 / 负值都必须跳出，否则死循环 */
+      {
+        break;
+      }
+
+    offset += (int)n;
+  }
+
+audio_in_stop();
+free(buf);
+```
+
+### 阻塞语义
+
+- `read()`（以及 `audio_in_read()`）**会一直阻塞到读满你要求的字节数**，
+  期间任务处于等待状态，不占 CPU。
+- 驱动下层一次 read 内部还有一个 **5 秒超时**
+  （`board/contest_board/src/sf32lb52_audio.c:1130`
+  的 `nxsem_tickwait_uninterruptible(..., MSEC2TICK(5000))`），
+  超时会**返回 0**，所以"读 6 秒"必须拆成 6 次 1 秒，不能一次读（坑 3）。
+- **从别的任务发 `AUDIOIOC_STOP` 能把阻塞中的 read 唤醒**
+  （驱动已修：`sf32lb52_audio.c:665-721` 的 `sf32lb52_audio_hw_stop()`，
+  先 `nxsem_post(&priv->rx_sem)`（`:686`），再把还挂在 DMA 上的 buffer
+  通过 `AUDIO_CALLBACK_DEQUEUE` 还给上层（`:698-704`），
+  于是 read 返回 0 而不是一直等满）。
+  这也是做"录音必须带超时/必须能取消"的基础。
+- `read` 返回 **0 不是错误码，而是"这次没读到任何字节"**（被打断或超时），
+  上层必须跳出循环；返回正数才是读到的字节数。
+
+### 不能同时录放
+
+`AUDIOIOC_STOP` 会**同时关掉播放和录音两条通路**
+（`sf32lb52_audio_hw_stop()` 里 TX/RX DMA 一起停，
+`sf32lb52_audio.c:667-668`），而且 codec 通路在硬件上也是分时复用的。
+所以：
+- 不要一个任务 `write()`、另一个任务 `read()` 想全双工；
+- 要"边说边听"（打断识别）请**顺序做**：先录完 → 停止 → 再播。
+- 播放和录音各自 `open()` 的时候注意：同一个 `/dev/audio/audio0`，
+  但**不能用同一个 fd 同时读写**。
+
+## 3.2 录音的坑（按重要性排序）
+
+1. **设备路径带子目录**：是 `/dev/audio/audio0`。
+   写成 `/dev/audio0` 一定 `open` 失败（`audio_register("audio0")` 的结果，
+   见 `sf32lb52_audio.c:1205`）。
+2. **`read` 返回 0 要立刻跳出**。0 = 被 `AUDIOIOC_STOP` 打断，
+   或下层 5 秒超时，或 `!priv->running` 的提前返回
+   （`sf32lb52_audio.c:1107-1112`）。**别把 0 当成"这次没数据、继续读"**，
+   否则就是死循环。
+3. **单次 read 不要超过 5 秒**（下层 `rx_sem` 超时是 5 秒，
+   `sf32lb52_audio.c:1130`）。建议一律拆成 1 秒（32000 字节）一块，
+   这也是 `audio_test` 验证过的大小。
+4. **必须能取消**：录音任务阻塞在 read 里时，只能由**另一个任务**
+   发 `AUDIOIOC_STOP` 来救。所以"录 N 秒"要带看门狗：
+   起一个读任务，主任务等 N + 余量秒，超时就 STOP。
+   `app/audio_test/main.c` 的 `stopwait` 和 `app/hw_test/main.c` 的
+   `step_audio()` 都是这么写的。
+5. **不要在中断/DMA 回调里 printf**（会因控制台锁死锁整机，
+   见下面第 4 节第 4 条）。
+6. **STOP 后要重新 CONFIGURE + START** 才能再录（`audio_test loop` 验证过
+   可以连续 open/config/start/stop/close）。
+7. 音量接口用 `AUDIOIOC_CONFIGURE` + `AUDIO_TYPE_FEATURE` +
+   `AUDIO_FU_VOLUME`（`ac_controls.hw[0]` = 0..1000，
+   0 = -36dB、1000 = +6dB），录音时它改的是**麦克风数字增益**；
+   参考 `audio_test vol <0..1000>`。
 
 ## 4. 关键实现要点（踩过的坑，改代码前务必先看）
 
@@ -118,3 +312,72 @@ RECORD peak=1636 avg=43 → RECORD OK（检测到声音）
 ```
 
 寄存器回读（播放启动后）：`PLL_STAT=0`（PLL 已锁）、`CFG=0x1f`、`DAC1_CFG=0x01f78001`（DAC1 内部功放使能）。
+
+---
+
+## 8. 2026-09-13 修复：`close()` 曾会让整机静默卡死
+
+### 现象
+
+`close()` 一个 `/dev/audio/audio0` 的 fd，**整机静默卡死**：无 panic、无 backtrace、
+不复位、串口探活毫无响应，只能重新烧录复位。
+
+### 根因
+
+`nuttx/audio/audio.c` 的 `audio_close()`（`:235` 起）在**最后一个 fd** 被关闭时：
+
+```
+nxmutex_lock(&upper->lock);                       /* :235 */
+flags = spin_lock_irqsave(&upper->spinlock);      /* :241 — 本构建非 SMP，等价 up_irq_save() */
+...
+if (upper->head == NULL)
+    lower->ops->shutdown(lower);                  /* :272 — 在「持锁 + 关中断」下调我们 */
+```
+
+也就是 `shutdown()` 是在**关中断**上下文里被调的。而我们的
+`sf32lb52_audio_shutdown()` 原来又走了一遍**完整的 `hw_stop()`** —— 可
+`AUDIOIOC_STOP` 时已经做过一次了。在关中断的上下文里**重复关闭已经关掉的
+音频模拟通路**（`HAL_AUDCODEC_Close_Analog_DACPath()` / `..._ADCPath()` 等
+HAL 调用）就卡死了。
+
+### 修复
+
+`board/contest_board/src/sf32lb52_audio.c`：
+
+- `hw_stop()` **幂等**：已经停过（`!running` 且没有挂着没收尾的
+  buffer/busy 标志）就直接 `return OK`。
+- 新增 `sf32lb52_audio_hw_shutdown()`：**只做关中断上下文里安全的事** ——
+  停 DMA、禁用 AUDPRC、复位通道状态、关功放（普通 GPIO 写）；
+  **不回调上层**（`AUDIO_CALLBACK_DEQUEUE`）、**不碰模拟通路**。
+- `sf32lb52_audio_shutdown()` 改调这个最小化函数；
+  `sf32lb52_audio_stop()`（`AUDIOIOC_STOP`，中断是开的）保持调完整 `hw_stop()`，
+  所以"STOP 唤醒阻塞 `read()`"的行为不变。
+
+### 为什么现在才发现
+
+只有当 fd 是**最后一个**时上层才调 `shutdown()`。上层应用（`hello_app`）
+通常一直占着同一个设备，所以 `audio_test` / `hw_test audio` 的 `close()`
+从来没走到过这条路。报警模块是"开一次、关一次"的用法，才把它踩出来。
+
+### 回归验证（2026-09-13，真机，同一次烧录）
+
+```
+hw_test audio 2       -> read 返回 64000/64000, 1/1 PASS
+audio_test 2000 1000  -> WRITE done: 64000/64000 / STOP done / audio_test: done
+hw_test rtc 3         -> 2/2 PASS
+hw_test alarm 1|2|3   -> 各 4/4 PASS（见 docs/alarm_usage.md）
+```
+
+### 排查手法（留个记录）
+
+现象是"整机静默无输出"，**先怀疑自旋/死锁，不要先怀疑崩溃**：
+本项目 `HAL_ASSERT()` 展开成 `while(1){}`（`USE_FULL_ASSERT` 是注释掉的），
+而且关中断上下文里的死循环连串口都出不来。定位手段是在可疑函数里
+**逐步打 `syslog(LOG_ERR, ...)`**，最后一条打印就是卡死点
+（本次最后一条是 `close` 之前的 `C3`，直接指到 `close(fd)`）。
+
+### 仍存疑（没验证过）
+
+`HAL_AUDPRC_DMAStop()` / `__HAL_AUDPRC_DISABLE()` 在关中断上下文里是否绝对安全，
+**没有证据**，只是风险低于模拟通路关闭，先保留在新函数里。
+若以后又出现"close 卡死"，下一步就是把这两个也挪出 `shutdown()` 路径。
