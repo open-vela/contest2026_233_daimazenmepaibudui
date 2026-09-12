@@ -86,6 +86,12 @@
 #define SF32LB52_AUDIO_VOL_MIN      (-36)
 #define SF32LB52_AUDIO_VOL_MAX      (6)
 
+/* 开/关功放时先把 DAC 拉到最小音量并等通路静态电平稳定，
+ * 避免功放使能/断开那一瞬间把 DAC 输出的跳变放大成"啪"的爆音。
+ * HAL 的下限就是 -36（没有真正的静音位），这是它能给的最大衰减。 */
+#define SF32LB52_AUDIO_VOL_MUTE      SF32LB52_AUDIO_VOL_MIN
+#define SF32LB52_AUDIO_SETTLE_MS     30
+
 /****************************************************************************
  * Private Types
  ****************************************************************************/
@@ -622,33 +628,46 @@ static int sf32lb52_audio_hw_start(FAR struct sf32lb52_audio_s *priv,
       cret = HAL_AUDCODEC_Init(&priv->codec);
     }
 
-  /* codec：DAC 模拟通路输出（SF32LB52X 无独立 HP 块，主 Instance 使能 DAC；
-   * 参考 SDK 播放序列 Config_DACPath(bypass=1) → 模拟通路 → bypass=0） */
-
-  __HAL_AUDCODEC_DAC_ENABLE(codec);
-  HAL_AUDCODEC_Config_DACPath(codec, 1);
-  HAL_AUDCODEC_Config_Analog_DACPath(codec->Init.dac_cfg.dac_clk);
-  HAL_AUDCODEC_Config_DACPath(codec, 0);
-  HAL_AUDCODEC_Config_DACPath_Volume(codec, 0, priv->playback_db);
-  HAL_AUDCODEC_Config_DACPath_Volume(codec, 1, priv->playback_db);
-
-  /* 回读 codec 寄存器确认通路状态（调试） */
-
-  /* codec：ADC 模拟通路 */
+  /* codec：ADC 模拟通路（录音用） */
 
   HAL_AUDCODEC_Config_RChanel(codec, SF32LB52_AUDIO_ADC_CH,
                               &codec->Init.adc_cfg);
   HAL_AUDCODEC_Config_Analog_ADCPath(codec->Init.adc_cfg.adc_clk);
   __HAL_AUDCODEC_ADC_ENABLE(codec);
 
-  /* 打开功放（测试：按 START 次数交替极性） */
+  /* codec：DAC 模拟通路 + 功放 —— 只有播放才碰。
+   *
+   * 纯录音时打开 DAC/功放是白开：麦克风数据不经过它，但功放使能那一下会在
+   * 喇叭上打出一声可听见的爆音（实测 hw_test audio 这种纯录音也能听到）。
+   *
+   * 播放时的顺序也不能反（SF32LB52X 无独立 HP 块，主 Instance 使能 DAC）：
+   *   1. 先把模拟通路以最小音量开起来，等耦合电容充到静态电平；
+   *   2. 再开功放 —— 此时 DAC 输出没有跳变；
+   *   3. 最后把音量拉到目标值。
+   */
 
-  sf32lb52_audio_pa_enable(true);
-  up_mdelay(20);   /* 等功放上电稳定 */
+  if (playback)
+    {
+      __HAL_AUDCODEC_DAC_ENABLE(codec);
+      HAL_AUDCODEC_Config_DACPath(codec, 1);
+      HAL_AUDCODEC_Config_Analog_DACPath(codec->Init.dac_cfg.dac_clk);
+      HAL_AUDCODEC_Config_DACPath(codec, 0);
+      HAL_AUDCODEC_Config_DACPath_Volume(codec, 0, SF32LB52_AUDIO_VOL_MUTE);
+      HAL_AUDCODEC_Config_DACPath_Volume(codec, 1, SF32LB52_AUDIO_VOL_MUTE);
+      up_mdelay(SF32LB52_AUDIO_SETTLE_MS);
 
-  audinfo("DAC+ADC path started\n");
+      sf32lb52_audio_pa_enable(true);
+      up_mdelay(20);   /* 等功放上电稳定 */
 
-  /* 模拟块寄存器全量 dump（调试） */
+      HAL_AUDCODEC_Config_DACPath_Volume(codec, 0, priv->playback_db);
+      HAL_AUDCODEC_Config_DACPath_Volume(codec, 1, priv->playback_db);
+
+      audinfo("DAC+PA path started\n");
+    }
+  else
+    {
+      audinfo("ADC path started (record only, DAC/PA untouched)\n");
+    }
 
   priv->playback = playback;
   priv->running  = true;
@@ -711,9 +730,26 @@ static int sf32lb52_audio_hw_stop(FAR struct sf32lb52_audio_s *priv)
       priv->dev.upper(priv->dev.priv, AUDIO_CALLBACK_DEQUEUE, apb, OK);
     }
 
-  HAL_AUDCODEC_Close_Analog_DACPath();
+  /* 关断顺序必须和开机顺序反过来：先把 DAC 拉到最小音量，再关功放，
+   * 最后才断模拟通路。原来的顺序（先 Close_Analog_DACPath 再关功放）是
+   * 把还开着的 DAC 输出直接抽掉，那一下直流跳变经功放放大 = 结尾一声爆音。
+   */
+
+  if (priv->playback)
+    {
+      HAL_AUDCODEC_Config_DACPath_Volume(&priv->codec, 0,
+                                         SF32LB52_AUDIO_VOL_MUTE);
+      HAL_AUDCODEC_Config_DACPath_Volume(&priv->codec, 1,
+                                         SF32LB52_AUDIO_VOL_MUTE);
+      up_mdelay(SF32LB52_AUDIO_SETTLE_MS);
+
+      sf32lb52_audio_pa_enable(false);
+      up_mdelay(5);
+
+      HAL_AUDCODEC_Close_Analog_DACPath();
+    }
+
   HAL_AUDCODEC_Close_Analog_ADCPath();
-  sf32lb52_audio_pa_enable(false);
 
   priv->running = false;
   audinfo("audio stopped\n");
@@ -1143,6 +1179,14 @@ static ssize_t sf32lb52_audio_read(FAR struct audio_lowerhalf_s *dev,
   /* 停止循环 DMA 传输（单次采集完成） */
 
   HAL_AUDPRC_DMAStop(&priv->aprc, SF32LB52_AUDIO_PRC_RX_CH);
+
+  /* HAL 的 HAL_AUDPRC_DMAStop() 不复位 State（那行被厂商注释掉了），
+   * 而 HAL_AUDPRC_Receive_DMA() 开头会判 State & HAL_AUDPRC_STATE_BUSY_RX
+   * 并直接返回 HAL_BUSY。不复位的话**同一次会话里第二次 read() 一定失败**
+   * （表现为"读了 1 秒就返回"，实测 hw_test audio 2 只拿到 32000/64000）。
+   */
+
+  priv->aprc.State[SF32LB52_AUDIO_PRC_RX_CH] = HAL_AUDPRC_STATE_READY;
 
   if (ret < 0)
     {

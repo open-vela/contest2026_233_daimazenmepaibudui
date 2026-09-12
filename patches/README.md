@@ -1,7 +1,8 @@
 # vendor_sifli 补丁
 
-两个补丁按顺序应用(`git apply` 相对 `<openvela 工作区>/vendor/sifli` 目录):
-先 `vendor_sifli-boot-fixes.patch`,再 `vendor_sifli-audio-driver.patch`。
+补丁按顺序应用(`git apply` 相对 `<openvela 工作区>/vendor/sifli` 目录):
+先 `vendor_sifli-boot-fixes.patch`,再 `vendor_sifli-audio-driver.patch`,
+最后 `vendor_sifli-rtc-alarm-fix.patch`(三者改的文件互不重叠,顺序只为可复现)。
 
 ## vendor_sifli-boot-fixes.patch
 
@@ -32,12 +33,63 @@ SF32LB52-DevKit-LCD 音频驱动,注册 `/dev/audio0`(NuttX audio_lowerhalf),支
 - 播放: `audio_test 3000 1000`(1 kHz 3 秒);录音: `audio_test record 3000`
 - 此补丁基于 boot 补丁已应用的状态生成,顺序不可颠倒
 
+## vendor_sifli-rtc-alarm-fix.patch（2026-09-12 新增，RTC alarm 不触发）
+
+改 `chips/sf32lb52/sf32lb_rtc.c` 三处。**现象**：`hw_test rtc 3` 里
+`RTC_SET_RELATIVE` 返回成功，但 3 秒后收不到 SIGUSR1；另外
+`date -s "Sep 12 15:30:00 2026"` 之后 `RTC_RD_TIME` 读回来是 **1926**。
+
+### 根因
+
+1. **读路径不还原世纪位**（`:198` `rtctime->tm_year = rtc_date.Year;`）
+   `date_2_reg()` 把 2000~2099 写成两位年 + CB=0、1900~1999 写成两位年 + CB=1
+   （`bf0_hal_rtc.c:374-377`），而 `HAL_RTC_GetDate()` 只对 19xx 打上
+   `RTC_CENTURY_BIT(0x80)`（`bf0_hal_rtc.c:484-490`）。驱动读回来直接赋给
+   `tm_year`，于是 2026 变成 1926。修法与厂商 SDK 参考驱动
+   `drv_rtc.c:182-185` 一致：CB 置位取低 7 位，否则 +100。
+2. **`RTC_SET_RELATIVE` 拿这个年份去喂 libc，算出垃圾 alarm 值**
+   本固件 `CONFIG_LIBC_LOCALTIME` 未开（`.config`），所以
+   `localtime()` 就是 `gmtime()`、`mktime()` 就是 `timegm()`；而 NuttX 这版
+   日历换算只支持 1970 以后（`nuttx/libs/libc/time/lib_gmtimer.c`）。
+   `add_timeout()`（`sf32lb_rtc.c:295`）用 `mktime()`/`localtime()` 算绝对
+   时间，输入是 1926 这种 <1970 的年份 → 得到负的 `time_t` → 拆出**负的
+   时/分/秒和越界日期** → 写进 `ALRMTR/ALRMDR` 的比较值硬件永远匹配不上
+   → 永远没有 alarm 中断，也就永远没有 SIGUSR1。ioctl 返回 0 是**假成功**。
+3. **星期字段被要求精确匹配、但值不是从硬件来的**（`:301` / `:367`）
+   `MSKWD/MSKD/MSKM` 为 0 表示"这几个字段必须精确匹配"，而写进
+   `ALRMDR.WD` 的星期来自 `add_timeout()` 里 libc 重算的 `tm_wday`，和硬件
+   `DR.WD` 不同源、编码还差一位。厂商 SDK 参考驱动是屏蔽
+   `RTC_ALRMDR_MSKD|MSKM|MSKWD` 的（`drv_rtc.c:482-484`）。
+
+### 修改
+
+| 位置 | 改动 |
+|------|------|
+| `sf32lb_rdtime()` `:198` | 按 CB 还原世纪：CB 置位取 `Year & ~RTC_CENTURY_BIT`，否则 `Year + 100` |
+| `sf32lb_rdalarm()` `:405` | 同上（保持 rd/set/rdalarm 一致） |
+| `sf32lb_setalarm()` `:301`、`sf32lb_setrelative()` `:367` | `AlarmMask` 加上 `RTC_ALRMDR_MSKWD`（屏蔽星期比较） |
+
+### 验证
+
+- `date -s "Sep 12 15:30:00 2026"` 后 `hw_test rtc 3`：时间应读回 **2026-09-12**，
+  并在约 3 秒后打印 `收到 SIGUSR1`，两项都 PASS
+- 注意 NSH 的 `date -s` 只认 `MMM DD HH:MM:SS YYYY` 格式（`nsh_timcmds.c`），
+  写 `2026-09-12 15:30:00` 会报 `argument invalid`
+
+### 已知遗留
+
+- `HAL_RTC_GetDate()` 在 CB=1 且年份 <70 时会**顺手清掉硬件 CB** 并返回不带
+  0x80 的年份（`bf0_hal_rtc.c:485-490`），此时上面的还原会当 20xx 处理。
+  这条分支只有写入 1900~1969 才会进，本项目的对时路径不会写这种年份，
+  暂不处理。
+
 ## 应用方式
 
 ```bash
 cd <openvela 工作区>/vendor/sifli
 git apply patches/vendor_sifli-boot-fixes.patch
 git apply patches/vendor_sifli-audio-driver.patch
+git apply patches/vendor_sifli-rtc-alarm-fix.patch
 ```
 
 ## 说明

@@ -493,6 +493,9 @@ nsh> hw_test
 | `hw_test touch <秒>` | 指定触摸观察时长（`hw_test touch 0` = 跳过触摸步骤） |
 | `hw_test lcdcolor` | 额外刷 4 条横向色带（红/绿/蓝/白），**退出前清屏成纯黑** |
 | `hw_test gpio` | 额外对 `/dev/gpio1`（PA26）做一次 1→回读→0 的电平翻转 |
+| `hw_test imu [帧数]` | 读 IMU(LSM6DS3) 加速度/陀螺，默认 10 帧。**单独运行**（不跑上面 5 步自检）；当前固件缺 `CONFIG_SENSORS_LSM6DSL` 会是 FAIL，见 `docs/sensor_rtc_usage.md` |
+| `hw_test rtc [秒]` | 读 RTC 时间 + 设 N 秒后 alarm（默认 3），带超时。**单独运行**；见 `docs/sensor_rtc_usage.md` |
+| `hw_test audio [秒]` | 录 N 秒到内存（默认 2），打印 peak/avg 与是否检测到声音，不写文件。**单独运行**；见 `docs/audio_driver_usage.md` 3.1 节 |
 
 说明：
 

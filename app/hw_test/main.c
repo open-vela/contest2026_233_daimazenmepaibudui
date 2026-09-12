@@ -1,18 +1,25 @@
 /****************************************************************************
  * app/hw_test/main.c
  *
- * SF32LB52-DevKit-LCD 硬件自检（显示 / 触摸 / 按键 / GPIO）
+ * SF32LB52-DevKit-LCD 硬件自检（显示 / 触摸 / 按键 / GPIO /
+ *                                  IMU / RTC / 音频输入）
  *
  * 用法：
  *   hw_test                 只读自检：不动屏幕、不拉 GPIO 电平
  *   hw_test touch <秒>       指定触摸观察时长（0 = 跳过触摸步骤）
  *   hw_test lcdcolor        额外做一次刷色测试（会改屏，退出前清屏）
  *   hw_test gpio            额外翻转一次板级 GPIO 输出脚 PA26（/dev/gpio1）
+ *   hw_test imu [帧数]       读 LSM6DS3 加速度/陀螺（默认 10 帧）—— 单独运行
+ *   hw_test rtc [秒]         读 RTC 时间 + 设一个 N 秒后的 alarm（默认 3 秒）—— 单独运行
+ *   hw_test audio [秒]       录 N 秒到内存，打印 peak/avg（默认 2 秒）—— 单独运行
  *
  * 设计约定：
  *   - 每一步失败都只打印 FAIL，不中断后面的步骤，也不会卡死
  *     （所有 open/ioctl/read 都判返回值，read 前先用 poll 等超时）
  *   - 默认（不带参数）不碰屏幕、不拉 GPIO 电平，只做只读自检
+ *   - imu / rtc / audio 都会真的开外设（START 转换、设 alarm、开麦克风），
+ *     所以放在子命令里；而且它们**不跑**上面那套 5 步自检，只跑自己，
+ *     免得每次验 IMU 还要先等 10 秒触摸 + 5 秒按键
  *
  ****************************************************************************/
 
@@ -42,6 +49,23 @@
 #include <nuttx/input/touchscreen.h>
 #include <nuttx/input/buttons.h>
 #include <nuttx/ioexpander/gpio.h>
+#include <nuttx/timers/rtc.h>
+#include <nuttx/sensors/ioctl.h>       /* SNIOC_START / SNIOC_STOP / ... */
+#include <nuttx/audio/audio.h>
+#include <nuttx/clock.h>               /* clock_systime_ticks() + TICK2MSEC() */
+#include <nuttx/sched.h>               /* task_create() */
+#include <signal.h>                    /* SIGUSR1 + sigaction() */
+
+/* IMU：本板的 LSM6DS3 走的是 NuttX **老式字符驱动**（不是 uORB），
+ * 节点是 /dev/lsm6dsl0，接口是 read() + ioctl(SNIOC_*)。
+ * 头文件本身被 CONFIG_SENSORS_LSM6DSL 包着，所以这里也要判一下，
+ * 否则编不过（拿不到 struct lsm6dsl_sensor_data_s）。
+ */
+
+#if defined(CONFIG_I2C) && defined(CONFIG_SENSORS_LSM6DSL)
+#  include <nuttx/sensors/lsm6dsl.h>
+#  define HW_TEST_HAS_IMU 1
+#endif
 
 /****************************************************************************
  * Pre-processor Definitions
@@ -53,6 +77,9 @@
 #define GPIO_IN_DEV    "/dev/gpio0"
 #define GPIO_OUT_DEV   "/dev/gpio1"
 #define GPIO_INT_DEV   "/dev/gpio2"
+#define IMU_DEV        "/dev/lsm6dsl0"
+#define RTC_DEV        "/dev/rtc0"
+#define AUDIO_DEV      "/dev/audio/audio0"   /* 注意：带 audio/ 子目录 */
 
 #define TOUCH_MAX_POINTS   16    /* FT6146 注册上限，见 touch_register(...,16) */
 #define TOUCH_SAMPLES_WANT 20    /* 读满这么多点就提前结束 */
@@ -67,6 +94,32 @@
 #define RGB565_BLUE        0x001f
 #define RGB565_WHITE       0xffff
 #define RGB565_BLACK       0x0000
+
+/* imu 子命令 */
+
+#define IMU_DEFAULT_FRAMES   10    /* 默认打印帧数 */
+#define IMU_FRAME_MS         100   /* 帧间隔（ms）；10 帧约 1 秒 */
+
+/* rtc 子命令 */
+
+#define RTC_DEFAULT_ALARM_SEC 3    /* 默认 alarm 延时（秒） */
+#define RTC_WAIT_SLACK_SEC    2    /* 等 alarm 的额外宽限；超时就 FAIL 退出 */
+
+/* audio 子命令（与 app/audio_test 保持同一套参数：16k 单声道 16bit） */
+
+#define AUDIO_SAMPLE_RATE     16000
+#define AUDIO_CHANNELS        1
+#define AUDIO_BITS            16
+#define AUDIO_DEFAULT_SEC     2    /* 默认录音秒数 */
+#define AUDIO_WAIT_SLACK_SEC  2    /* read 没在预期时间内返回就发 STOP 救场 */
+#define AUDIO_SOUND_PEAK      500  /* peak 超过它算“检测到声音”（同 audio_test） */
+#define AUDIO_READ_TASK_STACK 4096
+
+/* 驱动下层一次 read 只等 5 秒（sf32lb52_audio.c:1130 的 rx_sem 超时），
+ * 所以超过 1 秒的录音要拆成 1 秒一块地读，否则 6 秒的录音必然返回 0。
+ * 32000 字节 = 16k 单声道 16bit × 1 秒，正是 audio_test 验证过的大小。
+ */
+#define AUDIO_CHUNK_BYTES     (AUDIO_SAMPLE_RATE * 2)
 
 /****************************************************************************
  * Private Types
@@ -84,6 +137,18 @@ struct dev_node_s
 
 static int g_pass;
 static int g_total;
+
+/* rtc 子命令：alarm 到点后由信号处理函数置位 */
+
+static volatile sig_atomic_t g_rtc_alarm;
+
+/* audio 子命令：阻塞的 read() 放在独立任务里，主任务带超时等它 */
+
+static volatile int     g_arec_done;
+static volatile ssize_t g_arec_n;
+static int              g_arec_fd;
+static FAR int16_t     *g_arec_buf;
+static int              g_arec_len;
 
 /* 与本板硬件相关的设备节点（枚举顺序 = 打印顺序） */
 
@@ -145,6 +210,9 @@ static void usage(void)
   printf("  hw_test touch <秒>    指定触摸观察时长，0 = 跳过\n");
   printf("  hw_test lcdcolor     额外刷色测试（会改屏，退出前清屏）\n");
   printf("  hw_test gpio         额外翻转一次 /dev/gpio1 (PA26)\n");
+  printf("  hw_test imu [帧数]   IMU(LSM6DS3) 加速度/陀螺，默认 10 帧（单独运行）\n");
+  printf("  hw_test rtc [秒]     RTC 时间 + N 秒后的 alarm，默认 3 秒（单独运行）\n");
+  printf("  hw_test audio [秒]   录音电平 peak/avg，默认 2 秒（单独运行）\n");
 }
 
 /****************************************************************************
@@ -877,6 +945,508 @@ static int step_gpio(int do_toggle)
 }
 
 /****************************************************************************
+ * Name: step_imu
+ *
+ * Description:
+ *   imu 子命令：读 LSM6DS3 的加速度 / 陀螺 / 温度。
+ *
+ *   本板在树里的 LSM6DSL 驱动是 **NuttX 老式字符驱动**
+ *   （nuttx/drivers/sensors/lsm6dsl.c，走 register_driver(devpath, ...)），
+ *   注册出来的节点就是 "/dev/lsm6dsl0"，接口是：
+ *     ioctl(fd, SNIOC_START)                 -- 开始转换（写 CTRL1_XL/CTRL2_G）
+ *     ioctl(fd, SNIOC_LSM6DSLSENSORREAD, &s) -- 一次拿到 acc/gyro/temp/timestamp
+ *     read(fd, buf, len)                     -- 只要 acc，len/6 个 int16 xyz 原始码
+ *     ioctl(fd, SNIOC_STOP)                  -- 停转换
+ *   它**不是** uORB 传感器（没有 /dev/uorb/sensor_accel0），
+ *   所以这里没有用 orb_subscribe()。详见 docs/sensor_rtc_usage.md。
+ *
+ ****************************************************************************/
+
+static int step_imu(int frames)
+{
+  printf("[IMU] LSM6DS3 %s\n", IMU_DEV);
+
+#ifndef HW_TEST_HAS_IMU
+  (void)frames;
+  printf("      本板**没有加速度计/陀螺**：模组 SF32LB52-MOD-1 的 BOM 里\n");
+  printf("      只有 MCU + 128Mb NOR Flash + 晶振 + 天线，没有任何 IMU 器件。\n");
+  printf("      所以这不是\"驱动没编\"，是硬件不存在，开了也读不到。\n");
+  printf("      /dev/lsm6dsl0 不会出现；详见 docs/sensor_rtc_usage.md。\n");
+  report("IMU 读数", 0, "本板无 IMU 硬件");
+  return -1;
+#else
+  struct lsm6dsl_sensor_data_s sdata;
+  int got = 0;
+  int fd;
+  int i;
+
+  if (frames <= 0)
+    {
+      frames = IMU_DEFAULT_FRAMES;
+    }
+
+  fd = open(IMU_DEV, O_RDONLY);
+  if (fd < 0)
+    {
+      printf("      open 失败: %d\n", errno);
+      report("IMU 读数", 0, "open /dev/lsm6dsl0 失败");
+      return -1;
+    }
+
+  /* 注册时驱动只做了 WHO_AM_I 校验；不 START 就是 POWER_DOWN，读出来全是 0 */
+
+  if (ioctl(fd, SNIOC_START, 0) < 0)
+    {
+      printf("      SNIOC_START 失败: %d（IMU 没焊 / 地址不对？）\n", errno);
+      close(fd);
+      report("IMU 读数", 0, "SNIOC_START 失败");
+      return -1;
+    }
+
+  for (i = 0; i < frames; i++)
+    {
+      memset(&sdata, 0, sizeof(sdata));
+
+      if (ioctl(fd, SNIOC_LSM6DSLSENSORREAD, (unsigned long)&sdata) < 0)
+        {
+          printf("      第 %d 帧读取失败: %d\n", i + 1, errno);
+          break;
+        }
+
+      /* 单位：acc 是 mg（驱动内部已按 ±16g 的 0.488 mg/LSB 换算好），
+       *       gyro 是 mdps（±2000dps 的 70 mdps/LSB），
+       *       temp 是摄氏度，timestamp 是传感器自己的计数器（不是毫秒）。
+       */
+
+      printf("      #%-2d acc=(%5d,%5d,%5d) mg  gyro=(%6d,%6d,%6d) mdps  "
+             "temp=%d C  ts=%u\n",
+             i + 1,
+             (int)sdata.x_data, (int)sdata.y_data, (int)sdata.z_data,
+             (int)sdata.g_x_data, (int)sdata.g_y_data, (int)sdata.g_z_data,
+             (int)sdata.temperature, (unsigned)sdata.timestamp);
+      got++;
+      usleep(IMU_FRAME_MS * 1000);
+    }
+
+  ioctl(fd, SNIOC_STOP, 0);
+  close(fd);
+
+  if (got == frames)
+    {
+      char detail[32];
+
+      snprintf(detail, sizeof(detail), "%d 帧", got);
+      report("IMU 读数", 1, detail);
+      return OK;
+    }
+
+  printf("      只读到 %d/%d 帧\n", got, frames);
+  report("IMU 读数", 0, "读取中途失败，见上面");
+  return -1;
+#endif
+}
+
+/****************************************************************************
+ * Name: rtc_alarm_handler
+ *
+ * Description:
+ *   RTC alarm 到点后，rtc upper half 用 nxsig_notification() 给任务发信号，
+ *   这里只置一个标志位，真正的等待在主循环里带超时做。
+ *
+ ****************************************************************************/
+
+static void rtc_alarm_handler(int signo)
+{
+  (void)signo;
+  g_rtc_alarm = 1;
+}
+
+/****************************************************************************
+ * Name: step_rtc
+ *
+ * Description:
+ *   rtc 子命令：读当前时间 -> 设一个 N 秒后的 alarm -> 等它触发（带超时）。
+ *
+ *   关键事实（都从源码核实过，别按 Linux 直觉写）：
+ *   - /dev/rtc0 由 board 的 rtc_initialize(0, ...) 建出来
+ *     （sifli_ap.c:391 -> nuttx/drivers/timers/rtc.c:853）。
+ *   - rtc upper half 的 read() 直接 return 0（EOF），**不会阻塞等 alarm**
+ *     （rtc.c:318-321）；而且 g_rtc_fops 里 poll 是 NULL（rtc.c:136）。
+ *   - alarm 到点走的是 **信号**：ioctl 参数里带 struct sigevent，
+ *     upper half 用 nxsig_notification() 通知 pid（rtc.c:198-199）。
+ *
+ ****************************************************************************/
+
+static int step_rtc(int alarm_sec)
+{
+  struct rtc_setrelative_s rel;
+  struct rtc_rdalarm_s query;
+  struct sigaction sa;
+  struct rtc_time rt;
+  clock_t t0;
+  uint32_t elapsed_ms;
+  int fd;
+
+  printf("[RTC] %s\n", RTC_DEV);
+
+  if (alarm_sec < 1)
+    {
+      alarm_sec = RTC_DEFAULT_ALARM_SEC;
+    }
+
+  fd = open(RTC_DEV, O_RDONLY);
+  if (fd < 0)
+    {
+      printf("      open 失败: %d\n", errno);
+      report("打开 RTC", 0, "open /dev/rtc0 失败");
+      return -1;
+    }
+
+  memset(&rt, 0, sizeof(rt));
+  if (ioctl(fd, RTC_RD_TIME, (unsigned long)&rt) < 0)
+    {
+      printf("      RTC_RD_TIME 失败: %d\n", errno);
+      report("读 RTC 时间", 0, "RTC_RD_TIME 失败");
+      close(fd);
+      return -1;
+    }
+
+  /* tm_year 是从 1900 起的年数，tm_mon 是 0..11（和 struct tm 完全一样） */
+
+  printf("      当前时间 : %04d-%02d-%02d %02d:%02d:%02d\n",
+         rt.tm_year + 1900, rt.tm_mon + 1, rt.tm_mday,
+         rt.tm_hour, rt.tm_min, rt.tm_sec);
+
+  if (rt.tm_year < 100)
+    {
+      printf("      提示：RTC 时间看着没设过（年 %d），"
+             "先用 RTC_SET_TIME 或 NSH 的 `date -s` 对时\n",
+             rt.tm_year + 1900);
+    }
+
+  report("读 RTC 时间", 1, NULL);
+
+  /* 用 SIGUSR1 + 标志位等 alarm；主循环有超时，绝不永久卡住 */
+
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_handler = rtc_alarm_handler;
+  sigemptyset(&sa.sa_mask);
+
+  if (sigaction(SIGUSR1, &sa, NULL) < 0)
+    {
+      printf("      sigaction(SIGUSR1) 失败: %d\n", errno);
+      report("RTC alarm", 0, "装信号处理失败");
+      close(fd);
+      return -1;
+    }
+
+  g_rtc_alarm = 0;
+
+  memset(&rel, 0, sizeof(rel));
+  rel.id                 = 0;
+  rel.pid                = 0;          /* 0 = 通知调用者自己 */
+  rel.event.sigev_notify = SIGEV_SIGNAL;
+  rel.event.sigev_signo  = SIGUSR1;
+  rel.reltime            = alarm_sec;  /* 相对当前 RTC 时间的秒数 */
+
+  if (ioctl(fd, RTC_SET_RELATIVE, (unsigned long)&rel) < 0)
+    {
+      printf("      RTC_SET_RELATIVE(%d 秒) 失败: %d\n", alarm_sec, errno);
+      report("RTC alarm", 0, "RTC_SET_RELATIVE 失败");
+      close(fd);
+      return -1;
+    }
+
+  printf("      已设 %d 秒后的 alarm，最多等 %d 秒...\n",
+         alarm_sec, alarm_sec + RTC_WAIT_SLACK_SEC);
+
+  /* 计时必须用单调时钟。原来这里是"每轮 usleep(50ms) 就把 waited_ms 加 50"，
+   * 循环体本身的开销不计入，板子一忙（app 初始化/网络重连）就系统性偏小
+   * （实测：设 3 秒报 1600ms、设 5 秒报 3500ms），这种读数会让人误以为
+   * "alarm 提前触发了"。 */
+
+  t0 = clock_systime_ticks();
+  elapsed_ms = 0;
+
+  while (!g_rtc_alarm &&
+         elapsed_ms < (alarm_sec + RTC_WAIT_SLACK_SEC) * 1000)
+    {
+      usleep(50 * 1000);
+      elapsed_ms = (uint32_t)TICK2MSEC(clock_systime_ticks() - t0);
+    }
+
+  if (!g_rtc_alarm)
+    {
+      ioctl(fd, RTC_CANCEL_ALARM, 0);
+      printf("      超时：等了 %u ms 没收到 SIGUSR1\n",
+             (unsigned)elapsed_ms);
+      report("RTC alarm", 0, "超时未收到 alarm");
+      close(fd);
+      return -1;
+    }
+
+  printf("      收到 SIGUSR1：alarm 触发了（%u ms，设定 %d 秒）\n",
+         (unsigned)elapsed_ms, alarm_sec);
+
+  /* 注意：RTC_RD_ALARM 只能拿到**时间**字段。HAL_RTC_GetAlarm() 只读 ALRMTR、
+   * 不读 ALRMDR（bf0_hal_rtc.c 的 GetAlarm 实现），所以闹钟的日/月/年
+   * 永远是结构体里的 0，打出来是 "2000-00-00"。这里只打时间，别误导。 */
+
+  memset(&query, 0, sizeof(query));
+  query.id = 0;
+  if (ioctl(fd, RTC_RD_ALARM, (unsigned long)&query) == 0)
+    {
+      printf("      RTC_RD_ALARM: active=%d 时间 %02d:%02d:%02d"
+             "（日期字段 HAL 不填，见源码注释）\n",
+             (int)query.active,
+             query.time.tm_hour, query.time.tm_min, query.time.tm_sec);
+    }
+
+  report("RTC alarm", 1, "alarm 已触发");
+  close(fd);
+  return OK;
+}
+
+/****************************************************************************
+ * Name: audio_reader_task
+ *
+ * Description:
+ *   audio 子命令的读任务：read() 会阻塞到读满，或被 AUDIOIOC_STOP 唤醒。
+ *   按 AUDIO_CHUNK_BYTES（1 秒）分块读，避免踩驱动下层 5 秒的 read 超时。
+ *
+ ****************************************************************************/
+
+static int audio_reader_task(int argc, FAR char *argv)
+{
+  int offset = 0;
+
+  (void)argc;
+  (void)argv;
+
+  while (offset < g_arec_len)
+    {
+      int chunk = g_arec_len - offset;
+      ssize_t n;
+
+      if (chunk > AUDIO_CHUNK_BYTES)
+        {
+          chunk = AUDIO_CHUNK_BYTES;
+        }
+
+      n = read(g_arec_fd, (FAR char *)g_arec_buf + offset, chunk);
+      if (n <= 0)
+        {
+          break;                    /* 出错 / 被 STOP 打断（驱动按 0 返回） */
+        }
+
+      offset += (int)n;
+    }
+
+  g_arec_n    = offset;
+  g_arec_done = 1;
+  return 0;
+}
+
+/****************************************************************************
+ * Name: audio_level
+ *
+ * Description:
+ *   统计 peak / avg，判断有没有声音。返回 peak。
+ *
+ ****************************************************************************/
+
+static int audio_level(FAR const int16_t *buf, int nsamples)
+{
+  int peak = 0;
+  long sum = 0;
+  int i;
+
+  for (i = 0; i < nsamples; i++)
+    {
+      int v = buf[i];
+
+      if (v < 0)
+        {
+          v = -v;
+        }
+
+      if (v > peak)
+        {
+          peak = v;
+        }
+
+      sum += v;
+    }
+
+  printf("      peak=%d avg=%ld (16k mono 16bit)\n",
+         peak, nsamples > 0 ? sum / nsamples : 0);
+  printf("      声音检测 : %s\n",
+         peak > AUDIO_SOUND_PEAK ? "有声音" : "静音（麦克风没信号/没说话）");
+  return peak;
+}
+
+/****************************************************************************
+ * Name: step_audio
+ *
+ * Description:
+ *   audio 子命令：录 N 秒到内存，打印 peak/avg，不写文件。
+ *
+ *   走的完全是 app/audio_test 真机验证过的那套接口：
+ *     open(/dev/audio/audio0, O_RDONLY)
+ *     ioctl(AUDIOIOC_CONFIGURE, AUDIO_TYPE_INPUT 16k mono 16bit)
+ *     ioctl(AUDIOIOC_START) -> read() 阻塞读满 -> ioctl(AUDIOIOC_STOP)
+ *   阻塞的 read 放独立任务，主任务带超时；超时就 STOP（驱动已修：
+ *   STOP 能唤醒阻塞中的 read），保证不永久卡住。
+ *
+ ****************************************************************************/
+
+static int step_audio(int seconds)
+{
+  struct audio_caps_desc_s capdesc;
+  FAR int16_t *buf;
+  int nsamples;
+  clock_t t0;
+  uint32_t elapsed_ms;
+  int fd;
+
+  printf("[AUDIO] %s 录音 %d 秒\n", AUDIO_DEV, seconds);
+
+  if (seconds < 1)
+    {
+      seconds = AUDIO_DEFAULT_SEC;
+    }
+
+  nsamples = AUDIO_SAMPLE_RATE * seconds;
+  buf = (FAR int16_t *)malloc((size_t)nsamples * sizeof(int16_t));
+  if (buf == NULL)
+    {
+      printf("      malloc %d 字节失败\n", nsamples * 2);
+      report("录音", 0, "内存不足");
+      return -1;
+    }
+
+  fd = open(AUDIO_DEV, O_RDONLY);
+  if (fd < 0)
+    {
+      printf("      open 失败: %d（节点带 audio/ 子目录，别写成 /dev/audio0）\n",
+             errno);
+      report("打开音频设备", 0, "open /dev/audio/audio0 失败");
+      free(buf);
+      return -1;
+    }
+
+  memset(&capdesc, 0, sizeof(capdesc));
+  capdesc.caps.ac_len            = sizeof(struct audio_caps_s);
+  capdesc.caps.ac_type           = AUDIO_TYPE_INPUT;
+  capdesc.caps.ac_channels       = AUDIO_CHANNELS;
+  capdesc.caps.ac_controls.hw[0] = AUDIO_SAMPLE_RATE;
+  capdesc.caps.ac_controls.b[2]  = AUDIO_BITS;
+
+  if (ioctl(fd, AUDIOIOC_CONFIGURE, (unsigned long)&capdesc) < 0)
+    {
+      printf("      AUDIOIOC_CONFIGURE(input) 失败: %d\n", errno);
+      report("配置录音通路", 0, "CONFIGURE 失败");
+      close(fd);
+      free(buf);
+      return -1;
+    }
+
+  if (ioctl(fd, AUDIOIOC_START, 0) < 0)
+    {
+      printf("      AUDIOIOC_START 失败: %d\n", errno);
+      report("启动录音", 0, "START 失败");
+      close(fd);
+      free(buf);
+      return -1;
+    }
+
+  g_arec_fd   = fd;
+  g_arec_buf  = buf;
+  g_arec_len  = nsamples * 2;
+  g_arec_done = 0;
+  g_arec_n    = -999;
+
+  if (task_create("hwtest_rec", 100, AUDIO_READ_TASK_STACK,
+                  (main_t)audio_reader_task, NULL) < 0)
+    {
+      printf("      task_create 失败: %d\n", errno);
+      ioctl(fd, AUDIOIOC_STOP, 0);
+      report("录音", 0, "起读任务失败");
+      close(fd);
+      free(buf);
+      return -1;
+    }
+
+  /* 计时同样用单调时钟（理由见 step_rtc 里的注释） */
+
+  t0 = clock_systime_ticks();
+  elapsed_ms = 0;
+
+  while (!g_arec_done &&
+         elapsed_ms < (uint32_t)(seconds + AUDIO_WAIT_SLACK_SEC) * 1000)
+    {
+      usleep(100 * 1000);
+      elapsed_ms = (uint32_t)TICK2MSEC(clock_systime_ticks() - t0);
+    }
+
+  if (!g_arec_done)
+    {
+      /* 驱动已修：AUDIOIOC_STOP 能让阻塞在 read() 里的任务返回 */
+
+      ioctl(fd, AUDIOIOC_STOP, 0);
+      t0 = clock_systime_ticks();
+      while (!g_arec_done &&
+             (uint32_t)TICK2MSEC(clock_systime_ticks() - t0) < 1000)
+        {
+          usleep(100 * 1000);
+        }
+
+      printf("      read 没在 %d 秒内返回，已发 AUDIOIOC_STOP\n",
+             seconds + AUDIO_WAIT_SLACK_SEC);
+      report("录音", 0, g_arec_done ? "read 被 STOP 唤醒" : "read 卡住");
+
+      if (g_arec_done)
+        {
+          close(fd);
+          free(buf);
+        }
+      else
+        {
+          /* 读任务还卡在 read() 里：这里**故意不 close / 不 free**。
+           * 否则它以后被唤醒时会往已经释放的内存里写（use-after-free）。
+           * 一次失败的自检，漏一块缓冲 + 一个 fd 是可以接受的代价。 */
+          printf("      （读任务还活着，故意不关 fd / 不释放缓冲，避免它醒来写已释放内存）\n");
+        }
+
+      return -1;
+    }
+
+  printf("      read 返回 %zd 字节（期望 %d）\n", g_arec_n, nsamples * 2);
+  ioctl(fd, AUDIOIOC_STOP, 0);
+  close(fd);
+
+  if (g_arec_n <= 0)
+    {
+      report("录音", 0, "read 返回 <= 0");
+      free(buf);
+      return -1;
+    }
+
+  {
+    int peak = audio_level(buf, (int)(g_arec_n / 2));
+    char detail[64];
+
+    snprintf(detail, sizeof(detail), "%d 字节, peak=%d%s",
+             (int)g_arec_n, peak,
+             peak > AUDIO_SOUND_PEAK ? " 有声音" : " 静音");
+    report("录音", 1, detail);
+  }
+
+  free(buf);
+  return OK;
+}
+
+/****************************************************************************
  * Public Functions
  ****************************************************************************/
 
@@ -884,6 +1454,13 @@ int main(int argc, FAR char *argv[])
 {
   int do_color      = 0;
   int do_gpio       = 0;
+  int do_imu        = 0;
+  int do_rtc        = 0;
+  int do_audio      = 0;
+  int standalone;
+  int imu_frames    = IMU_DEFAULT_FRAMES;
+  int rtc_sec       = RTC_DEFAULT_ALARM_SEC;
+  int audio_sec     = AUDIO_DEFAULT_SEC;
   int touch_sec     = TOUCH_DEFAULT_SEC;
   int touch_set     = 0;
   int i;
@@ -906,6 +1483,21 @@ int main(int argc, FAR char *argv[])
           touch_sec = (i + 1 < argc) ? atoi(argv[++i]) : TOUCH_DEFAULT_SEC;
           touch_set = 1;
         }
+      else if (strcmp(argv[i], "imu") == 0)
+        {
+          do_imu     = 1;
+          imu_frames = (i + 1 < argc) ? atoi(argv[++i]) : IMU_DEFAULT_FRAMES;
+        }
+      else if (strcmp(argv[i], "rtc") == 0)
+        {
+          do_rtc  = 1;
+          rtc_sec = (i + 1 < argc) ? atoi(argv[++i]) : RTC_DEFAULT_ALARM_SEC;
+        }
+      else if (strcmp(argv[i], "audio") == 0)
+        {
+          do_audio  = 1;
+          audio_sec = (i + 1 < argc) ? atoi(argv[++i]) : AUDIO_DEFAULT_SEC;
+        }
       else
         {
           printf("hw_test: 未知参数 '%s'\n", argv[i]);
@@ -913,6 +1505,10 @@ int main(int argc, FAR char *argv[])
           return EXIT_FAILURE;
         }
     }
+
+  /* imu / rtc / audio 是各自独立的外设子命令：只跑自己，不跑那套 5 步自检 */
+
+  standalone = do_imu || do_rtc || do_audio;
 
   /* lcdcolor 只是刷个屏，别让它再干等 10 秒触摸 */
 
@@ -924,18 +1520,49 @@ int main(int argc, FAR char *argv[])
   printf("\n");
   printf("========================================\n");
   printf("   SF32LB52-DevKit-LCD 硬件自检 (hw_test)\n");
-  printf("   默认只做只读检查；lcdcolor/gpio 才会改硬件\n");
+  if (standalone)
+    {
+      printf("   子命令模式：只跑 imu/rtc/audio，不做 5 步自检\n");
+    }
+  else
+    {
+      printf("   默认只做只读检查；lcdcolor/gpio 才会改硬件\n");
+    }
+
   printf("========================================\n\n");
 
-  step_nodes();
-  printf("\n");
-  step_touch(touch_sec);
-  printf("\n");
-  step_lcd(do_color);
-  printf("\n");
-  step_buttons(BTN_TIMEOUT_MS);
-  printf("\n");
-  step_gpio(do_gpio);
+  if (standalone)
+    {
+      if (do_imu)
+        {
+          step_imu(imu_frames);
+          printf("\n");
+        }
+
+      if (do_rtc)
+        {
+          step_rtc(rtc_sec);
+          printf("\n");
+        }
+
+      if (do_audio)
+        {
+          step_audio(audio_sec);
+          printf("\n");
+        }
+    }
+  else
+    {
+      step_nodes();
+      printf("\n");
+      step_touch(touch_sec);
+      printf("\n");
+      step_lcd(do_color);
+      printf("\n");
+      step_buttons(BTN_TIMEOUT_MS);
+      printf("\n");
+      step_gpio(do_gpio);
+    }
 
   printf("\n========================================\n");
   printf("   结果: %d/%d PASS", g_pass, g_total);
