@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <time.h>
+#include <errno.h>
 
 /****************************************************************************
  * Pre-processor Definitions
@@ -72,16 +73,6 @@ static const char *g_default_greetings[] =
   "晚安！祝您今晚做个好梦。"
 };
 
-/* 默认健康提醒消息 */
-static const char *g_default_health_tips[] =
-{
-  "记得喝杯水，保持身体水分充足。",
-  "坐久了要站起来活动活动，对腰椎好。",
-  "今天记得量一下血压，记录下来。",
-  "眼睛看久了要休息一下，看看远处。",
-  "天气变化大，注意增减衣物。"
-};
-
 /****************************************************************************
  * Private Functions
  ****************************************************************************/
@@ -94,6 +85,11 @@ static uint32_t care_get_current_time_minutes(void)
 {
   time_t now = time(NULL);
   struct tm *tm = localtime(&now);
+  if (tm == NULL)
+    {
+      return 0;
+    }
+
   return tm->tm_hour * 60 + tm->tm_min;
 }
 
@@ -117,6 +113,7 @@ static int care_calc_next_trigger(care_task_t *task)
       return -EINVAL;
     }
 
+  uint32_t now = care_get_current_timestamp();
   uint32_t current_minutes = care_get_current_time_minutes();
   uint32_t trigger_minutes = task->hour * 60 + task->minute;
 
@@ -132,14 +129,14 @@ static int care_calc_next_trigger(care_task_t *task)
             {
               /* 今天还未到触发时间 */
 
-              task->next_trigger_time = care_get_current_timestamp() +
+              task->next_trigger_time = now +
                 (trigger_minutes - current_minutes) * 60;
             }
           else
             {
               /* 今天已过，设置为明天 */
 
-              task->next_trigger_time = care_get_current_timestamp() +
+              task->next_trigger_time = now +
                 (CARE_MINUTES_PER_DAY - current_minutes + trigger_minutes) * 60;
             }
         }
@@ -169,7 +166,12 @@ static int care_calc_next_trigger(care_task_t *task)
         {
           /* 首次触发 */
 
-          task->next_trigger_time = care_get_current_timestamp();
+          if (task->interval_minutes == 0)
+            {
+              return -EINVAL;
+            }
+
+          task->next_trigger_time = now + task->interval_minutes * 60;
         }
       else
         {
@@ -259,8 +261,6 @@ static void care_check_tasks(care_context_t *ctx)
     }
 
   uint32_t current_time = care_get_current_timestamp();
-  uint32_t current_minutes = care_get_current_time_minutes();
-
   for (int i = 0; i < ctx->task_count; i++)
     {
       care_task_t *task = &ctx->tasks[i];
@@ -276,34 +276,12 @@ static void care_check_tasks(care_context_t *ctx)
 
       bool should_execute = false;
 
-      if (task->trigger == CARE_TRIGGER_TIME)
+      if ((task->trigger == CARE_TRIGGER_TIME ||
+           task->trigger == CARE_TRIGGER_INTERVAL) &&
+          task->next_trigger_time != 0 &&
+          current_time >= task->next_trigger_time)
         {
-          /* 定时触发 - 检查是否到达触发时间 */
-
-          uint32_t trigger_minutes = task->hour * 60 + task->minute;
-
-          /* 允许1分钟的误差 */
-
-          if (current_minutes >= trigger_minutes &&
-              current_minutes <= trigger_minutes + 1)
-            {
-              /* 检查是否今天已经触发过 */
-
-              if (task->last_trigger_time == 0 ||
-                  (current_time - task->last_trigger_time) > 120)
-                {
-                  should_execute = true;
-                }
-            }
-        }
-      else if (task->trigger == CARE_TRIGGER_INTERVAL)
-        {
-          /* 间隔触发 - 检查是否到达间隔时间 */
-
-          if (current_time >= task->next_trigger_time)
-            {
-              should_execute = true;
-            }
+          should_execute = true;
         }
 
       /* 执行任务 */
@@ -325,8 +303,6 @@ static void *care_thread_func(void *arg)
 
   CARE_DEBUG("关怀线程启动");
 
-  ctx->care_stop = false;
-
   while (!ctx->care_stop)
     {
       /* 检查所有任务 */
@@ -335,7 +311,18 @@ static void *care_thread_func(void *arg)
 
       /* 休眠等待 */
 
-      usleep(ctx->check_interval_ms * 1000);
+      uint32_t waited_ms = 0;
+      while (!ctx->care_stop && waited_ms < ctx->check_interval_ms)
+        {
+          uint32_t slice_ms = ctx->check_interval_ms - waited_ms;
+          if (slice_ms > 100)
+            {
+              slice_ms = 100;
+            }
+
+          usleep(slice_ms * 1000);
+          waited_ms += slice_ms;
+        }
     }
 
   CARE_DEBUG("关怀线程退出");
@@ -464,6 +451,7 @@ int care_start(care_context_t *ctx)
 
   /* 启动关怀线程 */
 
+  ctx->care_stop = false;
   int ret = pthread_create(&ctx->care_thread, NULL,
                            care_thread_func, ctx);
   if (ret != 0)
@@ -473,6 +461,7 @@ int care_start(care_context_t *ctx)
     }
 
   ctx->running = true;
+  ctx->care_thread_valid = true;
 
   return OK;
 }
@@ -483,7 +472,7 @@ int care_start(care_context_t *ctx)
 
 void care_stop(care_context_t *ctx)
 {
-  if (ctx == NULL || !ctx->running)
+  if (ctx == NULL || !ctx->care_thread_valid)
     {
       return;
     }
@@ -498,6 +487,7 @@ void care_stop(care_context_t *ctx)
 
   pthread_join(ctx->care_thread, NULL);
 
+  ctx->care_thread_valid = false;
   ctx->running = false;
 }
 
@@ -516,6 +506,18 @@ int care_add_task(care_context_t *ctx, const care_task_t *task)
     {
       CARE_DEBUG("任务数量已达上限");
       return -ENOMEM;
+    }
+
+  if (task->type < CARE_TYPE_GREETING || task->type >= CARE_TYPE_MAX ||
+      task->state < CARE_TASK_DISABLED ||
+      task->state > CARE_TASK_PAUSED ||
+      task->trigger < CARE_TRIGGER_TIME ||
+      task->trigger > CARE_TRIGGER_SMART ||
+      task->hour > 23 || task->minute > 59 ||
+      (task->trigger == CARE_TRIGGER_INTERVAL &&
+       task->interval_minutes == 0))
+    {
+      return -EINVAL;
     }
 
   /* 复制任务 */
@@ -560,6 +562,7 @@ int care_remove_task(care_context_t *ctx, int task_id)
     }
 
   ctx->task_count--;
+  memset(&ctx->tasks[ctx->task_count], 0, sizeof(care_task_t));
 
   return OK;
 }
@@ -658,7 +661,7 @@ const care_task_t *care_get_task(care_context_t *ctx, int task_id)
 int care_get_task_list(care_context_t *ctx,
                        care_task_t *tasks, int max_count)
 {
-  if (ctx == NULL || tasks == NULL)
+  if (ctx == NULL || tasks == NULL || max_count <= 0)
     {
       return 0;
     }
@@ -695,7 +698,7 @@ void care_set_user_habit(care_context_t *ctx,
 
 int care_trigger(care_context_t *ctx, care_type_t type)
 {
-  if (ctx == NULL || type >= CARE_TYPE_MAX)
+  if (ctx == NULL || type < CARE_TYPE_GREETING || type >= CARE_TYPE_MAX)
     {
       return -EINVAL;
     }
@@ -775,7 +778,7 @@ void care_reset_stats(care_context_t *ctx)
 
 const char *care_get_type_name(care_type_t type)
 {
-  if (type < CARE_TYPE_MAX)
+  if (type >= CARE_TYPE_GREETING && type < CARE_TYPE_MAX)
     {
       return g_type_names[type];
     }
@@ -789,7 +792,7 @@ const char *care_get_type_name(care_type_t type)
 
 const char *care_get_task_state_name(care_task_state_t state)
 {
-  if (state <= CARE_TASK_PAUSED)
+  if (state >= CARE_TASK_DISABLED && state <= CARE_TASK_PAUSED)
     {
       return g_state_names[state];
     }

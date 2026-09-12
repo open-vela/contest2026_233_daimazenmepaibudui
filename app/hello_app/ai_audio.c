@@ -18,10 +18,6 @@
 #include <pthread.h>
 #include <math.h>
 
-/* NuttX音频驱动头文件 */
-
-#include <nuttx/audio/audio.h>
-
 /****************************************************************************
  * Pre-processor Definitions
  ****************************************************************************/
@@ -177,48 +173,45 @@ static void audio_close_play_device(audio_context_t *ctx)
 static void *audio_record_thread(void *arg)
 {
   audio_context_t *ctx = (audio_context_t *)arg;
-  size_t frame_bytes;
-  size_t buf_frames;
   size_t frames_per_read;
-  size_t frames_read;
   ssize_t nbytes;
 
   AUDIO_DEBUG("录音线程启动");
 
-  /* 每帧期望读取的帧数, 但不能超过缓冲区容量 */
-  frame_bytes = ctx->config.channels *
-                (ctx->config.format == AUDIO_FORMAT_S16_LE ? 2 : 1);
-  buf_frames = ctx->record_buf_size / frame_bytes;
+  /* 每次读取的帧数 */
 
   frames_per_read = ctx->config.sample_rate * ctx->config.frame_ms / 1000;
-  if (frames_per_read > buf_frames)
-    {
-      frames_per_read = buf_frames;
-    }
-
-  ctx->record_stop = false;
 
   while (!ctx->record_stop && ctx->recording)
     {
-      /* TODO: 真正从设备读取音频数据 */
-      /* nbytes = read(ctx->record_fd, ctx->record_buf,  */
-      /*               frames_per_read * frame_bytes); */
+      /* 从设备读取音频数据 */
 
-      /* 音频驱动尚未接入: 先填充静音(0), 避免把堆上未初始化的
-       * 残留数据当成语音, 导致VAD被垃圾能量反复误触发 */
-      nbytes = frames_per_read * frame_bytes;
-      memset(ctx->record_buf, 0, nbytes);
+      nbytes = frames_per_read * ctx->config.channels *
+               (ctx->config.format == AUDIO_FORMAT_S16_LE ? 2 : 1);
+
+      /* TODO: 实际读取音频数据 */
+      /* nbytes = read(ctx->record_fd, ctx->record_buf, nbytes); */
+
+      /* 无板级驱动时只生成静音测试帧，避免读取未初始化内存。 */
+
+      if ((size_t)nbytes > ctx->record_buf_size)
+        {
+          nbytes = ctx->record_buf_size;
+        }
+
+      memset(ctx->record_buf, 0, (size_t)nbytes);
 
       if (nbytes > 0)
         {
-          frames_read = nbytes / frame_bytes; /* 实际读到的帧数 */
+          size_t frames_read = nbytes / (2 * ctx->config.channels);
+          size_t samples_read = frames_read * ctx->config.channels;
 
           /* VAD检测 */
 
           if (ctx->vad_enabled)
             {
               uint32_t energy = audio_calc_frame_energy(
-                ctx->record_buf, frames_read);
+                ctx->record_buf, samples_read);
 
               if (energy > ctx->vad_energy_threshold)
                 {
@@ -227,9 +220,12 @@ static void *audio_record_thread(void *arg)
                   ctx->vad_silence_frames = 0;
                   ctx->vad_speech_frames++;
 
+                  uint32_t min_speech_frames =
+                    (ctx->record_cfg.min_speech_ms +
+                     ctx->config.frame_ms - 1) / ctx->config.frame_ms;
+
                   if (!ctx->vad_speech_active &&
-                      ctx->vad_speech_frames > AUDIO_VAD_MIN_SPEECH_MS /
-                      ctx->config.frame_ms)
+                      ctx->vad_speech_frames >= min_speech_frames)
                     {
                       AUDIO_DEBUG("VAD: 检测到语音开始 (能量=%lu)",
                                   (unsigned long)energy);
@@ -248,9 +244,12 @@ static void *audio_record_thread(void *arg)
                   ctx->vad_speech_frames = 0;
                   ctx->vad_silence_frames++;
 
+                  uint32_t silence_frames =
+                    (ctx->record_cfg.silence_timeout_ms +
+                     ctx->config.frame_ms - 1) / ctx->config.frame_ms;
+
                   if (ctx->vad_speech_active &&
-                      ctx->vad_silence_frames > AUDIO_VAD_SILENCE_TIMEOUT_MS /
-                      ctx->config.frame_ms)
+                      ctx->vad_silence_frames >= silence_frames)
                     {
                       AUDIO_DEBUG("VAD: 语音结束 (静音超时)");
                       ctx->vad_speech_active = false;
@@ -263,6 +262,8 @@ static void *audio_record_thread(void *arg)
                 }
             }
 
+          usleep(ctx->config.frame_ms * 1000);
+
           /* 调用数据回调 */
 
           if (ctx->record_cfg.data_callback)
@@ -271,9 +272,6 @@ static void *audio_record_thread(void *arg)
                                             frames_read,
                                             ctx->record_cfg.user_data);
             }
-
-          /* 按帧周期节流, 避免忙等空转占用CPU */
-          usleep(frames_read * 1000000ULL / ctx->config.sample_rate);
         }
       else
         {
@@ -283,6 +281,8 @@ static void *audio_record_thread(void *arg)
     }
 
   AUDIO_DEBUG("录音线程退出");
+  ctx->recording = false;
+  ctx->state = ctx->playing ? AUDIO_STATE_PLAYING : AUDIO_STATE_IDLE;
   return NULL;
 }
 
@@ -296,23 +296,30 @@ static void *audio_play_thread(void *arg)
 
   AUDIO_DEBUG("播放线程启动");
 
-  ctx->play_stop = false;
-
   /* TODO: 实现音频播放逻辑 */
   /* 1. 从播放缓冲区读取数据 */
   /* 2. 写入播放设备 */
   /* 3. 等待播放完成 */
 
-  while (!ctx->play_stop && ctx->playing)
+  uint64_t duration_ms =
+    ((uint64_t)ctx->play_frames * 1000 + ctx->config.sample_rate - 1) /
+    ctx->config.sample_rate;
+  uint64_t elapsed_ms = 0;
+
+  while (!ctx->play_stop && ctx->playing && elapsed_ms < duration_ms)
     {
       /* 模拟播放 */
 
       usleep(ctx->config.frame_ms * 1000);
+      elapsed_ms += ctx->config.frame_ms;
     }
+
+  ctx->playing = false;
+  ctx->state = ctx->recording ? AUDIO_STATE_RECORDING : AUDIO_STATE_IDLE;
 
   /* 播放完成回调 */
 
-  if (ctx->play_cb)
+  if (!ctx->play_stop && ctx->play_cb)
     {
       ctx->play_cb(ctx->play_user_data);
     }
@@ -351,10 +358,20 @@ int audio_init(audio_context_t *ctx, const audio_config_t *config)
   else
     {
       ctx->config.sample_rate = AUDIO_DEFAULT_SAMPLE_RATE;
-      ctx->config.channels = AUDIO_DEFAULT_channels;
+      ctx->config.channels = AUDIO_DEFAULT_CHANNELS;
       ctx->config.format = AUDIO_FORMAT_S16_LE;
       ctx->config.frame_ms = AUDIO_DEFAULT_FRAME_MS;
       ctx->config.volume = AUDIO_VOLUME_DEFAULT;
+    }
+
+  if (ctx->config.sample_rate <= 0 ||
+      (ctx->config.channels != AUDIO_CH_MONO &&
+       ctx->config.channels != AUDIO_CH_STEREO) ||
+      (ctx->config.format != AUDIO_FORMAT_S16_LE &&
+       ctx->config.format != AUDIO_FORMAT_S16_BE) ||
+      ctx->config.frame_ms == 0)
+    {
+      return -EINVAL;
     }
 
   /* 初始化设备文件描述符 */
@@ -368,19 +385,22 @@ int audio_init(audio_context_t *ctx, const audio_config_t *config)
 
   /* 分配缓冲区 */
 
-  size_t frame_bytes = ctx->config.channels *
-                       (ctx->config.format == AUDIO_FORMAT_S16_LE ? 2 : 1);
+  size_t frame_bytes = ctx->config.channels * sizeof(int16_t);
+  size_t frames_per_period =
+    (size_t)ctx->config.sample_rate * ctx->config.frame_ms / 1000;
 
-  ctx->record_buf_size = AUDIO_RECORD_BUF_FRAMES * frame_bytes;
-  ctx->record_buf = (int16_t *)malloc(ctx->record_buf_size);
+  ctx->record_buf_size = frames_per_period * frame_bytes;
+  ctx->record_buf = (int16_t *)calloc(1, ctx->record_buf_size);
   if (ctx->record_buf == NULL)
     {
       AUDIO_DEBUG("分配录音缓冲区失败");
       return -ENOMEM;
     }
 
-  ctx->play_buf_size = AUDIO_PLAY_BUF_FRAMES * frame_bytes;
-  ctx->play_buf = (int16_t *)malloc(ctx->play_buf_size);
+  ctx->play_buf_size =
+    (size_t)ctx->config.sample_rate * AUDIO_PLAY_BUFFER_MS / 1000 *
+    frame_bytes;
+  ctx->play_buf = (int16_t *)calloc(1, ctx->play_buf_size);
   if (ctx->play_buf == NULL)
     {
       AUDIO_DEBUG("分配播放缓冲区失败");
@@ -473,6 +493,16 @@ int audio_record_start(audio_context_t *ctx,
       memset(&ctx->record_cfg, 0, sizeof(audio_record_config_t));
     }
 
+  if (ctx->record_cfg.silence_timeout_ms == 0)
+    {
+      ctx->record_cfg.silence_timeout_ms = AUDIO_VAD_SILENCE_TIMEOUT_MS;
+    }
+
+  if (ctx->record_cfg.min_speech_ms == 0)
+    {
+      ctx->record_cfg.min_speech_ms = AUDIO_VAD_MIN_SPEECH_MS;
+    }
+
   /* 打开录音设备 */
 
   int ret = audio_open_record_device(ctx);
@@ -494,6 +524,13 @@ int audio_record_start(audio_context_t *ctx,
 
   /* 启动录音线程 */
 
+  if (ctx->record_thread_valid)
+    {
+      pthread_join(ctx->record_thread, NULL);
+      ctx->record_thread_valid = false;
+    }
+
+  ctx->record_stop = false;
   ctx->recording = true;
 
   ret = pthread_create(&ctx->record_thread, NULL,
@@ -505,6 +542,8 @@ int audio_record_start(audio_context_t *ctx,
       audio_close_record_device(ctx);
       return -ret;
     }
+
+  ctx->record_thread_valid = true;
 
   /* 更新状态 */
 
@@ -519,7 +558,7 @@ int audio_record_start(audio_context_t *ctx,
 
 void audio_record_stop(audio_context_t *ctx)
 {
-  if (ctx == NULL || !ctx->recording)
+  if (ctx == NULL || !ctx->record_thread_valid)
     {
       return;
     }
@@ -533,6 +572,7 @@ void audio_record_stop(audio_context_t *ctx)
   /* 等待线程退出 */
 
   pthread_join(ctx->record_thread, NULL);
+  ctx->record_thread_valid = false;
 
   /* 关闭设备 */
 
@@ -563,7 +603,7 @@ int audio_play_start(audio_context_t *ctx,
                      audio_play_complete_cb_t callback,
                      void *user_data)
 {
-  if (ctx == NULL || !ctx->initialized)
+  if (ctx == NULL || !ctx->initialized || data == NULL || frames == 0)
     {
       return -EINVAL;
     }
@@ -583,15 +623,21 @@ int audio_play_start(audio_context_t *ctx,
 
   /* 复制音频数据到缓冲区 */
 
-  size_t copy_frames = frames < AUDIO_PLAY_BUF_FRAMES ?
-                       frames : AUDIO_PLAY_BUF_FRAMES;
-  size_t copy_bytes = copy_frames * ctx->config.channels *
-                      (ctx->config.format == AUDIO_FORMAT_S16_LE ? 2 : 1);
+  size_t frame_bytes = ctx->config.channels * sizeof(int16_t);
+  size_t capacity_frames = ctx->play_buf_size / frame_bytes;
+  if (frames > capacity_frames)
+    {
+      return -ENOSPC;
+    }
+
+  size_t copy_bytes = frames * frame_bytes;
 
   if (data != NULL && ctx->play_buf != NULL)
     {
       memcpy(ctx->play_buf, data, copy_bytes);
     }
+
+  ctx->play_frames = frames;
 
   /* 打开播放设备 */
 
@@ -604,6 +650,13 @@ int audio_play_start(audio_context_t *ctx,
 
   /* 启动播放线程 */
 
+  if (ctx->play_thread_valid)
+    {
+      pthread_join(ctx->play_thread, NULL);
+      ctx->play_thread_valid = false;
+    }
+
+  ctx->play_stop = false;
   ctx->playing = true;
 
   ret = pthread_create(&ctx->play_thread, NULL,
@@ -615,6 +668,8 @@ int audio_play_start(audio_context_t *ctx,
       audio_close_play_device(ctx);
       return -ret;
     }
+
+  ctx->play_thread_valid = true;
 
   /* 更新状态 */
 
@@ -637,6 +692,9 @@ int audio_play_file(audio_context_t *ctx,
       return -EINVAL;
     }
 
+  (void)callback;
+  (void)user_data;
+
   AUDIO_DEBUG("播放文件: %s", filepath);
 
   /* TODO: 读取音频文件 */
@@ -645,9 +703,7 @@ int audio_play_file(audio_context_t *ctx,
   /* 3. 读取音频数据 */
   /* 4. 调用audio_play_start播放 */
 
-  /* 模拟播放 */
-
-  return audio_play_start(ctx, NULL, 0, callback, user_data);
+  return -ENOSYS;
 }
 
 /**
@@ -656,7 +712,7 @@ int audio_play_file(audio_context_t *ctx,
 
 void audio_play_stop(audio_context_t *ctx)
 {
-  if (ctx == NULL || !ctx->playing)
+  if (ctx == NULL || !ctx->play_thread_valid)
     {
       return;
     }
@@ -670,6 +726,7 @@ void audio_play_stop(audio_context_t *ctx)
   /* 等待线程退出 */
 
   pthread_join(ctx->play_thread, NULL);
+  ctx->play_thread_valid = false;
 
   /* 关闭设备 */
 
@@ -822,7 +879,7 @@ audio_state_t audio_get_state(audio_context_t *ctx)
 
 const char *audio_get_state_name(audio_state_t state)
 {
-  if (state <= AUDIO_STATE_BOTH)
+  if ((int)state >= 0 && state <= AUDIO_STATE_BOTH)
     {
       return g_state_names[state];
     }

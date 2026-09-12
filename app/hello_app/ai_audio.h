@@ -15,6 +15,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdio.h>
+#include <pthread.h>
 
 /****************************************************************************
  * Pre-processor Definitions
@@ -22,14 +24,15 @@
 
 /* 音频调试日志宏 */
 #ifdef CONFIG_DEBUG_AI_AUDIO
-#  define AUDIO_DEBUG(fmt, ...) printf("[AUDIO] " fmt "\n", ##__VA_ARGS__)
+#  define AUDIO_DEBUG(...) do { printf("[AUDIO] "); printf(__VA_ARGS__); \
+                                printf("\n"); } while (0)
 #else
-#  define AUDIO_DEBUG(fmt, ...)
+#  define AUDIO_DEBUG(...) do { } while (0)
 #endif
 
 /* 默认音频参数 */
 #define AUDIO_DEFAULT_SAMPLE_RATE    16000   /* 16kHz采样率 */
-#define AUDIO_DEFAULT_channels       1       /* 单声道 */
+#define AUDIO_DEFAULT_CHANNELS       1       /* 单声道 */
 #define AUDIO_DEFAULT_BITS_PER_SAMPLE 16     /* 16位采样 */
 #define AUDIO_DEFAULT_FRAME_MS       20      /* 20ms每帧 */
 
@@ -37,6 +40,7 @@
 /* 注意: 16000Hz * 20ms = 320 帧, 缓冲必须能容纳一个帧周期的数据 */
 #define AUDIO_RECORD_BUF_FRAMES      640     /* 录音缓冲帧数 (640=40ms@16kHz, 留余量) */
 #define AUDIO_PLAY_BUF_FRAMES        80      /* 播放缓冲帧数 (80*20ms=1.6秒) */
+#define AUDIO_PLAY_BUFFER_MS         5000    /* 最大缓存5秒 */
 
 /* VAD (Voice Activity Detection) 参数 */
 #define AUDIO_VAD_ENERGY_THRESHOLD   500     /* 能量阈值 */
@@ -131,6 +135,7 @@ typedef struct
   int16_t            *record_buf;     /* 录音缓冲区 */
   size_t              record_buf_size; /* 缓冲区大小(字节) */
   volatile bool       record_stop;    /* 停止录音标志 */
+  bool                record_thread_valid; /* 录音线程需要回收 */
 
   /* 播放相关 */
   bool                playing;        /* 是否正在播放 */
@@ -140,6 +145,8 @@ typedef struct
   int16_t            *play_buf;       /* 播放缓冲区 */
   size_t              play_buf_size;  /* 缓冲区大小(字节) */
   volatile bool       play_stop;      /* 停止播放标志 */
+  size_t              play_frames;    /* 当前播放帧数 */
+  bool                play_thread_valid; /* 播放线程需要回收 */
 
   /* VAD相关 */
   bool                vad_enabled;    /* VAD是否启用 */

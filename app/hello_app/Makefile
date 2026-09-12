@@ -7,10 +7,10 @@ include $(APPDIR)/Make.defs
 
 # 程序配置
 
-PROGNAME  = ai_companion
-PRIORITY  = SCHED_PRIORITY_DEFAULT
-STACKSIZE = 4096
-MODULE    = $(CONFIG_LVX_USE_DEMO_CONTEST2026_000_HELLO_APP)
+PROGNAME  = $(CONFIG_HELLO_APP_PROGNAME)
+PRIORITY  = $(CONFIG_HELLO_APP_PRIORITY)
+STACKSIZE = $(CONFIG_HELLO_APP_STACKSIZE)
+MODULE    = $(CONFIG_LVX_USE_CONTEST2026_233_HELLO_APP)
 
 # 源文件
 
@@ -20,11 +20,11 @@ CSRCS = ai_state_machine.c \
         ai_audio.c \
         ai_llm.c \
         ai_sound_detect.c \
-        ai_care.c
+        ai_care.c \
+        ai_network.c
 
-# 头文件路径
-
-CFLAGS += -I$(APPDIR)/demos/contest2026_233_hello_app
-CFLAGS += -I$(APPDIR)/app/contest2026_233_hello_app
+ifeq ($(CONFIG_HELLO_APP_LLM_AI_AGENT),y)
+CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/../packages/ai_agent/include
+endif
 
 include $(APPDIR)/Application.mk

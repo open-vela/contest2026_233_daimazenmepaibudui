@@ -15,7 +15,12 @@
 #include <unistd.h>
 #include <errno.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <time.h>
+
+#ifdef CONFIG_HELLO_APP_LLM_AI_AGENT
+#  include <velaclaw/client.h>
+#endif
 
 /* NuttX网络相关头文件 */
 
@@ -24,14 +29,6 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
-
-/* TLS相关头文件 (使用mbedtls) */
-
-#include <mbedtls/net_sockets.h>
-#include <mbedtls/ssl.h>
-#include <mbedtls/entropy.h>
-#include <mbedtls/ctr_drbg.h>
-#include <mbedtls/error.h>
 
 /****************************************************************************
  * Pre-processor Definitions
@@ -48,7 +45,7 @@
   "{" \
   "\"model\":\"%s\"," \
   "\"messages\":[%s]," \
-  "\"max_tokens\":%d," \
+  "\"max_tokens\":%lu," \
   "\"temperature\":%.2f," \
   "\"stream\":%s" \
   "}"
@@ -64,11 +61,13 @@
  ****************************************************************************/
 
 static void *llm_request_thread(void *arg);
+#ifndef CONFIG_HELLO_APP_LLM_AI_AGENT
 static int llm_do_http_request(llm_context_t *ctx,
                                const char *url,
                                const char *api_key,
                                const char *body,
                                llm_response_t *response);
+#endif
 static int llm_send_to_api(llm_context_t *ctx,
                            const char *text,
                            llm_stream_cb_t stream_cb,
@@ -80,8 +79,14 @@ static void llm_add_to_history(llm_context_t *ctx,
 static int llm_build_messages_json(llm_context_t *ctx,
                                    const char *user_message,
                                    char *buf, size_t buf_size);
-static void llm_escape_json_string(const char *input, char *output, size_t max_len);
+static int llm_escape_json_string(const char *input, char *output,
+                                  size_t max_len);
 static uint32_t llm_get_timestamp(void);
+
+#ifdef CONFIG_HELLO_APP_LLM_AI_AGENT
+static int llm_do_ai_agent_request(llm_context_t *ctx, const char *text,
+                                   char *response, size_t response_size);
+#endif
 
 /****************************************************************************
  * Private Data
@@ -125,19 +130,28 @@ static uint32_t llm_get_timestamp(void)
  * @brief  JSON字符串转义
  */
 
-static void llm_escape_json_string(const char *input, char *output,
-                                   size_t max_len)
+static int llm_escape_json_string(const char *input, char *output,
+                                  size_t max_len)
 {
   if (input == NULL || output == NULL || max_len == 0)
     {
-      return;
+      return -EINVAL;
     }
 
   size_t i = 0;
   size_t j = 0;
 
-  while (input[i] != '\0' && j < max_len - 1)
+  while (input[i] != '\0')
     {
+      size_t needed = input[i] == '"' || input[i] == '\\' ||
+                      input[i] == '\n' || input[i] == '\r' ||
+                      input[i] == '\t' ? 2 : 1;
+      if (j + needed >= max_len)
+        {
+          output[j] = '\0';
+          return -ENOSPC;
+        }
+
       switch (input[i])
         {
           case '"':
@@ -183,6 +197,31 @@ static void llm_escape_json_string(const char *input, char *output,
     }
 
   output[j] = '\0';
+  return OK;
+}
+
+static int llm_append(char *buf, size_t buf_size, size_t *offset,
+                      const char *format, ...)
+{
+  va_list args;
+  int written;
+
+  if (*offset >= buf_size)
+    {
+      return -ENOSPC;
+    }
+
+  va_start(args, format);
+  written = vsnprintf(buf + *offset, buf_size - *offset, format, args);
+  va_end(args);
+  if (written < 0 || (size_t)written >= buf_size - *offset)
+    {
+      buf[buf_size - 1] = '\0';
+      return -ENOSPC;
+    }
+
+  *offset += (size_t)written;
+  return OK;
 }
 
 /**
@@ -200,50 +239,69 @@ static int llm_build_messages_json(llm_context_t *ctx,
 
   size_t offset = 0;
   char escaped_content[LLM_MAX_INPUT_LENGTH * 2];
+  int ret;
+
+  buf[0] = '\0';
 
   /* 添加系统提示词 */
 
   if (ctx->config.system_prompt[0] != '\0')
     {
-      llm_escape_json_string(ctx->config.system_prompt,
-                             escaped_content, sizeof(escaped_content));
-      offset += snprintf(buf + offset, buf_size - offset,
-                         JSON_TEMPLATE_MESSAGE,
-                         g_role_names[LLM_ROLE_SYSTEM],
-                         escaped_content);
+      ret = llm_escape_json_string(ctx->config.system_prompt,
+                                   escaped_content,
+                                   sizeof(escaped_content));
+      if (ret < 0)
+        {
+          return ret;
+        }
+
+      ret = llm_append(buf, buf_size, &offset, JSON_TEMPLATE_MESSAGE,
+                       g_role_names[LLM_ROLE_SYSTEM], escaped_content);
+      if (ret < 0)
+        {
+          return ret;
+        }
 
       if (ctx->history.count > 0 || user_message != NULL)
         {
-          offset += snprintf(buf + offset, buf_size - offset, ",");
+          if (llm_append(buf, buf_size, &offset, ",") < 0)
+            {
+              return -ENOSPC;
+            }
         }
     }
 
   /* 添加历史消息 */
 
-  int start_idx = 0;
-  if (ctx->history.count >= LLM_MAX_HISTORY_SIZE)
-    {
-      start_idx = ctx->history.tail;
-    }
+  int start_idx = ctx->history.head;
 
-  for (int i = 0; i < ctx->history.count && offset < buf_size - 100; i++)
+  for (int i = 0; i < ctx->history.count; i++)
     {
       int idx = (start_idx + i) % LLM_MAX_HISTORY_SIZE;
       llm_message_t *msg = &ctx->history.messages[idx];
 
-      llm_escape_json_string(msg->content,
-                             escaped_content, sizeof(escaped_content));
+      ret = llm_escape_json_string(msg->content, escaped_content,
+                                   sizeof(escaped_content));
+      if (ret < 0)
+        {
+          return ret;
+        }
 
-      offset += snprintf(buf + offset, buf_size - offset,
-                         JSON_TEMPLATE_MESSAGE,
-                         g_role_names[msg->role],
-                         escaped_content);
+      ret = llm_append(buf, buf_size, &offset, JSON_TEMPLATE_MESSAGE,
+                       g_role_names[msg->role], escaped_content);
+      if (ret < 0)
+        {
+          return ret;
+        }
 
       /* 添加逗号分隔 */
 
       if (i < ctx->history.count - 1 || user_message != NULL)
         {
-          offset += snprintf(buf + offset, buf_size - offset, ",");
+          if (llm_append(buf, buf_size, &offset, ",") < 0)
+            {
+              return -ENOSPC;
+            }
         }
     }
 
@@ -251,12 +309,19 @@ static int llm_build_messages_json(llm_context_t *ctx,
 
   if (user_message != NULL)
     {
-      llm_escape_json_string(user_message,
-                             escaped_content, sizeof(escaped_content));
-      offset += snprintf(buf + offset, buf_size - offset,
-                         JSON_TEMPLATE_MESSAGE,
-                         g_role_names[LLM_ROLE_USER],
-                         escaped_content);
+      ret = llm_escape_json_string(user_message, escaped_content,
+                                   sizeof(escaped_content));
+      if (ret < 0)
+        {
+          return ret;
+        }
+
+      ret = llm_append(buf, buf_size, &offset, JSON_TEMPLATE_MESSAGE,
+                       g_role_names[LLM_ROLE_USER], escaped_content);
+      if (ret < 0)
+        {
+          return ret;
+        }
     }
 
   return OK;
@@ -279,7 +344,7 @@ static void llm_add_to_history(llm_context_t *ctx,
 
   if (ctx->history.count >= LLM_MAX_HISTORY_SIZE)
     {
-      ctx->history.tail = (ctx->history.tail + 1) % LLM_MAX_HISTORY_SIZE;
+      ctx->history.head = (ctx->history.head + 1) % LLM_MAX_HISTORY_SIZE;
     }
   else
     {
@@ -303,11 +368,103 @@ static void llm_add_to_history(llm_context_t *ctx,
             g_role_names[role], strlen(content));
 }
 
+#ifdef CONFIG_HELLO_APP_LLM_AI_AGENT
+static void llm_ai_agent_callback(int status, const char *text, void *cookie)
+{
+  llm_context_t *ctx = (llm_context_t *)cookie;
+
+  if (ctx == NULL || !ctx->backend_sem_valid)
+    {
+      return;
+    }
+
+  ctx->backend_reply_status = status;
+  if (text != NULL)
+    {
+      strncpy(ctx->backend_reply, text, sizeof(ctx->backend_reply) - 1);
+      ctx->backend_reply[sizeof(ctx->backend_reply) - 1] = '\0';
+    }
+  else
+    {
+      ctx->backend_reply[0] = '\0';
+    }
+
+  sem_post(&ctx->backend_sem);
+}
+
+static int llm_do_ai_agent_request(llm_context_t *ctx, const char *text,
+                                   char *response, size_t response_size)
+{
+  velaclaw_ask_req_t req;
+  struct timespec deadline;
+  int ret;
+
+  if (ctx->backend_client == NULL)
+    {
+      ctx->backend_client = velaclaw_client_open("elder_companion");
+      if (ctx->backend_client == NULL)
+        {
+          fprintf(stderr, "[LLM] ai_agent未运行，请先执行 ai_agent &\n");
+          return -ENOTCONN;
+        }
+    }
+
+  while (sem_trywait(&ctx->backend_sem) == 0)
+    {
+    }
+
+  ctx->backend_reply[0] = '\0';
+  ctx->backend_reply_status = -EIO;
+  req.text = text;
+  req.timeout_ms = LLM_HTTP_TIMEOUT_MS;
+
+  ret = velaclaw_ask((velaclaw_client_t *)ctx->backend_client, &req,
+                     llm_ai_agent_callback, ctx);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  clock_gettime(CLOCK_REALTIME, &deadline);
+  deadline.tv_sec += LLM_HTTP_TIMEOUT_MS / 1000;
+  deadline.tv_nsec += (LLM_HTTP_TIMEOUT_MS % 1000) * 1000000L;
+  if (deadline.tv_nsec >= 1000000000L)
+    {
+      deadline.tv_sec++;
+      deadline.tv_nsec -= 1000000000L;
+    }
+
+  do
+    {
+      ret = sem_timedwait(&ctx->backend_sem, &deadline);
+    }
+  while (ret < 0 && errno == EINTR && !ctx->request_cancel);
+
+  if (ret < 0)
+    {
+      return errno == ETIMEDOUT ? -ETIMEDOUT : -errno;
+    }
+  if (ctx->backend_reply_status < 0)
+    {
+      return ctx->backend_reply_status;
+    }
+  if (ctx->backend_reply[0] == '\0')
+    {
+      return -ENODATA;
+    }
+
+  strncpy(response, ctx->backend_reply, response_size - 1);
+  response[response_size - 1] = '\0';
+  return OK;
+}
+#endif
+
 /**
  * @brief  执行HTTP请求
  * @note   实际实现需要使用NuttX的网络接口
  */
 
+#ifndef CONFIG_HELLO_APP_LLM_AI_AGENT
 static int llm_do_http_request(llm_context_t *ctx,
                                const char *url,
                                const char *api_key,
@@ -318,6 +475,8 @@ static int llm_do_http_request(llm_context_t *ctx,
     {
       return -EINVAL;
     }
+
+  (void)api_key;
 
   LLM_DEBUG("发送HTTP请求到: %s", url);
   LLM_DEBUG("请求体长度: %zu", strlen(body));
@@ -472,6 +631,7 @@ static int llm_parse_api_response(llm_context_t *ctx,
 
   return OK;
 }
+#endif
 
 /**
  * @brief  发送到API
@@ -489,10 +649,13 @@ static int llm_send_to_api(llm_context_t *ctx,
     }
 
   int ret;
-  char request_json[4096];
   char response_content[LLM_MAX_OUTPUT_LENGTH];
 
-  /* 构建请求JSON */
+#ifdef CONFIG_HELLO_APP_LLM_AI_AGENT
+  ret = llm_do_ai_agent_request(ctx, text, response_content,
+                                sizeof(response_content));
+#else
+  char request_json[4096];
 
   ret = llm_build_request_json(ctx, text, request_json, sizeof(request_json));
   if (ret < 0)
@@ -563,11 +726,35 @@ static int llm_send_to_api(llm_context_t *ctx,
 
       return ret;
     }
+#endif
+
+  if (ret < 0)
+    {
+      if (complete_cb != NULL)
+        {
+          complete_cb(NULL, ret, user_data);
+        }
+
+      return ret;
+    }
+
+  if (ctx->request_cancel)
+    {
+      return -ECANCELED;
+    }
 
   /* 添加到历史 */
 
-  llm_add_to_history(ctx, LLM_ROLE_USER, text);
-  llm_add_to_history(ctx, LLM_ROLE_ASSISTANT, response_content);
+  if (ctx->config.enable_history)
+    {
+      llm_add_to_history(ctx, LLM_ROLE_USER, text);
+      llm_add_to_history(ctx, LLM_ROLE_ASSISTANT, response_content);
+    }
+
+  if (stream_cb != NULL)
+    {
+      stream_cb(response_content, user_data);
+    }
 
   /* 调用完成回调 */
 
@@ -590,8 +777,6 @@ static void *llm_request_thread(void *arg)
   llm_context_t *ctx = (llm_context_t *)arg;
 
   LLM_DEBUG("请求线程启动");
-
-  ctx->state = LLM_STATE_REQUESTING;
 
   /* 发送到API */
 
@@ -666,6 +851,11 @@ int llm_init(llm_context_t *ctx, const llm_config_t *config)
               sizeof(ctx->config.system_prompt) - 1);
     }
 
+  ctx->config.api_url[sizeof(ctx->config.api_url) - 1] = '\0';
+  ctx->config.api_key[sizeof(ctx->config.api_key) - 1] = '\0';
+  ctx->config.model[sizeof(ctx->config.model) - 1] = '\0';
+  ctx->config.system_prompt[sizeof(ctx->config.system_prompt) - 1] = '\0';
+
   /* 分配缓冲区 */
 
   ctx->request_buf_size = 4096;
@@ -684,6 +874,18 @@ int llm_init(llm_context_t *ctx, const llm_config_t *config)
       free(ctx->request_buf);
       return -ENOMEM;
     }
+
+#ifdef CONFIG_HELLO_APP_LLM_AI_AGENT
+  if (sem_init(&ctx->backend_sem, 0, 0) < 0)
+    {
+      int error = errno;
+      free(ctx->response_buf);
+      free(ctx->request_buf);
+      return -error;
+    }
+
+  ctx->backend_sem_valid = true;
+#endif
 
   /* 初始化历史 */
 
@@ -718,6 +920,20 @@ void llm_deinit(llm_context_t *ctx)
   /* 取消当前请求 */
 
   llm_cancel_request(ctx);
+
+#ifdef CONFIG_HELLO_APP_LLM_AI_AGENT
+  if (ctx->backend_client != NULL)
+    {
+      velaclaw_client_close((velaclaw_client_t *)ctx->backend_client);
+      ctx->backend_client = NULL;
+    }
+
+  if (ctx->backend_sem_valid)
+    {
+      sem_destroy(&ctx->backend_sem);
+      ctx->backend_sem_valid = false;
+    }
+#endif
 
   /* 释放缓冲区 */
 
@@ -761,22 +977,31 @@ int llm_send_text(llm_context_t *ctx,
       return -EBUSY;
     }
 
-  if (strlen(text) == 0)
+  size_t text_len = strlen(text);
+  if (text_len == 0 || text_len >= ctx->request_buf_size)
     {
       LLM_DEBUG("输入文本为空");
       return -EINVAL;
     }
 
-  LLM_DEBUG("发送文本请求: len=%zu", strlen(text));
+  LLM_DEBUG("发送文本请求: len=%zu", text_len);
+
+  if (ctx->request_thread_valid)
+    {
+      pthread_join(ctx->request_thread, NULL);
+      ctx->request_thread_valid = false;
+    }
 
   /* 保存请求参数 */
 
   ctx->current_request.type = LLM_REQUEST_TEXT;
-  ctx->current_request.text = text;
+  memcpy(ctx->request_buf, text, text_len + 1);
+  ctx->current_request.text = ctx->request_buf;
   ctx->current_request.stream_cb = stream_cb;
   ctx->current_request.complete_cb = complete_cb;
   ctx->current_request.user_data = user_data;
   ctx->request_cancel = false;
+  ctx->state = LLM_STATE_REQUESTING;
 
   /* 启动请求线程 */
 
@@ -788,6 +1013,8 @@ int llm_send_text(llm_context_t *ctx,
       ctx->state = LLM_STATE_ERROR;
       return -ret;
     }
+
+  ctx->request_thread_valid = true;
 
   return OK;
 }
@@ -836,8 +1063,7 @@ void llm_cancel_request(llm_context_t *ctx)
       return;
     }
 
-  if (ctx->state == LLM_STATE_REQUESTING ||
-      ctx->state == LLM_STATE_STREAMING)
+  if (ctx->request_thread_valid)
     {
       LLM_DEBUG("取消当前请求");
 
@@ -846,6 +1072,7 @@ void llm_cancel_request(llm_context_t *ctx)
       /* 等待请求线程退出 */
 
       pthread_join(ctx->request_thread, NULL);
+      ctx->request_thread_valid = false;
 
       ctx->state = LLM_STATE_IDLE;
     }
@@ -919,7 +1146,7 @@ const char *llm_get_last_response(llm_context_t *ctx)
   int idx = (ctx->history.tail - 1 + LLM_MAX_HISTORY_SIZE) %
             LLM_MAX_HISTORY_SIZE;
 
-  while (idx != ctx->history.tail)
+  for (int i = 0; i < ctx->history.count; i++)
     {
       if (ctx->history.messages[idx].role == LLM_ROLE_ASSISTANT)
         {
@@ -951,7 +1178,7 @@ llm_state_t llm_get_state(llm_context_t *ctx)
 
 const char *llm_get_state_name(llm_state_t state)
 {
-  if (state <= LLM_STATE_ERROR)
+  if (state >= LLM_STATE_UNINIT && state <= LLM_STATE_ERROR)
     {
       return g_state_names[state];
     }
@@ -977,18 +1204,21 @@ int llm_set_api_config(llm_context_t *ctx,
     {
       strncpy(ctx->config.api_url, api_url,
               sizeof(ctx->config.api_url) - 1);
+      ctx->config.api_url[sizeof(ctx->config.api_url) - 1] = '\0';
     }
 
   if (api_key != NULL)
     {
       strncpy(ctx->config.api_key, api_key,
               sizeof(ctx->config.api_key) - 1);
+      ctx->config.api_key[sizeof(ctx->config.api_key) - 1] = '\0';
     }
 
   if (model != NULL)
     {
       strncpy(ctx->config.model, model,
               sizeof(ctx->config.model) - 1);
+      ctx->config.model[sizeof(ctx->config.model) - 1] = '\0';
     }
 
   LLM_DEBUG("更新API配置");
@@ -1039,12 +1269,16 @@ int llm_build_request_json(llm_context_t *ctx,
 
   /* 构建完整请求JSON */
 
-  snprintf(buf, buf_size, JSON_TEMPLATE_REQUEST,
-           ctx->config.model,
-           messages_json,
-           ctx->config.max_tokens,
-           ctx->config.temperature,
-           ctx->config.enable_stream ? "true" : "false");
+  ret = snprintf(buf, buf_size, JSON_TEMPLATE_REQUEST,
+                 ctx->config.model,
+                 messages_json,
+                 (unsigned long)ctx->config.max_tokens,
+                 ctx->config.temperature,
+                 ctx->config.enable_stream ? "true" : "false");
+  if (ret < 0 || (size_t)ret >= buf_size)
+    {
+      return -ENOSPC;
+    }
 
   return OK;
 }
@@ -1062,5 +1296,5 @@ int llm_parse_response(const char *json, llm_response_t *response)
 
   /* TODO: 使用JSON解析库实现 */
 
-  return OK;
+  return -ENOSYS;
 }

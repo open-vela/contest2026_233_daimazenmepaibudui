@@ -1,59 +1,77 @@
-#
-# For a description of the syntax of this configuration file,
-# see the file kconfig-language.txt in the NuttX tools repository.
-#
 
-config LVX_USE_DEMO_CONTEST2026_000_HELLO_APP
+config LVX_USE_CONTEST2026_233_HELLO_APP
 	bool "AI Companion - 智爱陪伴AI老人陪伴守护终端"
 	default n
-	---help---
+	help
 		Enable the AI companion app for elderly care.
 
-config DEBUG_AI_COMPANION
-	bool "Enable AI Companion debug output"
-	default n
-	depends on LVX_USE_DEMO_CONTEST2026_000_HELLO_APP
-	---help---
-		Enable debug log output for AI companion state machine.
+if LVX_USE_CONTEST2026_233_HELLO_APP
 
-config DEBUG_AI_AUDIO
-	bool "Enable AI Audio debug output"
-	default n
-	depends on LVX_USE_DEMO_CONTEST2026_000_HELLO_APP
-	---help---
-		Enable debug log output for AI audio module.
+config HELLO_APP_PROGNAME
+	string "Program name"
+	default "ai_companion"
 
-config DEBUG_AI_LLM
-	bool "Enable AI LLM debug output"
-	default n
-	depends on LVX_USE_DEMO_CONTEST2026_000_HELLO_APP
-	---help---
-		Enable debug log output for AI LLM module.
+config HELLO_APP_PRIORITY
+	int "Task priority"
+	default 100
+
+config HELLO_APP_STACKSIZE
+	int "Stack size"
+	default 16384
+
+choice
+	prompt "Conversation backend"
+	default HELLO_APP_LLM_AI_AGENT if EXAMPLES_AI_AGENT_VELA
+	default HELLO_APP_LLM_MOCK
+
+config HELLO_APP_LLM_AI_AGENT
+	bool "openvela ai_agent (recommended for contest)"
+	depends on EXAMPLES_AI_AGENT_VELA
+	help
+		Send requests to the on-device ai_agent local client. Configure MiMo
+		at runtime with router_set; do not compile an API key into this app.
+
+config HELLO_APP_LLM_MOCK
+	bool "Offline mock (development only)"
+	help
+		Fixed local response for host tests. Not valid for the contest demo.
+
+endchoice
 
 config AI_LLM_API_KEY
-	string "LLM API Key"
+	string "Legacy test API key"
 	default ""
-	depends on LVX_USE_DEMO_CONTEST2026_000_HELLO_APP
-	---help---
-		API key for LLM service.
+	depends on HELLO_APP_LLM_MOCK
 
 config AI_LLM_MODEL
-	string "LLM Model Name"
-	default "gpt-3.5-turbo"
-	depends on LVX_USE_DEMO_CONTEST2026_000_HELLO_APP
-	---help---
-		LLM model name to use.
+	string "LLM model name"
+	default "mimo-v2.5"
+
+config HELLO_APP_EDGE_IMPULSE
+	bool "Enable Edge Impulse abnormal-sound model"
+	default n
+	help
+		Use a 16 kHz mono model exported into model/edge_impulse.
+
+config DEBUG_AI_COMPANION
+	bool "Enable state machine debug output"
+	default n
+
+config DEBUG_AI_AUDIO
+	bool "Enable audio debug output"
+	default n
+
+config DEBUG_AI_LLM
+	bool "Enable LLM debug output"
+	default n
 
 config DEBUG_AI_SOUND_DETECT
-	bool "Enable AI Sound Detection debug output"
+	bool "Enable sound detection debug output"
 	default n
-	depends on LVX_USE_DEMO_CONTEST2026_000_HELLO_APP
-	---help---
-		Enable debug log output for AI sound detection module.
 
 config DEBUG_AI_CARE
-	bool "Enable AI Care debug output"
+	bool "Enable care debug output"
 	default n
-	depends on LVX_USE_DEMO_CONTEST2026_000_HELLO_APP
-	---help---
-		Enable debug log output for AI care module.
+
+endif # LVX_USE_CONTEST2026_233_HELLO_APP
+

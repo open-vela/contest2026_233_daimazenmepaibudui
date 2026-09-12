@@ -15,6 +15,9 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdio.h>
+#include <pthread.h>
+#include <semaphore.h>
 
 /****************************************************************************
  * Pre-processor Definitions
@@ -22,14 +25,15 @@
 
 /* AI对话调试日志宏 */
 #ifdef CONFIG_DEBUG_AI_LLM
-#  define LLM_DEBUG(fmt, ...) printf("[LLM] " fmt "\n", ##__VA_ARGS__)
+#  define LLM_DEBUG(...) do { printf("[LLM] "); printf(__VA_ARGS__); \
+                              printf("\n"); } while (0)
 #else
-#  define LLM_DEBUG(fmt, ...)
+#  define LLM_DEBUG(...) do { } while (0)
 #endif
 
 /* API配置默认值 */
-#define LLM_DEFAULT_API_URL       "https://api.openai.com/v1/chat/completions"
-#define LLM_DEFAULT_MODEL         "gpt-3.5-turbo"
+#define LLM_DEFAULT_API_URL       "ai-agent://router"
+#define LLM_DEFAULT_MODEL         "mimo-v2.5"
 #define LLM_DEFAULT_MAX_TOKENS    500
 #define LLM_DEFAULT_TEMPERATURE   0.7f
 
@@ -162,6 +166,14 @@ typedef struct
   /* 线程相关 */
   pthread_t        request_thread; /* 请求线程 */
   volatile bool    request_cancel; /* 取消请求标志 */
+  bool             request_thread_valid; /* 请求线程需要回收 */
+
+  /* openvela ai_agent本地客户端 */
+  void            *backend_client;
+  sem_t            backend_sem;
+  bool             backend_sem_valid;
+  int              backend_reply_status;
+  char             backend_reply[LLM_MAX_OUTPUT_LENGTH];
 
   /* 用户数据 */
   void            *user_data;      /* 用户自定义数据 */
