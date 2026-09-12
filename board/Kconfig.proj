@@ -1,5 +1,5 @@
 #APP specific configuration.
 config CUSTOM_MEM_MAP
-    bool 
+    bool
 	select custom_mem_map
-	default y    
+	default y
