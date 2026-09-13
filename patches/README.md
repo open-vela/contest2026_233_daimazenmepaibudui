@@ -133,10 +133,14 @@ SF32LB52-DevKit-LCD 音频驱动,注册 `/dev/audio0`(NuttX audio_lowerhalf),支
 - 逐档下发：`hw_test lcd 0` / `hw_test lcd 30` / `hw_test lcd 60` /
   `hw_test lcd 100`，四档都应当 PASS，并且**屏幕亮度肉眼可见地变化**
   （0 = 关屏，100 = 全亮），`回读亮度` 等于设定值。
-- 板级封装 `board/contest_board/src/sf32lb_backlight.c` 和 UI 亮度滑块
+- 板级封装 `board/contest_board/src/sf32lb52_backlight.c` 和 UI 亮度滑块
   （`app/robot_ui/touch_ui.c` 的 `setting_slider_event_handler`）已经接到这条
   通路上；用法与兼容性（没打补丁的树仍然只有 0/100）见
   `docs/display_touch_gpio_usage.md` 第 3.3 节。
+- **只打这个补丁还不够**：板级封装原来那份实现（文件里写着"1..99 直接
+  `return -ENOSYS`，不往下发 ioctl"）会自己把中间值挡掉，`hw_test lcd 30`
+  报的 `-38` 是它编的，跟驱动无关。改完封装（走 `LCDDEVIO_SETCONTRAST`）
+  之后四档才真的 PASS。
 
 ## 应用方式
 
