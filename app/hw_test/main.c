@@ -80,6 +80,25 @@
 #include "sf32lb52_boardbtn.h"         /* 板级按键：GPIO 轮询 + 回调（不用 /dev/buttons） */
 #include "sf32lb52_status.h"           /* 板级统一外设状态 board_status_get/dump */
 
+/* tts 子命令要**播**声音：板级只封了录音（sf32lb52_audio_in），所以这里直接开
+ * /dev/audio/audio0，ioctl 顺序照 app/audio_test 和 ai_audio.c 真机验证过的那套
+ * （open -> CONFIGURE(OUTPUT) -> CONFIGURE(FEATURE/VOLUME) -> START ->
+ *  write -> STOP -> close）。 */
+#include <nuttx/audio/audio.h>
+
+/* tts / asr 子命令还要用 hello_app 的 MiMo 后端（mimo_voice.h）和 ai_agent 的
+ * voice_asr / voice_tts 分发层 —— 三处都得编进同一个固件才有符号。
+ * 这两个总开关与 app/hello_app、app/hw_test 的 CMakeLists 用的是同一对，
+ * 所以没开的配置里这两个子命令只打印"本配置不支持"，其余子命令不受影响。 */
+
+#if defined(CONFIG_HELLO_APP_LLM_AI_AGENT) \
+    && defined(CONFIG_LVX_USE_CONTEST2026_233_HELLO_APP)
+#  define HW_TEST_HAS_VOICE 1
+#  include "voice/voice_asr.h"
+#  include "voice/voice_tts.h"
+#  include "mimo_voice.h"
+#endif
+
 /* IMU：本板的 LSM6DS3 走的是 NuttX **老式字符驱动**（不是 uORB），
  * 节点是 /dev/lsm6dsl0，接口是 read() + ioctl(SNIOC_*)。
  * 头文件本身被 CONFIG_SENSORS_LSM6DSL 包着，所以这里也要判一下，
@@ -144,6 +163,17 @@
  * 32000 字节 = 16k 单声道 16bit × 1 秒，正是 audio_test 验证过的大小。
  */
 #define AUDIO_CHUNK_BYTES     (AUDIO_SAMPLE_RATE * 2)
+
+/* tts / asr 子命令（小米 MiMo 云端 TTS / ASR）。
+ * 这两个是**联网**子命令：要先拿到 IPv4、配置里要有 llm_host + api_key
+ * （开机从 /etc/assets/agent_config.json 拷到 /data/ai_agent/config/config.json），
+ * 缺了就 FAIL，不影响其它子命令。 */
+
+#define TTS_PCM_CAP        (256 * 1024)  /* 合成缓冲：16k 单声道 16bit ≈ 8 秒 */
+#define TTS_MAX_TEXT       512           /* tts 子命令拼起来的文本上限 */
+#define PLAY_CHUNK_BYTES   3200          /* 100ms 一块，跟 ai_audio.c 的播放线程一致 */
+#define PLAY_VOLUME        70            /* 0..100（换算到驱动的 0..1000） */
+#define ASR_TEXT_CAP       1024          /* 识别结果缓冲（字节） */
 
 /* alarm 子命令（设备级报警模块：响喇叭，持续到解除或超时；不驱指示灯） */
 
@@ -305,6 +335,11 @@ static void usage(void)
          "默认 15 秒，超时算 FAIL（单独运行）\n");
   printf("  hw_test status       打印统一外设状态（board_status_get/dump）；"
          "网络没拿到 IPv4 地址算 FAIL，其它设备只提示（单独运行）\n");
+  printf("  hw_test tts <文本>   MiMo 云端 TTS 合成，打印字节数并直接从喇叭"
+         "放出来；带空格要加引号，如 hw_test tts \"你好，今天天气不错\""
+         "（要联网 + 配好 api_key/llm_host，单独运行）\n");
+  printf("  hw_test asr <文件>   读一个 WAV（16bit PCM，采样率不限，内部转 16k）"
+         "做 MiMo 云端语音识别并打印结果（单独运行）\n");
 }
 
 /****************************************************************************
@@ -1812,6 +1847,257 @@ static int step_audio(int seconds)
 }
 
 /****************************************************************************
+ * Name: audio_out_play
+ *
+ * Description:
+ *   tts 子命令的播放：直接开 /dev/audio/audio0 写 PCM。
+ *   ioctl 顺序照 app/audio_test 与 app/hello_app/ai_audio.c 真机验证过的那套：
+ *     open -> CONFIGURE(AUDIO_TYPE_OUTPUT 16k/1ch/16bit)
+ *          -> CONFIGURE(AUDIO_TYPE_FEATURE + AUDIO_FU_VOLUME)
+ *          -> START -> write(100ms 一块) -> STOP -> close
+ *
+ *   本板是半双工（AUDIOIOC_STOP 会把录放两条通路一起停），所以这里只放不录。
+ *   音量下发失败不当致命错误：NuttX 上层没实现 AUDIOIOC_SETVOLUME，
+ *   板级 alarm 模块 / audio_test 走的也是这个 CONFIGURE 口径。
+ *
+ * Returned Value:
+ *   OK = 全部字节都写下去了；-1 = 中途失败（原因见 printf）。
+ *
+ ****************************************************************************/
+
+static int audio_out_play(FAR const int16_t *pcm, size_t bytes)
+{
+  struct audio_caps_desc_s capdesc;
+  size_t done = 0;
+  int fd;
+
+  fd = open(AUDIO_DEV, O_WRONLY);
+  if (fd < 0)
+    {
+      printf("      open %s 失败: %d\n", AUDIO_DEV, errno);
+      return -1;
+    }
+
+  memset(&capdesc, 0, sizeof(capdesc));
+  capdesc.caps.ac_len            = sizeof(struct audio_caps_s);
+  capdesc.caps.ac_type           = AUDIO_TYPE_OUTPUT;
+  capdesc.caps.ac_channels       = AUDIO_CHANNELS;
+  capdesc.caps.ac_controls.hw[0] = AUDIO_SAMPLE_RATE;
+  capdesc.caps.ac_controls.b[2]  = AUDIO_BITS;
+
+  if (ioctl(fd, AUDIOIOC_CONFIGURE, (unsigned long)&capdesc) < 0)
+    {
+      printf("      CONFIGURE(OUTPUT %dHz %dch %dbit) 失败: %d\n",
+             AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, AUDIO_BITS, errno);
+      close(fd);
+      return -1;
+    }
+
+  memset(&capdesc, 0, sizeof(capdesc));
+  capdesc.caps.ac_len            = sizeof(struct audio_caps_s);
+  capdesc.caps.ac_type           = AUDIO_TYPE_FEATURE;
+  capdesc.caps.ac_format.hw      = AUDIO_FU_VOLUME;
+  capdesc.caps.ac_controls.hw[0] = PLAY_VOLUME * AUDIO_VOLUME_MAX / 100;
+
+  if (ioctl(fd, AUDIOIOC_CONFIGURE, (unsigned long)&capdesc) < 0)
+    {
+      printf("      音量 %d 下发失败: %d（继续，用驱动当前音量）\n",
+             PLAY_VOLUME, errno);
+    }
+
+  if (ioctl(fd, AUDIOIOC_START, 0) < 0)
+    {
+      printf("      START 失败: %d\n", errno);
+      close(fd);
+      return -1;
+    }
+
+  while (done < bytes)
+    {
+      size_t chunk = bytes - done;
+      ssize_t n;
+
+      if (chunk > PLAY_CHUNK_BYTES)
+        {
+          chunk = PLAY_CHUNK_BYTES;
+        }
+
+      n = write(fd, (FAR const char *)pcm + done, chunk);
+      if (n <= 0)
+        {
+          printf("      write 失败（已写 %zu/%zu 字节）: %d\n", done, bytes,
+                 errno);
+          break;
+        }
+
+      done += (size_t)n;
+    }
+
+  /* 顺序和录音一样：先 STOP 再 close（STOP 顺带停掉录音通路，半双工） */
+
+  ioctl(fd, AUDIOIOC_STOP, 0);
+  close(fd);
+
+  printf("      写完 %zu/%zu 字节\n", done, bytes);
+  return done == bytes ? OK : -1;
+}
+
+/****************************************************************************
+ * Name: step_tts
+ *
+ * Description:
+ *   tts 子命令：注册 MiMo TTS 后端 -> voice_tts_speak() 合成 -> 打印字节数
+ *   -> 用板级音频通路放出来。
+ *
+ *   合成走云端（HTTPS + TLS），所以必须在有网、且 /data/ai_agent/config/
+ *   config.json 里有 llm_host + api_key 时才通（配置来源见 agent_config.h）。
+ *
+ ****************************************************************************/
+
+static int step_tts(FAR const char *text)
+{
+#ifndef HW_TEST_HAS_VOICE
+  (void)text;
+
+  printf("[TTS] 本配置没有同时启用 hello_app 和 ai_agent，MiMo TTS 不可用\n");
+  report("MiMo TTS", 0, "编译时未启用");
+  return -1;
+#else
+  FAR unsigned char *pcm;
+  char detail[64];
+  size_t pcm_len = 0;
+  int ret;
+
+  printf("[TTS] MiMo 云端合成: \"%s\"\n", text);
+
+  /* 后端注册只要一次：NuttX 是 flat 地址空间，同一个 app 反复跑
+   * （`hw_test tts a` 跑几次）会往分发层的静态表里重复登记，表满（4 个）
+   * 之后 register 返回 -ENOMEM。所以先 set_backend 试一下，没找到才注册。 */
+
+  if (voice_tts_set_backend("mimo") != OK)
+    {
+      if (mimo_tts_register() != OK || voice_tts_set_backend("mimo") != OK)
+        {
+          printf("      注册/选择 mimo 后端失败"
+                 "（配置里有 llm_host + api_key 吗？）\n");
+          report("注册 MiMo TTS 后端", 0, "register/set_backend 失败");
+          return -1;
+        }
+    }
+
+  report("注册 MiMo TTS 后端", 1, voice_tts_get_backend());
+
+  pcm = malloc(TTS_PCM_CAP);
+  if (pcm == NULL)
+    {
+      report("MiMo TTS 合成", 0, "缓冲分配失败");
+      return -1;
+    }
+
+  ret = voice_tts_speak(text, pcm, TTS_PCM_CAP, &pcm_len);
+  if (ret != OK || pcm_len == 0)
+    {
+      snprintf(detail, sizeof(detail), "voice_tts_speak=%d, len=%zu",
+               ret, pcm_len);
+      report("MiMo TTS 合成", 0, detail);
+      free(pcm);
+      return -1;
+    }
+
+  printf("      合成 %zu 字节 PCM（16kHz/单声道/16bit，约 %zu ms）\n",
+         pcm_len, pcm_len * 1000 / (AUDIO_SAMPLE_RATE * 2));
+
+  snprintf(detail, sizeof(detail), "%zu 字节", pcm_len);
+  report("MiMo TTS 合成", 1, detail);
+
+  printf("      播放（%s，音量 %d）...\n", AUDIO_DEV, PLAY_VOLUME);
+  ret = audio_out_play((FAR const int16_t *)pcm, pcm_len);
+  report("播放 TTS 语音", ret == OK, ret == OK ? "已写完" : "播放失败");
+
+  free(pcm);
+  return ret;
+#endif
+}
+
+/****************************************************************************
+ * Name: step_asr
+ *
+ * Description:
+ *   asr 子命令：从任意路径读一个 WAV（16bit PCM，采样率不限，内部转 16k）
+ *   -> 注册 MiMo ASR 后端 -> voice_asr_recognize() -> 打印识别结果。
+ *
+ *   文件路径是**板子上**的路径（比如 /data/test.wav 或 U 盘挂载点），
+ *   不是 PC 上的路径。
+ *
+ ****************************************************************************/
+
+static int step_asr(FAR const char *path)
+{
+#ifndef HW_TEST_HAS_VOICE
+  (void)path;
+
+  printf("[ASR] 本配置没有同时启用 hello_app 和 ai_agent，MiMo ASR 不可用\n");
+  report("MiMo ASR", 0, "编译时未启用");
+  return -1;
+#else
+  FAR unsigned char *pcm = NULL;
+  char text[ASR_TEXT_CAP];
+  char detail[64];
+  size_t pcm_len = 0;
+  int ret;
+
+  printf("[ASR] MiMo 云端识别: %s\n", path);
+
+  ret = mimo_wav_load_16k(path, &pcm, &pcm_len);
+  if (ret != OK || pcm == NULL)
+    {
+      printf("      读 WAV 失败: %d（要 16bit PCM 的 WAV；路径是板子上的，"
+             "比如 /data/test.wav）\n", ret);
+      report("读 WAV 文件", 0, "见上面");
+      return -1;
+    }
+
+  printf("      WAV -> %zu 字节 PCM（16kHz/单声道/16bit，约 %zu ms）\n",
+         pcm_len, pcm_len * 1000 / (AUDIO_SAMPLE_RATE * 2));
+
+  snprintf(detail, sizeof(detail), "%zu 字节 PCM", pcm_len);
+  report("读 WAV 文件", 1, detail);
+
+  /* 同 step_tts：注册只做一次，重复跑 `hw_test asr` 不会把静态表撑满 */
+
+  if (voice_asr_set_backend("mimo") != OK)
+    {
+      if (mimo_asr_register() != OK || voice_asr_set_backend("mimo") != OK)
+        {
+          printf("      注册/选择 mimo 后端失败"
+                 "（配置里有 llm_host + api_key 吗？）\n");
+          report("注册 MiMo ASR 后端", 0, "register/set_backend 失败");
+          free(pcm);
+          return -1;
+        }
+    }
+
+  report("注册 MiMo ASR 后端", 1, voice_asr_get_backend());
+
+  memset(text, 0, sizeof(text));
+  ret = voice_asr_recognize(pcm, pcm_len, text, sizeof(text));
+  free(pcm);
+
+  if (ret != OK)
+    {
+      snprintf(detail, sizeof(detail), "voice_asr_recognize=%d", ret);
+      report("MiMo ASR 识别", 0, detail);
+      return -1;
+    }
+
+  printf("      识别结果: %s\n", text);
+  report("MiMo ASR 识别", text[0] != '\0', text[0] != '\0' ? text : "结果为空");
+
+  return text[0] != '\0' ? OK : -1;
+#endif
+}
+
+/****************************************************************************
  * Name: alarm_level_name / alarm_event_name
  ****************************************************************************/
 
@@ -2165,6 +2451,41 @@ static int step_status(void)
 }
 
 /****************************************************************************
+ * Name: append_arg
+ *
+ * Description:
+ *   `hw_test tts <文本>` 用：NSH 按空格把命令切成多个参数，这里把 "tts"
+ *   后面的参数用空格重新拼成一段文本。装不下就丢弃剩余参数并提示。
+ *
+ ****************************************************************************/
+
+static void append_arg(FAR char *dst, size_t cap, FAR const char *arg)
+{
+  size_t len = strlen(dst);
+  size_t add = strlen(arg);
+
+  if (len > 0)
+    {
+      if (len + 1 + add >= cap)
+        {
+          printf("      警告：文本超过 %zu 字节，后面的参数被丢弃\n", cap - 1);
+          return;
+        }
+
+      dst[len++] = ' ';
+      dst[len] = '\0';
+    }
+
+  if (len + add >= cap)
+    {
+      printf("      警告：文本超过 %zu 字节，后面的参数被丢弃\n", cap - 1);
+      return;
+    }
+
+  strcat(dst, arg);
+}
+
+/****************************************************************************
  * Public Functions
  ****************************************************************************/
 
@@ -2180,6 +2501,8 @@ int main(int argc, FAR char *argv[])
   int do_button     = 0;
   int do_backlight  = 0;
   int do_status     = 0;
+  int do_tts        = 0;
+  int do_asr        = 0;
   int standalone;
   int imu_frames    = IMU_DEFAULT_FRAMES;
   int rtc_sec       = RTC_DEFAULT_ALARM_SEC;
@@ -2193,10 +2516,13 @@ int main(int argc, FAR char *argv[])
   int lcd_percent   = BACKLIGHT_DEFAULT_PCT;
   int touch_sec     = TOUCH_DEFAULT_SEC;
   int touch_set     = 0;
+  char tts_text[TTS_MAX_TEXT];
+  FAR const char *asr_path = NULL;
   int i;
 
   g_pass  = 0;
   g_total = 0;
+  tts_text[0] = '\0';
 
   for (i = 1; i < argc; i++)
     {
@@ -2264,6 +2590,37 @@ int main(int argc, FAR char *argv[])
         {
           do_status = 1;
         }
+      else if (strcmp(argv[i], "tts") == 0)
+        {
+          do_tts = 1;
+
+          /* "tts" 后面所有参数拼成一段文本（NSH 按空格切参数）。
+           * 文本里有空格建议直接加引号：hw_test tts "你好 世界" */
+
+          while (i + 1 < argc)
+            {
+              append_arg(tts_text, sizeof(tts_text), argv[++i]);
+            }
+
+          if (tts_text[0] == '\0')
+            {
+              printf("hw_test tts: 缺要合成的文本\n");
+              usage();
+              return EXIT_FAILURE;
+            }
+        }
+      else if (strcmp(argv[i], "asr") == 0)
+        {
+          if (i + 1 >= argc)
+            {
+              printf("hw_test asr: 缺 WAV 文件路径\n");
+              usage();
+              return EXIT_FAILURE;
+            }
+
+          do_asr   = 1;
+          asr_path = argv[++i];
+        }
       else
         {
           printf("hw_test: 未知参数 '%s'\n", argv[i]);
@@ -2272,11 +2629,12 @@ int main(int argc, FAR char *argv[])
         }
     }
 
-  /* imu / rtc / rtcday / audio / alarm / lcd / button / status 是各自独立的
-   * 外设子命令：只跑自己，不跑那套 5 步自检 */
+  /* imu / rtc / rtcday / audio / alarm / lcd / button / status / tts / asr
+   * 是各自独立的子命令：只跑自己，不跑那套 5 步自检
+   * （tts / asr 要联网，是全自检里唯一会等网络的，所以也放单独模式）。 */
 
   standalone = do_imu || do_rtc || do_rtcday || do_audio || do_alarm ||
-               do_backlight || do_button || do_status;
+               do_backlight || do_button || do_status || do_tts || do_asr;
 
   /* lcdcolor 只是刷个屏，别让它再干等 10 秒触摸 */
 
@@ -2290,8 +2648,8 @@ int main(int argc, FAR char *argv[])
   printf("   SF32LB52-DevKit-LCD 硬件自检 (hw_test)\n");
   if (standalone)
     {
-      printf("   子命令模式：只跑 imu/rtc/rtcday/audio/alarm/lcd/button/status，"
-             "不做 5 步自检\n");
+      printf("   子命令模式：只跑 imu/rtc/rtcday/audio/alarm/lcd/button/status/"
+             "tts/asr，不做 5 步自检\n");
     }
   else
     {
@@ -2347,6 +2705,18 @@ int main(int argc, FAR char *argv[])
       if (do_status)
         {
           step_status();
+          printf("\n");
+        }
+
+      if (do_tts)
+        {
+          step_tts(tts_text);
+          printf("\n");
+        }
+
+      if (do_asr)
+        {
+          step_asr(asr_path);
           printf("\n");
         }
     }

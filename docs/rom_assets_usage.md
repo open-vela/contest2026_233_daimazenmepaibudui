@@ -135,3 +135,24 @@ int play_ding(void)
 | 上板后文件是旧的 | 只烧了旧的 `nuttx.bin`；确认烧录的是刚编出来的那个（对比 md5/时间） |
 | `open()` 返回 `ENOENT` | 文件名拼错（注意 `/etc/assets/` 前缀），或者忘了重新烧录 |
 | 想验证 ROM 里的内容 | `md5_test /etc/assets/<名>` 可以和 PC 上 `md5sum` 的结果对比 |
+
+
+## 附：用同一个机制自动装密钥（2026-09-13 加）
+
+`/data` 是 tmpfs（`board/contest_board/src/sifli_ap.c` 里挂的），**断电就清空**，
+而 ai_agent 把配置写在 `/data/ai_agent/config/config.json`。所以本机放一个
+`board/contest_board/src/etc/assets/agent_config.json`（**不进版本库**，见
+`.git/info/exclude`），开机时板级函数 `sf32lb52_install_agent_config()`
+（`board/contest_board/src/sifli_ap.c`）会把它拷成
+`/data/ai_agent/config/config.json`，之后就等价于你手敲过 `set_llm`。
+
+规则：
+
+- 目标已存在则**不覆盖**（保留运行时改过的值）；素材不存在则安静跳过。
+- 文件权限 0600；拷贝过程不打印内容，串口日志只有字节数。
+- 内容格式就是 ai_agent 的 config.json：扁平字符串键 + `llm_backend_0`（值本身是一段 JSON 字符串）。
+  常用键：`model` / `api_key` / `llm_host` / `llm_path`，
+  火山语音：`volc_appkey` / `volc_token` / `volc_asr_cluster` / `volc_api_key` / `volc_speaker`。
+- 改了 `src/etc/` 下的文件，必须**先删 ROMFS 产物再编**：
+  `<build>/boards/exclude_board/src/romfs.img`、`romfs_etc.c`、`romfs_etc/`。
+- 上板确认：`ls -l /data/ai_agent/config/` 有 config.json 即可；再进 `ai_agent` 直接 `ask`，不用先 `set_llm`。

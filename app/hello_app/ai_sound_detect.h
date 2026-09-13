@@ -36,6 +36,21 @@
 #define SOUND_DETECT_WINDOW_MS      1000    /* 1秒检测窗口 */
 #define SOUND_DETECT_CHANNELS       1       /* 单声道 */
 
+/* 内置"启发式"异常声音检测的总开关。
+ * 1 = 启用（sound_detect_start() 起检测线程，喂进来的音频会被实时打分）；
+ * 0 = 关闭（不起线程、喂进来的音频直接丢弃，只在收到
+ *     sound_detect_report_anomaly() 时才走回调）。
+ *
+ * 为什么默认关：没有真模型时走的是 sound_detect_run_fallback()（纯能量/过零率），
+ * 一声脆响——包括板子自己喇叭放的提示音——就能拿到 0.9 的"跌倒"分，实测误报。
+ * 队友训练好的模型接进来之后，把这里改成 1（或从 Kconfig 传）即可，
+ * 上层（机器人的提醒/报警/推送）一行都不用动。
+ * 接入点：CONFIG_HELLO_APP_EDGE_IMPULSE + edge_impulse_sound_classify()，
+ * 或 sound_detect_load_model_file() 加载模型文件。 */
+#ifndef SOUND_DETECT_HEURISTIC_ENABLE
+#  define SOUND_DETECT_HEURISTIC_ENABLE  0
+#endif
+
 /* 检测阈值 */
 #define SOUND_DETECT_THRESHOLD_DEFAULT  0.7f   /* 默认置信度阈值 */
 #define SOUND_DETECT_THRESHOLD_HIGH     0.85f  /* 高置信度阈值 */
@@ -167,6 +182,11 @@ typedef struct
   /* 推理结果 */
   float               results[SOUND_DETECT_MAX_CLASSES]; /* 各类得分 */
 
+  /* 连续命中确认（抑制误报）：同一个类别要连续 N 个窗口都超阈值才上报。
+   * fallback 分类器是纯启发式的，一声脆响就能拿到 0.9 的"跌倒"分。 */
+  int                 confirm_type;   /* 正在确认的类别（SOUND_TYPE_NONE = 无） */
+  int                 confirm_count;  /* 已连续命中几个窗口 */
+
   /* 统计信息 */
   sound_detect_stats_t stats;         /* 检测统计 */
 
@@ -265,6 +285,24 @@ int sound_detect_feed(sound_detect_context_t *ctx,
  * @param  confidence: 输出置信度
  * @return 0成功, 负值失败
  */
+
+/* 上报一次"异常声音"（这是给外部检测来源用的统一入口）。
+ *
+ * 谁可以调：
+ *   - 队友训练好的模型（Edge Impulse / 自己撸的推理）判出结果后；
+ *   - 将来别的传感器（IMU 撞击、按键长按等）；
+ *   - 手动测试：想验证"报警页 + 手机推送"这条链，不必真的摔一跤。
+ *
+ * 它做的事和内置检测器判出结果时完全一样：累加统计 + 调 sound_detect_init()
+ * 里注册的 callback（robot_ui / ai_companion 那边接到回调就弹报警页、响铃、推手机）。
+ *
+ * @param ctx          sound_detect_init() 过的上下文（回调从它里面取）
+ * @param type         SOUND_TYPE_FALL / HELP / SCREAM / KNOCK ...（不能是 SOUND_TYPE_NONE）
+ * @param confidence   0.0 ~ 1.0，用你自己的模型给的置信度
+ * @return OK / -EINVAL
+ */
+int sound_detect_report_anomaly(sound_detect_context_t *ctx,
+                                sound_type_t type, float confidence);
 
 int sound_detect_once(sound_detect_context_t *ctx,
                       const int16_t *data, size_t frames,

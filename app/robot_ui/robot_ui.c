@@ -192,6 +192,16 @@ static void ui_clock_timer_cb(lv_timer_t *t)
 }
 
 /* ==================== 创建状态栏 ==================== */
+/* 状态栏上的「菜单」按钮：主菜单的保底入口。
+ * 主菜单只在开机时显示一次，关掉之后要么右滑（手势，见 touch_ui.c），
+ * 要么点这里。两者都调 touch_ui_show_menu(MENU_TYPE_MAIN)。 */
+static void menu_button_event_handler(lv_event_t *e)
+{
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+        touch_ui_show_menu(MENU_TYPE_MAIN);
+    }
+}
+
 static void create_status_bar(lv_obj_t *parent)
 {
     /* 状态栏容器 */
@@ -243,6 +253,17 @@ static void create_status_bar(lv_obj_t *parent)
     lv_label_set_text(lbl_net, "NET --");
     lv_obj_set_style_text_color(lbl_net, lv_color_hex(0xFFC107), 0);
     lv_obj_set_style_text_font(lbl_net, &lv_font_ui_24, 0);
+
+    /* 「菜单」按钮：主菜单的保底入口（手势不灵时也能进）。 */
+    lv_obj_t *btn_menu = lv_btn_create(bar);
+    lv_obj_set_size(btn_menu, LV_SIZE_CONTENT, 36);
+    lv_obj_add_style(btn_menu, &style_btn, 0);
+    lv_obj_add_event_cb(btn_menu, menu_button_event_handler,
+                        LV_EVENT_CLICKED, NULL);
+    lv_obj_t *lbl_menu = lv_label_create(btn_menu);
+    lv_label_set_text(lbl_menu, "菜单");
+    lv_obj_set_style_text_font(lbl_menu, &lv_font_ui_24, 0);
+    lv_obj_center(lbl_menu);
 }
 
 /* ==================== 更新网络状态 ==================== */
@@ -561,10 +582,16 @@ void robot_ui_show_reminder(const char *title, const char *content)
 
     lv_msgbox_add_title(mbox, title);
     lv_msgbox_add_text(mbox, content);
-    lv_msgbox_add_close_button(mbox);
+    touch_ui_msgbox_add_close_x(mbox);
     lv_obj_center(mbox);
     lv_obj_set_style_bg_color(mbox, lv_color_hex(0x2D2D44), 0);
     lv_obj_set_style_text_color(mbox, lv_color_hex(0xFFFFFF), 0);
+
+    /* 字体必须显式指定：msgbox 默认吃 LVGL 主题字体，而本工程的默认字体是
+     * 16px 的 simsun（约 1436 个字形），界面用到的一些汉字（"散""嘱"…）
+     * 它会画成方块。这里统一成 build 里真正的三档字库之一，和 touch_ui 的
+     * 弹窗一致（20px：比 24px 少占地方，长一点的提醒语不容易顶出屏幕）。 */
+    lv_obj_set_style_text_font(mbox, &lv_font_ui_20, 0);
 }
 
 /* ==================== 显示报警 ==================== */

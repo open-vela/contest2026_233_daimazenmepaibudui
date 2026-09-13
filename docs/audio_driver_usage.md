@@ -75,8 +75,9 @@ nsh> hw_test audio 2           # 录 2 秒，打印 peak/avg 和"是否检测到
 
 ## 3.1 录音：用板级封装 `audio_in_*`
 
-成员二的 `app/hello_app/ai_audio.c` 里 open/ioctl/**全是注释**、
-`record_fd = 1` 是占位，所以**用不了**。这个问题已经由板级模块解决：
+`app/hello_app/ai_audio.c` 里的录音以前是假的（open/ioctl 全是注释、
+`record_fd = 1` 占位、`memset` 造静音），**2026-09-13 已经改成调下面这个板级封装**
+（详见第 10 节），不再是"用不了"的状态：
 
 - 头文件：`board/contest_board/src/sf32lb52_audio_in.h`
 - 实现：`board/contest_board/src/sf32lb52_audio_in.c`（已加入板级 `CMakeLists.txt`）
@@ -320,9 +321,9 @@ hw_test alarm 1|2|3   -> 各 4/4 PASS（见 docs/alarm_usage.md）
 
 ## 9. 封装好的录音接口 `audio_in_*`（2026-09-13）
 
-背景：成员二的 `app/hello_app/ai_audio.c` 里 open/ioctl 全是注释、
-`record_fd = 1` 是占位，实际**用不了录音**。所以把录音收成一个板级模块，
-上层不必再碰驱动的 ioctl 细节：
+背景：`app/hello_app/ai_audio.c` 早先的录音是假的（open/ioctl 全是注释、
+`record_fd = 1` 占位），所以把录音收成一个板级模块，上层不必再碰驱动的 ioctl 细节。
+**2026-09-13 起 `ai_audio.c` 已经改用下面这套接口**（第 10 节），这份文档的用法不变：
 
 | 文件 | 内容 |
 |------|------|
@@ -455,3 +456,35 @@ int record_3s_to_file(const char *path)
   否则设备一直占着，`close()` 的 shutdown 路径也不会被触发。
 - 要"边说边听"的请**顺序做**（先录完 → `audio_in_stop()` → 再播），
   `AUDIOIOC_STOP` 会把播放和录音两条通路一起关掉（第 3.1 节末）。
+
+---
+
+## 10. 应用层（`ai_audio.c`）现在接上了（2026-09-13）
+
+`app/hello_app/ai_audio.c` 从"空壳"改成了真实现：
+
+| 做的事 | 怎么做的 |
+|--------|----------|
+| 录音 | 调板级封装 `audio_in_start()` / `audio_in_read()` / `audio_in_stop()`（第 3.1 / 9 节），设备路径原来写的 `/dev/sound/pcmC0D0c` 本板不存在，已删 |
+| 播放 | 播放线程里真的 `open(/dev/audio/audio0, O_WRONLY)` → `CONFIGURE(AUDIO_TYPE_OUTPUT)` → `CONFIGURE(AUDIO_FU_VOLUME)` → `START` → 按 100 ms 分块 `write()` → `STOP` → `close`（以前只有一个 `usleep`） |
+| 停止录音 | **先** `audio_in_stop()`（它会唤醒阻塞在 `audio_in_read()` 里的线程）**再** `pthread_join`。顺序反了会自锁死 |
+| 音量 | 走 `AUDIOIOC_CONFIGURE + AUDIO_TYPE_FEATURE + AUDIO_FU_VOLUME`（0~100 → 0~1000）。注意 NuttX 上层**没有**实现 `AUDIOIOC_SETVOLUME`，别用它 |
+| 缓冲 | TTS 缓冲 256 KB、播放缓冲 8 秒，都是**堆分配**（静态放 BSS 会把内核 SRAM 顶到约 96%） |
+
+上层入口没变：`audio_record_start/stop()`、`audio_play_start/stop()`、`audio_set_volume()`、
+`audio_play_file()`（这条从 `-ENOSYS` 实现成了"读裸 PCM 播放"）。
+
+### 怎么验（按层级，由下到上）
+
+```text
+hw_test audio 2                     # 板级录音封装：应打印 read 64000/64000、peak/avg、PASS
+audio_test 1000 1000                # 板级播放通路：应打印 WRITE 32000/32000 并听到 1kHz 音
+hw_test tts "你好，今天天气不错"      # 上层 TTS 后端（MiMo）+ 播放，喇叭出声
+hw_test asr /etc/assets/test_16k.wav # 上层 ASR 后端（MiMo），打印识别文字
+```
+
+界面上则是「菜单 → 语音聊天」：弹窗打开即录音、显示计时，点「提交」走
+ASR → 大模型 → TTS → 播放（实现见 `app/robot_ui/main.c` 的语音聊天那一节）。
+
+⚠️ 麦克风是**半双工独占**的：录音和播放不能并行，两个 app 也不能同时占着
+`/dev/audio/audio0`（所以 `hello_app` 的开机自启被关掉了，界面所在的 `robot_ui` 当唯一入口）。

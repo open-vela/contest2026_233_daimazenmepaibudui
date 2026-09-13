@@ -27,6 +27,7 @@
 #include "voice/voice_tts.h"
 #include "volc_asr.h"
 #include "volc_tts.h"
+#include "mimo_voice.h"
 
 /****************************************************************************
  * Pre-processor Definitions
@@ -137,7 +138,11 @@ static void audio_data_callback(const int16_t *data, size_t frames,
   if (g_sound_started)
     {
       int ret = sound_detect_feed(&g_sound_ctx, data, frames);
-      if (ret < 0 && ret != -ENOSPC)
+
+      /* -EINVAL 表示"检测器当前不在收数据状态"：检测线程正把上一窗口拿去处理，
+       * state 短暂变成 PROCESSING，这时喂数据是正常被拒，不是故障。
+       * 原来每帧打一行，串口被刷屏，真日志全淹没了。 */
+      if (ret < 0 && ret != -ENOSPC && ret != -EINVAL)
         {
           printf("[安全] 音频送入检测器失败: %d\n", ret);
         }
@@ -454,10 +459,36 @@ static void llm_complete_callback(const char *response, int error,
 
   /* TTS: 文字转语音 */
 
-  static unsigned char tts_buf[32 * 1024];
+  /* TTS 缓冲 256 KB ≈ 16 kHz/单声道/16 bit 的 8 秒；原来 32 KB 只有 1 秒，
+   * 超出部分会被 volc_tts.c 静默截断（PCM buffer full）。
+   * 必须走堆：静态 256 KB 会把内核 SRAM 顶到 96%（构建报告可查），运行时就没余量了；
+   * 堆里有第二块 PSRAM（8 MB），大块分配会落到那边。 */
+  static unsigned char *tts_buf = NULL;
+  static size_t tts_buf_size = 0;
   size_t tts_len = 0;
+  int ret;
 
-  int ret = voice_tts_speak(response, tts_buf, sizeof(tts_buf), &tts_len);
+  if (tts_buf == NULL)
+    {
+      tts_buf_size = 256 * 1024;
+      tts_buf = malloc(tts_buf_size);
+      if (tts_buf == NULL)
+        {
+          tts_buf_size = 32 * 1024;
+          tts_buf = malloc(tts_buf_size);
+        }
+
+      if (tts_buf == NULL)
+        {
+          printf("[TTS] 缓冲分配失败，跳过合成\n");
+          sm_handle_event(ctx, SM_EVENT_AI_RESPONSE);
+          return;
+        }
+
+      printf("[TTS] 缓冲 %zu 字节已分配\n", tts_buf_size);
+    }
+
+  ret = voice_tts_speak(response, tts_buf, tts_buf_size, &tts_len);
   if (ret < 0 || tts_len == 0)
     {
       printf("[TTS] 语音合成失败: %d\n", ret);
@@ -669,13 +700,42 @@ int main(int argc, char *argv[])
       return ret;
     }
 
-  /* 3.5 注册语音 ASR/TTS 后端 (火山引擎) */
+  /* 3.5 注册语音 ASR/TTS 后端
+   *
+   * 两套都注册，然后按配置选：
+   *   - 配置里有非空的 api_key + llm_host（开机从 agent_config.json 拷进
+   *     /data/ai_agent/config/config.json）-> 用小米 MiMo（mimo_voice.c）；
+   *   - 否则回落到火山引擎（volc_asr/volc_tts，需要 volc_api_key 等凭据）。
+   * 火山那条路保留不动：队友的凭据以后可能还会用。
+   */
 
   printf("[初始化] 正在注册语音后端...\n");
+  mimo_asr_register();
+  mimo_tts_register();
   volc_asr_register();
   volc_tts_register();
-  voice_asr_set_backend("volcengine");
-  voice_tts_set_backend("volcengine");
+
+  if (mimo_voice_available())
+    {
+      if (voice_asr_set_backend("mimo") == 0
+          && voice_tts_set_backend("mimo") == 0)
+        {
+          printf("[初始化] 语音后端: MiMo (mimo)\n");
+        }
+      else
+        {
+          printf("[警告] MiMo 后端注册异常，回落到火山引擎\n");
+          voice_asr_set_backend("volcengine");
+          voice_tts_set_backend("volcengine");
+        }
+    }
+  else
+    {
+      printf("[初始化] 语音后端: 火山引擎 (volcengine)"
+             "（配置里没有 api_key + llm_host）\n");
+      voice_asr_set_backend("volcengine");
+      voice_tts_set_backend("volcengine");
+    }
 
   /* 分配语音段累积缓冲区 */
 

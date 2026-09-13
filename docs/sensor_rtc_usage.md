@@ -146,8 +146,13 @@ PA30 = Sensor Power、触摸 SCL = PA37。本仓库自己的
   （写 2026 读回 **1926**）、以及 alarm 精确要求匹配"星期"字段。
   不修的话 `RTC_SET_RELATIVE` 会**返回成功但永远不触发** —— 这正是
   `hw_test rtc` 一开始 alarm 那条一直 FAIL 的原因。
-- app 里现在的"提醒"只是存了个字符串 `touch_ui_add_reminder("Medicine","08:00")`，
-  **没有任何定时触发**。
+- app 里的"提醒"以前只是存了个字符串
+  `touch_ui_add_reminder("Medicine","08:00")`，**没有任何定时触发**。
+  现在是真会响的：界面（`app/robot_ui/touch_ui.c`）能新增 / 删除提醒，
+  调度在 `app/robot_ui/reminder_sched.c`（软排队，硬件只有一个日循环
+  alarm 槽，见 `docs/rtc_alarm_usage.md`），到点回调由 `main.c` 弹窗 +
+  响提示音 + 手机推送。**仍然要先对时**（板上没电池），时间没对过时不挂
+  闹钟、只打印提示。
 
 ### 2.2 关键语义（源码核实，别按 Linux 直觉写）
 
