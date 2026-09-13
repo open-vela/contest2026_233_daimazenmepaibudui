@@ -572,7 +572,23 @@ void robot_ui_show_alarm(const char *content)
 {
     int ret;
 
-    /* 设备级动作：让喇叭真的响起来（板级报警模块，非阻塞返回）。
+    /* ① 先把红色报警页面切出来（**必须第一步**）。
+     *
+     * 这一步原来排在报警声和上报后面，实测踩了坑：上报走网络（MQTT + TLS 推送），
+     * 一旦这条路上出问题/卡住，红色页面就永远切不出来 —— 现场看到的现象就是
+     * "按了报警，声音在响但屏幕上没有报警页，也退不出来"。
+     * 先刷页面，后面无论网络怎么慢，用户至少能看到报警界面并点"返回"。
+     */
+    lv_scr_load(scr_alarm);
+
+    /* 设置报警表情 */
+    robot_ui_set_face(ROBOT_FACE_ALARM);
+    robot_ui_set_status(ROBOT_STATUS_ALARM);
+
+    /* 启动报警闪烁动画 */
+    lv_anim_start(&anim_blink);
+
+    /* ② 设备级动作：让喇叭真的响起来（板级报警模块，非阻塞返回）。
      *
      * 放在这个函数里、而不是各个调用点，是因为界面上的"报警"按钮走的是
      *   btn_event_handler() -> robot_ui_show_alarm()
@@ -589,7 +605,7 @@ void robot_ui_show_alarm(const char *content)
         printf("robot_ui: alarm_trigger failed: %d\n", ret);
     }
 
-    /* 上报：MQTT 发到 zhi_ai/<client_id>/alarm（+ 手机推送）。
+    /* ③ 上报：MQTT 发到 zhi_ai/<client_id>/alarm（+ 手机推送）。
      * 以前这里没接，所以按了报警按钮只响、不上报；补上这一句
      * 才算"响 + 屏幕 + 上报 + 推送"四个动作齐全。
      * 注意 report_alarm() 不阻塞（MQTT 没连上时它内部会很快失败返回）。 */
@@ -599,16 +615,6 @@ void robot_ui_show_alarm(const char *content)
             printf("robot_ui: report_alarm failed: %d（MQTT 没连上？）\n", rret);
         }
     }
-
-    /* 切换到报警屏幕 */
-    lv_scr_load(scr_alarm);
-
-    /* 设置报警表情 */
-    robot_ui_set_face(ROBOT_FACE_ALARM);
-    robot_ui_set_status(ROBOT_STATUS_ALARM);
-
-    /* 启动报警闪烁动画 */
-    lv_anim_start(&anim_blink);
 }
 
 /* ==================== 关闭报警 ==================== */

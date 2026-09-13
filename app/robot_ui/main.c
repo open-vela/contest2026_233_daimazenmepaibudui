@@ -22,7 +22,10 @@
 #include "ai_llm.h"
 #include "ai_sound_detect.h"
 #include "ai_care.h"
-#include "ai_checkin.h"
+/* [缺文件临时隔离] 上游 3ec9ab9 用了 ai_checkin_begin/respond/tick/snapshot，
+ * 但 ai_checkin.{c,h} 没有提交（全仓库找不到），这份提交本身编不过。
+ * 等队友补上文件后，把本文件里所有 [缺文件临时隔离] 的 #if 0 删掉即可。 */
+/* #include "ai_checkin.h" */
 #include <string.h>
 
 /* LVGL 定时器 */
@@ -196,10 +199,14 @@ static void checkin_btn_callback(uint64_t checkin_id, bool needs_help, void *use
     printf("[Checkin] Respond: id=%lu needs_help=%d\n",
            (unsigned long)checkin_id, needs_help);
 
+#if 0 /* [缺文件临时隔离] ai_checkin_respond() */
     int ret = ai_checkin_respond(checkin_id, needs_help, now_ms);
     if (ret != 0) {
         printf("[Checkin] respond failed: %d\n", ret);
     }
+#else
+    printf("[Checkin] (ai_checkin 未提交，这里只打印)\n");
+#endif
 }
 
 /* 用于 lv_async_call 的 show_checkin 参数 */
@@ -237,6 +244,7 @@ static void care_remind_callback(care_type_t type, const char *message, void *us
     push_send_health_reminder(type_name, message);
 
     /* 启动关怀确认：分配 30 秒超时 */
+#if 0 /* [缺文件临时隔离] ai_checkin_begin() + 确认面板投递 */
     uint64_t checkin_id = 0;
     uint64_t now_ms = lv_tick_get();
     if (ai_checkin_begin(now_ms, 30000, &checkin_id) == 0) {
@@ -254,6 +262,7 @@ static void care_remind_callback(care_type_t type, const char *message, void *us
     } else {
         printf("[Checkin] Failed to start\n");
     }
+#endif
 }
 
 /**
@@ -497,6 +506,7 @@ int main(int argc, char *argv[])
         if (g_ai_initialized) {
             sm_run(&g_sm_ctx);
 
+#if 0 /* [缺文件临时隔离] ai_checkin_tick() / ai_checkin_snapshot() 轮询 */
             /* 运行关怀确认状态机 */
             ai_checkin_tick(lv_tick_get());
 
@@ -525,6 +535,7 @@ int main(int argc, char *argv[])
                         break;
                 }
             }
+#endif
         }
 
         usleep(5000); // 5ms 刷新周期

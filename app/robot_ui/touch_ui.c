@@ -31,6 +31,12 @@ static lv_obj_t *reminder_panel = NULL;
 static int32_t swipe_start_x = 0;
 static bool swipe_tracking = false;
 
+/* 当前菜单层级：决定"返回 / 右滑"该回哪一级。
+ * 主菜单那一层再返回就关掉浮层（回到主界面），子菜单则回主菜单。
+ * 注：touch_ui_hide_menu() 以前没有任何调用点，菜单浮层因此没有出口，
+ *     现场表现就是"进了菜单回不去"。 */
+static menu_type_t current_menu_type = MENU_TYPE_MAIN;
+
 /* 当前状态 */
 static robot_mode_t current_mode = MODE_NORMAL;
 static settings_t user_settings = {
@@ -196,7 +202,7 @@ void touch_ui_init(void)
     lv_obj_add_event_cb(current_screen, screen_gesture_event_handler,
                         LV_EVENT_RELEASED, NULL);
     lv_obj_add_event_cb(current_screen, screen_gesture_event_handler,
-                        LV_EVENT_CANCELLED, NULL);
+                        LV_EVENT_CANCEL, NULL);
 
     /* 加载持久化设置 */
     settings_load_from_file();
@@ -222,6 +228,9 @@ void touch_ui_show_menu(menu_type_t type)
         lv_obj_del(reminder_panel);
         reminder_panel = NULL;
     }
+
+    /* 记住当前层级：返回按钮 / 右滑手势靠它决定回上一级还是关掉浮层 */
+    current_menu_type = type;
 
     /* 创建菜单面板 */
     create_menu_panel(type);
@@ -698,12 +707,23 @@ static void menu_item_event_handler(lv_event_t *e)
     }
 }
 
+/* 返回上一级：主菜单 -> 关掉浮层回主界面；子菜单 -> 回主菜单。
+ * 原来这里无条件 show_menu(MENU_TYPE_MAIN)，而主菜单上的"返回"也是它，
+ * 于是浮层永远关不掉 —— 菜单没有出口。 */
+static void menu_go_back_one_level(void)
+{
+    if (current_menu_type == MENU_TYPE_MAIN) {
+        touch_ui_hide_menu();
+    } else {
+        touch_ui_show_menu(MENU_TYPE_MAIN);
+    }
+}
+
 /* 返回按钮点击事件 */
 static void back_button_event_handler(lv_event_t *e)
 {
     touch_ui_play_sound("back");
-    /* 返回后始终显示主菜单，避免返回后找不到主界面 */
-    touch_ui_show_menu(MENU_TYPE_MAIN);
+    menu_go_back_one_level();
 }
 
 /* 滑块值改变事件 */
@@ -857,7 +877,7 @@ static void screen_gesture_event_handler(lv_event_t *e)
             swipe_tracking = true;
         }
     }
-    else if (code == LV_EVENT_RELEASED || code == LV_EVENT_CANCELLED) {
+    else if (code == LV_EVENT_RELEASED || code == LV_EVENT_CANCEL) {
         if (!swipe_tracking) return;
         swipe_tracking = false;
 
@@ -868,11 +888,11 @@ static void screen_gesture_event_handler(lv_event_t *e)
         lv_indev_get_point(indev, &p);
         int32_t dx = p.x - swipe_start_x;
 
-        /* 向右滑动超过 80px，显示主菜单 */
+        /* 向右滑动超过 80px = 返回上一级（与"返回"按钮同语义） */
         if (dx > 80) {
-            printf("[Gesture] Swipe right detected (dx=%d), showing main menu\n", (int)dx);
+            printf("[Gesture] Swipe right detected (dx=%d), go back one level\n", (int)dx);
             touch_ui_play_sound("click");
-            touch_ui_show_menu(MENU_TYPE_MAIN);
+            menu_go_back_one_level();
         }
     }
 }
