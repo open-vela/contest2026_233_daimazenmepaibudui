@@ -20,15 +20,6 @@
 
 include $(TOPDIR)/Make.defs
 
-# SiFli SF32LB52 HAL include paths
-CHIPSIFLIDIR = $(TOPDIR)/../vendor/sifli/chips
-CFLAGS += -I$(CHIPSIFLIDIR)/drivers/Include
-CFLAGS += -I$(CHIPSIFLIDIR)/drivers/cmsis/Include
-CFLAGS += -I$(CHIPSIFLIDIR)/drivers/cmsis/sf32lb52x
-CFLAGS += -I$(CHIPSIFLIDIR)/external/CMSIS/Include
-CFLAGS += -I$(CHIPSIFLIDIR)/boards/include/config/sf32lb52x
-CFLAGS += -DSOC_BF0_HCPU -DSF32LB52X -DHAL_TICK_PER_SECOND=1000 -DUSE_HAL_DRIVER
-
 CSRCS = sifli_ap.c
 
 ifeq ($(CONFIG_ARCH_BUTTONS),y)

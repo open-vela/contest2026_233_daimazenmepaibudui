@@ -1,7 +1,9 @@
 # vendor_sifli 补丁
 
-两个补丁按顺序应用(`git apply` 相对 `<openvela 工作区>/vendor/sifli` 目录):
-先 `vendor_sifli-boot-fixes.patch`,再 `vendor_sifli-audio-driver.patch`。
+补丁按顺序应用(`git apply` 相对 `<openvela 工作区>/vendor/sifli` 目录):
+先 `vendor_sifli-boot-fixes.patch`,再 `vendor_sifli-audio-driver.patch`、
+`vendor_sifli-rtc-alarm-fix.patch`,最后 `vendor_sifli-lcd-brightness.patch`
+(四者改的文件互不重叠,顺序只为可复现)。
 
 ## vendor_sifli-boot-fixes.patch
 
@@ -32,12 +34,118 @@ SF32LB52-DevKit-LCD 音频驱动,注册 `/dev/audio0`(NuttX audio_lowerhalf),支
 - 播放: `audio_test 3000 1000`(1 kHz 3 秒);录音: `audio_test record 3000`
 - 此补丁基于 boot 补丁已应用的状态生成,顺序不可颠倒
 
+## vendor_sifli-rtc-alarm-fix.patch（2026-09-12 新增，RTC alarm 不触发）
+
+改 `chips/sf32lb52/sf32lb_rtc.c` 三处。**现象**：`hw_test rtc 3` 里
+`RTC_SET_RELATIVE` 返回成功，但 3 秒后收不到 SIGUSR1；另外
+`date -s "Sep 12 15:30:00 2026"` 之后 `RTC_RD_TIME` 读回来是 **1926**。
+
+### 根因
+
+1. **读路径不还原世纪位**（`:198` `rtctime->tm_year = rtc_date.Year;`）
+   `date_2_reg()` 把 2000~2099 写成两位年 + CB=0、1900~1999 写成两位年 + CB=1
+   （`bf0_hal_rtc.c:374-377`），而 `HAL_RTC_GetDate()` 只对 19xx 打上
+   `RTC_CENTURY_BIT(0x80)`（`bf0_hal_rtc.c:484-490`）。驱动读回来直接赋给
+   `tm_year`，于是 2026 变成 1926。修法与厂商 SDK 参考驱动
+   `drv_rtc.c:182-185` 一致：CB 置位取低 7 位，否则 +100。
+2. **`RTC_SET_RELATIVE` 拿这个年份去喂 libc，算出垃圾 alarm 值**
+   本固件 `CONFIG_LIBC_LOCALTIME` 未开（`.config`），所以
+   `localtime()` 就是 `gmtime()`、`mktime()` 就是 `timegm()`；而 NuttX 这版
+   日历换算只支持 1970 以后（`nuttx/libs/libc/time/lib_gmtimer.c`）。
+   `add_timeout()`（`sf32lb_rtc.c:295`）用 `mktime()`/`localtime()` 算绝对
+   时间，输入是 1926 这种 <1970 的年份 → 得到负的 `time_t` → 拆出**负的
+   时/分/秒和越界日期** → 写进 `ALRMTR/ALRMDR` 的比较值硬件永远匹配不上
+   → 永远没有 alarm 中断，也就永远没有 SIGUSR1。ioctl 返回 0 是**假成功**。
+3. **星期字段被要求精确匹配、但值不是从硬件来的**（`:301` / `:367`）
+   `MSKWD/MSKD/MSKM` 为 0 表示"这几个字段必须精确匹配"，而写进
+   `ALRMDR.WD` 的星期来自 `add_timeout()` 里 libc 重算的 `tm_wday`，和硬件
+   `DR.WD` 不同源、编码还差一位。厂商 SDK 参考驱动是屏蔽
+   `RTC_ALRMDR_MSKD|MSKM|MSKWD` 的（`drv_rtc.c:482-484`）。
+
+### 修改
+
+| 位置 | 改动 |
+|------|------|
+| `sf32lb_rdtime()` `:198` | 按 CB 还原世纪：CB 置位取 `Year & ~RTC_CENTURY_BIT`，否则 `Year + 100` |
+| `sf32lb_rdalarm()` `:405` | 同上（保持 rd/set/rdalarm 一致） |
+| `sf32lb_setalarm()` `:301`、`sf32lb_setrelative()` `:367` | `AlarmMask` 加上 `RTC_ALRMDR_MSKWD`（屏蔽星期比较） |
+
+### 验证
+
+- `date -s "Sep 12 15:30:00 2026"` 后 `hw_test rtc 3`：时间应读回 **2026-09-12**，
+  并在约 3 秒后打印 `收到 SIGUSR1`，两项都 PASS
+- 注意 NSH 的 `date -s` 只认 `MMM DD HH:MM:SS YYYY` 格式（`nsh_timcmds.c`），
+  写 `2026-09-12 15:30:00` 会报 `argument invalid`
+
+### 已知遗留
+
+- `HAL_RTC_GetDate()` 在 CB=1 且年份 <70 时会**顺手清掉硬件 CB** 并返回不带
+  0x80 的年份（`bf0_hal_rtc.c:485-490`），此时上面的还原会当 20xx 处理。
+  这条分支只有写入 1900~1969 才会进，本项目的对时路径不会写这种年份，
+  暂不处理。
+
+## vendor_sifli-lcd-brightness.patch（2026-09-13 新增，屏幕百分比亮度）
+
+改 `boards/sf32lb52/drivers/lcd/sf32lb_lcd.c`（行号都是**改前**的）。
+
+### 现象
+
+屏幕只能开/关，中间亮度够不着：`hw_test lcd 50` 判 FAIL，
+`backlight_set(50) -> -38`（`-ENOSYS`），屏幕亮度和 100 时一模一样。
+
+### 根因
+
+1. **`LCDDEVIO_SETPOWER` 根本不是亮度**（`:634` `sf32lb_lcd_setpower()`）：
+   实现是 `power > 0 ? DisplayOn : DisplayOff`，power 的数值只被存下来给
+   `GETPOWER` 回读。传 30 和传 100 出来一样亮 —— 典型的"假亮度"。
+2. **真正该干这事的 `LCDDEVIO_SETCONTRAST` 是死的**：`:697`
+   `sf32lb_lcd_setcontrast()` 直接 `return -ENOSYS`，`:683` 的
+   `GETCONTRAST` 同理。
+3. **面板其实有这个能力**：CO5300 的 `0x51 WBRIGHT`，SDK 里已经写好
+   `co5300.c:544` 的 `LCD_SetBrightness(hlcdc, br)`（**入参就是百分比 0..100**，
+   内部换算成 0..255），挂在 `LCD_DrvOpsDef.SetBrightness` 回调上
+   （`sf32lb_lcd.h:36`）—— 但 `sf32lb_lcd.c` 从来不调它。
+   能力在，入口没接。
+
+### 修改
+
+| 位置 | 改动 |
+|------|------|
+| `struct sf32lb_lcd_dev_s` `:87` | 新增 `int contrast;`（亮度百分比 0..100） |
+| `board_lcd_initialize()` `:923` | `memset` 之后置 `s_drv_lcd.contrast = SF32LB_LCD_BRIGHTNESS_MAX`（面板上电默认就是满值） |
+| `sf32lb_lcd_setcontrast()` `:697` | 真实现：校验 `0..100` → `priv->p_drv_ops->p_ops->SetBrightness(&priv->hlcdc, percent)` → 记下值 |
+| `sf32lb_lcd_getcontrast()` `:683` | 回 `priv->power > 0 ? priv->contrast : 0`（关屏按 0 报） |
+
+三个注意点：
+
+- `SetBrightness` 是**可选回调**，别的面板可能没实现：判空后返回 `-ENOSYS`，
+  **不空指针调用**。本补丁不新增任何 Kconfig 符号。
+- 参数按**亮度百分比 0..100** 解释，**不跟 `CONFIG_LCD_MAXCONTRAST`**
+  （本板那个宏是 **63**，照它走会把 100% 挡在外面），所以用自己定义的
+  `SF32LB_LCD_BRIGHTNESS_MAX` 做上界。面板只有 `WBRIGHT` 写口、没有回读通路
+  （CO5300 的 `0x52 RBRIGHT` 在本驱动里没有读函数），`GETCONTRAST` 回的是
+  “最近一次下发的值”。
+- **`SETPOWER` 的语义一个字没改**：它仍然是开/关屏，别的地方
+  （`sf32lb_lcd_ensure_display_on`、LVGL 那条路）还在依赖它。
+
+### 验证
+
+- 逐档下发：`hw_test lcd 0` / `hw_test lcd 30` / `hw_test lcd 60` /
+  `hw_test lcd 100`，四档都应当 PASS，并且**屏幕亮度肉眼可见地变化**
+  （0 = 关屏，100 = 全亮），`回读亮度` 等于设定值。
+- 板级封装 `board/contest_board/src/sf32lb_backlight.c` 和 UI 亮度滑块
+  （`app/robot_ui/touch_ui.c` 的 `setting_slider_event_handler`）已经接到这条
+  通路上；用法与兼容性（没打补丁的树仍然只有 0/100）见
+  `docs/display_touch_gpio_usage.md` 第 3.3 节。
+
 ## 应用方式
 
 ```bash
 cd <openvela 工作区>/vendor/sifli
 git apply patches/vendor_sifli-boot-fixes.patch
 git apply patches/vendor_sifli-audio-driver.patch
+git apply patches/vendor_sifli-rtc-alarm-fix.patch
+git apply patches/vendor_sifli-lcd-brightness.patch
 ```
 
 ## 说明
@@ -202,3 +310,78 @@ config.h: CONFIG_NET_ETH_PKTSIZE 1514 / CONFIG_NETINIT_IPADDR 0xc0a88902
 nm nuttx | grep companion_main   → 1   (已链入内核)
 固件内建命令: ai_agent  ai_companion  net_test  robot_ui  zhi_ai
 ```
+
+---
+
+# ai_agent 的 LLM 计时/超时修复（2026-09-13 新增补丁）
+
+## 应用方式
+
+```bash
+cd <openvela 工作区>/packages/ai_agent
+git apply <本仓库>/patches/apps-ai-agent-llm-clock-fix.patch
+```
+
+> 注意目录是 **`packages/ai_agent`**（不是 `apps/...`；`apps/packages` 只是指向 `packages` 的软链接）。
+> 补丁里的路径是 `src/core/agent_loop.c`，所以必须在 `packages/ai_agent/` 下 apply。
+
+## apps-ai-agent-llm-clock-fix.patch（`packages/ai_agent/src/core/agent_loop.c`）
+
+### 现象
+
+`set_llm` 配好后端后执行 `ask`：**请求真的发出去、模型也真的回了**，但界面永远显示"请求超时"：
+
+```
+[llm] Response: 12 bytes text, 0 tool calls, finish=end_turn      ← 收到真实回复（12 字节 = "连接成功"）
+[agent] LLM watchdog: call took 955862003 ms (limit 60s), treating as timeout   ← 耗时是脏值
+[trace:...] END status=timeout ... llm_ms=955862003 elapsed=825589583s
+```
+
+### 根因（算术闭环，可复核）
+
+1. `src/infra/vela_tls.c:255-259` 在**每次 TLS 握手**时检查墙钟，若 `< 2024-01-01` 就把它
+   **硬跳到硬编码常量 `1772275200`**：
+   ```c
+   if (now < 1704067200) {
+       syslog(LOG_WARNING, "[%s] Clock too old, forcing to 2026\n", TAG);
+       struct timespec ts = { .tv_sec = 1772275200, .tv_nsec = 0 };
+       clock_settime(CLOCK_REALTIME, &ts);
+   }
+   ```
+2. `agent_loop.c` 用**墙钟**（`gettimeofday`）算 LLM 耗时，而这次跳变正好发生在请求进行中。
+   `calc_elapsed_ms()` 只防了"时钟倒退"，没防"往前跳"：
+   ```
+   sec_diff = 1772275203 - 946685621 = 825589582 秒
+   825589582 * 1000 = 825,589,582,000
+   对 2^32 取模（192 × 4294967296 = 824,633,720,832）
+   = 955,861,168 + 微秒部分 835 = 955,862,003 ms       ← 与日志逐位一致
+   ```
+3. watchdog（阈值 `AGENT_LLM_TIMEOUT_SEC = 60`）据此判超时，并在 `:1126` **无条件
+   `llm_response_free(&resp)`**，把已经到手的 `resp.text`（那 12 字节）free 掉、换成超时文案。
+
+**独立佐证**：串口日志里心跳的 `timestamp` 在 `ask` 那一次从 `946685544`
+**精确跳到 `1772275200`** —— 正是上面那个硬编码常量。（见
+`docs/test_logs/2026-09-13-ai_agent-llm-verify.log`。）
+
+### 修改
+
+| 改动 | 内容 |
+|------|------|
+| `calc_elapsed_ms()` 上方 | 新增 `mono_gettimeofday()`：用 `CLOCK_MONOTONIC`，不受改墙钟影响 |
+| 5 对计时打点（`:823/825`、`:993/995`、`:1068/1070`、`:1086/1089`、`:1186/1189`） | `gettimeofday` → `mono_gettimeofday`（共 10 处） |
+| `calc_elapsed_ms()` | 加"往前跳"钳位：`sec_diff > 4294967`（约 49 天）时打警告并返回上限，杜绝 32 位回绕 |
+| watchdog 分支 | **响应其实已到时优先交付文本**：`resp.text_len > 0` 就 `strdup(resp.text)` 并打警告，只有真的没有文本才用超时文案 |
+
+### 为什么保留 `vela_tls.c` 的对时不动
+
+它确实会在请求中途跳墙钟（会污染 `message_bus` / `cron` / `network_manager` 那些基于
+`CLOCK_REALTIME` 的超时），但把它删掉会让板子时钟回到 2000-01-01（界面上时间会很难看）。
+**改成用单调时钟之后，这次跳变对 LLM 计时已经无害**，所以本轮不动它；如果以后要根治，
+应该是"启动时对一次时"而不是"每次握手都跳"。
+
+### 验证
+
+- 修复后 `ask` 应看到 `Response: N bytes text` **且不出现** `watchdog ... treating as timeout`；
+  即使再遇到时钟异常，也只会打印 `watchdog: delivering received reply (N bytes) despite latency=...`
+  并把回复交付出来。
+- 复现手法：故意把时钟设早（`date -s` 到 2024 之前）再 `ask`，看是否还能拿到回复。

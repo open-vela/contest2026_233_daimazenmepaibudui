@@ -33,5 +33,8 @@ if(CONFIG_LVX_USE_CONTEST2026_233_HELLO_APP)
     COMPILE_FLAGS ${HELLO_APP_COMPILE_FLAGS}
     DEPENDS ${HELLO_APP_DEPENDS}
     SRCS ${HELLO_APP_SRCS}
+    # 报警模块（board/contest_board/src/sf32lb52_alarm.h）在板级 src 目录下，
+    # 与 app/hw_test/CMakeLists.txt 同一写法。
+    INCLUDE_DIRECTORIES ${NUTTX_BOARD_ABS_DIR}/src
   )
 endif()

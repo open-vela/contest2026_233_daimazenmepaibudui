@@ -8,6 +8,19 @@
 #include <string.h>
 #include <stdlib.h>
 
+/* 板级亮度封装（头文件在 board/contest_board/src，路径由 CMakeLists.txt 的
+ * INCLUDE_DIRECTORIES ${NUTTX_BOARD_ABS_DIR}/src 提供）。亮度滑块只调它，
+ * 不自己 open("/dev/lcd0") 拼 ioctl。 */
+#include "sf32lb52_backlight.h"
+
+/* 中文字库（实现在 lv_font_ui_16/20/24.c，见 CMakeLists.txt 的 SRCS）。
+ * 原来这里用的是 LVGL 自带的 16px 中文点阵字体（字形不够，汉字一半是方块）。
+ * 现在按改动前 montserrat 的字号分三档：
+ *   14/16/18 -> lv_font_ui_16   20/22/24 -> lv_font_ui_20   >=28 -> lv_font_ui_24 */
+LV_FONT_DECLARE(lv_font_ui_16);
+LV_FONT_DECLARE(lv_font_ui_20);
+LV_FONT_DECLARE(lv_font_ui_24);
+
 /* ==================== 全局变量 ==================== */
 static lv_obj_t *current_screen = NULL;
 static lv_obj_t *menu_panel = NULL;
@@ -81,7 +94,7 @@ static void init_elder_styles(void)
     lv_style_set_bg_color(&style_elder, lv_color_hex(0x1A1A2E));
     lv_style_set_bg_opa(&style_elder, LV_OPA_COVER);
     lv_style_set_text_color(&style_elder, lv_color_hex(0xFFFFFF));
-    lv_style_set_text_font(&style_elder, &lv_font_montserrat_24);
+    lv_style_set_text_font(&style_elder, &lv_font_ui_20);
     lv_style_set_border_width(&style_elder, 0);
     lv_style_set_radius(&style_elder, 0);
 
@@ -93,7 +106,7 @@ static void init_elder_styles(void)
     lv_style_set_shadow_width(&style_big_btn, 15);
     lv_style_set_shadow_color(&style_big_btn, lv_color_hex(0x388E3C));
     lv_style_set_text_color(&style_big_btn, lv_color_hex(0xFFFFFF));
-    lv_style_set_text_font(&style_big_btn, &lv_font_montserrat_20);
+    lv_style_set_text_font(&style_big_btn, &lv_font_ui_20);
     lv_style_set_pad_all(&style_big_btn, 20);
 
     /* 菜单项样式 */
@@ -104,7 +117,7 @@ static void init_elder_styles(void)
     lv_style_set_border_width(&style_menu_item, 2);
     lv_style_set_border_color(&style_menu_item, lv_color_hex(0x4CAF50));
     lv_style_set_text_color(&style_menu_item, lv_color_hex(0xFFFFFF));
-    lv_style_set_text_font(&style_menu_item, &lv_font_montserrat_22);
+    lv_style_set_text_font(&style_menu_item, &lv_font_ui_20);
     lv_style_set_pad_all(&style_menu_item, 25);
 
     /* 返回按钮样式 */
@@ -113,7 +126,7 @@ static void init_elder_styles(void)
     lv_style_set_bg_opa(&style_back_btn, LV_OPA_COVER);
     lv_style_set_radius(&style_back_btn, 25);
     lv_style_set_text_color(&style_back_btn, lv_color_hex(0xFFFFFF));
-    lv_style_set_text_font(&style_back_btn, &lv_font_montserrat_18);
+    lv_style_set_text_font(&style_back_btn, &lv_font_ui_16);
 
     /* 设置滑块样式 */
     lv_style_init(&style_slider);
@@ -233,7 +246,7 @@ static void create_menu_panel(menu_type_t type)
             lv_label_set_text(title, "菜单");
             break;
     }
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_font(title, &lv_font_ui_24, 0);
     lv_obj_set_style_text_color(title, lv_color_hex(0xFFEB3B), 0);
     lv_obj_set_style_pad_bottom(title, 20, 0);
 
@@ -282,19 +295,19 @@ static void create_menu_item(lv_obj_t *parent, const char *icon_text,
     /* 图标和标题 */
     lv_obj_t *icon_label = lv_label_create(item);
     lv_label_set_text(icon_label, icon_text);
-    lv_obj_set_style_text_font(icon_label, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_font(icon_label, &lv_font_ui_24, 0);
 
     /* 副标题 */
     lv_obj_t *sub_label = lv_label_create(item);
     lv_label_set_text(sub_label, subtitle);
     lv_obj_set_style_text_color(sub_label, lv_color_hex(0x9E9E9E), 0);
-    lv_obj_set_style_text_font(sub_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(sub_label, &lv_font_ui_16, 0);
     lv_obj_set_style_pad_left(sub_label, 15, 0);
 
     /* 右箭头 */
     lv_obj_t *arrow = lv_label_create(item);
     lv_label_set_text(arrow, ">");
-    lv_obj_set_style_text_font(arrow, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_font(arrow, &lv_font_ui_24, 0);
     lv_obj_set_style_text_color(arrow, lv_color_hex(0x9E9E9E), 0);
 }
 
@@ -306,7 +319,7 @@ static void create_reminder_list_items(lv_obj_t *parent)
         lv_obj_t *empty = lv_label_create(parent);
         lv_label_set_text(empty, "暂无提醒\n\n点击 + 添加");
         lv_obj_set_style_text_color(empty, lv_color_hex(0x9E9E9E), 0);
-        lv_obj_set_style_text_font(empty, &lv_font_simsun_16_cjk, 0);
+        lv_obj_set_style_text_font(empty, &lv_font_ui_16, 0);
         lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_set_style_pad_top(empty, 50, 0);
     } else {
@@ -334,12 +347,12 @@ static void create_reminder_item(lv_obj_t *parent, const char *title,
     lv_obj_t *time_label = lv_label_create(item);
     lv_label_set_text(time_label, time_str);
     lv_obj_set_style_text_color(time_label, lv_color_hex(0xFF9800), 0);
-    lv_obj_set_style_text_font(time_label, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_font(time_label, &lv_font_ui_16, 0);
 
     /* 提醒标题 */
     lv_obj_t *title_label = lv_label_create(item);
     lv_label_set_text(title_label, title);
-    lv_obj_set_style_text_font(title_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(title_label, &lv_font_ui_20, 0);
     lv_obj_set_style_pad_left(title_label, 15, 0);
 }
 
@@ -359,7 +372,7 @@ static void create_setting_panel(void)
     /* 标题 */
     lv_obj_t *title = lv_label_create(setting_panel);
     lv_label_set_text(title, "[设] 设置");
-    lv_obj_set_style_text_font(title, &lv_font_simsun_16_cjk, 0);
+    lv_obj_set_style_text_font(title, &lv_font_ui_24, 0);
     lv_obj_set_style_text_color(title, lv_color_hex(0xFFEB3B), 0);
     lv_obj_set_style_pad_bottom(title, 20, 0);
 
@@ -382,7 +395,7 @@ static void create_setting_panel(void)
     lv_obj_add_event_cb(btn_reset, setting_reset_event_handler, LV_EVENT_CLICKED, NULL);
     lv_obj_t *lbl_reset = lv_label_create(btn_reset);
     lv_label_set_text(lbl_reset, "[重] 恢复默认");
-    lv_obj_set_style_text_font(lbl_reset, &lv_font_simsun_16_cjk, 0);
+    lv_obj_set_style_text_font(lbl_reset, &lv_font_ui_16, 0);
     lv_obj_center(lbl_reset);
 
     /* 返回按钮 */
@@ -411,11 +424,11 @@ static void create_slider_setting(lv_obj_t *parent, const char *title,
 
     lv_obj_t *title_label = lv_label_create(title_row);
     lv_label_set_text(title_label, title);
-    lv_obj_set_style_text_font(title_label, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_font(title_label, &lv_font_ui_20, 0);
 
     lv_obj_t *value_label = lv_label_create(title_row);
     lv_label_set_text_fmt(value_label, "%d%%", value);
-    lv_obj_set_style_text_font(value_label, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_font(value_label, &lv_font_ui_16, 0);
     lv_obj_set_style_text_color(value_label, lv_color_hex(0x4CAF50), 0);
 
     /* 滑块 */
@@ -443,7 +456,7 @@ static void create_switch_setting(lv_obj_t *parent, const char *title,
     /* 标题 */
     lv_obj_t *title_label = lv_label_create(container);
     lv_label_set_text(title_label, title);
-    lv_obj_set_style_text_font(title_label, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_font(title_label, &lv_font_ui_20, 0);
 
     /* 开关 */
     lv_obj_t *sw = lv_switch_create(container);
@@ -472,7 +485,7 @@ static void create_interval_setting(lv_obj_t *parent, const char *title,
     /* 标题 */
     lv_obj_t *title_label = lv_label_create(container);
     lv_label_set_text(title_label, title);
-    lv_obj_set_style_text_font(title_label, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_font(title_label, &lv_font_ui_20, 0);
     lv_obj_set_style_pad_bottom(title_label, 10, 0);
 
     /* 间隔选择按钮组 */
@@ -503,7 +516,7 @@ static void create_interval_setting(lv_obj_t *parent, const char *title,
 
         lv_obj_t *btn_label = lv_label_create(btn);
         lv_label_set_text(btn_label, interval_texts[i]);
-        lv_obj_set_style_text_font(btn_label, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_font(btn_label, &lv_font_ui_16, 0);
         lv_obj_center(btn_label);
     }
 }
@@ -522,7 +535,7 @@ static void create_about_info(lv_obj_t *parent)
         "界面: LVGL\n\n"
         "2026 智爱团队");
     lv_obj_set_style_text_color(info, lv_color_hex(0xCCCCCC), 0);
-    lv_obj_set_style_text_font(info, &lv_font_simsun_16_cjk, 0);
+    lv_obj_set_style_text_font(info, &lv_font_ui_16, 0);
     lv_obj_set_style_text_align(info, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_pad_top(info, 20, 0);
 }
@@ -538,7 +551,7 @@ static void create_back_button(lv_obj_t *parent)
 
     lv_obj_t *lbl = lv_label_create(btn);
     lv_label_set_text(lbl, "< 返回");
-    lv_obj_set_style_text_font(lbl, &lv_font_simsun_16_cjk, 0);
+    lv_obj_set_style_text_font(lbl, &lv_font_ui_16, 0);
     lv_obj_center(lbl);
 }
 
@@ -586,6 +599,7 @@ static void setting_slider_event_handler(lv_event_t *e)
     lv_obj_t *slider = lv_event_get_target(e);
     int index = (int)(intptr_t)lv_event_get_user_data(e);
     int value = lv_slider_get_value(slider);
+    int ret;
 
     switch (index) {
         case 0: // 音量
@@ -593,7 +607,13 @@ static void setting_slider_event_handler(lv_event_t *e)
             break;
         case 1: // 亮度
             user_settings.brightness = value;
-            // TODO: 实际调整屏幕亮度
+
+            /* 回调里只设值，不做重活：backlight_set() 内部是懒打开的 fd +
+             * 两个 ioctl。失败只打一行。未打 vendor 补丁的树上 1..99 会回
+             * -ENOSYS（见 sf32lb52_backlight.h 文件头）。 */
+            ret = backlight_set(value);
+            if (ret != OK)
+                printf("touch_ui: backlight_set(%d) failed: %d\n", value, ret);
             break;
         default:
             break;
@@ -633,7 +653,7 @@ static void reminder_item_event_handler(lv_event_t *e)
 /* 恢复默认设置事件 */
 static void setting_reset_event_handler(lv_event_t *e)
 {
-    show_confirm_dialog("重置", "确定恢复默认设置？",
+    show_confirm_dialog("重置", "确定恢复默认设置?",
                        confirm_dialog_event_handler);
 }
 
@@ -691,7 +711,7 @@ static void show_confirm_dialog(const char *title, const char *content,
     lv_obj_center(mbox);
     lv_obj_set_style_bg_color(mbox, lv_color_hex(0x2D2D44), 0);
     lv_obj_set_style_text_color(mbox, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_text_font(mbox, &lv_font_simsun_16_cjk, 0);
+    lv_obj_set_style_text_font(mbox, &lv_font_ui_16, 0);
 
     /* 添加按钮事件 */
     lv_obj_add_event_cb(btn_cancel, callback, LV_EVENT_CLICKED, (void *)(intptr_t)0);
@@ -754,7 +774,7 @@ void touch_ui_show_setting_detail(const char *title, const char *content)
     lv_obj_center(mbox);
     lv_obj_set_style_bg_color(mbox, lv_color_hex(0x2D2D44), 0);
     lv_obj_set_style_text_color(mbox, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_text_font(mbox, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(mbox, &lv_font_ui_20, 0);
 }
 
 /* 添加提醒 */

@@ -163,17 +163,19 @@ typedef struct {
 /**
  * 初始化推送服务
  * @param service  推送服务类型
- * @param key      推送 key (从 Bark/PushPlus 获取)
+ * @param key      推送 key；传 NULL/空串时自动从 /etc/assets/push_key.txt
+ *                 读取，读不到再用 network_comm.c 里的编译期默认值
  * @return 0 成功, -1 失败
  */
 int push_init(push_service_t service, const char *key);
 
 /**
- * 发送推送通知
+ * 发送推送通知（异步：仅投递到后台推送任务，不等 HTTP 结果）
  * @param title    通知标题
  * @param content  通知内容
  * @param group    分组 (可选，用于分类通知)
- * @return 0 成功, -1 失败
+ * @return 0 已投递到后台任务, -1 未启用/构建请求失败
+ *         真正的成功判据是后台任务拿到的 HTTP 状态码 200/201，见串口 [PUSH] 日志
  */
 int push_send_notification(const char *title, const char *content, const char *group);
 

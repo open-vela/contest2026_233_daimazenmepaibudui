@@ -1,0 +1,135 @@
+================================================================================
+ai_agent 云端通路验证日志（只读）
+日期：2026-09-13
+环境：SF32LB52-DevKit-LCD + openvela；上位机 Windows，板子经 USB RNDIS + ICS 上网
+串口：COM4 @ 1000000 8N1（_flash/cmd_cap.py，按 UTF-8 落原始输出）
+说明：已滤掉 USB RNDIS 刷屏（usbclass_/rndis_/Pending data）与 MQTT 重连噪声。
+      **本文件不含 API 密钥** —— 配置那一行是刻意不录制的（见第 6 节）。
+================================================================================
+
+--------------------------------------------------------------------------------
+1) nsh> ps   —— 确认没有 ai_agent 在跑
+--------------------------------------------------------------------------------
+  PID GROUP PRI POLICY   TYPE    STATE      STACK    USED FILLED COMMAND
+    0     0   0 FIFO     Kthread Ready      0016016 0001420   8.8%  CPU0 IDLE
+    1     0 224 RR       Kthread Waiting    0015968 0000536   3.3%  hpwork
+    2     0 120 RR       Kthread Waiting    0015968 0001548   9.6%  lpwork
+    7     7 110 RR       Task    Waiting    0016280 0003820  23.4%  robot_ui
+    8     8 100 RR       Task    Waiting    0012184 0002784  22.8%  net_task
+    9     7 120 RR       pthread Waiting    0032688 0003024   9.2%  robot_ui（推送任务）
+   ...                                                              hello_app + 4 pthread
+   11    11 100 RR       Task    Running    0015992 0002252  14.0%  nsh_main
+→ 没有 ai_agent，可以启动。
+
+--------------------------------------------------------------------------------
+2) nsh> net_test   —— 基础网络
+--------------------------------------------------------------------------------
+[1/4] 网卡 eth0 配置      IP = 192.168.137.2   网关 = 192.168.137.1    [PASS]
+[2/4] DNS 解析 broker.emqx.io                                        [PASS]
+[3/4] TCP 连接 34.243.217.54:1883                                    [PASS]
+[4/4] MQTT CONNECT -> CONNACK（broker.emqx.io 回了 CONNACK）          [PASS]
+   结果: 4/4 PASS   >>> 板子网络正常 <<<
+
+--------------------------------------------------------------------------------
+3) nsh> ai_agent   —— 前台启动（没有加 &）
+--------------------------------------------------------------------------------
+[agent] P5: cron + heartbeat started
+[agent] P5: network_watch thread started (async)
+[agent] P6: nsh_commands_start (rc=0)
+[agent] AI Agent ready. Type 'help' in NSH for commands.
+[agent] Outbound dispatch started
+[agent] Network watcher started
+[netmgr] No saved WiFi credentials. Use CLI: set_wifi <ssid> <pass>
+[netmgr] Found iface eth0 addr 192.168.137.2
+[netmgr] Network connected: 192.168.137.2          ← 只按"有非回环 IPv4 地址"判断，RNDIS eth0 认到了
+[agent] Agent loop started, free heap: 7387056
+[agent] Buffers: ctx=8192 hist=8192 tool=8192
+[agent] Tool output pool: 2 x 16384 bytes
+[agent] Tools JSON loaded: 9985 bytes
+[ws] WebSocket server started on port 28789
+[mqtt] No mqtt_broker configured, MQTT disabled
+[cli] NSH CLI started. Type 'help' for commands.
+→ 注意：本固件里它是 **NSH 命令**风格（提示符 `vela>` 的 CLI 也能收命令，两种都能用）。
+
+--------------------------------------------------------------------------------
+4) vela> help   —— 实际注册的命令
+--------------------------------------------------------------------------------
+  net_status           - Show network connection status
+  set_llm <preset|host> [model] [key] - Switch LLM backend
+  set_vision_llm <preset|host> [model] [key]
+  heap_info            - Show memory usage
+  ask <text>           - Chat with AI Agent
+  quit                 - Exit agent
+
+--------------------------------------------------------------------------------
+5) vela> set_llm（不带参数，看用法）   —— 以板子输出为准
+--------------------------------------------------------------------------------
+Presets:
+  kimi     - api.moonshot.cn          (kimi-k2.5)
+  qwen     - dashscope.aliyuncs.com   (qwen-turbo)
+  deepseek - api.deepseek.com         (deepseek-chat)
+  glm      - open.bigmodel.cn         (glm-4-flash)
+  openai   - api.openai.com           (gpt-4o)
+  openrouter - openrouter.ai          (openrouter/hunter-alpha)
+  mimo     - api.xiaomimimo.com       (MiMo-v2-Flash)      ← 有 mimo 预设，但用的是老站点/老模型名
+URL format (for custom endpoints):
+  set_llm http://host:port/path model key
+  set_llm http://<your-endpoint>/v1 model-name sk-xxx
+Note: set_llm writes to router slot 0 and applies immediately.
+
+vela> net_status
+[netmgr] Found iface eth0 addr 192.168.137.2
+Network connected: yes
+IP: 192.168.137.2
+
+--------------------------------------------------------------------------------
+6) 配置 LLM 后端（**这一行刻意不做录制**）
+--------------------------------------------------------------------------------
+执行（密钥不在本文件、也不在命令行里出现，脚本运行时从构建目录 .config 里读进内存，
+只用于这一次串口发送，全程不打印、不读回显、不落盘）：
+
+    set_llm https://token-plan-cn.xiaomimimo.com/v1/chat/completions mimo-v2.5 <key>
+
+板子回显里那句话（只保留脱敏后的部分，它本身不打印密钥）：
+    [llm] LLM config updated atomically: token-plan-cn.xiaomimimo.com/v1/chat/completions
+          (model: mimo-v2.5)
+
+--------------------------------------------------------------------------------
+7) vela> ask 请只回答：连接成功      —— 关键证据
+--------------------------------------------------------------------------------
+（配置之前的第一次 ask，用来对照）
+[llm_router] No available backend
+[agent] LLM call failed (iter 0)
+[trace:...] END status=fail iters=1 tools=0 llm_ms=0 elapsed=0s backend=-1
+[Agent]: Sorry, I encountered an error.
+
+（配置之后再 ask）
+[trace:386d46b435c3b13a] BEGIN chat=console chan=cli
+[llm] OpenAI API with tools (model: mimo-v2.5, 14925 bytes)     ← 请求真的发出去了（14925 字节）
+[Agent]: 稍等，处理中...
+[llm] Response: 12 bytes text, 0 tool calls, finish=end_turn      ← ★ 收到真实回复，12 字节，正常收尾
+[agent] LLM watchdog: call took 955862003 ms (limit 60s), treating as timeout   ← ★ 耗时统计荒谬
+[trace:386d46b435c3b13a] iter=0 tool=(none) latency=955862003ms llm=fail backend=0
+[trace:386d46b435c3b13a] END status=timeout iters=1 tools=0 llm_ms=955862003 elapsed=825589583s
+[Agent]: 请求超时，LLM 响应时间过长。请稍后重试，或尝试简化你的问题。
+
+★ 判读：
+  - DNS ✅（请求出了板子）
+  - TLS/HTTPS ✅（能到 token-plan-cn.xiaomimimo.com 并拿到响应）
+  - 鉴权 ✅（没有 401/403；带 tools 的 14925 字节请求被接受）
+  - 模型回复 ✅（`Response: 12 bytes text, finish=end_turn`；12 字节 = 4 个汉字，
+    和要求的"连接成功"正好对上）
+  - ❌ 唯一失败点：**客户端的耗时统计/超时判断**。955862003 ms ≈ 11 天，
+    明显是脏值（tick 当 ms、秒差当 ms、或回调后读已释放的结构体）。
+    响应其实已经到了，却被 watchdog 判成超时丢弃。
+
+--------------------------------------------------------------------------------
+8) vela> heap_info
+--------------------------------------------------------------------------------
+Heap: arena=8648648  fordblks(free)=7274224  uordblks(used)=1374424
+→ 约 8.65MB 堆，空闲 7.27MB，占用 1.37MB。**内存不是瓶颈。**
+
+================================================================================
+本文件为只读记录；需要更新请新增一份带日期的日志。
+本文件不含 API 密钥（配置那一行刻意未录制）。
+================================================================================

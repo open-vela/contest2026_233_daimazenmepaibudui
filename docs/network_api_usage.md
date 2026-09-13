@@ -188,3 +188,4 @@ listening on zhi_ai/# for 120s ...
 | 收到消息但没反应 | 回调里是不是阻塞了（拖住了 `network_task`） |
 | `report_*` 一直返回 -1 | `mqtt_is_connected()` 是 false，先解决连接 |
 | `MQTT connected` 打印了但云端收不到 | 它**不等 CONNACK**，打印是"乐观成功"；用 `_flash/mqtt_watch.py` 在 PC 上订阅验证 |
+| **所有 DNS 都解析失败**（MQTT `DNS 解析失败`、MiMo 连不上、推送发不出） | ★ **先查 PC 侧 ICS 的 DNS 代理**，不是板子的问题：在 PC 上跑 `nslookup api.day.app 192.168.137.1`。返回 IP = 代理活着；`No response from server` = **代理已死** → 重做 ICS 共享，或管理员 `Restart-Service SharedAccess -Force`。**注意必须问 `192.168.137.1` 这个地址**——默认 DNS 走 PC 自己的 Wi-Fi，它一直是好的，光看"PC 能上网"会被完全带偏。**换 Wi-Fi / 换路由器之后高发**（ICS 的 NAT/DNS 代理还绑在旧网络上），详见 `README.md` 第 6 节 |

@@ -13,7 +13,24 @@
     <linkfile src="app/zhi_ai" dest="packages/demos/contest2026_233_zhi_ai"/>
     <linkfile src="app/robot_ui" dest="packages/demos/contest2026_233_robot_ui"/>
     <linkfile src="app/audio_test" dest="packages/demos/contest2026_233_audio_test"/>
+    <linkfile src="app/hw_test" dest="packages/demos/contest2026_233_hw_test"/>
     <linkfile src="quickapp/hello_quickapp" dest="packages/apps/contest2026_233_hello_quickapp"/>
     <linkfile src="board/contest_board" dest="vendor/openvela/boards/contest2026_233_board"/>
+    <!--
+      板级实现（BSP）暴露给 vendor/sifli。注意这里是**逐项目录**而不是整目录：
+      nuttx/CMakeLists.txt 用 ${NUTTX_BOARD_ABS_DIR}/../drivers 去软链芯片驱动，
+      如果 sf32lb52_devkit_lcd 整个是软链，.. 会解析到软链目标的父目录，驱动就找不到了。
+      所以必须保持 sf32lb52_devkit_lcd 是个真目录、里面每一项才是软链。
+      若 repo sync 之后 vendor/sifli 的原始目录被恢复，重跑
+      board/contest_board/scripts/link_board_impl.sh 即可。
+    -->
+    <linkfile src="board/contest_board/CMakeLists.txt" dest="vendor/sifli/boards/sf32lb52/sf32lb52_devkit_lcd/CMakeLists.txt"/>
+    <linkfile src="board/contest_board/Kconfig" dest="vendor/sifli/boards/sf32lb52/sf32lb52_devkit_lcd/Kconfig"/>
+    <linkfile src="board/contest_board/README.md" dest="vendor/sifli/boards/sf32lb52/sf32lb52_devkit_lcd/README.md"/>
+    <linkfile src="board/contest_board/README_zh-cn.md" dest="vendor/sifli/boards/sf32lb52/sf32lb52_devkit_lcd/README_zh-cn.md"/>
+    <linkfile src="board/contest_board/configs" dest="vendor/sifli/boards/sf32lb52/sf32lb52_devkit_lcd/configs"/>
+    <linkfile src="board/contest_board/include" dest="vendor/sifli/boards/sf32lb52/sf32lb52_devkit_lcd/include"/>
+    <linkfile src="board/contest_board/scripts" dest="vendor/sifli/boards/sf32lb52/sf32lb52_devkit_lcd/scripts"/>
+    <linkfile src="board/contest_board/src" dest="vendor/sifli/boards/sf32lb52/sf32lb52_devkit_lcd/src"/>
   </project>
 </manifest>

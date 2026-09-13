@@ -1,0 +1,100 @@
+diff --git a/boards/sf32lb52/drivers/lcd/sf32lb_lcd.c b/boards/sf32lb52/drivers/lcd/sf32lb_lcd.c
+index 66fcfc6..a93f21c 100644
+--- a/boards/sf32lb52/drivers/lcd/sf32lb_lcd.c
++++ b/boards/sf32lb52/drivers/lcd/sf32lb_lcd.c
+@@ -73,6 +73,12 @@ const void *_lcd_drv_ref_ili8688e
+  ****************************************************************************/
+ #define lcd_debug_print lcdinfo
+ 
++/* LCDDEVIO_SETCONTRAST / GETCONTRAST 在本驱动里按“亮度百分比 0..100”解释，
++ * **不跟 CONFIG_LCD_MAXCONTRAST 走**（本板它是 63，会把 100% 挡在外面）。
++ * 面板侧对应 CO5300 的 0x51 WBRIGHT，见 co5300.c 的 LCD_SetBrightness()。 */
++
++#define SF32LB_LCD_BRIGHTNESS_MAX 100
++
+ struct sf32lb_lcd_dev_s
+ {
+     struct lcd_dev_s dev;
+@@ -85,6 +91,7 @@ struct sf32lb_lcd_dev_s
+     FAR sem_t draw_sem;
+ 
+     int power;
++    int contrast;               /* 亮度百分比 0..100，见 setcontrast/getcontrast */
+     uint8_t bpp;
+ };
+ 
+@@ -676,29 +683,56 @@ static int sf32lb_lcd_setpower(FAR struct lcd_dev_s *dev, int power)
+  * Name:  sf32lb_lcd_getcontrast
+  *
+  * Description:
+- *   Get the current contrast setting (0-CONFIG_LCD_MAXCONTRAST).
++ *   回当前亮度百分比（0..100）。面板只有 0x51 WBRIGHT 这个写口、没有回读
++ *   通路（CO5300 的 0x52 RBRIGHT 在本驱动里没有读函数），所以这里回的是
++ *   “最近一次下发的值”；屏幕关着的时候按 0 报，免得调用方以为亮度还在。
+  *
+  ****************************************************************************/
+ 
+ static int sf32lb_lcd_getcontrast(FAR struct lcd_dev_s *dev)
+ {
+-  lcdinfo("Not implemented\n");
+-  return -ENOSYS;
++  FAR struct sf32lb_lcd_dev_s *priv = (FAR struct sf32lb_lcd_dev_s *)dev;
++
++  return priv->power > 0 ? priv->contrast : 0;
+ }
+ 
+ /****************************************************************************
+  * Name:  sf32lb_lcd_setcontrast
+  *
+  * Description:
+- *   Set LCD panel contrast (0-CONFIG_LCD_MAXCONTRAST).
++ *   设亮度百分比（0..100），转发给面板驱动的 SetBrightness 回调 —— CO5300 的
++ *   LCD_SetBrightness() 把百分比换算成 0..255 写 0x51 WBRIGHT。
++ *
++ *   别的屏可能没实现这个可选回调，那时如实回 -ENOSYS，不空指针调用。
+  *
+  ****************************************************************************/
+ 
+ static int sf32lb_lcd_setcontrast(FAR struct lcd_dev_s *dev,
+                               unsigned int contrast)
+ {
+-  lcdinfo("contrast: %d\n", contrast);
+-  return -ENOSYS;
++  FAR struct sf32lb_lcd_dev_s *priv = (FAR struct sf32lb_lcd_dev_s *)dev;
++
++  lcdinfo("contrast(brightness): %u\n", contrast);
++
++  if (contrast > SF32LB_LCD_BRIGHTNESS_MAX)
++    {
++      lcderr("contrast %u out of range 0..%d\n",
++             contrast, SF32LB_LCD_BRIGHTNESS_MAX);
++      return -EINVAL;
++    }
++
++  if (priv->p_drv_ops == NULL || priv->p_drv_ops->p_ops == NULL ||
++      priv->p_drv_ops->p_ops->SetBrightness == NULL)
++    {
++      lcdinfo("SetBrightness() not implemented by this panel\n");
++      return -ENOSYS;
++    }
++
++  priv->p_drv_ops->p_ops->SetBrightness(&priv->hlcdc, (uint8_t)contrast);
++
++  priv->contrast = (int)contrast;
++
++  return OK;
+ }
+ 
+                               
+@@ -922,6 +956,11 @@ int board_lcd_initialize(void)
+     
+     memset(&s_drv_lcd, 0, sizeof(s_drv_lcd));
+ 
++    /* 面板上电默认 WBRIGHT 就是满值，让 GETCONTRAST 在第一次设置前也报 100；
++     * 真正“亮不亮”仍然看 priv->power（开机时是 0，第一次刷像素才 DisplayOn）。 */
++
++    s_drv_lcd.contrast = SF32LB_LCD_BRIGHTNESS_MAX;
++
+     s_drv_lcd.hlcdc.Instance = LCDC1;
+ 
+     s_drv_lcd.select_layer = HAL_LCDC_LAYER_DEFAULT;

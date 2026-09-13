@@ -658,7 +658,16 @@ int main(int argc, char *argv[])
 
   if (sound_self_test && g_sound_started)
     {
-      int16_t test_audio[SOUND_DETECT_FRAMES_PER_WINDOW];
+      /* static 很关键：这是一个 16000 样本 × 2 字节 = 32KB 的缓冲区。
+       * 放在栈上时，GCC（-O2）会把整个函数的栈帧在入口序言里一次性开出来：
+       *     sub.w sp, sp, #32000
+       *     sub   sp, #16
+       * 也就是 ai_companion_main 一进来就要 32,016 字节栈。
+       * 而任务栈只有 CONFIG_HELLO_APP_STACKSIZE（默认 16KB）→ 一启动就踩穿栈、
+       * 硬件异常、整机 panic。它只在 --sound-self-test 分支用一次，
+       * 没有重入需求，所以挪到 .bss 最合适（对栈的占用变成 0）。
+       */
+      static int16_t test_audio[SOUND_DETECT_FRAMES_PER_WINDOW];
       memset(test_audio, 0, sizeof(test_audio));
       for (size_t i = 0; i < SOUND_DETECT_FRAMES_PER_WINDOW; i += 80)
         {

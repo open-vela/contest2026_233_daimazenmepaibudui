@@ -14,6 +14,17 @@
 #include <errno.h>
 #include <time.h>
 
+/* 板级报警模块（board/contest_board/src）：把报警"响起来"。
+ * 接口是异步非阻塞的，声音由报警模块自己的工作线程播。 */
+
+#include "sf32lb52_alarm.h"
+
+/* 成员三（app/robot_ui）的异常声音上报接口：MQTT 上报 + 本地报警回调。
+ * 这是跨 app 调用（hello_app -> robot_ui），但同一条链路 ai_network.c
+ * 早就在用了（同一份 network_comm.h），不是新引入的依赖。 */
+
+#include "../robot_ui/network_comm.h"
+
 /****************************************************************************
  * Private Function Prototypes
  ****************************************************************************/
@@ -210,11 +221,22 @@ static void sm_alarm_enter(void *ctx)
 {
   (void)ctx;
   SM_DEBUG("进入报警状态: 发送异常通知");
-  /* TODO: 立即通知家人/护理人员 */
-  /* network_send_alarm(); */
 
-  /* TODO: 通知成员三显示报警界面 */
-  /* TODO: 持续录音并上传作为证据 */
+  /* 1) 本地报警：让板子自己响起来。
+   *    alarm_trigger() 只改状态 + 唤醒报警模块的工作线程，非阻塞，
+   *    在状态机回调上下文里调用是安全的（声音在别人的线程里播）。
+   *    报警自动解除时间与 SM_STATE_ALARM 的 60 秒对齐，见 sf32lb52_alarm.h。 */
+
+  (void)alarm_trigger(ALARM_LEVEL_EMERGENCY, "sound",
+                      "检测到异常声音，请立即查看");
+
+  /* 2) 上报 / 手机推送 / 报警界面：成员三的异常声音上报。
+   *    sound_detect_callback() 只把事件交给状态机、没带声音类型字符串，
+   *    状态机也拿不到，所以这里用中性的 "abnormal"；
+   *    置信度同理拿不到，传 0（表示未量化）。
+   *    注意：这条会走 cJSON + MQTT 发送，不是"立刻返回"的接口。 */
+
+  (void)report_abnormal_sound("abnormal", 0);
 }
 
 /****************************************************************************
@@ -255,7 +277,11 @@ static void sm_alarm_exit(void *ctx)
 {
   (void)ctx;
   SM_DEBUG("退出报警状态");
-  /* TODO: 停止报警相关操作 */
+
+  /* 解除本地报警：停音频、清 active。没有处于报警中时是安全的空操作，
+   * 同样是非阻塞的（真正的停止在报警模块的工作线程里做）。 */
+
+  (void)alarm_clear();
 }
 
 /****************************************************************************

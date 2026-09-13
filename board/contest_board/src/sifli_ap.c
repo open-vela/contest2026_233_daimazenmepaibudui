@@ -30,6 +30,7 @@
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <debug.h>
+#include <unistd.h>
 
 #if defined(CONFIG_RTC) && defined(CONFIG_RTC_DRIVER)
 #  include <nuttx/timers/rtc.h>
@@ -40,17 +41,23 @@
 #include "bf0_hal.h"
 #include "drv_io.h"
 #include "sifli_gpio.h"
+#include "sf32lb52_audio.h"
+
+/* sifli_i2cbus_initialize is defined in chips/sf32lb52/sifli_i2c.c
+ * (no public header exists yet in vendor_sifli)
+ */
+extern struct i2c_master_s *sifli_i2cbus_initialize(int port);
 
 #include <nuttx/arch.h>
 #include <nuttx/board.h>
+#include <nuttx/i2c/i2c_master.h>
 #include <nuttx/lcd/lcd.h>
 #include <nuttx/lcd/lcd_dev.h>
+#include <nuttx/sched.h>
 #include <nuttx/timers/pwm.h>
 #include <nuttx/timers/timer.h>
+#include <nuttx/usb/rndis.h>
 #include <nuttx/video/fb.h>
-#if defined(CONFIG_I2C) && defined(CONFIG_SENSORS_LSM6DSL)
-#  include <nuttx/sensors/lsm6dsl.h>
-#endif
 #if defined(CONFIG_SPI) && defined(CONFIG_BSP_USING_SPI1)
 #  include <nuttx/spi/spi.h>
 #  include "sf32lb_spi.h"
@@ -84,13 +91,6 @@ extern int sf32lb_nor_automount(int minor, int block_offset, int block_count);
 
 #if defined(CONFIG_SPI) && defined(CONFIG_BSP_USING_SPI1)
 #  define SF32LB52_SPI1_PORT           0
-#endif
-
-#if defined(CONFIG_I2C) && defined(CONFIG_SENSORS_LSM6DSL)
-#  define SF32LB52_LSM6DS3_I2C_BUS     1
-#  define SF32LB52_LSM6DS3_DEVPATH     "/dev/lsm6dsl0"
-#  define SF32LB52_LSM6DS3_LDO_PIN     GET_PIN_2(hwp_gpio1, 30)
-#  define SF32LB52_LSM6DS3_INT_PIN     GET_PIN_2(hwp_gpio1, 31)
 #endif
 
 #if defined(CONFIG_SPI) && defined(CONFIG_MMCSD_SPI) && \
@@ -230,55 +230,10 @@ static int sf32lb52_tfcard_initialize(void)
 #endif
 #endif
 
-#if defined(CONFIG_I2C) && defined(CONFIG_SENSORS_LSM6DSL)
-static int sf32lb52_lsm6ds3_initialize(FAR struct i2c_master_s *i2c)
-{
-  int ret;
-
-  /* LSM6DS3TR-C is register-compatible enough with the in-tree LSM6DSL
-   * test driver for board bringup.  The board wiring is:
-   *   PA39 - I2C2 SDA
-   *   PA40 - I2C2 SCL
-   *   PA31 - INT
-   *   PA30 - sensor LDO enable, active high
-   */
-
-  HAL_PIN_Set(PAD_PA30, GPIO_A30, PIN_NOPULL, 1);
-  sifli_gpio_config(SF32LB52_LSM6DS3_LDO_PIN, GPIO_OUTPUT);
-  sifli_gpio_write(SF32LB52_LSM6DS3_LDO_PIN, true);
-  usleep(10000);
-
-  HAL_PIN_Set(PAD_PA31, GPIO_A31, PIN_PULLUP, 1);
-  sifli_gpio_config(SF32LB52_LSM6DS3_INT_PIN, GPIO_INPUT);
-
-  ret = lsm6dsl_sensor_register(SF32LB52_LSM6DS3_DEVPATH,
-                                i2c,
-                                LSM6DSLACCEL_ADDR0);
-  if (ret < 0)
-    {
-      syslog(LOG_WARNING,
-             "WARN: LSM6DS3 not found at 0x%02x on I2C%d: %d\n",
-             LSM6DSLACCEL_ADDR0, SF32LB52_LSM6DS3_I2C_BUS, ret);
-
-      ret = lsm6dsl_sensor_register(SF32LB52_LSM6DS3_DEVPATH,
-                                    i2c,
-                                    LSM6DSLACCEL_ADDR1);
-    }
-
-  if (ret < 0)
-    {
-      syslog(LOG_ERR,
-             "ERROR: LSM6DS3 register failed on I2C%d: %d\n",
-             SF32LB52_LSM6DS3_I2C_BUS, ret);
-      return ret;
-    }
-
-  syslog(LOG_INFO,
-         "INFO: LSM6DS3 test device registered as %s, INT=%d\n",
-         SF32LB52_LSM6DS3_DEVPATH, SF32LB52_LSM6DS3_INT_PIN);
-  return OK;
-}
-#endif
+/* 本板没有 IMU。原先这里有一段从 SF32LB52-ULP/黄山派 抄来的 LSM6DS3
+ * bringup（把 PA30 抢成"传感器 LDO 使能"），而本板 PA30 = 触摸 I2C1_SCL，
+ * 属于引脚错位。已删除，理由与替换方案见 docs/sensor_rtc_usage.md。
+ */
 
 /****************************************************************************
  * Public Functions
@@ -395,6 +350,15 @@ int sf32lb52_lchspi_ulp_bringup(void)
     }
 #endif
 
+#ifdef CONFIG_AUDIO
+  ret = sf32lb52_audio_initialize();
+  if (ret < 0)
+    {
+      serr("ERROR: sf32lb52_audio_initialize failed: %d\n", ret);
+      return ret;
+    }
+#endif
+
 #ifdef CONFIG_DEV_GPIO
   ret = sifli_gpio_initialize();
   if (ret < 0)
@@ -463,11 +427,10 @@ int sf32lb52_lchspi_ulp_bringup(void)
 #endif
 
 #ifdef CONFIG_I2C
-  /* Initialize I2C bus 0 on the touch panel pins. */
+  /* Initialize I2C bus 0 on the touch panel pins.
+   * Pinmux for I2C1 (SCL=PA30, SDA=PA33) is done in bsp_pinmux.c.
+   */
   struct i2c_master_s *i2c0 = NULL;
-
-  HAL_PIN_Set(PAD_PA37, I2C1_SCL, PIN_PULLUP, 1);
-  HAL_PIN_Set(PAD_PA33, I2C1_SDA, PIN_PULLUP, 1);
 
   i2c0 = sifli_i2cbus_initialize(0);
   if (i2c0 == NULL)
@@ -499,11 +462,6 @@ int sf32lb52_lchspi_ulp_bringup(void)
   /* Initialize I2C bus 1 for charger (AW32001). */
   struct i2c_master_s *i2c1 = NULL;
 
-#if defined(CONFIG_SENSORS_LSM6DSL)
-  HAL_PIN_Set(PAD_PA40, I2C2_SCL, PIN_PULLUP, 1);
-  HAL_PIN_Set(PAD_PA39, I2C2_SDA, PIN_PULLUP, 1);
-#endif
-
   i2c1 = sifli_i2cbus_initialize(1);
   if (i2c1 == NULL)
     {
@@ -516,16 +474,6 @@ int sf32lb52_lchspi_ulp_bringup(void)
         {
           syslog(LOG_ERR, "ERROR: i2c_register(/dev/i2c1) failed: %d\n", ret);
         }
-
-#if defined(CONFIG_SENSORS_LSM6DSL)
-      tmpret = sf32lb52_lsm6ds3_initialize(i2c1);
-      if (tmpret < 0)
-        {
-          syslog(LOG_ERR,
-                 "ERROR: sf32lb52_lsm6ds3_initialize failed: %d\n",
-                 tmpret);
-        }
-#endif
     }
 #endif /* CONFIG_BSP_USING_I2C2 */
 #endif /* CONFIG_I2C */
@@ -652,6 +600,101 @@ void board_late_initialize(void)
   /* Perform board-specific initialization */
 
   sf32lb52_lchspi_ulp_bringup();
+
+#ifdef CONFIG_RNDIS
+  /* Bring up the USB RNDIS Ethernet-over-USB gadget: the host (PC)
+   * enumerates this board as a virtual Ethernet adapter. The RNDIS
+   * class driver registers the netdev itself; configure it afterwards
+   * via ifconfig / netmgr (static or DHCP from the host).
+   */
+  {
+    static const uint8_t rndis_mac[6] =
+    {
+      0x00, 0xe0, 0x4c, 0x53, 0x42, 0x31
+    };
+
+    /* Plain bring-up -- no USB register poking at all.  usbdev_register()
+     * enables the USB clock, configures the PHY and asserts DP_EN via
+     * pullup().
+     */
+
+    (void)usbdev_rndis_initialize(rndis_mac);
+  }
+#endif
+
+#ifdef CONFIG_LVX_USE_CONTEST2026_233_ZHI_AI
+  /* Autostart the ZhiAi companion UI (robot_ui) so the device boots
+   * straight into the touch UI, while NSH stays available on the serial
+   * console for debugging. Give the async LCD/touch probe a moment to
+   * finish before LVGL opens /dev/lcd0 and /dev/input0.
+   * robot_ui also brings up WiFi (wifi_connect) during its init.
+   */
+  {
+    extern int robot_ui_main(int argc, FAR char *argv[]);
+    int ret;
+
+    usleep(2 * 1000 * 1000);
+    /* 优先级必须高于后台任务（net_task / lpwork / hello_app 都是 100）：
+     * lpwork 是 USB RNDIS 的工作队列，网络有流量时会持续占用 CPU，
+     * 同级轮转下 UI 线程会被挤到 12 次/秒，触摸明显迟钝。
+     * 提到 110 让 UI 永远优先，但仍低于 hpwork(224)，
+     * 所以触摸中断的 worker 依然能及时把样点送上来。
+     */
+    ret = task_create("robot_ui", 110, 16384, robot_ui_main, NULL);
+    if (ret < 0)
+      {
+        syslog(LOG_ERR, "ERROR: robot_ui autostart failed: %d\n", ret);
+      }
+  }
+#endif
+
+#ifdef CONFIG_LVX_USE_CONTEST2026_233_HELLO_APP
+  /* Autostart the AI companion logic (hello_app: state machine, care
+   * timers, voice/sound detection). Started after robot_ui so the WiFi
+   * link is already up if the LLM path is ever exercised.
+   *
+   * 注意：这里原来写的是 CONFIG_LVX_USE_DEMO_CONTEST2026_000_HELLO_APP，
+   * 是上游模板改名前的旧符号 —— defconfig 里从来没有这个符号，
+   * 所以这段自启**永远不会生效**（ps 里看不到 hello_app 线程）。
+   * 实际生效的符号是 app/hello_app/Kconfig 里的
+   * CONFIG_LVX_USE_CONTEST2026_233_HELLO_APP，defconfig 已置 y。
+   *
+   * ⚠ 2026-09-12 实测：符号改对之后自启确实起来了（ps 里能看到优先级 100 的
+   * hello_app 任务）——**但它一启动就 hardfault，整机断言 panic 死掉**：
+   *   Assertion failed panic: at file: /arch/arm/src/arm_m/arm_hardfault.c:186
+   *   task: hello_app
+   * 所以现在用一个开关把它挡住，等定位完再打开。
+   * 定位方法：关掉自启后，在 NSH 里手动敲 `ai_companion` 看是否同样崩，
+   * 以区分「app 自身缺陷」和「开机时序问题」。
+   *
+   * 后续：整个固件原来是 -O0（CONFIG_DEBUG_NOOPT，见 defconfig 里的说明），
+   * 打开 -O2 之后重新测试本开关。
+   */
+#define AUTOSTART_HELLO_APP 1
+#if AUTOSTART_HELLO_APP
+  {
+    /* 入口符号由 nuttx_add_application(NAME ...) 决定：
+     * app/hello_app/CMakeLists.txt 里 NAME 是 ${CONFIG_HELLO_APP_PROGNAME}
+     * = "ai_companion"，所以函数名是 ai_companion_main（在 ai_companion_main.c 里），
+     * 不是 hello_app_main。写成 hello_app_main 会 undefined reference。
+     */
+    extern int ai_companion_main(int argc, FAR char *argv[]);
+    int ret;
+
+    usleep(500 * 1000);
+    /* 栈必须用 CONFIG_HELLO_APP_STACKSIZE（defconfig 里设成 64KB）。
+     * 之前这里硬编码 16384，而 ai_companion_main 一进函数就要 32KB 栈帧，
+     * 结果一启动就踩穿栈、hard fault、整机 panic。
+     * 详情见 board/contest_board/configs/sf32lb52_ai/defconfig 里的注释。 */
+    ret = task_create("hello_app", 100, CONFIG_HELLO_APP_STACKSIZE,
+                      ai_companion_main, NULL);
+    if (ret < 0)
+      {
+        syslog(LOG_ERR, "ERROR: hello_app autostart failed: %d\n", ret);
+      }
+  }
+#endif
+#endif
 }
 #endif
 

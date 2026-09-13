@@ -1,0 +1,139 @@
+diff --git a/src/core/agent_loop.c b/src/core/agent_loop.c
+index 3d9dec3..08ad368 100644
+--- a/src/core/agent_loop.c
++++ b/src/core/agent_loop.c
+@@ -38,6 +38,7 @@
+ #include "agent_config.h"
+ 
+ #include <pthread.h>
++#include <time.h>
+ #include <stdint.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -65,8 +66,26 @@ static bool llm_call_timed_out(uint32_t latency_ms);
+ #define LLM_TIMEOUT_TASK_COMPLETE_MSG \
+     "任务已完成，但生成确认消息超时。"
+ 
++/* ── Monotonic clock for latency measurement ─────────────
++ *
++ * 计时一律用单调时钟：不受 RTC_SET_TIME / NTP / `date -s` 改墙钟影响。
++ *
++ * 背景（真机踩过，现象很吓人）：vela_tls.c 在 TLS 握手时若发现板子时钟太旧，
++ * 会把 CLOCK_REALTIME 硬跳到 2026。如果这里用墙钟算耗时，请求进行中的这次跳变
++ * 会让 sec_diff 变成 8.26e8 秒，再乘 1000 就在 32 位上回绕成 955862003 ms，
++ * watchdog 于是把已经收到的回复判成超时丢掉。
++ * ───────────────────────────────────────────────────────────── */
++static inline void mono_gettimeofday(struct timeval* tv)
++{
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    tv->tv_sec  = (time_t)ts.tv_sec;
++    tv->tv_usec = (suseconds_t)(ts.tv_nsec / 1000);
++}
++
+ /* ── Clock-safe elapsed time calculation ───────────────────── */
+ 
++
+ static inline uint32_t calc_elapsed_ms(const struct timeval* t0,
+     const struct timeval* t1)
+ {
+@@ -89,6 +108,15 @@ static inline uint32_t calc_elapsed_ms(const struct timeval* t0,
+         return 0;
+     }
+ 
++    /* 往前跳了不合理的大跨度（改墙钟 / 时钟异常）：钳到上限。
++     * 否则下面乘 1000 会在 32 位上回绕，把一个荒谬的 latency 写进 router
++     * 统计，还会让 watchdog 误判超时。约 49 天以内乘 1000 不会溢出 uint32。 */
++    if (sec_diff > 4294967) {
++        syslog(LOG_WARNING, "[%s] Clock jumped forward %lds, clamping\n",
++               TAG, (long)sec_diff);
++        return 0xFFFFFFFFu;
++    }
++
+     return (uint32_t)sec_diff * 1000 + (uint32_t)usec_diff / 1000;
+ }
+ 
+@@ -820,9 +848,9 @@ static char* force_finish_reply(const char* system_prompt,
+     llm_response_t resp;
+     char* result = NULL;
+     struct timeval t0, t1;
+-    gettimeofday(&t0, NULL);
++    mono_gettimeofday(&t0);
+     int err = llm_chat_tools(system_prompt, messages, NULL, &resp);
+-    gettimeofday(&t1, NULL);
++    mono_gettimeofday(&t1);
+     uint32_t ms = calc_elapsed_ms(&t0, &t1);
+     bool timed_out = llm_call_timed_out(ms);
+ 
+@@ -990,9 +1018,9 @@ static char* handle_task_complete(const char* sys_prompt, cJSON* messages,
+     llm_response_t final_resp;
+     char* result = NULL;
+     struct timeval t0, t1;
+-    gettimeofday(&t0, NULL);
++    mono_gettimeofday(&t0);
+     int err = llm_chat_tools(sys_prompt, messages, NULL, &final_resp);
+-    gettimeofday(&t1, NULL);
++    mono_gettimeofday(&t1);
+     uint32_t ms = calc_elapsed_ms(&t0, &t1);
+     bool timed_out = llm_call_timed_out(ms);
+ 
+@@ -1065,9 +1093,9 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
+ 
+         llm_response_t resp;
+         struct timeval tv_start, tv_end;
+-        gettimeofday(&tv_start, NULL);
++        mono_gettimeofday(&tv_start);
+         int err = llm_chat_tools(sys_prompt, messages, tools_json, &resp);
+-        gettimeofday(&tv_end, NULL);
++        mono_gettimeofday(&tv_end);
+         uint32_t latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
+ 
+         /* Router failover: on LLM call failure, try next backend */
+@@ -1083,10 +1111,10 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
+                 router_idx = next_idx;
+                 trace.backend_idx = next_idx;
+                 llm_response_free(&resp);
+-                gettimeofday(&tv_start, NULL);
++                mono_gettimeofday(&tv_start);
+                 err = llm_chat_tools(sys_prompt, messages,
+                     tools_json, &resp);
+-                gettimeofday(&tv_end, NULL);
++                mono_gettimeofday(&tv_end);
+                 latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
+             }
+         }
+@@ -1123,9 +1151,19 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
+                 "treating as timeout\n",
+                 TAG, latency_ms, AGENT_LLM_TIMEOUT_SEC);
+             agent_trace_step(&trace, iteration, NULL, latency_ms, 0);
++            /* 响应其实已经拿到了：宁可交付文本，也不要因为耗时统计异常把结果丢掉。
++             * （真机踩过：12 字节的真实回复就是这样被丢的，界面只显示“请求超时”） */
++            if (resp.text != NULL && resp.text_len > 0) {
++                final_text = strdup(resp.text);
++                syslog(LOG_WARNING,
++                       "[%s] watchdog: delivering received reply (%d bytes) "
++                       "despite latency=%" PRIu32 " ms\n",
++                       TAG, (int)resp.text_len, latency_ms);
++            } else {
++                final_text = strdup(LLM_TIMEOUT_MSG);
++                watchdog_fired = true;
++            }
+             llm_response_free(&resp);
+-            final_text = strdup(LLM_TIMEOUT_MSG);
+-            watchdog_fired = true;
+             break;
+         }
+ 
+@@ -1183,10 +1221,10 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
+                     router_idx = prem_idx;
+                     trace.backend_idx = prem_idx;
+ 
+-                    gettimeofday(&tv_start, NULL);
++                    mono_gettimeofday(&tv_start);
+                     err = llm_chat_tools(sys_prompt, messages,
+                         tools_json, &resp);
+-                    gettimeofday(&tv_end, NULL);
++                    mono_gettimeofday(&tv_end);
+                     latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
+ 
+                     /* Watchdog check on cascade retry */

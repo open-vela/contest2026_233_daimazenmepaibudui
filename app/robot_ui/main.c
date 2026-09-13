@@ -57,7 +57,12 @@ static void on_ai_command_received(const char *action, const char *param)
 
         /* 调用成员二的 AI 模块开始录音 */
         if (g_ai_initialized) {
-            audio_record_start(&g_audio_ctx, NULL, 0);
+/* [临时改动.仅本次联调] 原来这行是 audio_record_start(&g_audio_ctx, NULL, 0)，但成员二当前头文件里的签名是
+             *   int audio_record_start(audio_context_t *ctx, const audio_record_config_t *config)
+             * 参数对不上、编不过;这几处本来是按猜测写的占位桩（传 NULL/0 帧，
+             * 实际什么也不做）。先注释掉以便把 UI 编出来验证，等你按真实
+             * 接口改对再放开。 */
+            /* audio_record_start(&g_audio_ctx, NULL, 0); */
             sm_handle_event(&g_sm_ctx, SM_EVENT_WAKEUP);
         }
     }
@@ -80,7 +85,12 @@ static void on_ai_command_received(const char *action, const char *param)
 
         /* 播放语音回复 */
         if (g_ai_initialized) {
-            audio_play_start(&g_audio_ctx, NULL, 0);
+/* [临时改动.仅本次联调] 原来这行是 audio_play_start(&g_audio_ctx, NULL, 0)，但成员二当前头文件里的签名是
+             *   int audio_play_start(audio_context_t *ctx, const int16_t *data, size_t frames, audio_play_complete_cb_t callback, void *user_data)
+             * 参数对不上、编不过;这几处本来是按猜测写的占位桩（传 NULL/0 帧，
+             * 实际什么也不做）。先注释掉以便把 UI 编出来验证，等你按真实
+             * 接口改对再放开。 */
+            /* audio_play_start(&g_audio_ctx, NULL, 0); */
         }
     }
     else if (strcmp(action, "start_remind") == 0) {
@@ -126,7 +136,12 @@ static void on_ai_command_received(const char *action, const char *param)
         if (g_ai_initialized) {
             robot_ui_set_status(ROBOT_STATUS_LISTENING);
             robot_ui_set_face(ROBOT_FACE_THINKING);
-            llm_send_request(&g_llm_ctx, param, NULL);
+/* [临时改动.仅本次联调] 原来这行是 llm_send_request(&g_llm_ctx, param, NULL)，但成员二当前头文件里的签名是
+             *   ai_llm.h 里没有 llm_send_request，只有 llm_send_text(ctx, ...) / llm_send_audio(ctx, ...)
+             * 参数对不上、编不过;这几处本来是按猜测写的占位桩（传 NULL/0 帧，
+             * 实际什么也不做）。先注释掉以便把 UI 编出来验证，等你按真实
+             * 接口改对再放开。 */
+            /* llm_send_request(&g_llm_ctx, param, NULL); */
         }
     }
 }
@@ -161,7 +176,12 @@ static void llm_response_callback(const char *response, void *user_data)
 
     /* 播放语音 */
     if (g_ai_initialized) {
-        audio_play_start(&g_audio_ctx, NULL, 0);
+/* [临时改动.仅本次联调] 原来这行是 audio_play_start(&g_audio_ctx, NULL, 0)，但成员二当前头文件里的签名是
+             *   int audio_play_start(audio_context_t *ctx, const int16_t *data, size_t frames, audio_play_complete_cb_t callback, void *user_data)
+             * 参数对不上、编不过;这几处本来是按猜测写的占位桩（传 NULL/0 帧，
+             * 实际什么也不做）。先注释掉以便把 UI 编出来验证，等你按真实
+             * 接口改对再放开。 */
+        /* audio_play_start(&g_audio_ctx, NULL, 0); */
     }
 
     /* 通知状态机 */
@@ -244,6 +264,13 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    /* 触摸采样周期:默认跟随 LV_DEF_REFR_PERIOD（33ms ~ 30Hz），手感偏迟钝。
+     * 这里只把输入设备读取定时器提到 10ms，屏幕刷新节奏不变。 */
+    if (lv_result.indev != NULL)
+    {
+        lv_timer_set_period(lv_indev_get_read_timer(lv_result.indev), 10);
+    }
+
     /* ===== 初始化网络通信 ===== */
     network_comm_init();
 
@@ -260,10 +287,12 @@ int main(int argc, char *argv[])
     }
 
     /* ===== 初始化手机推送服务 ===== */
+    /* key 传 NULL：由 network_comm.c 统一从 /etc/assets/push_key.txt
+     * 或那里的 PUSH_KEY_DEFAULT* 取，源码里不再硬编码密钥。 */
     /* PushPlus (Android 微信推送) */
-    push_init(PUSH_SERVICE_PUSHPLUS, "1043ad84f9ba4dbb921756173d36277a");
+    push_init(PUSH_SERVICE_PUSHPLUS, NULL);
     /* Bark (iPad iOS 推送) */
-    push_init(PUSH_SERVICE_BARK, "726d1da9c292efcf947a85897c38310f6200a45c60ec8683813ae4d06fe67be9");
+    push_init(PUSH_SERVICE_BARK, NULL);
 
     /* ===== 注册回调函数 ===== */
     network_set_mqtt_callback(on_mqtt_message_received);
@@ -271,6 +300,16 @@ int main(int argc, char *argv[])
 
     /* ===== 初始化 AI 模块 (成员二) ===== */
     printf("Initializing AI modules...\n");
+
+#if 0
+    /* [临时改动.仅本次联调] 这整段是照一套**当前树里不存在**的 API 写的，编不过:
+     *   - audio_config_t 没有 bits_per_sample 成员
+     *   - sound_detect_init() 需要 (ctx, config) 两个参数，这里是 1 个
+     *   - sound_detect_set_alarm_callback() 不存在
+     *   - care_init() 需要 (ctx, config) 两个参数，这里是 1 个
+     *   - care_set_remind_callback() 不存在
+     * 为了先把 UI 编出来看界面，整段停用。请按成员二 ai_audio.h / ai_sound_detect.h /
+     * ai_care.h 的真实签名改对后放开，并删掉这个 #if 0。 */
 
     /* 初始化状态机 */
     if (sm_init(&g_sm_ctx) == 0) {
@@ -307,8 +346,9 @@ int main(int argc, char *argv[])
         /* 注册提醒回调 */
         care_set_remind_callback(&g_care_ctx, care_remind_callback, NULL);
     }
+#endif /* 临时停用的 AI 初始化 */
 
-    g_ai_initialized = true;
+    g_ai_initialized = false;
     printf("AI modules initialization done\n");
 
     /* ===== 初始化机器人 UI（先创建主屏并 lv_scr_load，成为活动屏） ===== */
@@ -325,7 +365,7 @@ int main(int argc, char *argv[])
     /* ===== 设置初始状态 ===== */
     robot_ui_set_status(ROBOT_STATUS_IDLE);
     robot_ui_set_face(ROBOT_FACE_HAPPY);
-    robot_ui_set_ai_reply("你好！我是智爱陪伴\n有什么可以帮你的吗？");
+    robot_ui_set_ai_reply("你好！我是智爱陪伴\n有什么可以帮你的吗?");
 
     /* ===== 显示主菜单 ===== */
     touch_ui_show_menu(MENU_TYPE_MAIN);
@@ -340,7 +380,7 @@ int main(int argc, char *argv[])
         lvgl_timer_handler();
 
         /* 每 ~200ms 刷新一次状态栏上的网络状态。
-         * LVGL 不是线程安全的，所以只在这个任务里改控件；network_task 那边
+         * LVGL 不是线程安全的，所以只在这个任务里改控件;network_task 那边
          * 只维护 mqtt_config.connected，由这里轮询。
          */
         if (++net_tick >= 40) {
@@ -356,7 +396,6 @@ int main(int argc, char *argv[])
         /* 运行 AI 模块 */
         if (g_ai_initialized) {
             sm_run(&g_sm_ctx);
-        }
         }
 
         usleep(5000); // 5ms 刷新周期

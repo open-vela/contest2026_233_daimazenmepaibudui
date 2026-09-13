@@ -1,0 +1,72 @@
+diff --git a/chips/sf32lb52/sf32lb_rtc.c b/chips/sf32lb52/sf32lb_rtc.c
+index 5b237ec..f1630f4 100644
+--- a/chips/sf32lb52/sf32lb_rtc.c
++++ b/chips/sf32lb52/sf32lb_rtc.c
+@@ -195,7 +195,23 @@ static int sf32lb_rdtime(FAR struct rtc_lowerhalf_s *lower,
+   rtctime->tm_mday = rtc_date.Date;
+   rtctime->tm_mon = rtc_date.Month - 1;
+   rtctime->tm_wday = rtc_date.WeekDay - 1;
+-  rtctime->tm_year = rtc_date.Year;
++
++  /* Date_2_reg() 把 2000~2099 的年份写成两位 + CB=0，1900~1999 写成
++   * 两位 + CB=1；HAL_RTC_GetDate() 只对 19xx 打上 RTC_CENTURY_BIT。
++   * 这里必须还原成"自 1900 起的年数"，否则 2026 会被读成 1926，
++   * 而 RTC_SET_RELATIVE 拿这个年份去喂 mktime()/localtime()（本固件
++   * localtime 就是 gmtime，日历换算只支持 1970 以后）会算出越界的
++   * 时/分/秒，写进 ALRMTR/ALRMDR 的比较值永远匹配不上 → alarm 不触发。
++   * 逻辑与 SDK 参考驱动 drv_rtc.c 的读回处理一致。 */
++
++  if (rtc_date.Year & RTC_CENTURY_BIT)
++    {
++      rtctime->tm_year = rtc_date.Year & ~RTC_CENTURY_BIT;
++    }
++  else
++    {
++      rtctime->tm_year = rtc_date.Year + 100;
++    }
+ 
+ #if defined(CONFIG_RTC_HIRES) || defined(CONFIG_ARCH_HAVE_RTC_SUBSECONDS)
+   rtctime->tm_nsec = rtc_time.SubSeconds * 1000000 / 256 * 1000;
+@@ -281,8 +297,12 @@ static int sf32lb_setalarm(FAR struct rtc_lowerhalf_s *lower,
+   alarm.AlarmDate.Year = alarminfo->time.tm_year;
+   alarm.AlarmDate.WeekDay = alarminfo->time.tm_wday + 1;
+ 
+-  /* Use high precision on subsecond match to avoid repetitive IRQ trigger. */
+-  alarm.AlarmMask = (10 << RTC_ALRMDR_MSKSS_Pos);
++  /* 亚秒只比高位（避免同一次 alarm 反复触发），另外必须屏蔽"星期"：
++   * ALRMDR 的 MSKWD/MSKD/MSKM 为 0 时硬件要求这些字段精确匹配，而星期
++   * 字段来自 libc 重算（add_timeout 里的 localtime），和硬件 DR.WD 不同源，
++   * 编码也差一位 → 不屏蔽就会永远匹配不上。日期已唯一确定星期，屏蔽不丢信息。
++   * 厂商 SDK 参考驱动同样是屏蔽 MSKD|MSKM|MSKWD 的。 */
++  alarm.AlarmMask = RTC_ALRMDR_MSKWD | (10 << RTC_ALRMDR_MSKSS_Pos);
+ 
+   if (HAL_RTC_SetAlarm(&lh->rtc_handler, &alarm, RTC_FORMAT_BIN) != HAL_OK)
+     {
+@@ -344,7 +364,7 @@ static int sf32lb_setrelative(FAR struct rtc_lowerhalf_s *lower,
+   alarm.AlarmDate.Month = alarm_tm.tm_mon + 1;
+   alarm.AlarmDate.Year = alarm_tm.tm_year;
+   alarm.AlarmDate.WeekDay = alarm_tm.tm_wday + 1;
+-  alarm.AlarmMask = (10 << RTC_ALRMDR_MSKSS_Pos);
++  alarm.AlarmMask = RTC_ALRMDR_MSKWD | (10 << RTC_ALRMDR_MSKSS_Pos);
+ 
+   if (HAL_RTC_SetAlarm(&lh->rtc_handler, &alarm, RTC_FORMAT_BIN) != HAL_OK)
+     {
+@@ -382,7 +402,17 @@ static int sf32lb_rdalarm(FAR struct rtc_lowerhalf_s *lower,
+   alarminfo->time->tm_mday = alarm.AlarmDate.Date;
+   alarminfo->time->tm_mon = alarm.AlarmDate.Month - 1;
+   alarminfo->time->tm_wday = alarm.AlarmDate.WeekDay - 1;
+-  alarminfo->time->tm_year = alarm.AlarmDate.Year;
++
++  /* 与 sf32lb_rdtime() 同样要还原世纪位，否则读回来的 alarm 年份会差 100 */
++
++  if (alarm.AlarmDate.Year & RTC_CENTURY_BIT)
++    {
++      alarminfo->time->tm_year = alarm.AlarmDate.Year & ~RTC_CENTURY_BIT;
++    }
++  else
++    {
++      alarminfo->time->tm_year = alarm.AlarmDate.Year + 100;
++    }
+ 
+   return OK;
+ }
