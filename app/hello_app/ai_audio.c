@@ -9,6 +9,14 @@
  ****************************************************************************/
 
 #include "ai_audio.h"
+#include <sys/ioctl.h>
+#include <nuttx/audio/audio.h>
+
+/* AI_AUDIO_REAL_DEVICE_V1
+ * Lifecycle API: one controlling thread per context.
+ * Callbacks must not start another operation or deinitialize the context.
+ * STOP cancellation of a permanently blocked driver is not implemented.
+ */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,8 +31,8 @@
  ****************************************************************************/
 
 /* 音频设备路径 */
-#define AUDIO_RECORD_DEVICE    "/dev/sound/pcmC0D0c"  /* 录音设备 */
-#define AUDIO_PLAY_DEVICE      "/dev/sound/pcmC0D0p"  /* 播放设备 */
+#define AUDIO_RECORD_DEVICE "/dev/audio/audio0"
+#define AUDIO_PLAY_DEVICE "/dev/audio/audio0"
 
 /* 缓冲区大小计算 */
 #define AUDIO_BUF_SIZE(frames, channels, bps) \
@@ -47,6 +55,48 @@ static void audio_close_play_device(audio_context_t *ctx);
  ****************************************************************************/
 
 /* 状态名称表 */
+
+static void audio_release_play_buffer(audio_context_t *ctx)
+{
+  free(ctx->play_buf);
+  ctx->play_buf = NULL;
+  ctx->play_buf_size = 0;
+  ctx->play_frames = 0;
+}
+
+/* One controlling thread per context; owns ctx->play_buf. */
+static int audio_launch_play(audio_context_t *ctx,
+                             audio_play_complete_cb_t callback,
+                             void *user_data)
+{
+  int ret = audio_open_play_device(ctx);
+  if (ret < 0)
+    {
+      audio_release_play_buffer(ctx);
+      return ret;
+    }
+
+  ctx->play_cb = callback;
+  ctx->play_user_data = user_data;
+  ctx->play_frames = ctx->play_buf_size / sizeof(int16_t);
+  __atomic_store_n(&ctx->play_stop, false, __ATOMIC_RELEASE);
+  __atomic_store_n(&ctx->state, AUDIO_STATE_PLAYING, __ATOMIC_RELEASE);
+  __atomic_store_n(&ctx->playing, true, __ATOMIC_RELEASE);
+
+  ret = pthread_create(&ctx->play_thread, NULL, audio_play_thread, ctx);
+  if (ret != 0)
+    {
+      audio_close_play_device(ctx);
+      audio_release_play_buffer(ctx);
+      __atomic_store_n(&ctx->state, AUDIO_STATE_IDLE, __ATOMIC_RELEASE);
+      __atomic_store_n(&ctx->playing, false, __ATOMIC_RELEASE);
+      return -ret;
+    }
+
+  ctx->play_thread_valid = true;
+  return 0;
+}
+
 static const char *g_state_names[] =
 {
   [AUDIO_STATE_UNINIT]     = "UNINIT",
@@ -80,29 +130,85 @@ static uint32_t audio_calc_frame_energy(const int16_t *data, size_t frames)
  * @brief  打开录音设备
  */
 
-static int audio_open_record_device(audio_context_t *ctx)
+
+static int audio_hw_volume(int fd, uint8_t percent)
 {
-  AUDIO_DEBUG("打开录音设备: %s", AUDIO_RECORD_DEVICE);
+  struct audio_caps_desc_s desc;
+  memset(&desc, 0, sizeof(desc));
+  desc.caps.ac_len = sizeof(struct audio_caps_s);
+  desc.caps.ac_type = AUDIO_TYPE_FEATURE;
+  desc.caps.ac_format.hw = AUDIO_FU_VOLUME;
+  desc.caps.ac_controls.hw[0] = (uint16_t)percent * 10;
 
-  /* TODO: 使用NuttX音频驱动API打开设备 */
-  /* ctx->record_fd = open(AUDIO_RECORD_DEVICE, O_RDONLY); */
-
-  /* 模拟打开成功 */
-
-  ctx->record_fd = 1; /* 占位符 */
-
-  if (ctx->record_fd < 0)
+  if (ioctl(fd, AUDIOIOC_CONFIGURE, (unsigned long)&desc) < 0)
     {
-      AUDIO_DEBUG("打开录音设备失败: %d", errno);
       return -errno;
     }
 
-  /* TODO: 配置音频参数 */
-  /* struct audio_buf_s buf; */
-  /* ioctl(ctx->record_fd, AUDIOIOC_CONFIGURE, &buf); */
+  return 0;
+}
 
-  AUDIO_DEBUG("录音设备打开成功");
-  return OK;
+static int audio_hw_open(bool output, uint8_t volume)
+{
+  const char *path = output ? AUDIO_PLAY_DEVICE : AUDIO_RECORD_DEVICE;
+  int fd = open(path, output ? O_WRONLY : O_RDONLY);
+  int ret;
+  struct audio_caps_desc_s desc;
+
+  if (fd < 0)
+    {
+      ret = -errno;
+      printf("[AUDIO] open %s failed: %d\n", path, ret);
+      return ret;
+    }
+
+  memset(&desc, 0, sizeof(desc));
+  desc.caps.ac_len = sizeof(struct audio_caps_s);
+  desc.caps.ac_type = output ? AUDIO_TYPE_OUTPUT : AUDIO_TYPE_INPUT;
+  desc.caps.ac_channels = 1;
+  desc.caps.ac_controls.hw[0] = 16000;
+  desc.caps.ac_controls.b[2] = 16;
+
+  if (ioctl(fd, AUDIOIOC_CONFIGURE, (unsigned long)&desc) < 0)
+    {
+      ret = -errno;
+      goto fail;
+    }
+
+  /* Only set speaker volume on the playback path. */
+  if (output)
+    {
+      ret = audio_hw_volume(fd, volume);
+      if (ret < 0)
+        {
+          goto fail;
+        }
+    }
+
+  if (ioctl(fd, AUDIOIOC_START, 0) < 0)
+    {
+      ret = -errno;
+      goto fail;
+    }
+
+  return fd;
+
+fail:
+  printf("[AUDIO] configure/start failed: %d\n", ret);
+  close(fd);
+  return ret;
+}
+
+static int audio_open_record_device(audio_context_t *ctx)
+{
+  int fd = audio_hw_open(false, ctx->config.volume);
+  if (fd < 0)
+    {
+      return fd;
+    }
+
+  ctx->record_fd = fd;
+  return 0;
 }
 
 /**
@@ -111,25 +217,14 @@ static int audio_open_record_device(audio_context_t *ctx)
 
 static int audio_open_play_device(audio_context_t *ctx)
 {
-  AUDIO_DEBUG("打开播放设备: %s", AUDIO_PLAY_DEVICE);
-
-  /* TODO: 使用NuttX音频驱动API打开设备 */
-  /* ctx->play_fd = open(AUDIO_PLAY_DEVICE, O_WRONLY); */
-
-  /* 模拟打开成功 */
-
-  ctx->play_fd = 2; /* 占位符 */
-
-  if (ctx->play_fd < 0)
+  int fd = audio_hw_open(true, ctx->config.volume);
+  if (fd < 0)
     {
-      AUDIO_DEBUG("打开播放设备失败: %d", errno);
-      return -errno;
+      return fd;
     }
 
-  /* TODO: 配置音频参数 */
-
-  AUDIO_DEBUG("播放设备打开成功");
-  return OK;
+  ctx->play_fd = fd;
+  return 0;
 }
 
 /**
@@ -140,11 +235,12 @@ static void audio_close_record_device(audio_context_t *ctx)
 {
   if (ctx->record_fd >= 0)
     {
-      AUDIO_DEBUG("关闭录音设备");
+      if (ioctl(ctx->record_fd, AUDIOIOC_STOP, 0) < 0)
+        {
+          printf("[AUDIO] record STOP failed: %d\n", errno);
+        }
 
-      /* TODO: 关闭设备 */
-      /* close(ctx->record_fd); */
-
+      close(ctx->record_fd);
       ctx->record_fd = -1;
     }
 }
@@ -157,11 +253,12 @@ static void audio_close_play_device(audio_context_t *ctx)
 {
   if (ctx->play_fd >= 0)
     {
-      AUDIO_DEBUG("关闭播放设备");
+      if (ioctl(ctx->play_fd, AUDIOIOC_STOP, 0) < 0)
+        {
+          printf("[AUDIO] play STOP failed: %d\n", errno);
+        }
 
-      /* TODO: 关闭设备 */
-      /* close(ctx->play_fd); */
-
+      close(ctx->play_fd);
       ctx->play_fd = -1;
     }
 }
@@ -182,24 +279,52 @@ static void *audio_record_thread(void *arg)
 
   frames_per_read = ctx->config.sample_rate * ctx->config.frame_ms / 1000;
 
-  while (!ctx->record_stop && ctx->recording)
+  while (!__atomic_load_n(&ctx->record_stop, __ATOMIC_ACQUIRE))
     {
-      /* 从设备读取音频数据 */
 
-      nbytes = frames_per_read * ctx->config.channels *
-               (ctx->config.format == AUDIO_FORMAT_S16_LE ? 2 : 1);
+      size_t wanted = frames_per_read * sizeof(int16_t);
+      size_t received = 0;
+      int read_error = 0;
 
-      /* TODO: 实际读取音频数据 */
-      /* nbytes = read(ctx->record_fd, ctx->record_buf, nbytes); */
-
-      /* 无板级驱动时只生成静音测试帧，避免读取未初始化内存。 */
-
-      if ((size_t)nbytes > ctx->record_buf_size)
+      while (received < wanted &&
+             !__atomic_load_n(&ctx->record_stop, __ATOMIC_ACQUIRE))
         {
-          nbytes = ctx->record_buf_size;
+          ssize_t n = read(ctx->record_fd,
+                           (uint8_t *)ctx->record_buf + received,
+                           wanted - received);
+
+          if (n < 0)
+            {
+              if (errno == EINTR)
+                {
+                  continue;
+                }
+
+              read_error = errno;
+              break;
+            }
+
+          if (n == 0)
+            {
+              read_error = EIO;
+              break;
+            }
+
+          received += (size_t)n;
         }
 
-      memset(ctx->record_buf, 0, (size_t)nbytes);
+      if (read_error != 0)
+        {
+          printf("[AUDIO] record read failed: %d\n", read_error);
+          break;
+        }
+
+      if (__atomic_load_n(&ctx->record_stop, __ATOMIC_ACQUIRE))
+        {
+          break;
+        }
+
+      nbytes = (ssize_t)received;
 
       if (nbytes > 0)
         {
@@ -262,7 +387,6 @@ static void *audio_record_thread(void *arg)
                 }
             }
 
-          usleep(ctx->config.frame_ms * 1000);
 
           /* 调用数据回调 */
 
@@ -280,9 +404,10 @@ static void *audio_record_thread(void *arg)
         }
     }
 
+  audio_close_record_device(ctx);
   AUDIO_DEBUG("录音线程退出");
-  ctx->recording = false;
-  ctx->state = ctx->playing ? AUDIO_STATE_PLAYING : AUDIO_STATE_IDLE;
+  __atomic_store_n(&ctx->state, __atomic_load_n(&ctx->playing, __ATOMIC_ACQUIRE) ? AUDIO_STATE_PLAYING : AUDIO_STATE_IDLE, __ATOMIC_RELEASE);
+  __atomic_store_n(&ctx->recording, false, __ATOMIC_RELEASE);
   return NULL;
 }
 
@@ -292,39 +417,66 @@ static void *audio_record_thread(void *arg)
 
 static void *audio_play_thread(void *arg)
 {
-  audio_context_t *ctx = (audio_context_t *)arg;
+  audio_context_t *ctx = arg;
+  size_t total = ctx->play_frames * sizeof(int16_t);
+  size_t offset = 0;
+  int error = 0;
 
-  AUDIO_DEBUG("播放线程启动");
-
-  /* TODO: 实现音频播放逻辑 */
-  /* 1. 从播放缓冲区读取数据 */
-  /* 2. 写入播放设备 */
-  /* 3. 等待播放完成 */
-
-  uint64_t duration_ms =
-    ((uint64_t)ctx->play_frames * 1000 + ctx->config.sample_rate - 1) /
-    ctx->config.sample_rate;
-  uint64_t elapsed_ms = 0;
-
-  while (!ctx->play_stop && ctx->playing && elapsed_ms < duration_ms)
+  while (offset < total &&
+         !__atomic_load_n(&ctx->play_stop, __ATOMIC_ACQUIRE))
     {
-      /* 模拟播放 */
+      size_t chunk = total - offset;
+      if (chunk > ctx->record_buf_size)
+        {
+          chunk = ctx->record_buf_size;
+        }
 
-      usleep(ctx->config.frame_ms * 1000);
-      elapsed_ms += ctx->config.frame_ms;
+      ssize_t n = write(ctx->play_fd,
+                        (const uint8_t *)ctx->play_buf + offset,
+                        chunk);
+
+      if (n < 0)
+        {
+          if (errno == EINTR)
+            {
+              continue;
+            }
+
+          error = errno;
+          break;
+        }
+
+      if (n == 0)
+        {
+          error = EIO;
+          break;
+        }
+
+      offset += (size_t)n;
     }
 
-  ctx->playing = false;
-  ctx->state = ctx->recording ? AUDIO_STATE_RECORDING : AUDIO_STATE_IDLE;
+  audio_close_play_device(ctx);
 
-  /* 播放完成回调 */
+  if (error != 0)
+    {
+      printf("[AUDIO] playback failed: %d, wrote %lu/%lu bytes\n",
+             error, (unsigned long)offset, (unsigned long)total);
+    }
 
-  if (!ctx->play_stop && ctx->play_cb)
+  audio_release_play_buffer(ctx);
+
+  /* Callback runs before the worker is marked inactive.
+   * It must only notify the controlling thread.
+   */
+  if (error == 0 && offset == total &&
+      !__atomic_load_n(&ctx->play_stop, __ATOMIC_ACQUIRE) &&
+      ctx->play_cb != NULL)
     {
       ctx->play_cb(ctx->play_user_data);
     }
 
-  AUDIO_DEBUG("播放线程退出");
+  __atomic_store_n(&ctx->state, AUDIO_STATE_IDLE, __ATOMIC_RELEASE);
+  __atomic_store_n(&ctx->playing, false, __ATOMIC_RELEASE);
   return NULL;
 }
 
@@ -361,15 +513,15 @@ int audio_init(audio_context_t *ctx, const audio_config_t *config)
       ctx->config.channels = AUDIO_DEFAULT_CHANNELS;
       ctx->config.format = AUDIO_FORMAT_S16_LE;
       ctx->config.frame_ms = AUDIO_DEFAULT_FRAME_MS;
-      ctx->config.volume = AUDIO_VOLUME_DEFAULT;
+      ctx->config.volume = AI_AUDIO_VOLUME_DEFAULT;
     }
 
-  if (ctx->config.sample_rate <= 0 ||
-      (ctx->config.channels != AUDIO_CH_MONO &&
-       ctx->config.channels != AUDIO_CH_STEREO) ||
-      (ctx->config.format != AUDIO_FORMAT_S16_LE &&
-       ctx->config.format != AUDIO_FORMAT_S16_BE) ||
-      ctx->config.frame_ms == 0)
+
+  if (ctx->config.sample_rate != AUDIO_RATE_16K ||
+      ctx->config.channels != AUDIO_CH_MONO ||
+      ctx->config.format != AUDIO_FORMAT_S16_LE ||
+      ctx->config.frame_ms != AUDIO_DEFAULT_FRAME_MS ||
+      ctx->config.volume > AI_AUDIO_VOLUME_MAX)
     {
       return -EINVAL;
     }
@@ -397,18 +549,11 @@ int audio_init(audio_context_t *ctx, const audio_config_t *config)
       return -ENOMEM;
     }
 
-  ctx->play_buf_size =
-    (size_t)ctx->config.sample_rate * AUDIO_PLAY_BUFFER_MS / 1000 *
-    frame_bytes;
-  ctx->play_buf = (int16_t *)calloc(1, ctx->play_buf_size);
-  if (ctx->play_buf == NULL)
-    {
-      AUDIO_DEBUG("分配播放缓冲区失败");
-      free(ctx->record_buf);
-      return -ENOMEM;
-    }
+  /* AI_AUDIO_MEMORY_V2: allocate on playback only. */
+  ctx->play_buf = NULL;
+  ctx->play_buf_size = 0;
 
-  ctx->state = AUDIO_STATE_IDLE;
+  __atomic_store_n(&ctx->state, AUDIO_STATE_IDLE, __ATOMIC_RELEASE);
   ctx->initialized = true;
 
   AUDIO_DEBUG("音频模块初始化完成");
@@ -430,7 +575,18 @@ void audio_deinit(audio_context_t *ctx)
       return;
     }
 
+
+  if ((ctx->record_thread_valid &&
+       pthread_equal(pthread_self(), ctx->record_thread)) ||
+      (ctx->play_thread_valid &&
+       pthread_equal(pthread_self(), ctx->play_thread)))
+    {
+      printf("[AUDIO] deinit must run on the controlling thread\n");
+      return;
+    }
+
   AUDIO_DEBUG("反初始化音频模块");
+
 
   /* 停止录音和播放 */
 
@@ -457,7 +613,7 @@ void audio_deinit(audio_context_t *ctx)
     }
 
   ctx->initialized = false;
-  ctx->state = AUDIO_STATE_UNINIT;
+  __atomic_store_n(&ctx->state, AUDIO_STATE_UNINIT, __ATOMIC_RELEASE);
 
   AUDIO_DEBUG("音频模块已反初始化");
 }
@@ -474,10 +630,16 @@ int audio_record_start(audio_context_t *ctx,
       return -EINVAL;
     }
 
-  if (ctx->recording)
+  if (__atomic_load_n(&ctx->recording, __ATOMIC_ACQUIRE) || __atomic_load_n(&ctx->playing, __ATOMIC_ACQUIRE))
     {
       AUDIO_DEBUG("已在录音中");
       return -EBUSY;
+    }
+
+  if (ctx->record_thread_valid)
+    {
+      pthread_join(ctx->record_thread, NULL);
+      ctx->record_thread_valid = false;
     }
 
   AUDIO_DEBUG("开始录音");
@@ -524,22 +686,20 @@ int audio_record_start(audio_context_t *ctx,
 
   /* 启动录音线程 */
 
-  if (ctx->record_thread_valid)
-    {
-      pthread_join(ctx->record_thread, NULL);
-      ctx->record_thread_valid = false;
-    }
 
-  ctx->record_stop = false;
-  ctx->recording = true;
+  __atomic_store_n(&ctx->record_stop, false, __ATOMIC_RELEASE);
+  __atomic_store_n(&ctx->recording, true, __ATOMIC_RELEASE);
+
+  __atomic_store_n(&ctx->state, AUDIO_STATE_RECORDING, __ATOMIC_RELEASE);
 
   ret = pthread_create(&ctx->record_thread, NULL,
                        audio_record_thread, ctx);
   if (ret != 0)
     {
       AUDIO_DEBUG("创建录音线程失败: %d", ret);
-      ctx->recording = false;
+      __atomic_store_n(&ctx->recording, false, __ATOMIC_RELEASE);
       audio_close_record_device(ctx);
+      __atomic_store_n(&ctx->state, AUDIO_STATE_IDLE, __ATOMIC_RELEASE);
       return -ret;
     }
 
@@ -547,7 +707,7 @@ int audio_record_start(audio_context_t *ctx,
 
   /* 更新状态 */
 
-  ctx->state = ctx->playing ? AUDIO_STATE_BOTH : AUDIO_STATE_RECORDING;
+
 
   return OK;
 }
@@ -567,7 +727,12 @@ void audio_record_stop(audio_context_t *ctx)
 
   /* 设置停止标志 */
 
-  ctx->record_stop = true;
+  __atomic_store_n(&ctx->record_stop, true, __ATOMIC_RELEASE);
+
+  if (pthread_equal(pthread_self(), ctx->record_thread))
+    {
+      return;
+    }
 
   /* 等待线程退出 */
 
@@ -578,11 +743,11 @@ void audio_record_stop(audio_context_t *ctx)
 
   audio_close_record_device(ctx);
 
-  ctx->recording = false;
+  __atomic_store_n(&ctx->recording, false, __ATOMIC_RELEASE);
 
   /* 更新状态 */
 
-  ctx->state = ctx->playing ? AUDIO_STATE_PLAYING : AUDIO_STATE_IDLE;
+  __atomic_store_n(&ctx->state, __atomic_load_n(&ctx->playing, __ATOMIC_ACQUIRE) ? AUDIO_STATE_PLAYING : AUDIO_STATE_IDLE, __ATOMIC_RELEASE);
 }
 
 /**
@@ -591,119 +756,123 @@ void audio_record_stop(audio_context_t *ctx)
 
 bool audio_is_recording(audio_context_t *ctx)
 {
-  return (ctx != NULL) ? ctx->recording : false;
+  return (ctx != NULL) ? __atomic_load_n(&ctx->recording, __ATOMIC_ACQUIRE) : false;
 }
 
 /**
  * @brief  开始播放音频数据
  */
 
-int audio_play_start(audio_context_t *ctx,
-                     const int16_t *data, size_t frames,
-                     audio_play_complete_cb_t callback,
+int audio_play_start(audio_context_t *ctx, const int16_t *data,
+                     size_t frames, audio_play_complete_cb_t callback,
                      void *user_data)
 {
   if (ctx == NULL || !ctx->initialized || data == NULL || frames == 0)
-    {
-      return -EINVAL;
-    }
+    return -EINVAL;
 
-  if (ctx->playing)
-    {
-      AUDIO_DEBUG("已在播放中");
-      return -EBUSY;
-    }
+  if (__atomic_load_n(&ctx->playing, __ATOMIC_ACQUIRE) || __atomic_load_n(&ctx->recording, __ATOMIC_ACQUIRE))
+    return -EBUSY;
 
-  AUDIO_DEBUG("开始播放 (%zu 帧)", frames);
-
-  /* 保存回调 */
-
-  ctx->play_cb = callback;
-  ctx->play_user_data = user_data;
-
-  /* 复制音频数据到缓冲区 */
-
-  size_t frame_bytes = ctx->config.channels * sizeof(int16_t);
-  size_t capacity_frames = ctx->play_buf_size / frame_bytes;
-  if (frames > capacity_frames)
-    {
-      return -ENOSPC;
-    }
-
-  size_t copy_bytes = frames * frame_bytes;
-
-  if (data != NULL && ctx->play_buf != NULL)
-    {
-      memcpy(ctx->play_buf, data, copy_bytes);
-    }
-
-  ctx->play_frames = frames;
-
-  /* 打开播放设备 */
-
-  int ret = audio_open_play_device(ctx);
-  if (ret < 0)
-    {
-      AUDIO_DEBUG("打开播放设备失败: %d", ret);
-      return ret;
-    }
-
-  /* 启动播放线程 */
+  if (frames >
+      (size_t)AUDIO_DEFAULT_SAMPLE_RATE * AUDIO_PLAY_BUFFER_MS / 1000)
+    return -ENOSPC;
 
   if (ctx->play_thread_valid)
     {
-      pthread_join(ctx->play_thread, NULL);
+      int ret = pthread_join(ctx->play_thread, NULL);
+      if (ret != 0) return -ret;
       ctx->play_thread_valid = false;
     }
 
-  ctx->play_stop = false;
-  ctx->playing = true;
+  size_t bytes = frames * sizeof(int16_t);
+  int16_t *buffer = malloc(bytes);
+  if (buffer == NULL) return -ENOMEM;
 
-  ret = pthread_create(&ctx->play_thread, NULL,
-                       audio_play_thread, ctx);
-  if (ret != 0)
-    {
-      AUDIO_DEBUG("创建播放线程失败: %d", ret);
-      ctx->playing = false;
-      audio_close_play_device(ctx);
-      return -ret;
-    }
-
-  ctx->play_thread_valid = true;
-
-  /* 更新状态 */
-
-  ctx->state = ctx->recording ? AUDIO_STATE_BOTH : AUDIO_STATE_PLAYING;
-
-  return OK;
+  memcpy(buffer, data, bytes);
+  ctx->play_buf = buffer;
+  ctx->play_buf_size = bytes;
+  return audio_launch_play(ctx, callback, user_data);
 }
 
 /**
  * @brief  从文件播放音频
  */
 
-int audio_play_file(audio_context_t *ctx,
-                    const char *filepath,
-                    audio_play_complete_cb_t callback,
-                    void *user_data)
+int audio_play_file(audio_context_t *ctx, const char *filepath,
+                    audio_play_complete_cb_t callback, void *user_data)
 {
-  if (ctx == NULL || filepath == NULL)
+  if (ctx == NULL || !ctx->initialized || filepath == NULL)
+    return -EINVAL;
+
+  if (__atomic_load_n(&ctx->playing, __ATOMIC_ACQUIRE) || __atomic_load_n(&ctx->recording, __ATOMIC_ACQUIRE))
+    return -EBUSY;
+
+  if (ctx->play_thread_valid)
     {
-      return -EINVAL;
+      int ret = pthread_join(ctx->play_thread, NULL);
+      if (ret != 0) return -ret;
+      ctx->play_thread_valid = false;
     }
 
-  (void)callback;
-  (void)user_data;
+  FILE *file = fopen(filepath, "rb");
+  if (file == NULL) return -errno;
 
-  AUDIO_DEBUG("播放文件: %s", filepath);
+  int ret = -EIO;
+  int16_t *buffer = NULL;
 
-  /* TODO: 读取音频文件 */
-  /* 1. 打开文件 */
-  /* 2. 解析文件头(WAV/MP3等) */
-  /* 3. 读取音频数据 */
-  /* 4. 调用audio_play_start播放 */
+  if (fseek(file, 0, SEEK_END) != 0) goto done;
+  long length = ftell(file);
+  if (length < 0) goto done;
 
-  return -ENOSYS;
+  if (length == 0 || length % sizeof(int16_t) != 0)
+    {
+      ret = -EINVAL;
+      goto done;
+    }
+
+  if ((unsigned long)length >
+      (unsigned long)AUDIO_DEFAULT_SAMPLE_RATE *
+      AUDIO_PLAY_BUFFER_MS / 1000 * 2)
+    {
+      ret = -EFBIG;
+      goto done;
+    }
+
+  if (fseek(file, 0, SEEK_SET) != 0) goto done;
+
+  buffer = malloc((size_t)length);
+  if (buffer == NULL)
+    {
+      ret = -ENOMEM;
+      goto done;
+    }
+
+  if (fread(buffer, 1, (size_t)length, file) != (size_t)length)
+    goto done;
+
+  if (fgetc(file) != EOF || ferror(file)) goto done;
+
+  if ((length >= 4 && memcmp(buffer, "RIFF", 4) == 0) ||
+      (length >= 3 && memcmp(buffer, "ID3", 3) == 0))
+    {
+      ret = -ENOTSUP;
+      goto done;
+    }
+
+  ret = 0;
+
+done:
+  fclose(file);
+
+  if (ret != 0)
+    {
+      free(buffer);
+      return ret;
+    }
+
+  ctx->play_buf = buffer;
+  ctx->play_buf_size = (size_t)length;
+  return audio_launch_play(ctx, callback, user_data);
 }
 
 /**
@@ -721,7 +890,12 @@ void audio_play_stop(audio_context_t *ctx)
 
   /* 设置停止标志 */
 
-  ctx->play_stop = true;
+  __atomic_store_n(&ctx->play_stop, true, __ATOMIC_RELEASE);
+
+  if (pthread_equal(pthread_self(), ctx->play_thread))
+    {
+      return;
+    }
 
   /* 等待线程退出 */
 
@@ -732,11 +906,11 @@ void audio_play_stop(audio_context_t *ctx)
 
   audio_close_play_device(ctx);
 
-  ctx->playing = false;
+  __atomic_store_n(&ctx->playing, false, __ATOMIC_RELEASE);
 
   /* 更新状态 */
 
-  ctx->state = ctx->recording ? AUDIO_STATE_RECORDING : AUDIO_STATE_IDLE;
+  __atomic_store_n(&ctx->state, __atomic_load_n(&ctx->recording, __ATOMIC_ACQUIRE) ? AUDIO_STATE_RECORDING : AUDIO_STATE_IDLE, __ATOMIC_RELEASE);
 }
 
 /**
@@ -745,7 +919,7 @@ void audio_play_stop(audio_context_t *ctx)
 
 bool audio_is_playing(audio_context_t *ctx)
 {
-  return (ctx != NULL) ? ctx->playing : false;
+  return (ctx != NULL) ? __atomic_load_n(&ctx->playing, __ATOMIC_ACQUIRE) : false;
 }
 
 /**
@@ -754,24 +928,19 @@ bool audio_is_playing(audio_context_t *ctx)
 
 int audio_set_volume(audio_context_t *ctx, uint8_t volume)
 {
-  if (ctx == NULL || !ctx->initialized)
+  if (ctx == NULL || !ctx->initialized ||
+      volume > AI_AUDIO_VOLUME_MAX)
     {
       return -EINVAL;
     }
 
-  if (volume > AUDIO_VOLUME_MAX)
+  if (__atomic_load_n(&ctx->recording, __ATOMIC_ACQUIRE) || __atomic_load_n(&ctx->playing, __ATOMIC_ACQUIRE))
     {
-      volume = AUDIO_VOLUME_MAX;
+      return -EBUSY;
     }
 
-  AUDIO_DEBUG("设置音量: %d", volume);
-
   ctx->config.volume = volume;
-
-  /* TODO: 实际设置硬件音量 */
-  /* ioctl(ctx->play_fd, AUDIOIOC_SETVOLUME, volume); */
-
-  return OK;
+  return 0;
 }
 
 /**
@@ -870,7 +1039,7 @@ audio_state_t audio_get_state(audio_context_t *ctx)
       return AUDIO_STATE_UNINIT;
     }
 
-  return ctx->state;
+  return __atomic_load_n(&ctx->state, __ATOMIC_ACQUIRE);
 }
 
 /**

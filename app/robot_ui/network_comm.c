@@ -24,6 +24,9 @@
 /* cJSON 用于 JSON 解析 */
 #include <netutils/cJSON.h>
 
+/* ai_agent TLS 客户端（HTTPS 推送） */
+#include "infra/vela_tls.h"
+
 /* ==================== 全局变量 ==================== */
 static wifi_config_t wifi_config = {0};
 static mqtt_config_t mqtt_config = {0};
@@ -493,65 +496,69 @@ int push_init(push_service_t service, const char *key)
     strncpy(push_config.push_key, key, sizeof(push_config.push_key) - 1);
     push_config.enabled = true;
 
-    printf("push_init: service=%d, key=%s\n", service, key);
+    printf("push_init: service=%d, key configured\n", service);
     return 0;
 }
 
-/* 发送 HTTP POST 请求 */
+/* 发送 HTTPS POST 请求（复用 ai_agent TLS 客户端） */
 static int http_post(const char *url, const char *body)
 {
+    if (url == NULL || body == NULL) {
+        return -EINVAL;
+    }
+
     char host[128] = {0};
     char path[256] = {0};
     int port = 443;
 
-    /* 解析 URL */
-    if (sscanf(url, "https://%127[^/]/%255s", host, path) != 2) {
-        if (sscanf(url, "http://%127[^/]/%255s", host, path) != 2) {
-            printf("http_post: invalid URL: %s\n", url);
+    /* 解析 URL: https://host[:port]/path */
+    if (sscanf(url, "https://%127[^/]:%d/%255s", host, &port, path) < 2) {
+        if (sscanf(url, "https://%127[^/]/%255s", host, path) != 2) {
+            printf("push: invalid URL: %s\n", url);
             return -1;
         }
-        port = 80;
     }
 
-    printf("http_post: host=%s, path=%s, port=%d\n", host, path, port);
+    char port_str[8];
+    snprintf(port_str, sizeof(port_str), "%d", port);
 
-    /* 创建 TCP 连接 */
-    int sockfd = create_tcp_socket(host, port);
-    if (sockfd < 0) {
-        printf("http_post: TCP connect failed\n");
-        return -1;
+    /* 路径需要前导 / */
+    char full_path[260];
+    snprintf(full_path, sizeof(full_path), "/%s", path);
+
+    printf("push: POST https://%s:%d%s\n", host, port, full_path);
+
+    /* 调用 vela_tls HTTPS 客户端 */
+    char resp[2048] = {0};
+    int status = vela_https_post_json(host, port_str, full_path,
+                                      NULL, body, resp, sizeof(resp));
+    if (status < 0) {
+        printf("push: TLS error %d for %s\n", status, host);
+        return status;
     }
 
-    /* 构建 HTTP 请求 */
-    char request[HTTP_BUFFER_SIZE];
-    int body_len = strlen(body);
-    snprintf(request, sizeof(request),
-        "POST /%s HTTP/1.1\r\n"
-        "Host: %s\r\n"
-        "Content-Type: application/json; charset=utf-8\r\n"
-        "Content-Length: %d\r\n"
-        "Connection: close\r\n"
-        "\r\n"
-        "%s",
-        path, host, body_len, body);
-
-    /* 发送请求 */
-    int ret = send(sockfd, request, strlen(request), 0);
-    if (ret < 0) {
-        printf("http_post: send failed\n");
-        close(sockfd);
-        return -1;
+    /* 检查 HTTP 状态码 */
+    if (status < 200 || status >= 300) {
+        printf("push: HTTP %d from %s\n", status, host);
+        return -EIO;
     }
 
-    /* 接收响应 */
-    char response[1024];
-    int len = recv(sockfd, response, sizeof(response) - 1, 0);
-    if (len > 0) {
-        response[len] = '\0';
-        printf("http_post: response=%s\n", response);
+    /* 解析业务返回码（Bark/PushPlus 都在 JSON 里返回 code 字段） */
+    cJSON *root = cJSON_Parse(resp);
+    if (root) {
+        cJSON *code = cJSON_GetObjectItem(root, "code");
+        if (code && cJSON_IsNumber(code) && (int)code->valuedouble != 200) {
+            const char *msg = cJSON_GetStringValue(
+                cJSON_GetObjectItem(root, "message"));
+            printf("push: business error %d: %s\n",
+                   (int)code->valuedouble, msg ? msg : "unknown");
+            cJSON_Delete(root);
+            return -EIO;
+        }
+        cJSON_Delete(root);
     }
 
-    close(sockfd);
+    printf("push: OK (HTTP %d)\n", status);
     return 0;
 }
 

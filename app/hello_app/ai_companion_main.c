@@ -31,7 +31,7 @@
 #define MAIN_LOOP_INTERVAL_MS    100
 
 /* 程序退出标志 */
-static volatile bool g_running = true;
+static volatile sig_atomic_t g_running = 1;
 static bool g_audio_started;
 static bool g_sound_started;
 static bool g_care_started;
@@ -73,8 +73,8 @@ static void print_usage(const char *program)
 
 static void signal_handler(int signo)
 {
-  printf("收到信号 %d, 准备退出...\n", signo);
-  g_running = false;
+  (void)signo;
+  g_running = 0;
 }
 
 /**
@@ -528,6 +528,8 @@ int main(int argc, char *argv[])
   const char *startup_text = NULL;
   bool sound_self_test = false;
 
+  g_running = 1;
+
   for (int i = 1; i < argc; i++)
     {
       if (strcmp(argv[i], "--help") == 0)
@@ -640,8 +642,13 @@ int main(int argc, char *argv[])
   if (ret != 0)
     {
       printf("[错误] 主循环任务创建失败: %d\n", ret);
+      stop_audio_listening();
+      stop_care();
+      stop_sound_detection();
+      llm_deinit(&g_llm_ctx);
+      audio_deinit(&g_audio_ctx);
       sm_deinit(&g_sm_ctx);
-      return ret;
+      return -ret;
     }
 
   printf("[运行] 系统已启动, 按 Ctrl+C 退出\n\n");
@@ -658,8 +665,14 @@ int main(int argc, char *argv[])
 
   if (sound_self_test && g_sound_started)
     {
-      int16_t test_audio[SOUND_DETECT_FRAMES_PER_WINDOW];
-      memset(test_audio, 0, sizeof(test_audio));
+      int16_t *test_audio = calloc(SOUND_DETECT_FRAMES_PER_WINDOW,
+                                   sizeof(*test_audio));
+      if (test_audio == NULL)
+        {
+          printf("[自检] 内存不足，跳过测试\n");
+        }
+      else
+        {
       for (size_t i = 0; i < SOUND_DETECT_FRAMES_PER_WINDOW; i += 80)
         {
           test_audio[i] = (i / 80) % 2 == 0 ? INT16_MAX : INT16_MIN;
@@ -669,6 +682,8 @@ int main(int argc, char *argv[])
                               SOUND_DETECT_FRAMES_PER_WINDOW);
       printf("[自检] 声音检测测试数据已注入: %s (%d)\n",
              ret == OK ? "成功" : "失败", ret);
+          free(test_audio);
+        }
     }
 
   /* 3. 主线程等待退出 */
@@ -686,13 +701,13 @@ int main(int argc, char *argv[])
 
   stop_care();
 
-  /* 停止声音检测 */
-
-  stop_sound_detection();
-
-  /* 停止音频监听 */
+  /* 先等待录音线程退出，确保不会再调用 sound_detect_feed。 */
 
   stop_audio_listening();
+
+  /* 然后释放声音检测器。 */
+
+  stop_sound_detection();
 
   /* 等待主循环任务退出 */
 

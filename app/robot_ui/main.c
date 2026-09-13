@@ -57,7 +57,7 @@ static void on_ai_command_received(const char *action, const char *param)
 
         /* 调用成员二的 AI 模块开始录音 */
         if (g_ai_initialized) {
-            audio_record_start(&g_audio_ctx, NULL, 0);
+            audio_record_start(&g_audio_ctx, NULL);
             sm_handle_event(&g_sm_ctx, SM_EVENT_WAKEUP);
         }
     }
@@ -80,7 +80,7 @@ static void on_ai_command_received(const char *action, const char *param)
 
         /* 播放语音回复 */
         if (g_ai_initialized) {
-            audio_play_start(&g_audio_ctx, NULL, 0);
+            audio_play_start(&g_audio_ctx, NULL, 0, NULL, NULL);
         }
     }
     else if (strcmp(action, "start_remind") == 0) {
@@ -126,7 +126,7 @@ static void on_ai_command_received(const char *action, const char *param)
         if (g_ai_initialized) {
             robot_ui_set_status(ROBOT_STATUS_LISTENING);
             robot_ui_set_face(ROBOT_FACE_THINKING);
-            llm_send_request(&g_llm_ctx, param, NULL);
+            llm_send_text(&g_llm_ctx, param, NULL, NULL, NULL);
         }
     }
 }
@@ -161,7 +161,7 @@ static void llm_response_callback(const char *response, void *user_data)
 
     /* 播放语音 */
     if (g_ai_initialized) {
-        audio_play_start(&g_audio_ctx, NULL, 0);
+        audio_play_start(&g_audio_ctx, NULL, 0, NULL, NULL);
     }
 
     /* 通知状态机 */
@@ -281,7 +281,7 @@ int main(int argc, char *argv[])
     audio_config_t audio_config = {
         .sample_rate = AUDIO_RATE_16K,
         .channels = AUDIO_CH_MONO,
-        .bits_per_sample = 16
+        .format = AUDIO_FORMAT_S16_LE
     };
     if (audio_init(&g_audio_ctx, &audio_config) == 0) {
         printf("Audio module initialized\n");
@@ -295,17 +295,35 @@ int main(int argc, char *argv[])
     }
 
     /* 初始化声音检测 */
-    if (sound_detect_init(&g_sound_ctx) == 0) {
-        printf("Sound detect initialized\n");
-        /* 注册报警回调 */
-        sound_detect_set_alarm_callback(&g_sound_ctx, sound_alarm_callback, NULL);
+    {
+        sound_detect_config_t detect_cfg = {
+            .mode = DETECT_MODE_REALTIME,
+            .threshold = SOUND_DETECT_THRESHOLD_DEFAULT,
+            .sample_rate = SOUND_DETECT_SAMPLE_RATE,
+            .frame_ms = SOUND_DETECT_FRAME_MS,
+            .enable_vad = true,
+            .enable_feedback = true,
+            .callback = NULL,
+            .user_data = NULL
+        };
+        if (sound_detect_init(&g_sound_ctx, &detect_cfg) == 0) {
+            printf("Sound detect initialized\n");
+        }
     }
 
     /* 初始化主动关怀 */
-    if (care_init(&g_care_ctx) == 0) {
-        printf("Care module initialized\n");
-        /* 注册提醒回调 */
-        care_set_remind_callback(&g_care_ctx, care_remind_callback, NULL);
+    {
+        care_config_t care_cfg = {
+            .enable_greeting = true,
+            .enable_health = true,
+            .enable_life = true,
+            .enable_exercise = true,
+            .callback = NULL,
+            .user_data = NULL
+        };
+        if (care_init(&g_care_ctx, &care_cfg) == 0) {
+            printf("Care module initialized\n");
+        }
     }
 
     g_ai_initialized = true;
@@ -356,7 +374,6 @@ int main(int argc, char *argv[])
         /* 运行 AI 模块 */
         if (g_ai_initialized) {
             sm_run(&g_sm_ctx);
-        }
         }
 
         usleep(5000); // 5ms 刷新周期
