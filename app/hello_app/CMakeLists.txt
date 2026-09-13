@@ -12,9 +12,10 @@ if(CONFIG_LVX_USE_CONTEST2026_233_HELLO_APP)
   set(HELLO_APP_COMPILE_FLAGS "")
 
   if(CONFIG_HELLO_APP_LLM_AI_AGENT)
-    # The ai_agent include is at ${NUTTX_APPS_DIR}/packages/ai_agent/include
     list(APPEND HELLO_APP_COMPILE_FLAGS
       -I${NUTTX_APPS_DIR}/packages/ai_agent/include
+      -I${NUTTX_APPS_DIR}/packages/ai_agent/src
+      -I${NUTTX_APPS_DIR}/packages/ai_agent/src/voice
     )
   endif()
 

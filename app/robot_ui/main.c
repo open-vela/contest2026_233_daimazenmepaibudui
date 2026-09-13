@@ -364,31 +364,35 @@ int main(int argc, char *argv[])
     }
 
     /* 初始化声音检测 */
-    sound_detect_config_t detect_cfg = {
-        .mode = DETECT_MODE_REALTIME,
-        .threshold = SOUND_DETECT_THRESHOLD_DEFAULT,
-        .sample_rate = SOUND_DETECT_SAMPLE_RATE,
-        .frame_ms = SOUND_DETECT_FRAME_MS,
-        .enable_vad = true,
-        .enable_feedback = true,
-        .callback = sound_alarm_callback,
-        .user_data = NULL
-    };
-    if (sound_detect_init(&g_sound_ctx, &detect_cfg) == 0) {
-        printf("Sound detect initialized\n");
+    {
+        sound_detect_config_t detect_cfg = {
+            .mode = DETECT_MODE_REALTIME,
+            .threshold = SOUND_DETECT_THRESHOLD_DEFAULT,
+            .sample_rate = SOUND_DETECT_SAMPLE_RATE,
+            .frame_ms = SOUND_DETECT_FRAME_MS,
+            .enable_vad = true,
+            .enable_feedback = true,
+            .callback = NULL,
+            .user_data = NULL
+        };
+        if (sound_detect_init(&g_sound_ctx, &detect_cfg) == 0) {
+            printf("Sound detect initialized\n");
+        }
     }
 
     /* 初始化主动关怀 */
-    care_config_t care_cfg = {
-        .enable_greeting = true,
-        .enable_health = true,
-        .enable_life = true,
-        .enable_exercise = true,
-        .callback = care_remind_callback,
-        .user_data = NULL
-    };
-    if (care_init(&g_care_ctx, &care_cfg) == 0) {
-        printf("Care module initialized\n");
+    {
+        care_config_t care_cfg = {
+            .enable_greeting = true,
+            .enable_health = true,
+            .enable_life = true,
+            .enable_exercise = true,
+            .callback = NULL,
+            .user_data = NULL
+        };
+        if (care_init(&g_care_ctx, &care_cfg) == 0) {
+            printf("Care module initialized\n");
+        }
     }
 
     g_ai_initialized = true;
@@ -446,35 +450,6 @@ int main(int argc, char *argv[])
         /* 运行 AI 模块 */
         if (g_ai_initialized) {
             sm_run(&g_sm_ctx);
-
-            /* 运行关怀确认状态机 */
-            ai_checkin_tick(lv_tick_get());
-
-            /* 轮询 checkin 状态并更新 UI */
-            checkin_snapshot_t snap = ai_checkin_snapshot();
-            static checkin_state_t last_checkin_state = CHECKIN_IDLE;
-            if (snap.state != last_checkin_state) {
-                last_checkin_state = snap.state;
-                switch (snap.state) {
-                    case CHECKIN_SENDING:
-                        touch_ui_update_checkin_state(TOUCH_CHECKIN_SENDING);
-                        break;
-                    case CHECKIN_SENT:
-                        touch_ui_update_checkin_state(TOUCH_CHECKIN_SENT);
-                        /* 通知成功后 2 秒自动关闭面板 */
-                        /* TODO: 用 lv_timer 延迟关闭 */
-                        break;
-                    case CHECKIN_FAILED:
-                        touch_ui_update_checkin_state(TOUCH_CHECKIN_FAILED);
-                        break;
-                    case CHECKIN_IDLE:
-                        /* 确认流程结束，隐藏面板 */
-                        touch_ui_hide_checkin();
-                        break;
-                    default:
-                        break;
-                }
-            }
         }
 
         usleep(5000); // 5ms 刷新周期

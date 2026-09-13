@@ -80,12 +80,7 @@ CONFIG_LV_USE_LOG=y
 CONFIG_LV_USE_NUTTX=y
 CONFIG_LV_USE_NUTTX_LCD=y
 CONFIG_LV_USE_NUTTX_TOUCHSCREEN=y
-# 用分块缓冲 + PARTIAL 渲染：只有脏区被重绘/刷屏。
-# 默认的 SINGLE_BUFFER 是整屏缓冲 + FULL 渲染，任意一个像素变化都会
-# 重绘并同步推送 390x450x2=351KB，会把 UI 线程卡住 30ms 量级，
-# 触摸手感明显迟钝。BUFFER_SIZE 单位是行数。
-CONFIG_LV_NUTTX_LCD_CUSTOM_BUFFER=y
-CONFIG_LV_NUTTX_LCD_BUFFER_SIZE=60
+CONFIG_LV_FONT_SIMSUN_16_CJK=y
 
 # ---- Audio (for voice companion) ----
 CONFIG_AUDIO=y
@@ -260,6 +255,25 @@ CONFIG_STACK_COLORATION=y
 # driver) is still higher than both.
 CONFIG_SCHED_LPWORKPRIORITY=120
 CONFIG_I2C=y
+
+# ==== AI Companion (hello_app) ====
+CONFIG_HELLO_APP_PROGNAME="ai_companion"
+CONFIG_HELLO_APP_PRIORITY=100
+CONFIG_HELLO_APP_STACKSIZE=16384
+CONFIG_HELLO_APP_LLM_AI_AGENT=y
+# CONFIG_HELLO_APP_LLM_MOCK is not set
+
+# ---- Audio I2S (for voice companion) ----
+CONFIG_AUDIO_I2S=y
+CONFIG_AUDIO_I2S_CHARDEV=y
+CONFIG_SF32LB52_I2S=y
+
+# ---- Debug options for AI modules ----
+CONFIG_DEBUG_AI_AUDIO=y
+CONFIG_DEBUG_AI_SOUND_DETECT=y
+CONFIG_DEBUG_AI_NETWORK=y
+CONFIG_DEBUG_AI_CARE=y
+
 CONFIG_EXAMPLES_AUDIO_TEST=y
 # Hardware self-test (display/touch/buttons/GPIO/I2C enumeration + read-only checks)
 # NSH command: hw_test
@@ -303,8 +317,6 @@ CONFIG_LV_FONT_MONTSERRAT_32=y
 CONFIG_LV_FONT_MONTSERRAT_48=y
 
 # robot_ui HTTP/MQTT 推送需要域名解析(DNS client over UDP)
-CONFIG_NET_UDP=y
-CONFIG_NETDB_DNSCLIENT=y
 CONFIG_SYSLOG_BUFFER=y
 # ==== USB 网络（RNDIS + Windows ICS 共享上网）====
 # 这些是工作区 .config 里手工配过、但 defconfig 一直漏掉的关键项，

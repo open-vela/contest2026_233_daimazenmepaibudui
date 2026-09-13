@@ -30,19 +30,8 @@
 /* cJSON 用于 JSON 解析 */
 #include <netutils/cJSON.h>
 
-/* 带 TLS 的 HTTP 客户端：手机推送走 https 必需。
- * webclient 自己不带 TLS，但允许应用用 ctx.tls_ops 注入实现。
- * 参考 apps/packages/demos/mimo/mimo_provider.c（CONFIG_DEMOS_MIMO=y）
- * 里已验证可用的 mimo_tls_* 写法，本文件的 push_tls_* 就是照它改的。
- * 依赖 Kconfig：CONFIG_NETUTILS_WEBCLIENT + CONFIG_CRYPTO_MBEDTLS（本工程已开）。 */
-#include <netutils/webclient.h>
-#include <semaphore.h>
-#include <pthread.h>
-#ifdef CONFIG_CRYPTO_MBEDTLS
-#include <mbedtls/ssl.h>
-#include <mbedtls/entropy.h>
-#include <mbedtls/ctr_drbg.h>
-#endif
+/* ai_agent TLS 客户端（HTTPS 推送） */
+#include "infra/vela_tls.h"
 
 /* ==================== 全局变量 ==================== */
 static wifi_config_t wifi_config = {0};
@@ -803,69 +792,46 @@ static int push_tls_init(void)
         return -1;
     }
 
-    /* 板端没有预置 CA 证书，先和 MiMo demo 一样跳过证书校验；生产环境
-     * 应在这里加载 CA 链并把 authmode 改成 MBEDTLS_SSL_VERIFY_REQUIRED。 */
-    mbedtls_ssl_conf_authmode(&g_push_tls_ctx.conf, MBEDTLS_SSL_VERIFY_NONE);
-    mbedtls_ssl_conf_rng(&g_push_tls_ctx.conf, mbedtls_ctr_drbg_random,
-                         &g_push_tls_ctx.ctr_drbg);
-
-    g_push_tls_ready = true;
+    printf("push_init: service=%d, key configured\n", service);
     return 0;
 }
 #endif /* CONFIG_CRYPTO_MBEDTLS */
 
-/* webclient 的响应体累加器 */
-struct push_resp_buf_s
-{
-    char  *data;
-    size_t len;
-    size_t cap;
-};
-
-static int push_sink_callback(char **buffer, int offset, int datend,
-                              int *buflen, void *arg)
-{
-    struct push_resp_buf_s *resp = arg;
-    int len = datend - offset;
-
-    (void)buflen;
-    if (len <= 0) {
-        return 0;
-    }
-
-    while (resp->len + (size_t)len + 1 > resp->cap) {
-        size_t newcap = resp->cap ? resp->cap * 2 : 256;
-        char *newdata = realloc(resp->data, newcap);
-
-        if (newdata == NULL) {
-            return -ENOMEM;
-        }
-        resp->data = newdata;
-        resp->cap = newcap;
-    }
-
-    memcpy(resp->data + resp->len, &((*buffer)[offset]), len);
-    resp->len += (size_t)len;
-    resp->data[resp->len] = '\0';
-    return 0;
-}
-
-/* 发送 HTTP POST 请求（带 TLS）。
- * 返回值：>=0 为 HTTP 状态码（200/201 表示成功），<0 为连接/传输失败。 */
+/* 发送 HTTPS POST 请求（复用 ai_agent TLS 客户端） */
 static int http_post(const char *url, const char *body)
 {
-    struct webclient_context ctx;
-    struct push_resp_buf_s resp;
-    const char *headers[1];
-    char *work_buf;
-    int ret;
+    if (url == NULL || body == NULL) {
+        return -EINVAL;
+    }
 
-    printf("[PUSH] http_post url=%s body_len=%d\n", url, (int)strlen(body));
+    char host[128] = {0};
+    char path[256] = {0};
+    int port = 443;
 
-#ifdef CONFIG_CRYPTO_MBEDTLS
-    if (push_tls_init() < 0) {
-        printf("[PUSH] http_post: TLS init failed\n");
-        return -1;
+    /* 解析 URL: https://host[:port]/path */
+    if (sscanf(url, "https://%127[^/]:%d/%255s", host, &port, path) < 2) {
+        if (sscanf(url, "https://%127[^/]/%255s", host, path) != 2) {
+            printf("push: invalid URL: %s\n", url);
+            return -1;
+        }
+    }
+
+    char port_str[8];
+    snprintf(port_str, sizeof(port_str), "%d", port);
+
+    /* 路径需要前导 / */
+    char full_path[260];
+    snprintf(full_path, sizeof(full_path), "/%s", path);
+
+    printf("push: POST https://%s:%d%s\n", host, port, full_path);
+
+    /* 调用 vela_tls HTTPS 客户端 */
+    char resp[2048] = {0};
+    int status = vela_https_post_json(host, port_str, full_path,
+                                      NULL, body, resp, sizeof(resp));
+    if (status < 0) {
+        printf("push: TLS error %d for %s\n", status, host);
+        return status;
     }
 #else
     printf("[PUSH] http_post: no TLS support (CONFIG_CRYPTO_MBEDTLS off)\n");
@@ -903,148 +869,28 @@ static int http_post(const char *url, const char *body)
     ret = webclient_perform(&ctx);
     free(work_buf);
 
-    if (ret < 0) {
-        printf("[PUSH] http_post: request failed ret=%d\n", ret);
-        if (resp.data != NULL) {
-            free(resp.data);
+    /* 检查 HTTP 状态码 */
+    if (status < 200 || status >= 300) {
+        printf("push: HTTP %d from %s\n", status, host);
+        return -EIO;
+    }
+
+    /* 解析业务返回码（Bark/PushPlus 都在 JSON 里返回 code 字段） */
+    cJSON *root = cJSON_Parse(resp);
+    if (root) {
+        cJSON *code = cJSON_GetObjectItem(root, "code");
+        if (code && cJSON_IsNumber(code) && (int)code->valuedouble != 200) {
+            const char *msg = cJSON_GetStringValue(
+                cJSON_GetObjectItem(root, "message"));
+            printf("push: business error %d: %s\n",
+                   (int)code->valuedouble, msg ? msg : "unknown");
+            cJSON_Delete(root);
+            return -EIO;
         }
-        return -1;
+        cJSON_Delete(root);
     }
 
-    /* 状态码 + 响应体前若干字节都打出来，串口上才能判断成功没成功 */
-    printf("[PUSH] HTTP status=%u resp_len=%d resp=%.200s\n",
-           ctx.http_status, (int)resp.len,
-           resp.data ? resp.data : "(empty)");
-
-    ret = (int)ctx.http_status;
-    if (resp.data != NULL) {
-        free(resp.data);
-    }
-    return ret;
-}
-
-/* -------------------------------------------------------------------------
- * 推送后台任务
- *
- * push_send_notification() 被 report_alarm()（UI 报警按钮）同步调用，
- * 一次 TLS 往返可能几百 ms 到数秒。这里把 url+body 放进单槽队列后立即返回，
- * 由独立任务真正发 HTTP，UI 线程不被阻塞。
- * ---------------------------------------------------------------------- */
-#define PUSH_TASK_STACKSIZE 32768
-#define PUSH_TASK_PRIORITY  120
-
-struct push_job_s
-{
-    bool pending;
-    char url[256];
-    char body[HTTP_BUFFER_SIZE];
-};
-
-static struct push_job_s g_push_job;
-static pthread_mutex_t g_push_job_lock = PTHREAD_MUTEX_INITIALIZER;
-static sem_t g_push_job_sem;
-static pthread_t g_push_task_id;
-static bool g_push_task_started = false;
-
-static void *push_task(void *arg)
-{
-    (void)arg;
-
-    for (;;) {
-        char url[sizeof(g_push_job.url)];
-        char body[sizeof(g_push_job.body)];
-        bool have = false;
-        int status;
-
-        sem_wait(&g_push_job_sem);
-
-        pthread_mutex_lock(&g_push_job_lock);
-        if (g_push_job.pending) {
-            strncpy(url, g_push_job.url, sizeof(url) - 1);
-            url[sizeof(url) - 1] = '\0';
-            strncpy(body, g_push_job.body, sizeof(body) - 1);
-            body[sizeof(body) - 1] = '\0';
-            g_push_job.pending = false;
-            have = true;
-        }
-        pthread_mutex_unlock(&g_push_job_lock);
-
-        if (!have) {
-            continue;
-        }
-
-        status = http_post(url, body);
-        if (status == 200 || status == 201) {
-            printf("[PUSH] OK: HTTP %d -> %s\n", status, url);
-        } else {
-            printf("[PUSH] FAIL: HTTP %d -> %s\n", status, url);
-        }
-    }
-
-    return NULL;
-}
-
-static void push_task_start_once(void)
-{
-    struct sched_param param;
-    pthread_attr_t attr;
-
-    if (g_push_task_started) {
-        return;
-    }
-
-    if (sem_init(&g_push_job_sem, 0, 0) != 0) {
-        printf("[PUSH] sem_init failed\n");
-        return;
-    }
-
-    pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr, PUSH_TASK_STACKSIZE);
-
-    /* 用比 UI 更低的优先级（数值更大），确保 TLS 计算不抢 UI */
-    pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
-    memset(&param, 0, sizeof(param));
-    param.sched_priority = PUSH_TASK_PRIORITY;
-    pthread_attr_setschedparam(&attr, &param);
-
-    if (pthread_create(&g_push_task_id, &attr, push_task, NULL) != 0) {
-        printf("[PUSH] push task create failed\n");
-        pthread_attr_destroy(&attr);
-        return;
-    }
-
-    pthread_attr_destroy(&attr);
-    g_push_task_started = true;
-    printf("[PUSH] async push task started (stack=%d prio=%d)\n",
-           PUSH_TASK_STACKSIZE, PUSH_TASK_PRIORITY);
-}
-
-/* 初始化推送服务。
- * key 为 NULL/空串时，按 service 从 /etc/assets/push_key.txt 或
- * PUSH_KEY_DEFAULT* 取（这样调用方就不用在源码里硬编码密钥）。 */
-int push_init(push_service_t service, const char *key)
-{
-    char loaded[sizeof(push_config.push_key)] = {0};
-    const char *use = key;
-
-    if (use == NULL || use[0] == '\0') {
-        if (!push_load_key(service, loaded, sizeof(loaded))) {
-            printf("push_init: no key for service=%d\n", service);
-            return -1;
-        }
-        use = loaded;
-    }
-
-    push_config.service = service;
-    strncpy(push_config.push_key, use, sizeof(push_config.push_key) - 1);
-    push_config.push_key[sizeof(push_config.push_key) - 1] = '\0';
-    push_config.enabled = true;
-
-    /* 不打印完整 key，避免密钥进串口日志 */
-    printf("push_init: service=%d, key=%.4s...(%d chars)\n",
-           service, use, (int)strlen(use));
-
-    push_task_start_once();
+    printf("push: OK (HTTP %d)\n", status);
     return 0;
 }
 

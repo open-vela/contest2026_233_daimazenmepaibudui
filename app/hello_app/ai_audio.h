@@ -48,9 +48,9 @@
 #define AUDIO_VAD_MIN_SPEECH_MS      300     /* 最小语音长度300ms */
 
 /* 音量范围 */
-#define AUDIO_VOLUME_MIN             0
-#define AUDIO_VOLUME_MAX             100
-#define AUDIO_VOLUME_DEFAULT         70
+#define AI_AUDIO_VOLUME_MIN             0
+#define AI_AUDIO_VOLUME_MAX             100
+#define AI_AUDIO_VOLUME_DEFAULT         70
 
 /****************************************************************************
  * Public Types

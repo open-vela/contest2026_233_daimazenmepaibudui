@@ -190,13 +190,17 @@ static void sm_listening_enter(void *ctx)
 
 static void sm_ai_talking_enter(void *ctx)
 {
-  (void)ctx;
+  sm_context_t *sm_ctx = (sm_context_t *)ctx;
   SM_DEBUG("进入AI对话状态: 等待云端回复");
-  /* TODO: 停止录音, 开始上传音频数据 */
-  /* audio_stop_recording(); */
-  /* network_send_audio(); */
 
-  /* TODO: 通知成员三显示思考动画 */
+  /* 通过 user_data 调用主程序的 AI 对话处理函数 (ASR → LLM) */
+
+  if (sm_ctx->user_data)
+    {
+      typedef void (*ai_talking_cb_t)(sm_context_t *);
+      ai_talking_cb_t cb = (ai_talking_cb_t)sm_ctx->user_data;
+      cb(sm_ctx);
+    }
 }
 
 /**

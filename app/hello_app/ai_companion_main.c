@@ -23,6 +23,11 @@
 #include "ai_sound_detect.h"
 #include "ai_care.h"
 
+#include "voice/voice_asr.h"
+#include "voice/voice_tts.h"
+#include "volc_asr.h"
+#include "volc_tts.h"
+
 /****************************************************************************
  * Pre-processor Definitions
  ****************************************************************************/
@@ -31,7 +36,7 @@
 #define MAIN_LOOP_INTERVAL_MS    100
 
 /* 程序退出标志 */
-static volatile bool g_running = true;
+static volatile sig_atomic_t g_running = 1;
 static bool g_audio_started;
 static bool g_sound_started;
 static bool g_care_started;
@@ -55,6 +60,13 @@ static sound_detect_context_t g_sound_ctx;
 /* 全局主动关怀上下文 */
 static care_context_t g_care_ctx;
 
+/* 语音段累积缓冲区 (用于 ASR) */
+
+#define SPEECH_BUF_MAX_FRAMES  (16000 * 10)  /* 最长10秒 @16kHz */
+static int16_t *g_speech_buf = NULL;
+static size_t   g_speech_frames = 0;
+static bool     g_speech_capturing = false;
+
 static void print_usage(const char *program)
 {
   printf("用法: %s [选项]\n", program);
@@ -73,8 +85,8 @@ static void print_usage(const char *program)
 
 static void signal_handler(int signo)
 {
-  printf("收到信号 %d, 准备退出...\n", signo);
-  g_running = false;
+  (void)signo;
+  g_running = 0;
 }
 
 /**
@@ -88,13 +100,15 @@ static void vad_callback(bool speech_detected, void *user_data)
   if (speech_detected)
     {
       printf("[VAD] 检测到语音开始\n");
-      /* 语音开始，触发唤醒事件 */
+      /* 重置缓冲区，开始累积语音数据 */
+      g_speech_frames = 0;
+      g_speech_capturing = true;
       sm_handle_event(ctx, SM_EVENT_WAKEUP);
     }
   else
     {
-      printf("[VAD] 语音结束\n");
-      /* 语音结束，触发语音完成事件 */
+      printf("[VAD] 语音结束 (累积 %zu 帧)\n", g_speech_frames);
+      g_speech_capturing = false;
       sm_handle_event(ctx, SM_EVENT_VOICE_COMPLETE);
     }
 }
@@ -103,6 +117,22 @@ static void audio_data_callback(const int16_t *data, size_t frames,
                                 void *user_data)
 {
   (void)user_data;
+
+  /* 累积语音数据到缓冲区，供 ASR 使用 */
+
+  if (g_speech_capturing && g_speech_buf != NULL)
+    {
+      size_t space = SPEECH_BUF_MAX_FRAMES - g_speech_frames;
+      size_t copy = frames < space ? frames : space;
+      if (copy > 0)
+        {
+          memcpy(&g_speech_buf[g_speech_frames], data,
+                 copy * sizeof(int16_t));
+          g_speech_frames += copy;
+        }
+    }
+
+  /* 送入声音检测器 */
 
   if (g_sound_started)
     {
@@ -422,18 +452,35 @@ static void llm_complete_callback(const char *response, int error,
 
   printf("[LLM] AI回复: %s\n", response);
 
-  /* TODO: 将文本转换为语音并播放 */
-  /* 1. 调用TTS服务将文本转为音频 */
-  /* 2. 播放音频 */
+  /* TTS: 文字转语音 */
 
-  /* 模拟播放 */
+  static unsigned char tts_buf[32 * 1024];
+  size_t tts_len = 0;
 
-  /* audio_play_start(&g_audio_ctx, tts_audio, frames, */
-  /*                  play_complete_callback, ctx); */
+  int ret = voice_tts_speak(response, tts_buf, sizeof(tts_buf), &tts_len);
+  if (ret < 0 || tts_len == 0)
+    {
+      printf("[TTS] 语音合成失败: %d\n", ret);
+      sm_handle_event(ctx, SM_EVENT_AI_RESPONSE);
+      return;
+    }
 
-  /* 模拟播放完成 */
+  printf("[TTS] 合成完成, %zu 字节\n", tts_len);
 
-  sm_handle_event(ctx, SM_EVENT_AI_RESPONSE);
+  /* 播放合成的语音 */
+
+  size_t frames = tts_len / sizeof(int16_t);
+  ret = audio_play_start(&g_audio_ctx,
+                         (const int16_t *)tts_buf, frames,
+                         play_complete_callback, ctx);
+  if (ret < 0)
+    {
+      printf("[TTS] 播放失败: %d\n", ret);
+      sm_handle_event(ctx, SM_EVENT_AI_RESPONSE);
+      return;
+    }
+
+  printf("[TTS] 开始播放语音\n");
 }
 
 /**
@@ -442,25 +489,49 @@ static void llm_complete_callback(const char *response, int error,
 
 static void process_ai_dialogue(sm_context_t *ctx)
 {
-  /* 获取最后录制的音频数据 */
+  char text_buf[512] = {0};
+  int ret;
 
-  /* TODO: 从音频模块获取录制的音频数据 */
+  printf("[AI] 开始AI对话处理 (累积 %zu 帧音频)\n", g_speech_frames);
 
-  /* 模拟音频数据 */
+  /* 如果没有累积到足够的语音数据，跳过 ASR */
 
-  printf("[AI] 开始AI对话处理\n");
+  if (g_speech_buf == NULL || g_speech_frames < 1600)
+    {
+      printf("[AI] 语音数据不足，跳过\n");
+      sm_handle_event(ctx, SM_EVENT_AI_ERROR);
+      return;
+    }
 
-  /* 发送到LLM */
+  /* ASR: 语音转文字 */
 
-  /* 模拟用户输入文本 */
-
-  const char *user_text = "你好，请问今天天气怎么样？";
-
-  int ret = llm_send_text(&g_llm_ctx, user_text,
-                          NULL, llm_complete_callback, ctx);
+  printf("[AI] 正在进行语音识别...\n");
+  ret = voice_asr_recognize((const unsigned char *)g_speech_buf,
+                            g_speech_frames * sizeof(int16_t),
+                            text_buf, sizeof(text_buf));
   if (ret < 0)
     {
-      printf("[AI] 发送请求失败: %d\n", ret);
+      printf("[AI] 语音识别失败: %d\n", ret);
+      sm_handle_event(ctx, SM_EVENT_AI_ERROR);
+      return;
+    }
+
+  if (text_buf[0] == '\0')
+    {
+      printf("[AI] 语音识别结果为空\n");
+      sm_handle_event(ctx, SM_EVENT_AI_ERROR);
+      return;
+    }
+
+  printf("[AI] 识别结果: %s\n", text_buf);
+
+  /* LLM: 发送文字到大模型 */
+
+  ret = llm_send_text(&g_llm_ctx, text_buf,
+                      NULL, llm_complete_callback, ctx);
+  if (ret < 0)
+    {
+      printf("[AI] 发送LLM请求失败: %d\n", ret);
       sm_handle_event(ctx, SM_EVENT_AI_ERROR);
     }
 }
@@ -527,6 +598,8 @@ int main(int argc, char *argv[])
   pthread_t loop_thread;
   const char *startup_text = NULL;
   bool sound_self_test = false;
+
+  g_running = 1;
 
   for (int i = 1; i < argc; i++)
     {
@@ -596,6 +669,26 @@ int main(int argc, char *argv[])
       return ret;
     }
 
+  /* 3.5 注册语音 ASR/TTS 后端 (火山引擎) */
+
+  printf("[初始化] 正在注册语音后端...\n");
+  volc_asr_register();
+  volc_tts_register();
+  voice_asr_set_backend("volcengine");
+  voice_tts_set_backend("volcengine");
+
+  /* 分配语音段累积缓冲区 */
+
+  g_speech_buf = malloc(SPEECH_BUF_MAX_FRAMES * sizeof(int16_t));
+  if (g_speech_buf == NULL)
+    {
+      printf("[警告] 语音缓冲区分配失败\n");
+    }
+
+  /* 设置 AI 对话回调给状态机 (通过 user_data) */
+
+  sm_set_user_data(&g_sm_ctx, (void *)process_ai_dialogue);
+
   /* 4. 初始化声音检测模块 */
 
   printf("[初始化] 正在初始化声音检测模块...\n");
@@ -640,8 +733,13 @@ int main(int argc, char *argv[])
   if (ret != 0)
     {
       printf("[错误] 主循环任务创建失败: %d\n", ret);
+      stop_audio_listening();
+      stop_care();
+      stop_sound_detection();
+      llm_deinit(&g_llm_ctx);
+      audio_deinit(&g_audio_ctx);
       sm_deinit(&g_sm_ctx);
-      return ret;
+      return -ret;
     }
 
   printf("[运行] 系统已启动, 按 Ctrl+C 退出\n\n");
@@ -658,17 +756,14 @@ int main(int argc, char *argv[])
 
   if (sound_self_test && g_sound_started)
     {
-      /* static 很关键：这是一个 16000 样本 × 2 字节 = 32KB 的缓冲区。
-       * 放在栈上时，GCC（-O2）会把整个函数的栈帧在入口序言里一次性开出来：
-       *     sub.w sp, sp, #32000
-       *     sub   sp, #16
-       * 也就是 ai_companion_main 一进来就要 32,016 字节栈。
-       * 而任务栈只有 CONFIG_HELLO_APP_STACKSIZE（默认 16KB）→ 一启动就踩穿栈、
-       * 硬件异常、整机 panic。它只在 --sound-self-test 分支用一次，
-       * 没有重入需求，所以挪到 .bss 最合适（对栈的占用变成 0）。
-       */
-      static int16_t test_audio[SOUND_DETECT_FRAMES_PER_WINDOW];
-      memset(test_audio, 0, sizeof(test_audio));
+      int16_t *test_audio = calloc(SOUND_DETECT_FRAMES_PER_WINDOW,
+                                   sizeof(*test_audio));
+      if (test_audio == NULL)
+        {
+          printf("[自检] 内存不足，跳过测试\n");
+        }
+      else
+        {
       for (size_t i = 0; i < SOUND_DETECT_FRAMES_PER_WINDOW; i += 80)
         {
           test_audio[i] = (i / 80) % 2 == 0 ? INT16_MAX : INT16_MIN;
@@ -678,6 +773,8 @@ int main(int argc, char *argv[])
                               SOUND_DETECT_FRAMES_PER_WINDOW);
       printf("[自检] 声音检测测试数据已注入: %s (%d)\n",
              ret == OK ? "成功" : "失败", ret);
+          free(test_audio);
+        }
     }
 
   /* 3. 主线程等待退出 */
@@ -695,13 +792,13 @@ int main(int argc, char *argv[])
 
   stop_care();
 
-  /* 停止声音检测 */
-
-  stop_sound_detection();
-
-  /* 停止音频监听 */
+  /* 先等待录音线程退出，确保不会再调用 sound_detect_feed。 */
 
   stop_audio_listening();
+
+  /* 然后释放声音检测器。 */
+
+  stop_sound_detection();
 
   /* 等待主循环任务退出 */
 
@@ -710,6 +807,11 @@ int main(int argc, char *argv[])
   /* 反初始化LLM模块 */
 
   llm_deinit(&g_llm_ctx);
+
+  /* 释放语音缓冲区 */
+
+  free(g_speech_buf);
+  g_speech_buf = NULL;
 
   /* 反初始化音频模块 */
 
