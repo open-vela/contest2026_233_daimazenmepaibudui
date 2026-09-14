@@ -48,6 +48,49 @@ DevKit-LCD 与 [SF32LB52-LCHSPI-ULP](../sf32lb52_lchspi_ulp) 参考板和
 > `dev-ai-contest-2026` 分支上可编译。`trunk` 或 `dev` 分支由于尚未合入
 > 芯片层依赖，无法编译。
 
+## 把板级实现挂进 openvela 工作区（**每个工作区都要做一次**）
+
+⚠️ **本目录（`board/contest_board`）不在 openvela 仓库里**。它是比赛仓库的内容，
+openvela 构建树是通过**软链**把它当成 `vendor/sifli/boards/sf32lb52/sf32lb52_devkit_lcd`
+来用的（`app/*` 同理链到 `packages/demos/contest2026_233_*`）。
+所以**只 clone 比赛仓库、不建这些软链**，编译就会报：
+
+```
+fatal error: sf32lb52_audio_in.h: No such file or directory
+fatal error: sf32lb52_alarm.h: No such file or directory
+```
+
+（`sf32lb52_audio_in.{c,h}`、`sf32lb52_alarm.{c,h}` 就在本目录的 `src/` 下，
+不是"仓库里没有"，而是"工作区没把它挂上"。）
+
+两种做法，任选一种：
+
+**1) `repo` 工作流（推荐）** —— 用本仓库根目录的 manifest：
+
+```bash
+repo init -u <本仓库 URL> -b dev-ai-contest-2026 -m contest2026_233_daimazenmepaibudui.xml
+repo sync
+```
+
+manifest 里的 `<linkfile>` 会自动把 `board/contest_board/*` 和 `app/*` 链到 openvela 树。
+
+**2) 已经有 openvela 工作树，只缺软链**（或 `repo sync` 把 `vendor/sifli` 的原始目录
+签回来、把软链覆盖掉了）—— 跑仓库自带的脚本：
+
+```bash
+bash board/contest_board/scripts/link_board_impl.sh
+# 工作树不在默认位置时显式指定：
+OPENVELA_DIR=/path/to/openvela bash board/contest_board/scripts/link_board_impl.sh
+```
+
+脚本会建好 `CMakeLists.txt / Kconfig / README*.md / configs / include / scripts / src`
+这 8 项软链，并**校验芯片驱动软链**（`drivers/platform/input/ft6146.c`）能否解析。
+
+> ⚠️ **必须逐项软链，不能把 `sf32lb52_devkit_lcd` 整个目录做成一个软链**：
+> `nuttx/CMakeLists.txt` 用 `${NUTTX_BOARD_ABS_DIR}/../drivers` 去找芯片侧驱动，
+> 整目录软链会让 `..` 按 POSIX 解析到**软链目标的父目录**，于是 `drivers` 找不到、
+> 构建报 `drivers/platform/input/ft6146.c missing`。脚本和 manifest 里都写了这条。
+
 ## 目录结构
 
 ```

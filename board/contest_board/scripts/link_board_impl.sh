@@ -25,8 +25,19 @@ BOARD_DIR="$(cd "$HERE/.." && pwd)"                     # .../board/contest_boar
 # openvela 工作树：优先用环境变量，其次按常见布局猜
 OPENVELA_DIR="${OPENVELA_DIR:-}"
 if [ -z "$OPENVELA_DIR" ]; then
+  # 常见布局：① 本仓库就在 openvela 工作树里（repo manifest 的 path 布局）
+  #           ② 平级克隆（~/openvela）
+  #           ③ 从本目录逐级向上找带 vendor/sifli/boards/sf32lb52 的目录
+  #              （别人的工作区怎么放都能找到，不用手填 OPENVELA_DIR）
   for c in "$BOARD_DIR/../../../.." "$HOME/openvela"; do
     if [ -d "$c/vendor/sifli/boards/sf32lb52" ]; then OPENVELA_DIR="$(cd "$c" && pwd)"; break; fi
+  done
+fi
+if [ -z "$OPENVELA_DIR" ]; then
+  d="$BOARD_DIR"
+  while [ "$d" != "/" ]; do
+    if [ -d "$d/vendor/sifli/boards/sf32lb52" ]; then OPENVELA_DIR="$d"; break; fi
+    d="$(dirname "$d")"
   done
 fi
 
