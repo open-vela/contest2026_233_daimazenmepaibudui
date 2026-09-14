@@ -265,6 +265,10 @@ RTCALARM: RTC time not set (year 1996 < 2000); waiting for time sync, retry ever
    或者模块只维护"下一个提醒"，业务层每次回调后决定下一次的时刻）。
    也可以以后在模块里加"提醒列表 + 每次只排最近的一个"，但**不要在硬件
    层放多个槽**——没有。
+   > 这个"业务层排队"已经做了：`app/robot_ui/reminder_sched.c`
+   > （`reminder_sched_reload()` 算最近的一条挂上，回调里再算下一条；
+   > 同刻多条一次报掉，排到明天还是今天由本模块的 `now >= target` 规则
+   > 决定，业务层不用自己算日期）。界面在 `app/robot_ui/touch_ui.c`。
 2. **等 alarm 必须靠信号，不能靠 `read()`**。`read(/dev/rtc0)` 永远返回 0
    （EOF），而且没有 `poll()`（`rtc.c:318-321`、`rtc.c:136`）。本模块已经
    把信号处理封装好了，上层不用管。
@@ -305,5 +309,10 @@ RTCALARM: RTC time not set (year 1996 < 2000); waiting for time sync, retry ever
   也试过）单独重编，stderr 为空。
 - ⏳ **真机未验证**：本文没有任何"已上板跑通"的结论；`hw_test rtcday`
   的实际输出（尤其"到点回调"）需要上板确认。
-- ⏳ 没做：多个提醒的业务层排队（第 7 节第 1 条）、和网络对时（NTP /
-  server 时间戳 + `RTC_SET_TIME`）的联调。
+- ✅ 多个提醒的业务层排队（第 7 节第 1 条）已在 `app/robot_ui/reminder_sched.c`
+  做了：算法用离板主机测试跑过 9 个用例（同刻两条、跨零点开机、把已过
+  时刻的提醒排到明天、删掉正要响的那条、时间没对过时不挂等，全过）。
+  测试脚手架在本机 `D:/apply/claw/_reminder_sched_host_test/`（**不在仓库里**，
+  里面是一份假的 `sf32lb52_rtc_alarm`），要复跑就照它 `test.c` 头部的命令编译。
+  ⏳ **提醒这条链路同样没上板验证过。**
+- ⏳ 没做：和网络对时（NTP / server 时间戳 + `RTC_SET_TIME`）的联调。

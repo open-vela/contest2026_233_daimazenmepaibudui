@@ -217,8 +217,7 @@ git apply <本仓库>/patches/vendor_sifli-lcd-brightness.patch
 
 **没打补丁的树仍然只有 0 / 100 是真的**（`SETCONTRAST` 回 `-ENOSYS`）：
 `backlight_set(1..99)` 会**如实返回 `-ENOSYS` 且不碰硬件**，
-`backlight_get()` 退化成模块内的“最近一次成功设定值”缓存
-（再兜底一层用 `GETPOWER` 归一化成 0 / 100）。不是假成功，别怀疑。
+`backlight_get()` 退化成用 `GETPOWER` 归一化成 0 / 100。不是假成功，别怀疑。
 
 为什么不能拿 `LCDDEVIO_SETPOWER` 冒充百分比：本板的
 `sf32lb_lcd_setpower()`（`sf32lb_lcd.c:634`）实现是
@@ -233,19 +232,36 @@ git apply <本仓库>/patches/vendor_sifli-lcd-brightness.patch
 
 **踩过的坑**：
 
+- **板级封装自己把中间值挡掉了**（2026-09-13 修）：`sf32lb52_backlight.c` 里曾经
+  有一句"本板只有 0/100 是真的，中间值直接 `return -ENOSYS`，**不往下发 ioctl**"
+  的短路，所以 `hw_test lcd 30` 看到的 `-38` 是**封装自己编的**，跟驱动补丁没关系
+  ——补丁早就打上、编进去了（`objdump` 能在 `final_nuttx` 里看到
+  `sf32lb_lcd_setcontrast` 里对 `p_ops->SetBrightness` 的判空与调用）。排错时
+  **别只看 `-ENOSYS` 就等于"驱动没实现"**：先确认那一跳有没有真的发出去
+  （日志里有没有 `BACKLIGHT: SETCONTRAST(n) failed`）。
+- **跨任务缓存 fd**（同一天紧接着踩的）：修好上面那条之后，
+  `hw_test lcd 30` 单跑 PASS，紧接着 `hw_test lcd 60` 却报
+  `BACKLIGHT: SETCONTRAST(60) failed: 9`（`EBADF`），而且 `设置前` 打印的
+  30 是模块内缓存的旧值、不是驱动回读。根因是封装用一个**模块级 `static int`
+  缓存 open 出来的 fd**，而 NuttX 的 fd 属于 task group：NSH 每条命令是一个
+  任务、`robot_ui` 又是另一个任务，A 任务 open 的 fd 数字在 B 任务里无效
+  （更糟时会指向 B 的另一个文件）。现在封装改成**每次调用 open/close、
+  不保存任何 fd 和跨任务状态**。用 `backlight_set()` 时不必再考虑调用方是哪个
+  任务。
 - `LCDDEVIO_SETCONTRAST` 的参数在本驱动里按**亮度百分比 0..100** 解释，
   **不是** NuttX 惯例的 `0..CONFIG_LCD_MAXCONTRAST`（本板该宏是 **63**，
   照它走会把 100% 挡掉）。所以补丁里用自己定义的 100 做上界校验。
 - 面板只有 `0x51 WBRIGHT` 写口、**没有回读通路**（CO5300 的 `0x52 RBRIGHT`
   在本驱动里没有读函数），所以 `GETCONTRAST` 回的是驱动里"最近一次下发的值"，
-  关屏时按 0 报；`backlight_get()` 拿不到驱动值时用模块内缓存兜底
-  （注释里写明是缓存值）。
+  关屏时按 0 报；`backlight_get()` 没有"上次设了多少"的缓存层，拿不到
+  `GETCONTRAST` 就退回 `GETPOWER` 归一化成 0/100。
 
 **坑**：
 
-1. `backlight_set()` 第一次调用会 `open("/dev/lcd0")` 并**长期持有 fd**
-   （模块内 `nxmutex` 保护）。这和第 9 节坑 6 是同一件事：`robot_ui`(LVGL)
-   正接管屏幕时别乱调，`backlight_set(0)` 会把 LVGL 的画面一起关掉。
+1. `backlight_set()` 每次调用都会 `open("/dev/lcd0")` 再 `close`（不缓存 fd）。
+   驱动侧 `lcddev_open` 只在 crefs 0->1 时动作、本驱动也没实现 `dev.open`，
+   所以这一对 open/close 很便宜。`robot_ui`(LVGL) 正接管屏幕时仍然别乱调：
+   `backlight_set(0)` 会把 LVGL 的画面一起关掉（那是同一块面板）。
 2. 别自己写 `ioctl(fd, LCDDEVIO_SETPOWER, 50)` 想"调暗一点"——那是自欺：
    `GETPOWER` 会回你 50，但屏幕亮度一点没变。
 3. 别用 `/dev/pwm0` 调背光：本配置 `CONFIG_PWM=n`，节点根本不存在
@@ -685,7 +701,7 @@ nsh> hw_test
 | `hw_test rtc [秒]` | 读 RTC 时间 + 设 N 秒后 alarm（默认 3），带超时。**单独运行**；见 `docs/sensor_rtc_usage.md` |
 | `hw_test audio [秒]` | 录 N 秒到内存（默认 2），打印 peak/avg 与是否检测到声音，不写文件。**单独运行**；走板级封装 `audio_in_*`，见 `docs/audio_driver_usage.md` 第 9 节 |
 | `hw_test button [秒]` | 等按键按下（默认 15 秒）：按到 `PA11(KEY)` 或 `PA34(HOME)` 会打印**键名 + 事件类型 + 按住时长**并报 `[PASS] 按键`，**超时 FAIL**。走板级 `sf32lb52_boardbtn`（GPIO），**不读 `/dev/buttons`**，见第 5 节。**单独运行** |
-| `hw_test lcd [0..100]` | 设屏幕亮度（默认 100）再回读。**单独运行**；本板只有 `0`/`100` 是真的，中间值 `backlight_set()` 返回 `-ENOSYS` ⇒ FAIL，见第 3.3 节 |
+| `hw_test lcd [0..100]` | 设屏幕亮度（默认 100）再回读。**单独运行**；0..100 全档都应 PASS（板级封装走 `SETCONTRAST`，依赖 vendor 亮度补丁），见第 3.3 节 |
 | `hw_test status` | 打一份统一外设状态（`board_status_get` / `board_status_dump`）：网络 / MQTT / ROM 素材 / `/data` / 音频 / 显示 / 触摸 / 按键 / RTC / 运行时间。**只有"网络拿到非回环 IPv4 地址"算 PASS/FAIL**，其它设备缺失只打印 `[提示]`，见 `docs/board_status_usage.md`。**单独运行** |
 
 说明：

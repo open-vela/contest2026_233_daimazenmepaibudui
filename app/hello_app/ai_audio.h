@@ -40,14 +40,17 @@
 /* 注意: 16000Hz * 20ms = 320 帧, 缓冲必须能容纳一个帧周期的数据 */
 #define AUDIO_RECORD_BUF_FRAMES      640     /* 录音缓冲帧数 (640=40ms@16kHz, 留余量) */
 #define AUDIO_PLAY_BUF_FRAMES        80      /* 播放缓冲帧数 (80*20ms=1.6秒) */
-#define AUDIO_PLAY_BUFFER_MS         5000    /* 最大缓存5秒 */
+#define AUDIO_PLAY_BUFFER_MS         8000    /* 最大缓存8秒（与 tts_buf 的 256 KB 对齐，否则 5~8 秒的 TTS 报 -ENOSPC 一声不响） */
 
 /* VAD (Voice Activity Detection) 参数 */
 #define AUDIO_VAD_ENERGY_THRESHOLD   500     /* 能量阈值 */
 #define AUDIO_VAD_SILENCE_TIMEOUT_MS 3000    /* 静音超时3秒 */
 #define AUDIO_VAD_MIN_SPEECH_MS      300     /* 最小语音长度300ms */
 
-/* 音量范围 */
+/* 音量范围（本模块对外口径 0..100）
+ * 注意：nuttx/audio/audio.h 里也有个同名宏 AUDIO_VOLUME_MAX，那是驱动侧的
+ * 0..1000。同一个文件里同时 include 两个头文件时要 #undef 让位，
+ * 写法见 ai_audio.c 的 Included Files。 */
 #define AUDIO_VOLUME_MIN             0
 #define AUDIO_VOLUME_MAX             100
 #define AUDIO_VOLUME_DEFAULT         70
@@ -131,22 +134,24 @@ typedef struct
   /* 录音相关 */
   bool                recording;      /* 是否正在录音 */
   audio_record_config_t record_cfg;   /* 录音配置 */
-  int                 record_fd;      /* 录音设备文件描述符 */
+  int                 record_fd;      /* 保留字段：录音 fd 由板级封装 audio_in_* 持有 */
   int16_t            *record_buf;     /* 录音缓冲区 */
   size_t              record_buf_size; /* 缓冲区大小(字节) */
   volatile bool       record_stop;    /* 停止录音标志 */
   bool                record_thread_valid; /* 录音线程需要回收 */
+  volatile bool       record_exited;  /* 录音线程已跑完（收尾用，见 audio_record_stop） */
 
   /* 播放相关 */
   bool                playing;        /* 是否正在播放 */
   audio_play_complete_cb_t play_cb;   /* 播放完成回调 */
   void               *play_user_data; /* 播放回调用户数据 */
-  int                 play_fd;        /* 播放设备文件描述符 */
+  int                 play_fd;        /* 保留字段：播放 fd 由播放线程自己 open/close */
   int16_t            *play_buf;       /* 播放缓冲区 */
   size_t              play_buf_size;  /* 缓冲区大小(字节) */
   volatile bool       play_stop;      /* 停止播放标志 */
   size_t              play_frames;    /* 当前播放帧数 */
   bool                play_thread_valid; /* 播放线程需要回收 */
+  bool                record_resume_on_play_end; /* 播放是为它停的录音，播完恢复 */
 
   /* VAD相关 */
   bool                vad_enabled;    /* VAD是否启用 */
@@ -185,8 +190,12 @@ void audio_deinit(audio_context_t *ctx);
 /**
  * @brief  开始录音
  * @param  ctx: 音频上下文指针
- * @param  config: 录音配置
+ * @param  config: 录音配置, NULL 表示不启用 VAD/回调
  * @return 0成功, 负值失败
+ *
+ * 走板级封装 sf32lb52_audio_in（设备 /dev/audio/audio0，16k/单声道/s16le）。
+ * 本板是半双工：调用时如果正在播放，会先 audio_play_stop() 停掉播放；
+ * 参数非法/设备忙时返回负 errno（-EINVAL / -EBUSY 等）。
  */
 
 int audio_record_start(audio_context_t *ctx,
@@ -210,11 +219,19 @@ bool audio_is_recording(audio_context_t *ctx);
 /**
  * @brief  开始播放音频数据
  * @param  ctx: 音频上下文指针
- * @param  data: 音频数据
+ * @param  data: 音频数据（16k/单声道/s16le）
  * @param  frames: 帧数
- * @param  callback: 播放完成回调
+ * @param  callback: 播放完成回调（在播放线程里调用；被 stop 打断时不调用）
  * @param  user_data: 回调用户数据
  * @return 0成功, 负值失败
+ *
+ * 半双工：调用时如果正在录音，会先 audio_record_stop() 停掉录音，
+ * **播完（或写失败退出）再按原配置自动恢复录音** —— 因为 ai_companion 的录音是
+ * 常开监听、只在开机时启动一次（ai_companion_main.c 的 start_audio_listening），
+ * 不自动恢复的话第一次 TTS 之后就没有麦克风了。要让上层自己管录音，
+ * 删掉 ai_audio.c 播放线程末尾那段"恢复录音"即可。
+ * data 超过播放缓冲（AUDIO_PLAY_BUFFER_MS）返回 -ENOSPC，不截断。
+ * 实际出声由播放线程完成（本线程自己 open/write/close 设备）。
  */
 
 int audio_play_start(audio_context_t *ctx,
@@ -225,10 +242,13 @@ int audio_play_start(audio_context_t *ctx,
 /**
  * @brief  从文件播放音频
  * @param  ctx: 音频上下文指针
- * @param  filepath: 音频文件路径
+ * @param  filepath: 音频文件路径（裸 PCM：16k / 单声道 / s16le）
  * @param  callback: 播放完成回调
  * @param  user_data: 回调用户数据
  * @return 0成功, 负值失败
+ *
+ * 不解析 WAV/MP3 等容器格式（本板没有解码器），文件要和
+ * `audio_test record <ms> <file>` 存出来的裸 PCM 一致。
  */
 
 int audio_play_file(audio_context_t *ctx,
@@ -256,6 +276,10 @@ bool audio_is_playing(audio_context_t *ctx);
  * @param  ctx: 音频上下文指针
  * @param  volume: 音量 0-100
  * @return 0成功, 负值失败
+ *
+ * 会即时下发到驱动（AUDIOIOC_CONFIGURE + AUDIO_TYPE_FEATURE +
+ * AUDIO_FU_VOLUME，换算成驱动的 0..1000）。设备打不开时返回负 errno，
+ * 但软件音量已经记下（audio_get_volume 返回新值）。
  */
 
 int audio_set_volume(audio_context_t *ctx, uint8_t volume);

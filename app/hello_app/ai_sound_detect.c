@@ -17,6 +17,7 @@
 #include <pthread.h>
 #include <time.h>
 #include <errno.h>
+#include <syslog.h>
 
 /****************************************************************************
  * Pre-processor Definitions
@@ -65,6 +66,9 @@ static const char *g_state_names[] =
 };
 
 /* 类型名称表 */
+/* 连续命中几个检测窗口才上报（见 sound_detect_run_model 里的确认逻辑）*/
+#define SOUND_DETECT_CONFIRM_WINDOWS  2
+
 static const char *g_type_names[] =
 {
   [SOUND_TYPE_NONE]         = "NONE",
@@ -331,10 +335,34 @@ static int sound_detect_run_model(sound_detect_context_t *ctx,
 
       if (ctx->classes[max_idx].enabled)
         {
-          sound_detect_add_result(ctx, max_idx, max_score);
+          /* 同一个类别连续 SOUND_DETECT_CONFIRM_WINDOWS 个窗口都超阈值才上报。
+           * 单窗口就报的话，一声脆响（点击声、喇叭自己的提示音、关门声）都会被
+           * 判成"跌倒"——现场就是这个现象。真跌倒的声音是持续的，多要一个窗口
+           * 代价是确认慢约 1 秒（一个窗口 1 秒）。 */
+          if (ctx->confirm_type == max_idx)
+            {
+              ctx->confirm_count++;
+            }
+          else
+            {
+              ctx->confirm_type = max_idx;
+              ctx->confirm_count = 1;
+            }
+
+          if (ctx->confirm_count >= SOUND_DETECT_CONFIRM_WINDOWS)
+            {
+              ctx->confirm_type = SOUND_TYPE_NONE;
+              ctx->confirm_count = 0;
+              sound_detect_add_result(ctx, max_idx, max_score);
+            }
+
           return OK;
         }
     }
+
+  /* 这一窗没有超阈值的类别：清掉待确认计数，免得"隔几秒响一下"被拼成连续 */
+  ctx->confirm_type = SOUND_TYPE_NONE;
+  ctx->confirm_count = 0;
 
   return -ENODATA;
 }
@@ -704,6 +732,16 @@ int sound_detect_start(sound_detect_context_t *ctx)
       return -EBUSY;
     }
 
+#if !SOUND_DETECT_HEURISTIC_ENABLE
+  /* 内置的启发式检测已被关掉：不起线程，也不进入 COLLECTING 状态，
+   * 只是把回调留着 —— 等模型（或别的来源）调 sound_detect_report_anomaly()。 */
+  ctx->state = DETECT_STATE_IDLE;
+  syslog(LOG_INFO,
+         "[sound_detect] 内置启发式检测已关闭（SOUND_DETECT_HEURISTIC_ENABLE=0），"
+         "仅保留 sound_detect_report_anomaly() 上报入口\n");
+  return OK;
+#endif
+
   SOUND_DEBUG("开始声音检测");
 
   /* 清空缓冲区 */
@@ -766,6 +804,14 @@ int sound_detect_feed(sound_detect_context_t *ctx,
       return -EINVAL;
     }
 
+#if !SOUND_DETECT_HEURISTIC_ENABLE
+  /* 启发式检测关着：音频直接丢掉，不占缓冲也不算错误。
+   * 上层照旧喂（录音回调里那句），一行都不用改。 */
+  (void)ctx;
+  (void)data;
+  (void)frames;
+  return 0;
+#else
   if (ctx->state != DETECT_STATE_COLLECTING)
     {
       return -EINVAL;
@@ -798,6 +844,7 @@ int sound_detect_feed(sound_detect_context_t *ctx,
   memcpy(ctx->audio_buffer + ctx->buffer_pos, data,
          frames * sizeof(int16_t));
   ctx->buffer_pos += frames;
+#endif /* SOUND_DETECT_HEURISTIC_ENABLE */
 
   ctx->stats.total_frames += frames;
 
@@ -1008,6 +1055,29 @@ const char *sound_detect_get_state_name(detect_state_t state)
 /**
  * @brief  获取声音类型名称字符串
  */
+
+int sound_detect_report_anomaly(sound_detect_context_t *ctx,
+                                sound_type_t type, float confidence)
+{
+  if (ctx == NULL || !ctx->initialized ||
+      type <= SOUND_TYPE_NONE || type >= SOUND_TYPE_MAX)
+    {
+      return -EINVAL;
+    }
+
+  if (confidence < 0.0f)
+    {
+      confidence = 0.0f;
+    }
+  else if (confidence > 1.0f)
+    {
+      confidence = 1.0f;
+    }
+
+  /* 与内置检测器判出结果时走同一条路：统计 + 回调（报警页 / 响铃 / 推送） */
+  sound_detect_add_result(ctx, type, confidence);
+  return OK;
+}
 
 const char *sound_detect_get_type_name(sound_type_t type)
 {

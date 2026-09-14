@@ -703,23 +703,45 @@ static int sf32lb52_audio_hw_stop(FAR struct sf32lb52_audio_s *priv)
   HAL_AUDPRC_DMAStop(&priv->aprc, HAL_AUDPRC_RX_CH0);
   __HAL_AUDPRC_DISABLE(&priv->aprc);
 
+  /* 播放用的 DAC DMA 也要停，而且**必须停**：
+   * HAL 把音频 DMA 初始化成 DMA_CIRCULAR（见 hw_init 的注释：WORD 对齐 +
+   * 循环 + 高优先级），也就是传输结束后硬件自己从头再来一遍。write() 正常
+   * 返回时它自己会 DMAStop，但"写失败提前 break""上层直接 close""stop 时
+   * 正阻塞在 write 里"这几条路上没人停它 —— 最后写进去的那 100 ms 就会
+   * 无限重播，现场听感就是"昂昂昂昂"卡住不停。
+   * 只动寄存器，和上面两行 AUDPRC DMAStop 一个量级，不碰模拟通路。 */
+
+  HAL_AUDCODEC_DMAStop(&priv->codec, HAL_AUDCODEC_DAC_CH0);
+  priv->codec.State[HAL_AUDCODEC_DAC_CH0] = HAL_AUDCODEC_STATE_READY;
+
   /* 清掉 HAL 的通道状态，否则下一次 Transmit/Receive DMA 会返回 HAL_BUSY */
   priv->aprc.State[HAL_AUDPRC_TX_CH0] = HAL_AUDPRC_STATE_READY;
   priv->aprc.State[HAL_AUDPRC_RX_CH0] = HAL_AUDPRC_STATE_READY;
 
   /* 唤醒可能正阻塞在 read() 里的任务。
    *
-   * read() 等的是 priv->rx_sem，而它只在 DMA 完成中断
-   * (HAL_AUDPRC_RxCpltCallback) 里被 post；stop 时 DMA 被停掉，
-   * 中断不会再来 —— 于是 read() 只能干等它自己的 5 秒超时。
-   * （实测：录音阻塞中发 STOP，3 秒后 read 仍未返回）
+   * read() 等的是 priv->rx_sem，正常由 DMA 完成中断 post。stop 时 DMA 被停掉，
+   * 中断不会再来 —— 必须在这里补一次，否则 read 只能干等它自己的超时。
+   * **无条件 post**（不再只在 rx_busy 时才 post）：rx_busy 的读写和中断有竞态，
+   * 实测出现过"stop 那一下刚好看到 rx_busy==false 就没唤醒"，录音线程卡在
+   * read 里出不来，而 join 它的正是 LVGL 线程 —— 界面整块卡死（提交按钮一直
+   * 不变色）。配对措施见 read()：起 DMA 前先 nxsem_reset()，多余的计数不会
+   * 被下一次 read 当成"采集完成"。
    */
 
-  if (priv->rx_busy)
-    {
-      priv->rx_aborted = true;
-      nxsem_post(&priv->rx_sem);
-    }
+  syslog(LOG_INFO, "AUDIO: stop 唤醒 read（rx_busy=%d running=%d）\n",
+         (int)priv->rx_busy, (int)priv->running);
+
+  /* 有 read 在等：置 abort 标记（让它按 EOF 收场，不能把半截缓冲当数据交上去）。
+   * 没有 read 在等：把标记清掉，别留下脏状态影响本函数开头的"幂等早退"判断。 */
+
+  priv->rx_aborted = priv->rx_busy;
+
+  /* **无条件** post：rx_busy 与中断之间有竞态，只在 busy 时 post 会漏唤醒
+   * （实测那次漏了）。配对措施见 read()：起 DMA 前先 nxsem_reset()，多余计数
+   * 不会被下次 read 当成"采集完成"。 */
+
+  nxsem_post(&priv->rx_sem);
 
   /* 把还挂着的 buffer 归还给上层。
    *
@@ -801,6 +823,22 @@ static int sf32lb52_audio_hw_shutdown(FAR struct sf32lb52_audio_s *priv)
   HAL_AUDPRC_DMAStop(&priv->aprc, HAL_AUDPRC_TX_CH0);
   HAL_AUDPRC_DMAStop(&priv->aprc, HAL_AUDPRC_RX_CH0);
   __HAL_AUDPRC_DISABLE(&priv->aprc);
+
+  /* DAC 的 DMA 同样要停：它是 DMA_CIRCULAR，不停就会无限重播最后一段
+   * （"昂昂昂昂"卡住不停）。close() 是最后一个 fd 被关时的收尾路径，
+   * 上一段播放如果没能自己停掉，这里就是唯一的机会。
+   * 顺带把"停的时候还在传"这个异常打出来 —— 正常收尾时 DAC 状态早该是
+   * READY，还带 BUSY_TX 就说明上一次传输没走完，下一次 write 会因此起不来。 */
+
+  if ((priv->codec.State[HAL_AUDCODEC_DAC_CH0] & HAL_AUDCODEC_STATE_BUSY_TX) != 0)
+    {
+      syslog(LOG_WARNING,
+             "AUDIO: shutdown 时 DAC 仍是 BUSY_TX(0x%x)，传输没收尾，已停\n",
+             priv->codec.State[HAL_AUDCODEC_DAC_CH0]);
+    }
+
+  HAL_AUDCODEC_DMAStop(&priv->codec, HAL_AUDCODEC_DAC_CH0);
+  priv->codec.State[HAL_AUDCODEC_DAC_CH0] = HAL_AUDCODEC_STATE_READY;
 
   priv->aprc.State[HAL_AUDPRC_TX_CH0] = HAL_AUDPRC_STATE_READY;
   priv->aprc.State[HAL_AUDPRC_RX_CH0] = HAL_AUDPRC_STATE_READY;
@@ -1166,10 +1204,63 @@ static ssize_t sf32lb52_audio_write(FAR struct audio_lowerhalf_s *dev,
 
   clock_t t0 = clock_systime_ticks();
 
+  (void)t0;
+
+  /* ★ 起传输前必须把状态摆正。
+   *
+   * vendor HAL 里 HAL_AUDCODEC_DMAStop() 那句 "State = READY" 是**注释掉的**，
+   * 而 HAL_AUDCODEC_Transmit_DMA() 只要看到 State 还带 HAL_AUDCODEC_STATE_BUSY_TX
+   * 就直接 return HAL_BUSY。于是只要上一次传输没走到本函数末尾那两行收尾
+   * （上一次会话被 STOP/close 打断、上一次 write 起不来、掉电前的残留……），
+   * State 就永远卡在 BUSY_TX：之后**每一次** write 都在这里失败、返回 0，
+   * 上层看到的就是"界面显示正在播放，但一个字节都没播出去"。
+   *
+   * 兜法：残留就先把 DMA 停掉，再把状态强制摆成 READY。这条警告正常播放时
+   * 一次都不该出现 —— 出现了就说明上一条路径没收好尾，串口日志能直接看到。 */
+
+  if ((priv->codec.State[HAL_AUDCODEC_DAC_CH0] & HAL_AUDCODEC_STATE_BUSY_TX) != 0)
+    {
+      syslog(LOG_WARNING,
+             "AUDIO: DAC 状态残留 BUSY_TX(0x%x)，先停 DMA 再重起\n",
+             priv->codec.State[HAL_AUDCODEC_DAC_CH0]);
+      HAL_AUDCODEC_DMAStop(&priv->codec, HAL_AUDCODEC_DAC_CH0);
+    }
+
+  priv->codec.State[HAL_AUDCODEC_DAC_CH0] = HAL_AUDCODEC_STATE_READY;
+
+  /* DMA 句柄自己也有状态机：HAL_AUDCODEC_Transmit_DMA 里
+   * HAL_DMA_Start_IT() 的返回值是被丢掉的，句柄如果不是 READY 它直接返回
+   * HAL_BUSY、DMA 根本没起来，而 codec 那边的 BUSY_TX 已经置上了 —— 现象
+   * 就是 write() 干等 600ms 超时、一个字节都没播。这里一并兜住并留证。 */
+
+  if (priv->codec.hdma[HAL_AUDCODEC_DAC_CH0] != NULL &&
+      priv->codec.hdma[HAL_AUDCODEC_DAC_CH0]->State != HAL_DMA_STATE_READY)
+    {
+      syslog(LOG_WARNING,
+             "AUDIO: DAC 的 DMA 句柄状态异常(0x%x)，强制复位成 READY\n",
+             priv->codec.hdma[HAL_AUDCODEC_DAC_CH0]->State);
+      priv->codec.hdma[HAL_AUDCODEC_DAC_CH0]->State = HAL_DMA_STATE_READY;
+    }
+
   res = HAL_AUDCODEC_Transmit_DMA(&priv->codec, (FAR uint8_t *)buffer, buflen,
                                   HAL_AUDCODEC_DAC_CH0);
   if (res != HAL_OK)
     {
+      /* 起不来也别把上一次的 DMA 留在循环模式里：DAC 的 DMA 是
+       * DMA_CIRCULAR，残留的传输会无限重播最后一段（"昂昂昂昂"）。
+       * 同时把 res / Lock / State 打出来 —— 这次现场就是靠它定位的。 */
+
+      syslog(LOG_ERR,
+             "AUDIO: Transmit_DMA 失败 res=%d Lock=%d State=0x%x dmastate=0x%x "
+             "buflen=%u running=%d\n",
+             (int)res, (int)priv->codec.Lock,
+             priv->codec.State[HAL_AUDCODEC_DAC_CH0],
+             priv->codec.hdma[HAL_AUDCODEC_DAC_CH0] != NULL ?
+               (int)priv->codec.hdma[HAL_AUDCODEC_DAC_CH0]->State : -1,
+             (unsigned)buflen, (int)priv->running);
+
+      HAL_AUDCODEC_DMAStop(&priv->codec, HAL_AUDCODEC_DAC_CH0);
+      priv->codec.State[HAL_AUDCODEC_DAC_CH0] = HAL_AUDCODEC_STATE_READY;
       priv->wr_busy = false;
       return 0;
     }
@@ -1191,6 +1282,12 @@ static ssize_t sf32lb52_audio_write(FAR struct audio_lowerhalf_s *dev,
 
   if (ret < 0)
     {
+      /* 等超时：DMA 没在预期时间内报完成，本块算丢。这条**正常播放时不该
+       * 出现**（每块 100ms，等的是 100ms+500ms 余量），出现就说明播放通路
+       * 出问题了，串口日志要留着看。 */
+
+      syslog(LOG_ERR, "AUDIO: 等播放完成超时（buflen=%u），本块丢弃\n",
+             (unsigned)buflen);
       return 0;
     }
 
@@ -1215,10 +1312,16 @@ static ssize_t sf32lb52_audio_read(FAR struct audio_lowerhalf_s *dev,
 
   if (buffer == NULL || buflen == 0 || !priv->running)
     {
-      syslog(LOG_ERR, "R: early ret buf=%p len=%zu run=%d\n",
-             buffer, buflen, priv->running);
+      syslog(LOG_WARNING, "AUDIO: read 时设备没在跑（len=%zu running=%d）\n",
+             buflen, (int)priv->running);
       return 0;
     }
+
+  /* 先把上一次 stop 可能留下的计数清掉，再起 DMA。
+   * 配合 hw_stop() 里"无条件 post"的唤醒：不清的话，上一次 stop 的 post
+   * 会让本次 read 一进等待就立刻返回，把没采满的缓冲当数据交上去。 */
+
+  nxsem_reset(&priv->rx_sem, 0);
 
   priv->rx_busy    = true;
   priv->rx_aborted = false;
@@ -1232,20 +1335,42 @@ static ssize_t sf32lb52_audio_read(FAR struct audio_lowerhalf_s *dev,
   if (res != HAL_OK)
     {
       priv->rx_busy = false;
-      auderr("ERROR: read DMA start failed: %d\n", res);
+      syslog(LOG_ERR, "AUDIO: read 起 DMA 失败 %d\n", (int)res);
       return 0;
     }
 
-  ret = nxsem_tickwait_uninterruptible(&priv->rx_sem, MSEC2TICK(5000));
+  /* 分片等待（每片 100ms，最多 5 秒），**不能一次等满 5 秒**：
+   * 上层的 audio_record_stop() 是"先停设备再 join 录音线程"，而 join 是在
+   * LVGL 线程里调的。实测出现过"停设备那一下没能唤醒这个等待、5 秒超时也没
+   * 回来"（提交按钮一直绿着、界面整块卡死），录音线程于是永远出不来。
+   * 分片之后：每 100ms 主动看一眼 rx_aborted / running，只要 stop 走过就把
+   * 这一片收掉返回 0，最坏 100ms 就能把录音线程放出来，不再靠那一次 post
+   * 或者那一次超时。 */
+
+  {
+    int slice;
+
+    for (slice = 0; slice < 50; slice++)
+      {
+        ret = nxsem_tickwait_uninterruptible(&priv->rx_sem, MSEC2TICK(100));
+
+        if (ret == OK || priv->rx_aborted || !priv->running)
+          {
+            break;
+          }
+      }
+  }
+
   priv->rx_busy = false;
 
-  /* 被 stop() 打断：按 EOF 返回（不能报 buflen，数据并没采满）*/
+  /* 被 stop() 打断（或设备已经不在跑了）：按 EOF 返回（不能报 buflen，
+   * 数据并没采满；上层拿到 0 就会跳出录音循环、把麦克风还回去）。 */
 
-  if (priv->rx_aborted)
+  if (priv->rx_aborted || !priv->running)
     {
       priv->rx_aborted = false;
       HAL_AUDPRC_DMAStop(&priv->aprc, SF32LB52_AUDIO_PRC_RX_CH);
-      audinfo("read aborted by stop\n");
+      priv->aprc.State[SF32LB52_AUDIO_PRC_RX_CH] = HAL_AUDPRC_STATE_READY;
       return 0;
     }
 
@@ -1263,7 +1388,11 @@ static ssize_t sf32lb52_audio_read(FAR struct audio_lowerhalf_s *dev,
 
   if (ret < 0)
     {
-      auderr("ERROR: read DMA wait failed: %d\n", ret);
+      /* 分片等待里出现过超时（也可能是 stop 把 running 清掉后正常回 0）。
+       * 用 syslog：这条在真机上必须看得见 —— 上层录音线程就是靠 read 返回
+       * 0 才能跳出循环退出的。 */
+
+      syslog(LOG_WARNING, "AUDIO: read 等 DMA 超时/被停（ret=%d）\n", ret);
       return 0;
     }
 

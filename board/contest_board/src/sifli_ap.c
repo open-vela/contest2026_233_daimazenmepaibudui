@@ -25,6 +25,7 @@
 // eg: arm_internal.h riscv_internal.h
 #include <nuttx/config.h>
 
+#include <fcntl.h>
 #include <syslog.h>
 #include <errno.h>
 #include <sys/mount.h>
@@ -276,6 +277,92 @@ static int lcd_async_init_thread(int argc, FAR char *argv[])
 #endif
 
 /****************************************************************************
+ * Name: sf32lb52_install_agent_config
+ *
+ * Description:
+ *   /etc 是只读 ROMFS，而 ai_agent 把配置写在 /data（tmpfs，重启即丢）。
+ *   开机时把只读素材 /etc/assets/agent_config.json 拷成
+ *   /data/ai_agent/config/config.json，省掉每次重启后手敲
+ *   set_llm / set_volc_asr / set_volc_key。
+ *
+ *   目标文件已存在则不覆盖（保留运行时改过的值）；素材不存在时安静跳过 ——
+ *   固件里不带密钥，密钥文件只在作者本机生成、不进版本库。
+ *
+ ****************************************************************************/
+
+static void sf32lb52_install_agent_config(void)
+{
+  static const char srcpath[] = "/etc/assets/agent_config.json";
+  static const char dstdir[]  = "/data/ai_agent/config";
+  static const char dstpath[] = "/data/ai_agent/config/config.json";
+  char buf[512];
+  ssize_t total = 0;
+  ssize_t nread;
+  int srcfd;
+  int dstfd;
+
+  if (access(dstpath, F_OK) == 0)
+    {
+      return;
+    }
+
+  srcfd = open(srcpath, O_RDONLY | O_CLOEXEC);
+  if (srcfd < 0)
+    {
+      /* 没有素材文件是正常情况（仓库不带密钥）。 */
+      return;
+    }
+
+  if (mkdir("/data/ai_agent", 0700) < 0 && errno != EEXIST)
+    {
+      serr("WARN: mkdir /data/ai_agent failed: %d\n", errno);
+    }
+
+  if (mkdir(dstdir, 0700) < 0 && errno != EEXIST)
+    {
+      serr("WARN: mkdir %s failed: %d\n", dstdir, errno);
+      close(srcfd);
+      return;
+    }
+
+  dstfd = open(dstpath, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+  if (dstfd < 0)
+    {
+      serr("WARN: open %s failed: %d\n", dstpath, errno);
+      close(srcfd);
+      return;
+    }
+
+  for (;;)
+    {
+      nread = read(srcfd, buf, sizeof(buf));
+      if (nread < 0)
+        {
+          serr("WARN: read %s failed: %d\n", srcpath, errno);
+          break;
+        }
+
+      if (nread == 0)
+        {
+          break;
+        }
+
+      if (write(dstfd, buf, (size_t)nread) != nread)
+        {
+          serr("WARN: write %s failed: %d\n", dstpath, errno);
+          break;
+        }
+
+      total += nread;
+    }
+
+  close(dstfd);
+  close(srcfd);
+
+  syslog(LOG_INFO, "INFO: agent config installed (%ld bytes)\n", (long)total);
+}
+
+/****************************************************************************
  * Name: sf32lb52_lchspi_ulp_bringup
  *
  * Description:
@@ -322,6 +409,9 @@ int sf32lb52_lchspi_ulp_bringup(void)
       serr("WARN: mount tmpfs on /data failed: %d\n", tmpret);
     }
 #endif
+
+  /* 把只读素材里的凭据装到可写位置（见 sf32lb52_install_agent_config）。 */
+  sf32lb52_install_agent_config();
 
 #if defined(CONFIG_RTC) && defined(CONFIG_RTC_DRIVER)
   struct rtc_lowerhalf_s *rtclower = NULL;
@@ -669,8 +759,17 @@ void board_late_initialize(void)
    *
    * 后续：整个固件原来是 -O0（CONFIG_DEBUG_NOOPT，见 defconfig 里的说明），
    * 打开 -O2 之后重新测试本开关。
+   *
+   * ⚠ 2026-09-13：这个开关现在置 0 关掉，原因是**麦克风只有一个**：
+   *   hello_app 一启动就常开录音、独占 /dev/audio/audio0（半双工设备），
+   *   而界面所在的 app 是 robot_ui —— "语音聊天"要由 robot_ui 自己录音并播放，
+   *   两个 app 抢同一个设备必然互相打断（audio_in_start() 直接 -EBUSY）。
+   *   所以 robot_ui 现在是唯一的语音入口；ai_companion 仍可在 NSH 里手动
+   *   `ai_companion` 起来（调试 AI 状态机/声音检测时用），只是不要和
+   *   robot_ui 的语音聊天同时用。
+   *   要恢复开机自启，把它改回 1，并把 robot_ui 的语音聊天入口当成不能用。
    */
-#define AUTOSTART_HELLO_APP 1
+#define AUTOSTART_HELLO_APP 0
 #if AUTOSTART_HELLO_APP
   {
     /* 入口符号由 nuttx_add_application(NAME ...) 决定：

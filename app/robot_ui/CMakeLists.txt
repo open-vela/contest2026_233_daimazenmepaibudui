@@ -5,11 +5,13 @@ if(CONFIG_LVX_USE_CONTEST2026_233_ZHI_AI)
 
   # 添加应用程序
   #
-  # INCLUDE_DIRECTORIES 里两个路径的用途：
+  # INCLUDE_DIRECTORIES 里三个路径的用途：
   #
   # ① `${CMAKE_CURRENT_SOURCE_DIR}/../hello_app`：robot_ui 的 main.c 会调成员二
-  #    hello_app 里的 AI 模块（ai_state_machine / ai_audio / ai_llm / ai_sound_detect /
-  #    ai_care），需要它们的头文件路径。
+  #    hello_app 里的 AI 模块（ai_state_machine / ai_audio / ai_sound_detect /
+  #    ai_care / mimo_voice），需要它们的头文件路径。
+  #    注意 ai_llm.h 已经不用了：main.c 的对话改走 mimo_voice.c 的 mimo_chat()，
+  #    不再碰 llm_send_text()（那条路会撞 ai_agent 消息总线的未初始化队列锁）。
   #    注意这里写 `../hello_app` 是**对的**：`contest2026_233_robot_ui` 本身是符号链接
   #    指向我们仓库的 `app/robot_ui`，所以 `${CMAKE_CURRENT_SOURCE_DIR}/..` 解析到的是
   #    仓库的 `app/` 目录，而不是构建树里的 `apps/packages/demos/`。
@@ -21,19 +23,35 @@ if(CONFIG_LVX_USE_CONTEST2026_233_ZHI_AI)
   #    与 app/hello_app、app/hw_test 的 CMakeLists.txt 是同一写法。
   #    robot_ui 的报警按钮要调 alarm_trigger()/alarm_clear()，需要它。
   #
-  # SRCS 里的 lv_font_ui_16/20/24.c：用 lv_font_conv + simhei.ttf 从 app/ 全部源码抽字符
-  # （971 个字符）生成的三档中文字库，变量名 lv_font_ui_16 / lv_font_ui_20 / lv_font_ui_24。
-  # LVGL 自带的 16px 中文点阵字体（simsun）只有约 1436 个字形，界面用到的汉字一半是方块；
-  # 这三档才是界面上真正用的字体。
+  # ③ `${NUTTX_APPS_DIR}/packages/ai_agent/include`：ai_agent 包的
+  #    voice/voice_asr.h、voice/voice_tts.h（语音后端分发层）。robot_ui 的
+  #    "语音聊天"要自己调 voice_asr_recognize()/voice_tts_speak()，
+  #    与 app/hello_app/CMakeLists.txt 里那两条 -I 是同一写法。
+  #    符号本身在 ai_agent 那个 app 里（voice_asr.c / voice_tts.c），最终链接时解析。
+  #
+  # SRCS 里的 lv_font_ui_16/20/24.c：用 lv_font_conv + simhei.ttf 生成的三档中文字库，
+  # 变量名 lv_font_ui_16 / lv_font_ui_20 / lv_font_ui_24（16/4bpp、20/4bpp、24/4bpp，
+  # 与改动前 montserrat 的字号分档一一对应）。
+  # 字符集是**常用汉字全集**：GB2312 一级+二级 6763 字 + ASCII 0x20-0x7E +
+  # CJK 标点 U+3000-U+303F + 全角 U+FF00-U+FFEF + 少量常用符号，共 7178 个码点
+  # （字库里实际 7010 个字形，simhei 没有的会跳过）。
+  # 以前是从 app/ 源码里抽字符生成的（971 个），AI 回复里源码没出现过的字全是方块，
+  # 所以换成了全集。生成脚本和命令见 patches/README.md「中文字库覆盖常用汉字全集」。
+  #
+  # SRCS 里的 reminder_sched.c：提醒的软调度（硬件只有一个 RTC 日循环 alarm 槽，
+  # 多个提醒要在软件层排队）。提醒列表的数据也放在那里，touch_ui.c 只通过
+  # reminder_sched_* 增删查；到点回调在工作线程里，main.c 用 lv_async_call 弹窗。
   nuttx_add_application(
     NAME robot_ui
-    SRCS main.c robot_ui.c touch_ui.c network_comm.c
+    SRCS main.c robot_ui.c touch_ui.c reminder_sched.c network_comm.c time_sync.c
          lv_font_ui_16.c lv_font_ui_20.c lv_font_ui_24.c
     STACKSIZE 32768
     PRIORITY 100
     INCLUDE_DIRECTORIES
       ${CMAKE_CURRENT_SOURCE_DIR}/../hello_app
       ${NUTTX_BOARD_ABS_DIR}/src
+      ${NUTTX_APPS_DIR}/packages/ai_agent/include
+      ${NUTTX_APPS_DIR}/packages/ai_agent/src
   )
 
   # 板子网络连通性测试（与 zhi_ai 无关，纯测网络）

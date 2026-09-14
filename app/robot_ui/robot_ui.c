@@ -21,8 +21,8 @@ static lv_timer_t *clock_timer = NULL;
 #include "sf32lb52_alarm.h"
 
 /* 中文字库（实现在 lv_font_ui_16/20/24.c，见 CMakeLists.txt 的 SRCS）。
- * 原来这里用的是 LVGL 自带的 16px 中文点阵字体（字形不够，汉字一半是方块）。
- * 现在按改动前 montserrat 的字号分三档：
+ * 字符集是常用汉字全集（GB2312 6763 字 + ASCII + CJK 标点 + 全角），
+ * 按改动前 montserrat 的字号分三档：
  *   14/16/18 -> lv_font_ui_16   20/22/24 -> lv_font_ui_20   >=28 -> lv_font_ui_24 */
 LV_FONT_DECLARE(lv_font_ui_16);
 LV_FONT_DECLARE(lv_font_ui_20);
@@ -192,6 +192,16 @@ static void ui_clock_timer_cb(lv_timer_t *t)
 }
 
 /* ==================== 创建状态栏 ==================== */
+/* 状态栏上的「菜单」按钮：主菜单的保底入口。
+ * 主菜单只在开机时显示一次，关掉之后要么右滑（手势，见 touch_ui.c），
+ * 要么点这里。两者都调 touch_ui_show_menu(MENU_TYPE_MAIN)。 */
+static void menu_button_event_handler(lv_event_t *e)
+{
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+        touch_ui_show_menu(MENU_TYPE_MAIN);
+    }
+}
+
 static void create_status_bar(lv_obj_t *parent)
 {
     /* 状态栏容器 */
@@ -243,6 +253,17 @@ static void create_status_bar(lv_obj_t *parent)
     lv_label_set_text(lbl_net, "NET --");
     lv_obj_set_style_text_color(lbl_net, lv_color_hex(0xFFC107), 0);
     lv_obj_set_style_text_font(lbl_net, &lv_font_ui_24, 0);
+
+    /* 「菜单」按钮：主菜单的保底入口（手势不灵时也能进）。 */
+    lv_obj_t *btn_menu = lv_btn_create(bar);
+    lv_obj_set_size(btn_menu, LV_SIZE_CONTENT, 36);
+    lv_obj_add_style(btn_menu, &style_btn, 0);
+    lv_obj_add_event_cb(btn_menu, menu_button_event_handler,
+                        LV_EVENT_CLICKED, NULL);
+    lv_obj_t *lbl_menu = lv_label_create(btn_menu);
+    lv_label_set_text(lbl_menu, "菜单");
+    lv_obj_set_style_text_font(lbl_menu, &lv_font_ui_24, 0);
+    lv_obj_center(lbl_menu);
 }
 
 /* ==================== 更新网络状态 ==================== */
@@ -561,10 +582,16 @@ void robot_ui_show_reminder(const char *title, const char *content)
 
     lv_msgbox_add_title(mbox, title);
     lv_msgbox_add_text(mbox, content);
-    lv_msgbox_add_close_button(mbox);
+    touch_ui_msgbox_add_close_x(mbox);
     lv_obj_center(mbox);
     lv_obj_set_style_bg_color(mbox, lv_color_hex(0x2D2D44), 0);
     lv_obj_set_style_text_color(mbox, lv_color_hex(0xFFFFFF), 0);
+
+    /* 字体必须显式指定：msgbox 默认吃 LVGL 主题字体，而本工程的默认字体是
+     * 16px 的 simsun（约 1436 个字形），界面用到的一些汉字（"散""嘱"…）
+     * 它会画成方块。这里统一成 build 里真正的三档字库之一，和 touch_ui 的
+     * 弹窗一致（20px：比 24px 少占地方，长一点的提醒语不容易顶出屏幕）。 */
+    lv_obj_set_style_text_font(mbox, &lv_font_ui_20, 0);
 }
 
 /* ==================== 显示报警 ==================== */
@@ -572,7 +599,23 @@ void robot_ui_show_alarm(const char *content)
 {
     int ret;
 
-    /* 设备级动作：让喇叭真的响起来（板级报警模块，非阻塞返回）。
+    /* ① 先把红色报警页面切出来（**必须第一步**）。
+     *
+     * 这一步原来排在报警声和上报后面，实测踩了坑：上报走网络（MQTT + TLS 推送），
+     * 一旦这条路上出问题/卡住，红色页面就永远切不出来 —— 现场看到的现象就是
+     * "按了报警，声音在响但屏幕上没有报警页，也退不出来"。
+     * 先刷页面，后面无论网络怎么慢，用户至少能看到报警界面并点"返回"。
+     */
+    lv_scr_load(scr_alarm);
+
+    /* 设置报警表情 */
+    robot_ui_set_face(ROBOT_FACE_ALARM);
+    robot_ui_set_status(ROBOT_STATUS_ALARM);
+
+    /* 启动报警闪烁动画 */
+    lv_anim_start(&anim_blink);
+
+    /* ② 设备级动作：让喇叭真的响起来（板级报警模块，非阻塞返回）。
      *
      * 放在这个函数里、而不是各个调用点，是因为界面上的"报警"按钮走的是
      *   btn_event_handler() -> robot_ui_show_alarm()
@@ -589,7 +632,7 @@ void robot_ui_show_alarm(const char *content)
         printf("robot_ui: alarm_trigger failed: %d\n", ret);
     }
 
-    /* 上报：MQTT 发到 zhi_ai/<client_id>/alarm（+ 手机推送）。
+    /* ③ 上报：MQTT 发到 zhi_ai/<client_id>/alarm（+ 手机推送）。
      * 以前这里没接，所以按了报警按钮只响、不上报；补上这一句
      * 才算"响 + 屏幕 + 上报 + 推送"四个动作齐全。
      * 注意 report_alarm() 不阻塞（MQTT 没连上时它内部会很快失败返回）。 */
@@ -599,16 +642,6 @@ void robot_ui_show_alarm(const char *content)
             printf("robot_ui: report_alarm failed: %d（MQTT 没连上？）\n", rret);
         }
     }
-
-    /* 切换到报警屏幕 */
-    lv_scr_load(scr_alarm);
-
-    /* 设置报警表情 */
-    robot_ui_set_face(ROBOT_FACE_ALARM);
-    robot_ui_set_status(ROBOT_STATUS_ALARM);
-
-    /* 启动报警闪烁动画 */
-    lv_anim_start(&anim_blink);
 }
 
 /* ==================== 关闭报警 ==================== */

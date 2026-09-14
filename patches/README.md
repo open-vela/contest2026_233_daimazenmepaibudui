@@ -133,10 +133,14 @@ SF32LB52-DevKit-LCD 音频驱动,注册 `/dev/audio0`(NuttX audio_lowerhalf),支
 - 逐档下发：`hw_test lcd 0` / `hw_test lcd 30` / `hw_test lcd 60` /
   `hw_test lcd 100`，四档都应当 PASS，并且**屏幕亮度肉眼可见地变化**
   （0 = 关屏，100 = 全亮），`回读亮度` 等于设定值。
-- 板级封装 `board/contest_board/src/sf32lb_backlight.c` 和 UI 亮度滑块
+- 板级封装 `board/contest_board/src/sf32lb52_backlight.c` 和 UI 亮度滑块
   （`app/robot_ui/touch_ui.c` 的 `setting_slider_event_handler`）已经接到这条
   通路上；用法与兼容性（没打补丁的树仍然只有 0/100）见
   `docs/display_touch_gpio_usage.md` 第 3.3 节。
+- **只打这个补丁还不够**：板级封装原来那份实现（文件里写着"1..99 直接
+  `return -ENOSYS`，不往下发 ioctl"）会自己把中间值挡掉，`hw_test lcd 30`
+  报的 `-38` 是它编的，跟驱动无关。改完封装（走 `LCDDEVIO_SETCONTRAST`）
+  之后四档才真的 PASS。
 
 ## 应用方式
 
@@ -385,3 +389,261 @@ git apply <本仓库>/patches/apps-ai-agent-llm-clock-fix.patch
   即使再遇到时钟异常，也只会打印 `watchdog: delivering received reply (N bytes) despite latency=...`
   并把回复交付出来。
 - 复现手法：故意把时钟设早（`date -s` 到 2024 之前）再 `ask`，看是否还能拿到回复。
+
+---
+
+# USB RNDIS 收到 -ENOMEM 就断言 → USB 设备栈死掉（2026-09-14 新增补丁）
+
+## 现象
+
+用户第二次点「语音聊天」，Windows 报「无法识别的 USB 设备」：
+
+```
+Assertion failed at /drivers/usbdev/rndis.c:1820   task: robot_ui
+  rndis_rdcomplete → sf32lb52_reqcomplete → sf32lb52_rdrequest → exception_direct
+```
+
+## 根因
+
+`rndis.c:1820` 原来是 `DEBUGASSERT(ret != -ENOMEM)`。`rndis_recvpacket()` 只在**一处**
+返回 `-ENOMEM`：`rndis_allocrxreq()` 拿不到 RX 缓冲（`iob_tryalloc()` 返回 NULL，
+或 `rndis_allocwrreq()` 的写请求空闲链空了）。IOB 池是启动时固定大小的，语音链路
+一轮里同时活着的东西不少（录音 PCM 最多 320 KB、ASR 请求体约 430 KB、TTS 响应
+1.5 MB、播放缓冲 256 KB），把网络收发缓冲挤空一次，就在 **USB 中断上下文**里踩中
+了这条断言 —— 丢的本来只是一帧以太网帧（TCP 会重传、ARP/ICMP 会重试），
+代价却是一整块 USB 网卡。
+
+## 修改
+
+文件：`nuttx/drivers/usbdev/rndis.c`。
+
+| 位置 | 改动 |
+|------|------|
+| `struct rndis_dev_s` | 新增 `uint32_t rx_dropped_nomem`（丢帧计数，给限流日志用） |
+| `rndis_rdcomplete()` `:1820` | 删掉 `DEBUGASSERT(ret != -ENOMEM)`，改成**丢帧 + 重挂读请求 + 限流日志**：`ret` 归位 `OK`，于是走下面原有的 `rndis_submit_rdreq(priv)` 重新武装 bulk OUT 管道；日志前 3 次全打、之后每 64 次打一条 |
+
+两条依据：
+
+- `rndis_recvpacket()` 的 `-ENOMEM` **只可能出现在一个数据报的开头**：续包进来时
+  `priv->rx_req` 已经不是 NULL，`rndis_allocrxreq()` 直接返回 true。所以丢这一帧
+  不会留下半截重组状态。
+- 丢帧之后**必须重挂读请求**，否则 `ret != OK` 会让 `if (ret == OK) rndis_submit_rdreq(priv);`
+  跳过，RX 永久停摆（和 `nuttx-usbdev-rndis.patch` 第 2 条同一个坑）。
+
+## 应用方式
+
+**在 `nuttx-usbdev-rndis.patch` 之后应用**（两者改同一个文件，改动不重叠但顺序固定）：
+
+```bash
+cd <openvela 工作区>/nuttx
+git apply <本仓库>/patches/nuttx-usbdev-rndis.patch
+git apply <本仓库>/patches/nuttx-usbdev-rndis-nomem.patch
+```
+
+## 验证
+
+- 编译通过；`syntax_check.sh nuttx/drivers/usbdev/rndis.c` 0 error。
+- 上板：正常跑一轮「语音聊天」不应再出现 `Assertion failed at .../rndis.c:1820`；
+  内存真被挤空时串口会出现 `ERROR: RX buffer unavailable, frame dropped (N total)`，
+  网卡仍然可用（丢一帧而已）。
+- 想主动复现 `-ENOMEM`：临时把 `CONFIG_IOB_NBUFFERS` 调小，或者在压满堆的同时
+  连续收报文。
+
+---
+
+# vela_tls 读到 chunked 响应的结尾还在等（2026-09-14 新增补丁）
+
+## 现象
+
+`[mimo_voice] TTS: 请求 406 字节文本` 之后：
+
+```
+[vela_tls] Handshake OK: TLSv1.2 ...
+        ← 之后再没有任何 TTS 日志，卡了两分多钟，直到用户手动关掉弹窗
+```
+
+「两分多钟」正好是 `AGENT_LLM_SOCKET_TIMEOUT_SEC` 给 socket 设的 `SO_RCVTIMEO`。
+
+## 根因
+
+`src/infra/vela_tls.c` 的 `tls_read_response()`（以及明文那条 `vela_http_post_json()`）
+读 body 的循环只有两个退出条件：**有 `Content-Length` 时按长度收尾**、连接关闭。
+而请求头里写死了 `Connection: keep-alive`（`:427`），服务器用
+`Transfer-Encoding: chunked` 时既没有 `Content-Length`、也不会主动关连接 ——
+循环就一直卡在 `mbedtls_ssl_read()` 上等永远不会再来的数据，直到 120 秒超时。
+
+## 修改
+
+| 位置 | 改动 |
+|------|------|
+| `chunked_body_complete()`（新增，在 `tls_read_response()` 上方） | 在已经读到的 body 末尾找 chunked 的终止块 `0\r\n\r\n` |
+| `tls_read_response()` body 读循环 `:651` | 每读到一段就判一次，终止块到了立刻 `break` |
+| `vela_http_post_json()` body 读循环 `:1022` | 同一处 guard（明文那条路有一样的毛病） |
+
+只认「没有 trailer」的终止形式（在末尾 8 字节里找 `0\r\n\r\n`）：带 trailer 的响应
+会退化成原来的行为（等超时），不会误判。
+
+## 应用方式
+
+```bash
+cd <openvela 工作区>/packages/ai_agent
+git apply <本仓库>/patches/apps-ai-agent-llm-clock-fix.patch        # 若有
+git apply <本仓库>/patches/apps-ai-agent-vela-tls-chunked-end.patch
+```
+
+## 验证
+
+- 编译通过；`syntax_check.sh packages/ai_agent/src/infra/vela_tls.c` 0 error。
+- 上板：`[mimo_voice] TTS: 请求 N 字节文本` 之后应在几秒内出现
+  `[mimo_voice] TTS: 收到 base64 音频 N 字节`，不再卡 120 秒。
+
+---
+
+# 2026-09-14 上板实测暴露的三个问题（本轮改动总览）
+
+| 文件 | 改了什么 |
+|------|----------|
+| `app/robot_ui/lv_font_ui_{16,20,24}.c` | 字库字符集从「源码里出现过的 971 字」扩到常用汉字全集 |
+| `board/contest_board/configs/sf32lb52_ai/defconfig` | 加 `CONFIG_LV_FONT_FMT_TXT_LARGE=y`（字变大之后必须开，见下） |
+| `app/robot_ui/main.c` | 新增显示用清洗 `sanitize_for_display()`；`voice_speak_reply()` 的状态行改成如实反映 |
+| `app/hello_app/mimo_voice.c` | TTS 合成文本截断；响应 cap 1 MB→1.5 MB；base64 就地解码；重采样直接写进调用方缓冲；每步分配/释放打日志 |
+| `app/robot_ui/CMakeLists.txt`、`robot_ui.c`、`touch_ui.c` | 更新「971 个字符」那段过期注释 |
+| `patches/nuttx-usbdev-rndis-nomem.patch` | RNDIS `-ENOMEM` 不再断言 |
+| `patches/apps-ai-agent-vela-tls-chunked-end.patch` | chunked 响应提前收尾 |
+
+## 中文字库覆盖常用汉字全集
+
+### 为什么
+
+原来的三档字库是用 `lv_font_conv` + `simhei.ttf` 从 `app/` 源码里抽字符生成的
+（971 个），所以 AI 回复里任何「源码里没出现过的汉字」都会显示成方块，
+emoji（😊📱🔍🗣️）更是必然没有。
+
+### 字符集
+
+`_ui_chars_full.txt`，共 **7178 个码点**，字库里实际 **7010 个字形**
+（simhei 没有的码点会被跳过）：
+
+- GB2312 一级 + 二级汉字 **6763** 个（遍历 0xB0A1..0xF7FE 全部双字节组合解码得到）
+- ASCII 0x20-0x7E
+- CJK 符号/标点 U+3000-U+303F
+- 全角字符 U+FF00-U+FFEF
+- 常用符号 °±×÷—…·“”‘’←↑→↓≈「」『』【】
+
+### 怎么生成的
+
+simhei.ttf 在 Windows 侧，所以用 Windows 的 node 跑 lv_font_conv：
+
+```bash
+node C:/Users/<user>/AppData/Roaming/npm/node_modules/lv_font_conv/lv_font_conv.js \
+  --font C:/Windows/Fonts/simhei.ttf \
+  --symbols "$(cat _ui_chars_full.txt)" \
+  --size 16 --bpp 4 --format lvgl --no-compress \
+  --lv-font-name lv_font_ui_16 --lv-include lvgl.h \
+  -o _lv_font_ui_16.c
+# 20 / 24 同理（--size 20 / 24，--lv-font-name lv_font_ui_20 / lv_font_ui_24）
+```
+
+生成后直接 `cp` 进 `app/robot_ui/`（变量名由 `--lv-font-name` 直接给定，
+原来 `ui_font_16 → lv_font_ui_16` 的那步 `sed` 已经不需要了）。
+`line_height` / `base_line` 和原来一模一样（16/19/3、20/22/4、24/25/4），
+**字号和行距没动，只扩了字符集**。
+
+> **别改成 `--range`**：GB2312 的 6763 个码点在 Unicode 上是散的，展开成连续区间
+> 要 3555 段、命令行 44 KB，超过 Windows CreateProcess 的 32 KB 上限；
+> `--symbols` 只要 7 KB（7178 个 UTF-16 码元）。
+
+### 三档字库各多大（`.rodata` 实测，`arm-none-eabi-size -A`）
+
+| 档 | C 源文件 | 旧 `.rodata`（971 字） | 新 `.rodata`（7010 字） | 增量 |
+|----|----------|----------------------|----------------------|------|
+| `lv_font_ui_16` | 5,895,482 B | ~111 KB | **945,537 B**（bitmap 820,127 + dsc 112,160 + cmap 13,250） | +835 KB |
+| `lv_font_ui_20` | 8,647,457 B | ~167 KB | **1,403,058 B**（bitmap 1,277,648 + dsc 112,160 + cmap 13,250） | +1.24 MB |
+| `lv_font_ui_24` | 11,585,160 B | ~229 KB | **1,895,118 B**（bitmap 1,769,708 + dsc 112,160 + cmap 13,250） | +1.67 MB |
+| 合计 | 26,128,099 B | ~507 KB | **4,243,713 B（4.05 MB）** | **+3.74 MB** |
+
+整体 flash：**2,184,592 B (13.02%) → 5,930,240 B (35.35%)**（+3,745,648 B ≈ 3.57 MB），
+16 MB 里还剩 10 MB 出头。sram 基本没动（228,376 → 228,440 B，+64 B）；psram 仍为 0。
+
+### 必须同时开 `CONFIG_LV_FONT_FMT_TXT_LARGE=y`
+
+20 px / 24 px 的 4bpp 位图分别是 1.28 MB / 1.77 MB，超过 LVGL 默认
+`lv_font_fmt_txt_glyph_dsc_t.bitmap_index` 的 **20 位（1 MB）** 上限，不开就是：
+
+```
+error: "Too large font or glyphs in LV_FONT_UI_20.
+        Enable LV_FONT_FMT_TXT_LARGE in lv_conf.h"
+```
+
+所以 `defconfig` 末尾加了这一行（附带 ASCII-only 注释，理由见上面
+`CONFIG_MIMO_API_KEY` 那段关于 CMake `file(STRINGS)` 丢非 ASCII 的警告）。
+代价是 `lv_font_fmt_txt_glyph_dsc_t` 从 8 字节变成 16 字节，
+每档多 `7010 × 8 ≈ 112 KB`（已含在上表里）。
+
+## 显示前过滤渲染不了的东西（`app/robot_ui/main.c`）
+
+新增 `sanitize_for_display()`：送 `lv_label` 之前先把字库渲染不了的码点丢掉、
+把 Markdown 降级成纯文本。
+
+- 丢：emoji（U+1F000 以上）、杂项符号/装饰符（U+2600-U+27BF）、
+  几何图形与制表符（U+2500-U+25FF）、带圈数字与技术符号（U+2300-U+24FF）、
+  箭头只留字库里有的 ←↑→↓、变体选择符/零宽字符（U+FE00-U+FE4F、
+  U+2000-U+206F 里除常用标点之外的全部）、Latin-1 里那堆重音字母。
+- Markdown：`*` 和反引号去掉、`__` 去掉（单个 `_` 留着，别拆 `ai_audio`）、
+  行首 `#`/`>` 连它后面的空白一起去掉、行首 `- `/`+ `/`* ` 列表符号换成 `· `。
+- 换行保留（连续 3 个以上压成 2 个），制表符换成空格，同一行里的连续空格压成一个
+  （丢掉 emoji 之后很容易留下双空格，比如 `- 📱 天气` → `· 天气`）。
+
+### 验证（不用上板）
+
+清洗是个纯函数，抽出来在 PC 上跑了一组用例（25 条，含真机现场那条回复）：
+
+```bash
+cd /home/youdian/contest2026_233_daimazenmepaibudui   # 脚本从 main.c 里抽函数
+python3 <scratch>/_check_sanitizer.py                 # 生成 /tmp/san_test.c
+gcc -std=c99 -Wall -Wextra -o /tmp/san_test /tmp/san_test.c && /tmp/san_test
+```
+
+覆盖：emoji / ZWJ 家庭序列 / 国旗、变体选择符、带圈数字、三种列表符号、
+标题号/引用号、反引号与 `__`、单个 `_` 保留、连续换行、CRLF、制表符、
+字库里有的箭头与标点保留、控制字符、空串、`out_cap` 截断不越界。
+**这个测试还抓到了两个真 bug**（只改 `cp` 不改拷贝源，导致制表符照样输出成制表符；
+`·` 被自己的过滤规则判成"没有字形"），已在实现里修掉。
+
+**只洗显示用的那一份**：`voice_speak_reply()` 里 `shown` 给界面、
+`response` 原样给 `voice_tts_speak()`；MQTT 的 `ai_reply` 动作也是先洗再
+`robot_ui_set_ai_reply()`。
+
+已知局限：GB2312 之外的生僻汉字（GBK 独有的字）仍会显示成方块 ——
+在设备上精确判断「这个字在字库里吗」要带一张表，这里只处理可枚举的几个符号区。
+
+## TTS 卡住 + 界面状态不实（`app/hello_app/mimo_voice.c` + `main.c`）
+
+| 改动 | 说明 |
+|------|------|
+| `MIMO_TTS_TEXT_MAX = 120` 字 + `tts_truncate()` | 按 UTF-8 码点截断，末尾补 `…`，日志打 `TTS: 合成文本过长（N 字节），只念前 120 个字` |
+| `MIMO_TTS_RESP_CAP` 1 MB → **1.5 MB** | 实测约 11 KB/字，120 字 ≈ 1.32 MB（占 cap 86%）。原来的 1 MB 装不下 130 字左右的回复 |
+| `b64_decode_inplace()`（替代 `b64_decode_alloc()`） | base64 就地解码，省掉一份 3/4 大小的解码缓冲（mbedtls 的写指针永远落后于读指针，原地安全） |
+| `wav_extract_16k_into()` | 重采样直接写进调用方的 PCM 缓冲，省掉 pcm16 临时缓冲和第二遍 memcpy；装不下就填满前一段（语义同原「装得下多少给多少」） |
+| `mimo_alloc_logged()` / `mimo_calloc_logged()` / `mimo_free_logged()` | ASR/chat/TTS 每步的分配和释放都打字节数，失败打 `LOG_ERR` |
+| 请求体不再先 malloc 一份 `esc` | TTS/chat 的 JSON 转义直接写进 body，各少一次 malloc+free |
+| 响应找不到 `audio.data` | 明确 `-EPROTO` 返回并打日志（响应被 cap 截断时就是这样），不再让调用方以为还在合成 |
+| `main.c` `voice_speak_reply()` | 合成期间显示「正在合成语音…」；`audio_play_start()` 返回 0 之后才显示「正在播放…」；失败显示 `语音合成失败 (errno)` / `播放失败 (errno)` |
+
+峰值对比（TTS 这一路，一轮里依次发生、不是同时）：
+
+| | 旧 | 新 |
+|---|---|---|
+| resp | 1 MB | 1.5 MB |
+| base64 解码缓冲 | 0.75 MB（独立 malloc） | 0（就地） |
+| 16k PCM 临时 | 0.5 MB（独立 malloc）+ 一次 memcpy | 0（直接写进调用方缓冲） |
+| **合计** | **≈ 2.25 MB** | **≈ 1.5 MB + 调用方 256 KB** |
+
+### 为什么没做「大块缓冲池复用」
+
+任务里提到「别在 calloc/free 之间反复要同样大小的大块（碎片），能复用就复用」。
+本轮没有引入常驻的响应缓冲池：那样会把峰值换成**永久占用**（1.5 MB 一直拿在手里），
+和同一条里「用完立刻 free」相冲突，而且 `mimo_voice.c` 的三个入口都在
+`voice_tts`/`voice_asr` 的分发层后面，不能假设调用方一定串行。改为**就地复用**
+（解码原地、重采样直接写调用方缓冲）+ 缩小块大小，同样把分配次数和峰值都降下来了。
+如果上板后仍然观察到 PSRAM 碎片问题，再考虑加带锁的 scratch 池。

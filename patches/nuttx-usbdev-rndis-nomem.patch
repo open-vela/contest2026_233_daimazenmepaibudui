@@ -1,0 +1,50 @@
+--- a/drivers/usbdev/rndis.c
++++ b/drivers/usbdev/rndis.c
+@@ -179,6 +179,7 @@
+   uint32_t rndis_packet_filter;          /* RNDIS packet filter value */
+   uint32_t rndis_host_tx_count;          /* TX packet counter */
+   uint32_t rndis_host_rx_count;          /* RX packet counter */
++  uint32_t rx_dropped_nomem;             /* RX frames dropped for lack of a buffer */
+   uint8_t host_mac_address[6];           /* Host side MAC address */
+   mutex_t lock;                          /* Mutex to protect the driver state */
+ 
+@@ -1817,7 +1818,38 @@
+     {
+     case 0: /* Normal completion */
+       ret = rndis_recvpacket(priv, req->buf, req->xfrd);
+-      DEBUGASSERT(ret != -ENOMEM);
++      if (ret == -ENOMEM)
++        {
++          /* No RX buffer could be obtained: either the IOB pool was empty
++           * or the write-request free list had nothing left.  This is a
++           * transient, recoverable condition and must NOT be fatal: the
++           * original DEBUGASSERT() panicked here, which takes the whole USB
++           * device stack down with it (the host then reports "USB device not
++           * recognized" until the board is re-plugged or rebooted).
++           *
++           * Recover by dropping this frame and re-arming the bulk OUT pipe
++           * below.  rndis_recvpacket() can only fail this way at the start of
++           * a fresh datagram -- a continuation packet always finds rx_req
++           * already allocated -- so no reassembly state is left behind.  The
++           * dropped frame is an Ethernet frame: TCP retransmits it, ARP and
++           * ICMP simply try again, which is far cheaper than losing the
++           * device.
++           *
++           * The log is rate limited (first 3, then every 64th) because this
++           * runs in interrupt context and a buffer shortage arrives in
++           * bursts.
++           */
++
++          priv->rx_dropped_nomem++;
++          if (priv->rx_dropped_nomem <= 3 ||
++              (priv->rx_dropped_nomem & 0x3f) == 0)
++            {
++              uerr("ERROR: RX buffer unavailable, frame dropped "
++                   "(%" PRIu32 " total)\n", priv->rx_dropped_nomem);
++            }
++
++          ret = OK;
++        }
+       break;
+ 
+     case -ESHUTDOWN: /* Disconnection */
