@@ -32,6 +32,14 @@ if(CONFIG_LVX_USE_CONTEST2026_233_ZHI_AI)
   # STACKSIZE 从 8192 提到 32768：tts/asr 要在本任务里跑一次完整 HTTPS
   # （mbedtls 握手 + 几十万字节的 base64 收发），8 KB 栈不够。
   # 任务栈是从堆上分配的，改大不影响任何现有子命令。
+  #
+  # INCLUDE_DIRECTORIES 里的 `../robot_ui`：hw_test lcdreinit 要调
+  # robot_ui_bridge_panel_reinit()（头文件 robot_ui_bridge.h）。
+  # 那份头文件是自给自足的（不引 LVGL / robot_ui 的任何头），实现
+  # robot_ui_bridge.c 编在 robot_ui 那个 app 里，跨 app 的符号最终链接时解析
+  # —— 和这里借 hello_app / ai_agent 的符号是同一套做法，不重复编译。
+  # `${CMAKE_CURRENT_SOURCE_DIR}/..` 的解析同上面 ①：本目录在构建树里是软链接，
+  # 所以 `..` 落到仓库的 app/。
 
   set(HW_TEST_COMPILE_FLAGS "")
   set(HW_TEST_DEPENDS "")
@@ -54,5 +62,6 @@ if(CONFIG_LVX_USE_CONTEST2026_233_ZHI_AI)
     DEPENDS ${HW_TEST_DEPENDS}
     INCLUDE_DIRECTORIES
       ${CMAKE_CURRENT_SOURCE_DIR}/../hello_app
+      ${CMAKE_CURRENT_SOURCE_DIR}/../robot_ui
       ${NUTTX_BOARD_ABS_DIR}/src)
 endif()

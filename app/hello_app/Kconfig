@@ -53,6 +53,18 @@ config HELLO_APP_EDGE_IMPULSE
 	help
 		Use a 16 kHz mono model exported into model/edge_impulse.
 
+config HELLO_APP_SOUND_EVENT
+	bool "Enable local sound event recognition (mel + DSCNN-lite)"
+	default y
+	help
+		Build app/hello_app/sound_event.c: an on-device, zero-dependency
+		sound-event classifier (0=other 1=fall 2=knock 3=scream).
+		mel front-end (own 512-point FFT) + DSCNN-lite forward + 3/4 window
+		voting with per-class thresholds and an 8 s refractory period.
+		Weights live in app/hello_app/sound_event_model.h (exported by
+		tools/audio_event/export_c.py). Callers feed PCM through
+		sound_event_feed() and hook sound_event_set_callback() to react.
+
 config DEBUG_AI_COMPANION
 	bool "Enable state machine debug output"
 	default n

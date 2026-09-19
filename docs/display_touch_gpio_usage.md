@@ -267,6 +267,245 @@ git apply <本仓库>/patches/vendor_sifli-lcd-brightness.patch
 3. 别用 `/dev/pwm0` 调背光：本配置 `CONFIG_PWM=n`，节点根本不存在
    （第 7.2 节那段示例只在 `CONFIG_PWM=y` 时可用）。
 
+### 3.4 黑屏救回：面板重新初始化 `hw_test lcdreinit`
+
+#### 3.4.1 它治的是哪一种黑屏
+
+**整屏黑，但应用一切正常**：LVGL 还在响应触摸、还在以 20~30 帧/s 往面板推画面
+（`[ui]` 计时仪表能看到 `最慢 flush 10 ms`），`hw_test lcd 80` 下发亮度也成功、
+能回读，可屏幕就是不亮。`reset` 无效，**只有真断电才恢复**（有时过一会儿自己好）。
+
+复现规律：开机后第一次点「提醒」/「主菜单」容易黑；短时间快速点右上角菜单会频繁
+黑闪、最后长时间黑屏 —— 像是**面板自己丢了配置**（一次是偶发，反复操作会累积），
+不是 CPU / LCDC / 应用挂了。所以救法是**重发一遍面板初始化序列**，不是重启系统。
+
+#### 3.4.2 敲什么
+
+在 NSH 里（串口）：
+
+```
+hw_test lcdreinit
+```
+
+单独运行（不跑那套 5 步自检）。耗时约 0.5 秒，期间画面会闪一下、触摸停约 0.5 秒，
+都是正常的。
+
+#### 3.4.3 期望看到什么：`[lcdreinit]` 逐步日志
+
+> ⚠ **驱动里原有的 `lcdinfo` / `lcdwarn` / `lcderr` 在本固件里全被编掉了**
+> （`CONFIG_DEBUG_LCD` 没开，`nuttx/include/debug.h:517-532` 把它们展开成 `_none`），
+> 所以那几行看不到。2026-09-16 起 `sf32lb_lcd_panel_reinit()` 的每一步都改成走
+> **`syslog()`**，前缀统一 `[lcdreinit]`，串口日志里直接 grep 它。
+
+```
+[lcdreinit] ===== 开始 (面板 co5300 bpp 16 power 100 亮度 80%) =====
+[lcdreinit] STEP1 拿到面板锁（等了 3 ms），之后刷屏会被挡住
+[lcdreinit] STEP2 LCDC: State=1 Lock=0 ErrorCode=0x00000000 起帧=18231 完帧=18231
+[lcdreinit] STEP2 寄存器: LCD_CONF=0x00001402 SPI_IF_CONF=0x00000280 LCD_IF_CONF=0x00800000
+[lcdreinit] STEP2 寄存器: TE_CONF=0x00000000 STATUS=0x00000000 LCD_SINGLE=0x00000000
+[lcdreinit] STEP2 显示时钟: HCLK=240MHz CLK_DIV=10 ⇒ 面板时钟≈24MHz
+[lcdreinit] PASS STEP3 读回面板 ID=0x00331100 (期望 0x00331100) ⇒ QSPI 链路和面板都活着
+[lcdreinit] PASS STEP4 Lock 干净 (HAL_UNLOCKED)
+[lcdreinit] PASS STEP4 State=READY
+[lcdreinit] PASS STEP5 BSP_LCD_PowerUp 完成（PA10 供电、PA37 VADD_EN=1、QSPI 脚 pinmux）
+[lcdreinit] PASS STEP6 RESET 脚: 1→10ms→0→30ms→1→120ms（开机只拉低 10ms）
+[lcdreinit] STEP7 面板 Init 完成（含 HAL_LCDC_Init: RCC_MOD_LCDC1 复位→接口/分频/格式/TE）
+[lcdreinit] PASS STEP7 SPI_IF_CONF.CLK_DIV=10 ⇒ 面板时钟≈24MHz
+[lcdreinit] PASS STEP8 irq_attach + up_enable_irq(LCDC1_IRQn=79)
+[lcdreinit] PASS STEP9 层复位/背景色清零 + SetColorMode(RGB565)
+[lcdreinit] PASS STEP10 亮度重下发 80%
+[lcdreinit] PASS STEP10 DisplayOn 已下发 (0x29)，power=100
+[lcdreinit] PASS STEP11 重发配置后读回面板 ID=0x00331100
+[lcdreinit] STEP12 结论: 动手前/后 ID 都读得回 ⇒ …
+[lcdreinit] ===== 结束: 总耗时 402 ms，其中持锁 399 ms（这段时间刷屏被挡） =====
+[Bridge] 面板已重初始化，已投一次全屏重绘
+      robot_ui_bridge_panel_reinit() -> 0，耗时 420 ms
+      [PASS] 面板重新初始化  (初始化序列已下发（亮不亮要看屏幕）)
+      看屏幕：
+        救回来了 -> 1~2 秒内整屏闪一下然后恢复画面，触摸也恢复响应；
+                   这时不用再敲别的，界面自己会继续刷。
+        没救回来 -> 屏幕仍然全黑 —— 接着看下面那张判读表。
+```
+
+#### 3.4.3.1 怎么从日志判断"卡在哪一层"（**这次的核心用途**）
+
+最有判别力的是 **STEP3 / STEP11 两次读面板 ID**（`0x04` 寄存器，本板期望
+`0x331100`）：ID 读得回来 = QSPI 链路 + LCDC 出位 + 面板**同时**活着。
+
+| 日志形状 | 结论 | 下一步查哪 |
+|---------|------|-----------|
+| STEP3 PASS + STEP11 PASS，屏幕仍黑 | 面板通路本来就是通的，**黑屏不在这一层** | 背光 PWM / 亮度（`backlight_set`、`0x51 WBRIGHT`）、LCDC 层格式、面板显示开关（`0x29`/`0x28`）、`SF32LB_LCD_CO5300_VSYNC` 那条死配置 |
+| STEP3 WARN + STEP11 PASS | 原本是 **QSPI / 面板那侧**的问题，这次重初始化把它救回来了 | 继续查"什么操作把面板/QSPI 弄坏了"（快速连点菜单时那条路径） |
+| STEP3 与 STEP11 都 WARN（ID=0 或 `0xffffffff`） | 面板通路**根本没起来**，不是"丢配置" | 看同一份日志里的 `State` / `Lock` / `CLK_DIV`：`State!=READY` ⇒ 见下面那条；`CLK_DIV=0` ⇒ 时钟没配上；两个都正常 ⇒ 面板供电（PA37 VADD_EN）/ RESET 脚（PA00）/ 排线 |
+| `STEP3 注意 State=… Lock=…` 紧跟一条 WARN | 读失败**未必**是 QSPI 坏：`HAL_LCDC_ReadDatas()` 开头就判 `State != READY` 返回 `HAL_BUSY` | 看 STEP4 有没有把它强置回 READY、STEP11 是否就好了 |
+| `STEP2 起帧` 远大于 `完帧` | LCDC 有传输开始却从不完成 | LCDC1 中断（STEP8 会重接）/ `draw_sem` 超时（`lcd xfer wait timeout`） |
+| `STEP2 LCDC: State=2`（BUSY） | State 卡在 BUSY，之后**每一次寄存器写都静默失败** | STEP4 会强置 READY；要查是谁把 `XferCpltCallback` 吃掉/中断没来 |
+
+另外 STEP12 会把**持锁时长**直接打出来（`总耗时 X ms，其中持锁 Y ms`）——
+那 Y 就是"这一下挡了刷屏多久"，和 `hw_test lcdreinit` 里那个 `耗时 420 ms` 对得上。
+
+**这两行是面板 QSPI 时钟唯一的窗口**：`STEP2 显示时钟` 是动手前的实时读值、
+`STEP7 SPI_IF_CONF.CLK_DIV` 是 `HAL_LCDC_Init()` 重写之后回读的值
+（`hlcdc->Instance` 是寄存器指针，读的是硬件、不是快照）。默认应当两行都是
+`CLK_DIV=10 ⇒ 24MHz`；读到 `CLK_DIV=5 ⇒ 48MHz` 说明降频那档没编进去（见 3.4.6）；
+`CLK_DIV=0` 才是"时钟没配上"。
+
+#### 3.4.4 它到底做了什么（以及为什么）
+
+| STEP | 在哪 | 说明 |
+|------|------|------|
+| 1 | 驱动内 | 拿 `panel_lock`（**带 1s 超时**）；超时只打 WARN 后继续，不会把调用方永久挡住 |
+| 2 | 驱动内 | 状态快照：`State` / `Lock` / `ErrorCode` / 起帧-完帧计数 / 四个关键寄存器 / `HCLK` 与 `CLK_DIV` |
+| 3 | `co5300.c:330` `LCD_ReadID()` | **动手前读一次面板 ID** —— 全流程最有判别力的一条 |
+| 4 | 驱动内 | 坏状态归零：`Lock→UNLOCKED`（防 `__HAL_LCDC_LOCK` 里的 `HAL_LCDC_ASSERT(0)` 死等）、`State→READY`、`ErrorCode→NONE` |
+| 5 | `board/contest_board/src/bsp_lcd_tp.c:29` | `BSP_LCD_PowerUp()`：VADD_EN(PA37) 拉高 + LCD 那几根脚重新 pinmux（幂等） |
+| 6 | 驱动内 + PA00 | 自己拉 RESET 脚：`1→10ms→0→30ms→1→120ms`。开机只拉低 10ms（`co5300.c:214`），这里给 3 倍余量（复位不彻底是"丢配置"最常见的形状） |
+| 7 | `co5300.c:200` `LCD_Drv_Init()` | **内部第一步就是 `HAL_LCDC_Init()`**：`LCDC_HW_Init()` 里 `HAL_RCC_EnableModule + HAL_RCC_ResetModule(RCC_MOD_LCDC1)` = LCDC 整模块硬复位，然后选接口 / 写 `SPI_IF_CONF.CLK_DIV` / 输出格式 / TE / 释放 RSTB。之后才是 RESET 脚 + 整串面板寄存器（0xFE 页切换、密码锁、0xC4 SPI 模式、0x3A 像素格式、0x2A/0x2B 窗口、0x11 出睡眠、**0x29 DisplayOn**） |
+| 8 | 驱动内 | 补开机那一步中断接线：`irq_attach` + `up_enable_irq(LCDC1_IRQn)`（幂等）。中断没使能时 `SendLayerData2Reg_IT` 永远等不到完成、`State` 会卡在 BUSY |
+| 9 | `sf32lb_lcd.c` `sf32lb_lcd_lcdc_setup()` | LCDC 侧背景色 / 层复位 / 层像素格式（**开机路径和重初始化调的是同一个函数**），再按当前 bpp 走一次 `SetColorMode` |
+| 10 | `SetBrightness()` + 驱动内 | 面板复位后 `0x51 WBRIGHT` 会回到上电默认值，按驱动里记着的百分比重下发；再重发 DisplayOn 并把 `priv->power` 对齐 |
+| 11 | `co5300.c:330` | 收工后再读一次 ID（和 STEP3 配对 = "这次救没救回来"） |
+| 12 | 驱动内 | 结论 + 耗时 / 持锁时长 |
+| ⑥(应用侧) | `app/robot_ui/robot_ui_bridge.c` | 请 LVGL 全屏重绘：面板被复位过、GRAM 里是随机内容，**光修面板它不会自己重画**。`lv_obj_invalidate(lv_screen_active())` 必须投到 LVGL 线程（`ui_async_call`），在 NSH 线程里直接碰控件会撞 `Invalidate area is not allowed during rendering` 断言 |
+
+调用链就一条：
+
+```
+hw_test lcdreinit
+  -> robot_ui_bridge_panel_reinit()          (app/robot_ui/robot_ui_bridge.c)
+       -> sf32lb_lcd_panel_reinit()          (vendor/sifli/.../drivers/lcd/sf32lb_lcd.c，STEP1~12)
+       -> ui_async_call(全屏 invalidate)      (⑥，跑在 LVGL 线程)
+```
+
+**为什么没有单独调 `HAL_LCDC_Reset()`**：读实现（`bf0_hal_lcdc.c:2373`）可知它就是
+`LCDC_HW_Init()` + `State = READY`，而 `HAL_LCDC_Init()` = 同样的 `LCDC_HW_Init()` +
+置 `Layer[].disable` —— **`p_ops->Init()` 里已经调过 `HAL_LCDC_Init()` 了**，再插一次
+只是多一次全模块复位。可重入性也不是靠猜：开机路径已经把 `p_ops->Init()` 调了三次
+（见 3.4.5）。所以改成"回读 `CLK_DIV` / `LCD_RSTB` 确认它确实做了"。
+
+**显示时钟 / PMU 显示电源域**：LCDC1 的模块时钟来自 HCLK（本板 240MHz，`bsp_init.c:155-159`
+用 DLL1 提供），分频写在 `SPI_IF_CONF.CLK_DIV`，`SetFreq()` 从 `HAL_RCC_GetHCLKFreq()`
+现算 —— **没有独立的显示 PLL，也没有 PMU 里的显示电源域**要重新使能。面板的 VADD_EN
+是板级 GPIO PA37，由 `BSP_LCD_PowerUp()` 拉（STEP5）。LCDC 那个"QSPI"就是面板总线
+本身，**不是 flash 的 SFC 控制器**，别去动 SFC。
+
+那条时钟的**唯一来源**是面板驱动里的请求频率
+（`co5300.c` 的 `lcdc_int_cfg_qadspi.freq` → `hlcdc->Init.freq` → `SetFreq()`），
+2026-09-16 起默认从 50MHz（实测 48MHz）降到 24MHz，见 3.4.6。
+
+**线程安全**：LVGL 线程一直在刷（20~30 帧/s），而 `lcdreinit` 是从 NSH 任务里调的。
+驱动里加了一把 `panel_lock`，`putrun` / `putarea` 推像素、`setpower` 和重初始化拿的是
+同一把，所以"重发配置"和"推一帧像素"不会同时在 QSPI 上跑。重初始化这 ~0.4 秒里刷新
+会卡住 —— 面板本来就在复位，卡住是应该的（STEP12 会打出实测值）。
+
+`hw_test lcdreinit` 的另一半用途是**验根因**：如果敲了它屏幕就回来，就证明原来那次
+黑屏是"面板 / QSPI 那侧坏了"，而不是 CPU / LCDC / 应用挂了；如果敲十次八次都能救回来，
+那下一步该查的是"什么操作把面板弄坏了"（大概率是快速连点时某条 SPI 时序出了问题），
+而不是继续在 LVGL / 应用这一侧找。**要是 STEP3/STEP11 两次 ID 都读得回来、屏幕还是黑**，
+那就别再怀疑面板通路了，去查背光 / 亮度 / 层格式那一侧。
+
+#### 3.4.5 回退开关 / 已知边界
+
+- **一键回退**：`vendor/sifli/boards/sf32lb52/drivers/lcd/sf32lb_lcd.c` 顶部
+  `#define SF32LB_LCD_PANEL_REINIT 1` 改成 `0` —— `sf32lb_lcd_panel_reinit()`
+  直接回 `-ENOSYS`，`panel_lock` 的三个宏全变成空操作，**刷新路径和开机路径一行不多**
+  （那两个小工具函数也一起被 `#if` 掉，不会有 unused 告警），等于完全没加过这个功能
+  （`hw_test lcdreinit` 还在，只是会报 `-38` / `本固件把 SF32LB_LCD_PANEL_REINIT 编成了 0`）。
+- **只治"面板 / QSPI 那侧坏了"这一种黑屏**。LVGL 没起来（连 `/dev/lcd0` 都开不了）、
+  LCDC 没出帧（`[ui]` 仪表根本没有 flush 日志）、或者背光关着，这个命令都不解决 ——
+  它不会替你判断，只会如实报每一步的结果（所以才有了 3.4.3.1 那张判读表）。
+- **重初始化**期间**不要**并发敲 `hw_test lcdcolor` / `hw_test lcd`：那几条也会
+  走 `/dev/lcd0`。真要连着敲，等上一条打印完。
+- 驱动里会把 HAL 句柄的 `Lock` 位清成 `HAL_UNLOCKED`、把 `State` 强置回
+  `HAL_LCDC_STATE_READY` 再重走初始化 —— 防的是"上一次传输把 HAL 锁留在 `LOCKED`、
+  之后每次写寄存器都在 `HAL_LCDC_ASSERT(0)` 上死等"，以及"`State` 卡在 BUSY 导致
+  之后每次寄存器读写都直接返回 `HAL_BUSY`"。这两条路径**不是靠猜**：STEP2 会把原值
+  打出来，看到 `Lock 干净` / `State=READY` 就说明这次黑屏跟它们无关。
+- **开机那三次面板复位**（`find_right_driver` → `lcd_init_thread_entry` →
+  `lcd_hw_setup_thread_entry`）里，第三次是**在 `/dev/lcd0` 和 `/dev/fb0` 都存在之后**
+  才做的。`putrun`/`putarea` 有 `s_lcd_hw_ready` 挡着，但 `setpower`
+  （`LCDDEVIO_SETPOWER`）过去不挡 —— 上层在这期间调一次 SETPOWER，就会往"RESET 脚
+  正被拉低、寄存器序列写到一半"的面板上插一个 `0x29`/`0x28`，面板停在半配置状态，
+  **之后一直黑到真断电**。这正好对上"重插有概率黑屏起不来"：
+  `board_late_initialize()` 里那句 2 秒 `usleep` 本来是防它的，但 `lcd_init` 的优先级
+  是 95、`lcd_hw` 是 100，而 **robot_ui 是 110 —— 本树数值越大越优先**
+  （`nuttx/sched/sched/sched.h:417` 按 `sched_priority` 降序排 ready-to-run 链表），
+  所以 robot_ui 一就绪就会抢正在忙等的 `lcd_hw`，SETPOWER 就插进复位序列里了。
+  现已让第三次复位和 `setpower` 拿同一把 `panel_lock`（`setpower` 用带 1s 超时的等，
+  超时只打 WARN 后照原样下发），`s_lcd_hw_ready = true` 也挪进锁里。
+  关掉开关即完全回退。
+
+#### 3.4.6 面板 QSPI 时钟：48MHz → 24MHz（2026-09-16，降频救间歇黑屏）
+
+**治的假设**：这块屏的现象是**间歇性**的 —— 偶尔闪出正常界面、多数时候"只能看到字、
+很浅、整体是黑"、有时全黑。而黑屏时应用侧一切正常（LVGL 20~30 帧/s、每次 flush
+0~10ms），`hw_test lcd 80` 下发亮度成功，面板 ID 读得回 `0x00331100`，LCDC
+`起帧=完帧` —— 也就是**面板会显示、像素能写进去，只是大部分时候不对**。
+形状是"大块背景丢、只剩细笔画"，最像**写像素时丢数据**，而不是面板丢了配置
+（所以 3.4 那套重初始化救不回来）。
+
+**为什么怀疑时钟**：厂商提交 `0a3cd0a` 自己的描述里写着 *"some panels do not respond
+reliably to ID queries **on USB-only power where read timing is marginal**"* ——
+而本板正是 USB 直供（不带电池）。那个提交的两处修复（`sf32lb_lcd.c:1053` 的显式
+`Init()`、`co5300.c` 的 SWRESET+ReadID 降级）**都已经在树里**，所以问题不是"它没修"，
+而是**边缘时序这件事本身还在**：48MHz 下这条 QSPI 在 USB 供电时贴着时序余量的边。
+
+**时钟是怎么定的（唯一一条路径）**：
+
+```
+co5300.c  lcdc_int_cfg_qadspi.freq
+  -> LCD_Init() memcpy 进 hlcdc->Init
+  -> LCD_Drv_Init()  HAL_LCDC_Init(hlcdc)
+  -> LCDC_HW_Init()  SetFreq(lcdc, init->freq)     (bf0_hal_lcdc.c:2284)
+       clk_div = ceil(HCLK / freq)   (HAL 里那个除法向上取整，硬件最小分频 2)
+       SPI_IF_CONF.CLK_DIV = clk_div
+```
+
+本板 HCLK = 240MHz（`board/contest_board/src/bsp_init.c:158` 的
+`HAL_RCC_HCPU_EnableDLL1(240000000)`），于是：
+
+| `.freq` | `CLK_DIV` | 实际面板时钟 |
+|---------|-----------|-------------|
+| `50000000`（改前，也是 `SF32LB_LCD_QSPI_CLK_SLOW 0`） | 5 | **48MHz** |
+| `24000000`（现在默认） | 10 | **24MHz** |
+
+所以"降一半"就是 `CLK_DIV` 5 → 10。**分频只在这一个地方写**：驱动侧没有任何代码
+写 `SPI_IF_CONF`，`sf32lb_lcd.c` 不碰时钟，读寄存器时的降速/恢复
+（`co5300.c` 的 `LCD_ReadMode()`，读 2MHz、恢复用 `lcdc_int_cfg.freq`）用的也是同一个值，
+改一处就全对。
+
+**一键回退**：`co5300.c` 顶部 `#define SF32LB_LCD_QSPI_CLK_SLOW 0`
+→ 预处理器走 `#else` 分支，字面值 `50000000`，逐字回到 48MHz。
+
+**上板怎么确认生效**：敲 `hw_test lcdreinit`，看这两行（见 3.4.3）——
+
+```
+[lcdreinit] STEP2 显示时钟: HCLK=240MHz CLK_DIV=10 ⇒ 面板时钟≈24MHz
+[lcdreinit] PASS STEP7 SPI_IF_CONF.CLK_DIV=10 ⇒ 面板时钟≈24MHz
+```
+
+两行都是 10/24MHz = 降频已生效（STEP2 那行打印的 `SPI_IF_CONF` 也会从
+`0x00000140` 变成 `0x00000280`，就是 `10 << 6`）；还是 `CLK_DIV=5` 就是没编进去。
+
+**如果这真是边缘时序问题，屏幕应该变成什么样**：
+
+- **正例**：开机后长时间不再出现"只剩字/很浅/全黑"，反复点菜单、亮暗切换、
+  长时间运行都能稳定显示完整画面（背景大块填充不再丢）。48MHz 下闪一下就好的
+  那些工况，24MHz 下应该**不闪**。
+- **反例（说明时钟不是根因）**：黑屏/丢像素的出现频率与画质**没有变化**
+  —— 那就把 `SF32LB_LCD_QSPI_CLK_SLOW` 置回 0（或继续降一档验证），
+  回头去查背光 / 偏置（PA37 VADD_EN）/ 排线接触 / 面板本身，
+  以及"闪出正常界面"那一刻和黑屏时**到底哪里不一样**。
+
+**代价（为什么值得先试）**：推送带宽减半 —— 4 数据线 24MHz ≈ 12MB/s，
+全屏 390×450×2B ≈ 29ms/帧（48MHz 时 ≈ 15ms）。**面板自刷新不受影响**
+（CO5300 带 GRAM，自刷新由它内部振荡器驱动），只有"SoC 往面板推画面"变慢，
+所以 LVGL 的帧率上界会从 ~60 帧/s 降到 ~34 帧/s。本机UI 实测在 20~30 帧/s
+（且多数是局部刷新，不是整屏），24MHz 仍有余量；**若上板后觉得动画明显变慢**，
+可把 `SF32LB_LCD_QSPI_CLK_HZ` 调成 30000000（`CLK_DIV=8` ⇒ 30MHz）或
+40000000（`CLK_DIV=6` ⇒ 40MHz）再试 —— 值随你改，`CLK_DIV` 会自动跟着变，
+但要记住 `CLK_DIV = ceil(240MHz / freq)`，**不是任意频率都取得准**。
+
 ## 4. 触摸：`/dev/input0`
 
 ### 4.1 推荐路线：LVGL indev
@@ -702,6 +941,7 @@ nsh> hw_test
 | `hw_test audio [秒]` | 录 N 秒到内存（默认 2），打印 peak/avg 与是否检测到声音，不写文件。**单独运行**；走板级封装 `audio_in_*`，见 `docs/audio_driver_usage.md` 第 9 节 |
 | `hw_test button [秒]` | 等按键按下（默认 15 秒）：按到 `PA11(KEY)` 或 `PA34(HOME)` 会打印**键名 + 事件类型 + 按住时长**并报 `[PASS] 按键`，**超时 FAIL**。走板级 `sf32lb52_boardbtn`（GPIO），**不读 `/dev/buttons`**，见第 5 节。**单独运行** |
 | `hw_test lcd [0..100]` | 设屏幕亮度（默认 100）再回读。**单独运行**；0..100 全档都应 PASS（板级封装走 `SETCONTRAST`，依赖 vendor 亮度补丁），见第 3.3 节 |
+| `hw_test lcdreinit` | 面板重新初始化（**黑屏救回**）：重发面板初始化序列（含拉一次 RESET 脚）+ 重设像素格式/亮度/DisplayOn，再请界面全屏重绘一次。**单独运行**；整屏黑但串口还活着时敲它，见第 3.4 节 |
 | `hw_test status` | 打一份统一外设状态（`board_status_get` / `board_status_dump`）：网络 / MQTT / ROM 素材 / `/data` / 音频 / 显示 / 触摸 / 按键 / RTC / 运行时间。**只有"网络拿到非回环 IPv4 地址"算 PASS/FAIL**，其它设备缺失只打印 `[提示]`，见 `docs/board_status_usage.md`。**单独运行** |
 
 说明：

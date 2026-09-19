@@ -10,6 +10,9 @@
  *   audio_test playfile <file>          回放裸 PCM 文件
  *   audio_test loop [n]                 连续 open/config/start/stop/close n 次
  *   audio_test stopwait [ms]            录音 read 阻塞中从另一个任务发 STOP，看能否退出
+ *   audio_test vol <0..1000>            设音量/录音增益
+ *   audio_test audfix                     ⚠️ 诊断期临时：手动打一次 RX 恢复
+ *                                         （复位整块 DMAC1 + 重建三个通道句柄）
  *
  ****************************************************************************/
 
@@ -29,6 +32,17 @@
 #define SAMPLE_RATE    16000
 #define CHANNELS       1
 #define BITS           16
+
+/* ⚠️ 诊断期临时的板级入口（定义在 board/contest_board/src/sf32lb52_audio.c）。
+ * 板级头文件本轮不许改（sf32lb52_audio_in.h 那边另一个任务在用），所以原型在
+ * 这里临时声明一份；删掉 audfix 分支时记得连它一起删。
+ *
+ * 参数：1..5 = 只打那一级；<=0 = 依次打 L1→L2→L3（L4 拆会话、L5 复位整块
+ *       DMAC1，两级都要明说）。
+ * 返回：>0 = 实际打的级（"依次"模式＝第一个让通路动起来的级）；0 = 都没动起来；
+ *       -ENODEV = 音频驱动还没起来；-EINVAL = 级号越界。 */
+
+int sf32lb52_audio_rx_fix(int level);
 
 /* stopwait 用：录音任务的状态 */
 static volatile int     g_rd_done;
@@ -449,6 +463,34 @@ int main(int argc, FAR char *argv[])
       vret = ioctl(fd, AUDIOIOC_CONFIGURE, (unsigned long)&capdesc);
       printf("SETVOLUME %d/1000 ret=%d\n", vol, vret);
       close(fd);
+      return 0;
+    }
+
+  /* ⚠️ 诊断期临时：手动打一次 RX 恢复（就是复位整块 DMAC1 + 重建三个通道句柄，
+   * 定案与依据见 sf32lb52_audio.c 顶部那一段）。
+   * 用法: audio_test audfix
+   *   不给参数、给 1、给 all 都是打这一记（参数只为兼容老用法保留）。
+   * 它回答"这一记能不能把请求线叫活"，定案后本分支随驱动里那个动作一起删。
+   *
+   * 为什么直接调板级函数而不是走 ioctl：驱动这一轮不许改板级头文件
+   * （sf32lb52_audio_in.h 那边另一个任务在用），所以原型只能在本文件里声明一份;
+   * driver 里那个函数就是给这个入口用的（app 调板级符号是本板既有做法，
+   * 例如 hello_app 直接调 sf32lb52_audio_rx_stats()）。 */
+
+  if (argc > 1 && strcmp(argv[1], "audfix") == 0)
+    {
+      int level = (argc > 2 && strcmp(argv[2], "all") != 0) ? atoi(argv[2]) : 0;
+      int ret   = sf32lb52_audio_rx_fix(level);
+
+      if (ret < 0)
+        {
+          printf("audfix: 失败 ret=%d（-19=驱动还没起来, -22=参数不认识）\n",
+                 ret);
+          return 1;
+        }
+
+      printf("audfix: 打了那一记（看串口那行 RX 恢复，再等一次 read 的"
+             "效果检查；正在播放时会被挡下，那行里是 note=skip-playback）\n");
       return 0;
     }
 

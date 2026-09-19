@@ -53,6 +53,7 @@
 #include <nuttx/semaphore.h>
 #include <nuttx/sched.h>
 #include <nuttx/timers/rtc.h>
+#include <nuttx/wdog.h>    /* 私有心跳：等工作线程状态变化那片等待，见 rtc_alarm_wait_wake */
 
 #include "sf32lb52_rtc_alarm.h"
 
@@ -93,6 +94,8 @@ struct rtc_alarm_priv_s
 {
   mutex_t        lock;        /* 保护下面所有状态（模块内只有这一把锁） */
   sem_t          wake;        /* at_daily/cancel 唤醒工作线程 */
+  struct wdog_s  wake_wdog;   /* 等工作线程状态变化那片等待的私有心跳 */
+  volatile bool  wake_to;     /* 这次醒是心跳到点叫的（不是有人 post） */
   bool           initialized; /* 工作线程已创建 */
   pid_t          worker;
   bool           running;     /* 有每日提醒在跑 */
@@ -394,17 +397,93 @@ static void rtc_alarm_disarm(int fd)
 }
 
 /****************************************************************************
+ * Name: rtc_alarm_wake_timeout
+ *
+ * Description:
+ *   等待的心跳到点了。
+ *
+ *   与 sf32lb52_audio.c 的 rx/tx_wait_wdog、sf32lb52_alarm.c 的 wake_wdog
+ *   逐条对应：跑在 systick 中断里，只做两件**与 TCB 无关**的事 —— 立 wake_to 旗
+ *   （告诉等待方这一次是到点了）＋ **无条件** post 一次 wake 信号量。
+ *   ★ 必须无条件：这记心跳就是到点叫醒回去看一眼状态的那一下，一旦加上
+ *   `if (xxx) 才 post` 这类条件，只要判据不为真就叫不醒，等待就没有上界了。
+ *   **不打日志**（中断里碰串口会抢控制台锁把整机挂住）。
+ *
+ ****************************************************************************/
+
+static void rtc_alarm_wake_timeout(wdparm_t arg)
+{
+  FAR struct rtc_alarm_priv_s *priv =
+    (FAR struct rtc_alarm_priv_s *)(uintptr_t)arg;
+
+  priv->wake_to = true;
+
+  nxsem_post(&priv->wake);
+}
+
+/****************************************************************************
  * Name: rtc_alarm_wait_wake
  *
  * Description:
- *   带超时地等工作线程信号量。OK = 被唤醒（cancel 或新任务）；
+ *   带超时地等工作线程状态变化。OK = 被唤醒（cancel 或新任务）；
  *   -ETIMEDOUT = 超时；-EINTR = 被 alarm 信号打断。
+ *
+ *   为什么不再用内核的 nxsem_tickwait（2026-09-19 定案）：那条路是内核定时等待
+ *   的超时与别人（at_daily / cancel 从**调用它的线程**、或者中断）的 nxsem_post
+ *   抢同一份 TCB 字段（rtcb->waitdog / rtcb->waitobj），本板临界区是 BASEPRI 型
+ *   （dump 里 BASEPRI=0x80）挡不住优先级 0 的异常，真机上抓到的断言正是：
+ *       ASSERT sem_waitirq.c:137  task robot_ui
+ *       nxsem_wait_irq <- nxsem_timeout <- wd_timer <- timer_callback
+ *                      <- systick_interrupt
+ *   （dump 全文在 _flash/gate_status.txt）同一块板同一天在音频 read/write 那两条
+ *   等待上各中过一次，那两处和 sf32lb52_alarm.c 都已换成同一套私有心跳。
+ *   本函数的等待方是 rtcalarm 工作线程，而 rtc_alarm_at_daily()/rtc_alarm_cancel()
+ *   **会从别的线程 post 同一个信号量** —— 形状完全一样，所以这里也换掉：心跳从不读
+ *   也不写 TCB，那条断言路径在这条等待上不会被走到；而心跳是本模块 priv 里的私有
+ *   看门狗，别人 post 取消不了它，所以 ms 是真的上界。
+ *
+ *   返回值语义**与原来那句 nxsem_tickwait 逐字一致**：
+ *     OK         = 确实有人登记了状态变化（调用方回主循环看一眼）；
+ *     -ETIMEDOUT = 到点了、没人登记（本模块自己的心跳叫醒的）；
+ *     -EINTR     = 被 alarm 信号（SIGUSR1）打断 —— 这一条必须保住：wait_fire()
+ *                  靠它立刻看见 g_rtc_alarm_fired，少了它到点回调最多晚一片
+ *                  （1000ms）才发出去。所以这里用可打断的 nxsem_wait，
+ *                  而不是音频/报警那两处用的 nxsem_wait_uninterruptible。
+ *
+ *   nxsem_reset(&wake, 0) 收掉上一次心跳多出来的那一次 post：不清的话下一次等待
+ *   会立刻返回、变成空转。它最多让一次状态变化晚 ms 被看见 —— 与原来"每次醒来先
+ *   重判状态"的粒度一致（调用方在 wait 前就判过 fired / job_changed）。
  *
  ****************************************************************************/
 
 static int rtc_alarm_wait_wake(uint32_t ms)
 {
-  return nxsem_tickwait(&g_rtc_alarm.wake, MSEC2TICK(ms));
+  int ret;
+
+  g_rtc_alarm.wake_to = false;
+
+  (void)nxsem_reset(&g_rtc_alarm.wake, 0);
+
+  (void)wd_start(&g_rtc_alarm.wake_wdog, MSEC2TICK(ms),
+                 rtc_alarm_wake_timeout, (wdparm_t)&g_rtc_alarm);
+
+  ret = nxsem_wait(&g_rtc_alarm.wake);
+
+  /* wd_cancel 对已经到点的心跳只返回 -EINVAL：那正是 wake_to 为真的那一刻。 */
+
+  if (wd_cancel(&g_rtc_alarm.wake_wdog) != OK)
+    {
+      g_rtc_alarm.wake_to = true;
+    }
+
+  /* 到点了（而没被信号打断）就照老样子报超时；-EINTR 原样透传。 */
+
+  if (ret == OK && g_rtc_alarm.wake_to)
+    {
+      ret = -ETIMEDOUT;
+    }
+
+  return ret;
 }
 
 /****************************************************************************

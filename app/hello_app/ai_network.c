@@ -14,7 +14,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <time.h>
 
 #include "ai_network.h"
 
@@ -37,186 +36,8 @@
 #endif
 
 /****************************************************************************
- * Private Data
- ****************************************************************************/
-
-/* 全局网络上下文（用于回调） */
-static ai_network_context_t *g_net_ctx = NULL;
-
-/****************************************************************************
- * Private Functions
- ****************************************************************************/
-
-/**
- * @brief  MQTT 消息接收回调
- */
-
-static void on_mqtt_message(const char *topic, const char *payload)
-{
-  ai_network_context_t *ctx = g_net_ctx;
-  if (!ctx)
-    {
-      return;
-    }
-
-  ai_network_info("MQTT message: topic=%s", topic);
-
-  /* 解析命令主题 */
-  char cmd_topic[128];
-  snprintf(cmd_topic, sizeof(cmd_topic), AI_MQTT_TOPIC_COMMAND, ctx->config.mqtt_client_id);
-
-  if (strstr(topic, "/command"))
-    {
-      /* 解析命令 JSON */
-      /* TODO: 使用 cJSON 解析 payload */
-      if (ctx->command_cb)
-        {
-          ctx->command_cb("unknown", payload, ctx->user_data);
-        }
-    }
-  else if (strstr(topic, "/voice"))
-    {
-      /* 语音数据回调 */
-      if (ctx->voice_cb)
-        {
-          ctx->voice_cb(payload, 0, ctx->user_data);
-        }
-    }
-  else if (strstr(topic, "/chat"))
-    {
-      /* 聊天消息回调 */
-      if (ctx->chat_cb)
-        {
-          ctx->chat_cb(payload, ctx->user_data);
-        }
-    }
-}
-
-/**
- * @brief  WiFi 状态变化回调
- */
-
-static void on_wifi_status(bool connected)
-{
-  ai_network_context_t *ctx = g_net_ctx;
-  if (!ctx)
-    {
-      return;
-    }
-
-  if (connected)
-    {
-      ai_network_info("WiFi connected");
-      ctx->state = AI_NET_STATE_WIFI_CONNECTED;
-    }
-  else
-    {
-      ai_network_info("WiFi disconnected");
-      ctx->state = AI_NET_STATE_IDLE;
-    }
-
-  /* 触发状态回调 */
-  if (ctx->status_cb)
-    {
-      ctx->status_cb(ctx->state, ctx->user_data);
-    }
-}
-
-/**
- * @brief  报警回调
- */
-
-static void on_alarm(const char *alarm_type, const char *details)
-{
-  ai_network_context_t *ctx = g_net_ctx;
-  if (!ctx)
-    {
-      return;
-    }
-
-  ai_network_info("Alarm: type=%s, details=%s", alarm_type, details);
-
-  /* 发送推送通知 */
-  push_send_alarm(alarm_type, details);
-}
-
-/**
- * @brief  AI 命令回调
- */
-
-static void on_ai_command(const char *action, const char *param)
-{
-  ai_network_context_t *ctx = g_net_ctx;
-  if (!ctx)
-    {
-      return;
-    }
-
-  ai_network_info("AI command: action=%s, param=%s", action, param);
-
-  if (ctx->command_cb)
-    {
-      ctx->command_cb(action, param, ctx->user_data);
-    }
-}
-
-/****************************************************************************
  * Public Functions
  ****************************************************************************/
-
-/**
- * @brief  初始化网络模块
- */
-
-int ai_network_init(ai_network_context_t *ctx, const ai_network_config_t *config)
-{
-  int ret;
-
-  if (!ctx || !config)
-    {
-      return -EINVAL;
-    }
-
-  /* 保存上下文到全局变量（用于回调） */
-  g_net_ctx = ctx;
-
-  /* 初始化上下文 */
-  memset(ctx, 0, sizeof(ai_network_context_t));
-  memcpy(&ctx->config, config, sizeof(ai_network_config_t));
-  ctx->state = AI_NET_STATE_IDLE;
-  ctx->initialized = true;
-
-  /* 初始化 network_comm 模块 */
-  ret = network_comm_init();
-  if (ret < 0)
-    {
-      ai_network_err("network_comm_init failed: %d", ret);
-      return ret;
-    }
-
-  /* 注册回调函数 */
-  network_set_mqtt_callback(on_mqtt_message);
-  network_set_wifi_callback(on_wifi_status);
-  network_set_alarm_callback(on_alarm);
-  network_set_ai_command_callback(on_ai_command);
-
-  /* 初始化推送服务 */
-  if (config->push_enabled && config->push_key[0] != '\0')
-    {
-      ret = push_init(PUSH_SERVICE_BARK, config->push_key);
-      if (ret < 0)
-        {
-          ai_network_warn("push_init failed: %d", ret);
-          /* 推送初始化失败不阻止启动 */
-        }
-    }
-
-  ai_network_info("Network module initialized");
-  ai_network_info("  MQTT broker: %s:%d", config->mqtt_broker, config->mqtt_port);
-  ai_network_info("  Client ID: %s", config->mqtt_client_id);
-
-  return OK;
-}
 
 /**
  * @brief  反初始化网络模块
@@ -239,7 +60,6 @@ void ai_network_deinit(ai_network_context_t *ctx)
   network_comm_deinit();
 
   ctx->initialized = false;
-  g_net_ctx = NULL;
 
   ai_network_info("Network module deinitialized");
 }
@@ -407,81 +227,6 @@ int ai_network_disconnect_mqtt(ai_network_context_t *ctx)
 }
 
 /**
- * @brief  发送语音数据到云端
- */
-
-int ai_network_send_voice(ai_network_context_t *ctx,
-                          const uint8_t *audio_data, int len)
-{
-  if (!ctx || !audio_data || len <= 0)
-    {
-      return -EINVAL;
-    }
-
-  if (!ai_network_is_mqtt_connected(ctx))
-    {
-      ai_network_err("MQTT not connected, cannot send voice");
-      return -ENOTCONN;
-    }
-
-  /* 调用 network_comm 发送语音 */
-  return ai_send_voice_data(audio_data, len, NULL);
-}
-
-/**
- * @brief  发送文本到云端获取 AI 回复
- */
-
-int ai_network_send_text(ai_network_context_t *ctx, const char *text)
-{
-  if (!ctx || !text)
-    {
-      return -EINVAL;
-    }
-
-  if (!ai_network_is_mqtt_connected(ctx))
-    {
-      ai_network_err("MQTT not connected, cannot send text");
-      return -ENOTCONN;
-    }
-
-  /* 调用 network_comm 发送文本 */
-  return ai_send_text(text, NULL);
-}
-
-/**
- * @brief  上报设备状态
- */
-
-int ai_network_report_status(ai_network_context_t *ctx,
-                             float temperature, float humidity,
-                             int battery_level)
-{
-  if (!ctx)
-    {
-      return -EINVAL;
-    }
-
-  if (!ai_network_is_mqtt_connected(ctx))
-    {
-      ai_network_err("MQTT not connected, cannot report status");
-      return -ENOTCONN;
-    }
-
-  /* 构建设备状态 */
-  device_status_t status;
-  memset(&status, 0, sizeof(status));
-  status.temperature = temperature;
-  status.humidity = humidity;
-  status.battery_level = battery_level;
-  strncpy(status.status, "online", sizeof(status.status) - 1);
-  status.alarm_active = false;
-
-  /* 调用 network_comm 上报状态 */
-  return report_device_status(&status);
-}
-
-/**
  * @brief  上报异常声音检测结果
  */
 
@@ -499,128 +244,10 @@ int ai_network_report_sound_alarm(ai_network_context_t *ctx,
       return -ENOTCONN;
     }
 
-  /* 调用 network_comm 上报异常声音 */
-  return report_abnormal_sound(sound_type, confidence);
-}
-
-/**
- * @brief  发送主动关怀提醒
- */
-
-int ai_network_send_reminder(ai_network_context_t *ctx,
-                             const char *title, const char *content)
-{
-  if (!ctx || !title || !content)
-    {
-      return -EINVAL;
-    }
-
-  if (!ai_network_is_mqtt_connected(ctx))
-    {
-      ai_network_err("MQTT not connected, cannot send reminder");
-      return -ENOTCONN;
-    }
-
-  /* 调用 network_comm 发送提醒 */
-  return send_proactive_reminder(title, content);
-}
-
-/**
- * @brief  上报健康数据
- */
-
-int ai_network_report_health(ai_network_context_t *ctx,
-                             int heart_rate, int blood_oxy)
-{
-  if (!ctx)
-    {
-      return -EINVAL;
-    }
-
-  if (!ai_network_is_mqtt_connected(ctx))
-    {
-      ai_network_err("MQTT not connected, cannot report health");
-      return -ENOTCONN;
-    }
-
-  /* 调用 network_comm 上报健康数据 */
-  return report_health_data(heart_rate, blood_oxy);
-}
-
-/**
- * @brief  发送心跳包
- */
-
-int ai_network_send_heartbeat(ai_network_context_t *ctx)
-{
-  if (!ctx)
-    {
-      return -EINVAL;
-    }
-
-  if (!ai_network_is_mqtt_connected(ctx))
-    {
-      return -ENOTCONN;
-    }
-
-  /* 调用 network_comm 发送心跳 */
-  return report_heartbeat();
-}
-
-/**
- * @brief  网络后台任务
- */
-
-void ai_network_task(void *arg)
-{
-  ai_network_context_t *ctx = (ai_network_context_t *)arg;
-  if (!ctx || !ctx->initialized)
-    {
-      return;
-    }
-
-  ai_network_info("Network task started");
-
-  while (ctx->initialized)
-    {
-      uint32_t now = (uint32_t)time(NULL) * 1000;
-
-      /* 检查 WiFi 状态 */
-      if (ctx->state == AI_NET_STATE_IDLE ||
-          ctx->state == AI_NET_STATE_ERROR)
-        {
-          /* 尝试重连 WiFi */
-          if (now - ctx->last_reconnect_time >= AI_RECONNECT_INTERVAL_MS)
-            {
-              ai_network_info("Attempting WiFi reconnection...");
-              ai_network_connect_wifi(ctx, ctx->config.wifi_ssid,
-                                      ctx->config.wifi_password);
-              ctx->last_reconnect_time = now;
-            }
-        }
-
-      /* 检查 MQTT 状态 */
-      if (ctx->state == AI_NET_STATE_WIFI_CONNECTED)
-        {
-          /* 尝试连接 MQTT */
-          ai_network_connect_mqtt(ctx);
-        }
-
-      /* 发送心跳 */
-      if (ctx->state == AI_NET_STATE_MQTT_CONNECTED)
-        {
-          if (now - ctx->last_heartbeat_time >= AI_HEARTBEAT_INTERVAL_MS)
-            {
-              ai_network_send_heartbeat(ctx);
-              ctx->last_heartbeat_time = now;
-            }
-        }
-
-      /* 休眠 100ms */
-      usleep(100000);
-    }
-
-  ai_network_info("Network task exited");
+  /* 调用 network_comm 上报异常声音。
+   * 走排队口：本函数被 hello_app 的线程调用（"两轮都没听清就报未确认"），
+   * 直发会打在本组里一个无效/别人的 fd 上（理由见 ai_network_publish_command）。 */
+  return report_abnormal_sound_queued(sound_type, confidence);
 }
 
 /**
@@ -743,8 +370,12 @@ int ai_network_send_alarm(ai_network_context_t *ctx,
       return -ENOTCONN;
     }
 
-  /* 调用 network_comm 上报报警 */
-  return report_alarm(alarm_type, details);
+  /* 调用 network_comm 上报报警。
+   * 走排队口：本函数被 hello_app 的线程调用（紧急追问判定 + 上报警页），
+   * 直发会打在本组里一个无效/别人的 fd 上（理由见 ai_network_publish_command）。
+   * topic（.../alarm）、payload 结构、QoS1 和本地回调/手机推送都由
+   * network_comm 那侧的同一段代码负责，行为不变。 */
+  return report_alarm_queued(alarm_type, details);
 }
 
 /**
@@ -765,6 +396,382 @@ int ai_network_send_device_command(ai_network_context_t *ctx,
       return -ENOTCONN;
     }
 
-  /* 调用 network_comm 发送设备命令 */
-  return send_device_command(device_id, command);
+  /* 调用 network_comm 发送设备命令。
+   * 走排队口：本函数被 hello_app 的线程调用（灯控工具 ai_tools_provider），
+   * 直发必然失败 —— 真机日志里那条
+   *   [意图] 命中灯控: 开灯，但 device_cmd 发送失败(-107)，兜底回话「网络没连上，灯没打开」
+   * 就是这里；而 -107 的直接原因是前面那条 hello_app 的 publish 把 connected
+   * 标成了 false（理由见 ai_network_publish_command）。
+   * topic（.../device_cmd）、payload {"type":"device_command","device_id":...,
+   * "command":...}、QoS1 都不变，只是改由 network_task 那条 socket 发。 */
+  return send_device_command_queued(device_id, command);
+}
+
+/****************************************************************************
+ * 结果回传：publish 到 zhi_ai/<client_id>/command (W1)
+ *
+ * 背景：语音入口统一到框架侧（ai_companion）之后，界面 robot_ui 不再开麦，
+ * 只认 MQTT。所以"要显示的东西"（AI 回复正文、表情、报警页）都从这里发出去。
+ *
+ * 一个必须知道的事实：network_comm.c 会被编进**同一个固件**，
+ * 界面那边（robot_ui）和这里用的是同一份 mqtt_config / mqtt_socket。
+ * 所以这里刻意做得很保守：
+ *   - 不调 network_comm_init()（它会把界面那边已配好的状态 memset 掉）；
+ *   - 不调 network_set_mqtt_callback()（MQTT 收包回调只有一个槽，
+ *     占了它就等于把界面的 ai_reply 派发顶掉，界面再也收不到消息）；
+ *   - 不重复订阅（界面 mqtt_connect() 里已经订阅了 command 主题）。
+ ****************************************************************************/
+
+/**
+ * @brief  把一段 UTF-8 文本转成能塞进 JSON 字符串的字节
+ *
+ * 只转义 JSON 必须转义的（" 和 \），把换行/制表压成空格，丢掉其余控制字符；
+ * 中文等 UTF-8 多字节序列原样透传。截断落在某段 UTF-8 序列中间时，
+ * 把这段不完整的字节丢掉 —— 界面是直接拿去显示的，半个字会变方块。
+ *
+ * @param  in        输入（NULL 当空串）
+ * @param  out       输出缓冲
+ * @param  out_size  输出缓冲大小（含结尾 '\0'）
+ * @return 写进 out 的字节数（不含结尾 '\0'）
+ */
+
+static size_t ai_network_json_escape(const char *in, char *out, size_t out_size)
+{
+  const unsigned char *p = (const unsigned char *)(in != NULL ? in : "");
+  size_t n = 0;
+  size_t i;
+
+  if (out_size == 0)
+    {
+      return 0;
+    }
+
+  while (*p != '\0')
+    {
+      unsigned char c = *p;
+      size_t seq;      /* 这个字符占几个输入字节 */
+      size_t need;     /* 转义后占几个输出字节 */
+
+      if (c == '"' || c == '\\')
+        {
+          seq = 1;
+          need = 2;
+        }
+      else if (c == '\n' || c == '\r' || c == '\t')
+        {
+          seq = 1;
+          need = 1;
+        }
+      else if (c < 0x20 || c == 0x7f)
+        {
+          seq = 1;
+          need = 0;    /* 其余控制字符直接丢 */
+        }
+      else if ((c & 0x80) == 0x00)
+        {
+          seq = 1;
+          need = 1;
+        }
+      else if ((c & 0xe0) == 0xc0)
+        {
+          seq = 2;
+          need = 2;
+        }
+      else if ((c & 0xf0) == 0xe0)
+        {
+          seq = 3;
+          need = 3;
+        }
+      else if ((c & 0xf8) == 0xf0)
+        {
+          seq = 4;
+          need = 4;
+        }
+      else
+        {
+          seq = 1;
+          need = 0;    /* 非法首字节 */
+        }
+
+      /* 多字节序列必须凑齐续字节，否则说明尾巴被截断了 */
+      for (i = 1; i < seq; i++)
+        {
+          if ((p[i] & 0xc0) != 0x80)
+            {
+              seq = 0;
+              break;
+            }
+        }
+
+      if (seq == 0 || n + need + 1 > out_size)
+        {
+          break;
+        }
+
+      if (need == 2)
+        {
+          out[n++] = '\\';
+        }
+
+      if (need != 0)
+        {
+          if (c == '\n' || c == '\r' || c == '\t')
+            {
+              out[n++] = ' ';
+            }
+          else
+            {
+              memcpy(&out[n], p, seq);
+              n += seq;
+            }
+        }
+
+      p += seq;
+    }
+
+  out[n] = '\0';
+  return n;
+}
+
+/**
+ * @brief  改 client_id
+ */
+
+int ai_network_set_client_id(ai_network_context_t *ctx, const char *client_id)
+{
+  if (ctx == NULL)
+    {
+      return -EINVAL;
+    }
+
+  if (client_id == NULL || client_id[0] == '\0')
+    {
+      client_id = AI_MQTT_DEFAULT_CLIENT_ID;
+    }
+
+  if (strlen(client_id) >= sizeof(ctx->config.mqtt_client_id))
+    {
+      ai_network_err("client_id 太长: %s", client_id);
+      return -EINVAL;
+    }
+
+  strncpy(ctx->config.mqtt_client_id, client_id,
+          sizeof(ctx->config.mqtt_client_id) - 1);
+  ctx->config.mqtt_client_id[sizeof(ctx->config.mqtt_client_id) - 1] = '\0';
+
+  return OK;
+}
+
+/**
+ * @brief  取当前 client_id
+ */
+
+const char *ai_network_get_client_id(ai_network_context_t *ctx)
+{
+  if (ctx == NULL || ctx->config.mqtt_client_id[0] == '\0')
+    {
+      return AI_MQTT_DEFAULT_CLIENT_ID;
+    }
+
+  return ctx->config.mqtt_client_id;
+}
+
+/**
+ * @brief  接上网络（复用界面已经建好的那条连接，没人管时兜底连一次）
+ */
+
+int ai_network_start_shared(ai_network_context_t *ctx, const char *client_id)
+{
+  int ret;
+  int i_;
+
+  if (ctx == NULL)
+    {
+      return -EINVAL;
+    }
+
+  /* 只清自己的上下文，不碰 network_comm 的全局状态 */
+
+  memset(ctx, 0, sizeof(ai_network_context_t));
+
+  ctx->config.mqtt_port = AI_MQTT_DEFAULT_PORT;
+  strncpy(ctx->config.mqtt_broker, AI_MQTT_DEFAULT_BROKER,
+          sizeof(ctx->config.mqtt_broker) - 1);
+
+  ret = ai_network_set_client_id(ctx, client_id);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  ctx->state = AI_NET_STATE_IDLE;
+  ctx->initialized = true;
+
+  /* 已经连着（界面那边的 network_task 连的）：直接复用，别再开第二条。
+   * 两个 client_id 相同的连接同时挂在一个 broker 上，broker 会把先来的踢掉。 */
+
+  if (ai_network_is_mqtt_connected(ctx))
+    {
+      ctx->state = AI_NET_STATE_MQTT_CONNECTED;
+      ai_network_info("复用已有的 MQTT 连接, client_id=%s",
+                      ai_network_get_client_id(ctx));
+      return OK;
+    }
+
+  /* 界面（robot_ui）在不在？
+   * 本板走 USB RNDIS，wifi_connect() 在这个板级配置下只是把"已联网"标志置上
+   * （和 robot_ui/main.c 的写法一致），不调用它 MQTT 那边会因为"WiFi 未连接"
+   * 直接拒绝连接。
+   * 这个标志顺带还是个"界面来过"的信号：界面一开机就调它、别的地方都不调，
+   * 所以我们自己单跑时它是 false。 */
+
+  if (!ai_network_is_wifi_connected(ctx))
+    {
+      /* 只有自己在跑：没人会去连 MQTT，直接连，不用等 */
+
+      wifi_connect("RNDIS", "");
+    }
+  else
+    {
+      /* 界面在跑：它的 network_task 开机后第一轮就会去连 MQTT，
+       * 先等它一会儿，别跟它抢同一条 client_id 的连接。 */
+
+      for (i_ = 0; i_ < AI_MQTT_SHARED_WAIT_MS / 100; i_++)
+        {
+          if (ai_network_is_mqtt_connected(ctx))
+            {
+              ctx->state = AI_NET_STATE_MQTT_CONNECTED;
+              ai_network_info("等到了界面建立的 MQTT 连接, client_id=%s",
+                              ai_network_get_client_id(ctx));
+              return OK;
+            }
+
+          usleep(100000);
+        }
+    }
+
+  /* 没人管连接（比如只跑了 ai_companion，没起界面）：自己兜底连一次。
+   * 注意 socket 建起来之后，收包/重连仍然是界面的 network_task 在做；
+   * 只跑 ai_companion 时没人收包（命令主题收不到），但回传照样能发。 */
+
+  ai_network_info("自己建立 MQTT 连接, client_id=%s",
+                  ai_network_get_client_id(ctx));
+  ret = ai_network_connect_mqtt(ctx);
+  if (ret < 0)
+    {
+      ai_network_err("连接 MQTT 失败: %d", ret);
+      return ret;
+    }
+
+  return OK;
+}
+
+/**
+ * @brief  往 zhi_ai/<client_id>/command 发一条 {action, param}
+ *
+ * ⚠️ 为什么这里必须用 mqtt_publish_queued() 而不是 mqtt_publish()：
+ *
+ * NuttX 的 fd 属于 task group。mqtt_socket 是 robot_ui 的 network_task 建的，
+ * 只存在于那个组的 fd 表里；本函数跑在 **hello_app 的线程**（语音状态机 /
+ * 工具执行）里，拿同一个数字去 send()，要么 EBADF、要么发到本组里恰好占了
+ * 这个编号的别的文件上。
+ *
+ * 真机日志（一轮完整语音之后，网络本身是好的 —— 同一时刻 HTTPS / ASR 都成功、
+ * free 还有 5.4 MB 空闲内存）：
+ *
+ *   MQTT connected
+ *   MQTT publish failed: -1, marked disconnected for reconnect   <- 本条（voice_state）
+ *   MQTT disconnected
+ *   [语音] user_said MQTT 回传失败(-107)（界面已由直调刷过，手机端看不到）: 帮我打开灯。
+ *   [AI_NET ERR] MQTT not connected, cannot send device command
+ *   ...
+ *   MQTT connecting: broker.emqx.io:1883 -> MQTT connected
+ *   Publish to zhi_ai/zhi_ai_001/heartbeat: {...}                <- network_task 自己发，成功
+ *
+ * 判据：**心跳（network_task 自己发）永远成功，凡是 hello_app 线程发起的
+ * （voice_state / user_said / device_cmd）全部失败**。而且第一条失败会把
+ * connected 标成 false（那是 mqtt_publish 里正确的重连逻辑），于是后面几条
+ * 连试都不试，直接 -ENOTCONN(-107) —— 那两行 -107 不是"网络断了"。
+ *
+ * 排队之后这三条走的是同一条已带重连/失败标记的发送路径（network_task 里），
+ * 没有第二套逻辑；topic 名、payload 结构、QoS 一个字节都没改。
+ */
+
+int ai_network_publish_command(ai_network_context_t *ctx,
+                               const char *action, const char *param)
+{
+  char topic[128];
+  char escaped[AI_CMD_PARAM_MAX];
+  char payload[AI_CMD_PARAM_MAX + 64];
+  int ret;
+
+  if (ctx == NULL || action == NULL || action[0] == '\0')
+    {
+      return -EINVAL;
+    }
+
+  if (!ai_network_is_mqtt_connected(ctx))
+    {
+      ai_network_warn("MQTT 未连接，命令发不出去: action=%s", action);
+      return -ENOTCONN;
+    }
+
+  if (ai_network_json_escape(param, escaped, sizeof(escaped)) == 0
+      && param != NULL && param[0] != '\0')
+    {
+      ai_network_warn("命令参数放不下或不可显示，已丢空: action=%s", action);
+    }
+
+  snprintf(payload, sizeof(payload), "{\"action\":\"%s\",\"param\":\"%s\"}",
+           action, escaped);
+  snprintf(topic, sizeof(topic), AI_MQTT_TOPIC_COMMAND,
+           ai_network_get_client_id(ctx));
+
+  ret = mqtt_publish_queued(topic, payload, 0, false);
+  if (ret < 0)
+    {
+      ai_network_err("命令下发失败: %s -> %d", topic, ret);
+      return ret;
+    }
+
+  ai_network_info("命令已下发: %s %s", topic, payload);
+  return OK;
+}
+
+/**
+ * @brief  把 AI 回复正文发给界面显示
+ */
+
+int ai_network_send_ai_reply(ai_network_context_t *ctx, const char *text)
+{
+  if (text == NULL || text[0] == '\0')
+    {
+      return -EINVAL;
+    }
+
+  return ai_network_publish_command(ctx, AI_CMD_ACTION_AI_REPLY, text);
+}
+
+/**
+ * @brief  让界面换个表情
+ */
+
+int ai_network_send_face(ai_network_context_t *ctx, const char *face)
+{
+  if (face == NULL || face[0] == '\0')
+    {
+      return -EINVAL;
+    }
+
+  return ai_network_publish_command(ctx, AI_CMD_ACTION_SET_FACE, face);
+}
+
+/**
+ * @brief  让界面弹报警页
+ */
+
+int ai_network_send_start_alarm(ai_network_context_t *ctx, const char *text)
+{
+  return ai_network_publish_command(ctx, AI_CMD_ACTION_START_ALARM,
+                                    text != NULL ? text : "");
 }

@@ -20,6 +20,11 @@
  *   - 到点回调 reminder_fire_cb_t 在**板级 RTC 模块的工作线程**里执行
  *     （不是 LVGL 线程，也不是中断）：回调里**不要阻塞、不要碰 LVGL**，
  *     只置标志，或者用 lv_async_call() 把活儿投给 UI 线程。
+ *
+ * 时区（重要）：
+ *   列表里的 hour/min 和回调给出的 hour/min 都是**用户看到的本地时间**
+ *   （状态栏上的北京时间，见 robot_ui.c 的 UI_TZ_OFFSET_SEC）。系统时钟 /
+ *   硬件 RTC 走的是 UTC，换算只在模块内部跟 RTC 打交道处做 —— 调用方不用管。
  */
 
 #ifndef REMINDER_SCHED_H
@@ -32,11 +37,12 @@
 #define REMINDER_TITLE_MAX   64
 
 /* 一条提醒。时间用 hour/min 而不是字符串：RTC 闹钟要的就是两个整数，
- * 字符串只用来显示（格式统一在格式化处拼 "HH:MM"）。 */
+ * 字符串只用来显示（格式统一在格式化处拼 "HH:MM"）。hour/min 是**本地
+ * 时间**（用户照着屏幕设的那个钟点），见文件头"时区"。 */
 typedef struct {
     char    title[REMINDER_TITLE_MAX];
-    int     hour;               /* 0..23 */
-    int     min;                /* 0..59 */
+    int     hour;               /* 0..23（本地时间） */
+    int     min;                /* 0..59（本地时间） */
     bool    enabled;            /* 关掉的提醒不参与调度（界面上暂时没有开关） */
 } reminder_item_t;
 
@@ -81,11 +87,14 @@ void reminder_sched_set_fire_cb(reminder_fire_cb_t cb, void *arg);
  * 系统时间还没对过时不会挂，而是打印提示并等 reminder_sched_tick()。 */
 void reminder_sched_reload(void);
 
-/* 主循环里隔一阵子（建议 30 秒）调一次：RTC 时间刚被对好时补挂闹钟。
+/* 主循环里隔一阵子（建议 30 秒）调一次。两个场合要补挂：
+ *   ① "RTC 时间还没对过"时没挂上的（列表非空）；
+ *   ② 两次 tick 之间系统时间被对时 / date -s 大步改过 —— 之前按老时间
+ *      算出来的"下一条"已经不算数了。
  * 其余情况是空操作，可以随便调。 */
 void reminder_sched_tick(void);
 
-/* 新建提醒时用的默认时刻：当前 RTC 时间往后取整到 5 分钟刻度（大约
+/* 新建提醒时用的默认时刻：当前**本地**时间往后取整到 5 分钟刻度（大约
  * "5 分钟内"），时间没对过时给 08:00。 */
 void reminder_sched_default_time(int *hour, int *min);
 

@@ -41,6 +41,7 @@
 #include <nuttx/mutex.h>
 #include <nuttx/semaphore.h>
 #include <nuttx/sched.h>
+#include <nuttx/wdog.h>    /* 私有心跳：等一次新触发/解除，见 alarm_wait_wake */
 
 #include "sf32lb52_alarm.h"
 
@@ -95,6 +96,10 @@
 #define ALARM_WORKER_PRIORITY 115
 #define ALARM_WORKER_STACK    4096
 
+/* 两轮之间等一等一次的粒度（毫秒）：原来的 nxsem_tickwait 用的就是这个数，
+ * 换成私有心跳之后语义一个字都没变（见 alarm_wait_wake）。 */
+#define ALARM_WAKE_SLICE_MS   50
+
 /****************************************************************************
  * Private Types
  ****************************************************************************/
@@ -103,6 +108,8 @@ struct alarm_priv_s
 {
   mutex_t               lock;        /* 保护 status / cb / 序号 */
   sem_t                 wake;        /* 触发/解除时唤醒工作线程 */
+  struct wdog_s         wake_wdog;   /* 等一次新触发/解除那片等待的私有心跳 */
+  volatile bool         wake_to;     /* 这次醒是心跳到点叫的（不是有人 post）*/
   bool                  initialized;
   pid_t                 worker;
   alarm_cb_t            cb;
@@ -417,6 +424,82 @@ static void alarm_request_exit(enum alarm_event_e event)
 }
 
 /****************************************************************************
+ * Name: alarm_wake_timeout
+ *
+ * Description:
+ *   两轮之间等一等那片等待的心跳到点了。
+ *
+ *   与音频驱动里那两记心跳（sf32lb52_audio.c 的 rx/tx_wait_wdog）逐条对应：
+ *   跑在 systick 中断里，只做两件**与 TCB 无关**的事 —— 立 wake_to 旗（告诉
+ *   等待方这一次是到点了）＋ **无条件** post 一次 wake 信号量。
+ *   ★ 必须无条件：这记心跳就是到点叫醒回去看一眼状态的那一下，一旦加上
+ *   `if (xxx) 才 post` 这类条件，只要判据不为真就叫不醒，等待就没有上界了。
+ *   **不打日志**（中断里碰串口会抢控制台锁把整机挂住）。
+ *
+ *   为什么不再用内核的 nxsem_tickwait_uninterruptible（2026-09-19 定案）：
+ *   那条路是内核定时等待的超时与别人的 nxsem_post 抢同一份 TCB 字段
+ *   （rtcb->waitdog / rtcb->waitobj），本板临界区是 BASEPRI 型（dump 里
+ *   BASEPRI=0x80 = 只挡优先级大于等于 8 的异常）挡不住它，真机上抓到的断言正是：
+ *       ASSERT sem_waitirq.c:137  task robot_ui
+ *       nxsem_wait_irq <- nxsem_timeout <- wd_timer <- timer_callback
+ *                      <- systick_interrupt
+ *   （dump 全文在 _flash/gate_status.txt）同一块板同一天在音频 read/write 那两条
+ *   等待上各中过一次，那两处已换成同一套私有心跳。报警的出声线程每 50ms 走一次
+ *   这条等待，而 alarm_trigger()/alarm_clear() **会从别的线程 post 同一个信号量**
+ *   —— 形状完全一样，所以这里也换掉：心跳从不读也不写 TCB，那条断言路径在这条
+ *   等待上不会被走到；而心跳是从本模块 priv 里起的一记普通看门狗，别人 post 取消
+ *   不了它，所以最多等 50ms 是真的上界。
+ ****************************************************************************/
+
+static void alarm_wake_timeout(wdparm_t arg)
+{
+  FAR struct alarm_priv_s *priv = (FAR struct alarm_priv_s *)(uintptr_t)arg;
+
+  priv->wake_to = true;
+
+  nxsem_post(&priv->wake);
+}
+
+/****************************************************************************
+ * Name: alarm_wait_wake
+ *
+ * Description:
+ *   等一次新触发/解除，最多 wait_ms 毫秒。
+ *
+ *   返回值语义**与原来那句 nxsem_tickwait_uninterruptible 完全一致**：
+ *     OK         = 确实有人登记了新触发/解除（调用方回主循环看一眼）；
+ *     -ETIMEDOUT = 到点了、没人登记（本模块自己的心跳叫醒的），调用方接着等下一片。
+ *
+ *   nxsem_reset(&wake, 0) 收掉上一次心跳多出来的那一次 post：不清的话下一次等待
+ *   会立刻返回、gap 里就变成空转（报警线程优先级 115，空转会饿着 lpwork）。
+ *   它最多让一次新触发晚 50ms 被看见 —— 与原来每片醒来先 alarm_recheck() 的
+ *   粒度一致（alarm_clear() 之后最迟 ~50ms 生效这条承诺本来就是这样）。
+ ****************************************************************************/
+
+static int alarm_wait_wake(uint32_t wait_ms)
+{
+  int ret;
+
+  g_alarm.wake_to = false;
+
+  (void)nxsem_reset(&g_alarm.wake, 0);
+
+  (void)wd_start(&g_alarm.wake_wdog, MSEC2TICK(wait_ms),
+                 alarm_wake_timeout, (wdparm_t)&g_alarm);
+
+  ret = nxsem_wait_uninterruptible(&g_alarm.wake);
+
+  /* wd_cancel 对已经到点的心跳只返回 -EINVAL：那正是 wake_to 为真的那一刻，
+   * 下面按到点报（调用方照常回主循环重判一次状态）。 */
+  if (wd_cancel(&g_alarm.wake_wdog) != OK)
+    {
+      g_alarm.wake_to = true;
+    }
+
+  return (ret == OK && !g_alarm.wake_to) ? OK : -ETIMEDOUT;
+}
+
+/****************************************************************************
  * Name: alarm_wait_gap
  *
  * Description:
@@ -438,7 +521,7 @@ static void alarm_wait_gap(enum alarm_level_e level, uint32_t gap_ms)
           return;
         }
 
-      if (nxsem_tickwait_uninterruptible(&g_alarm.wake, MSEC2TICK(50)) == OK)
+      if (alarm_wait_wake(ALARM_WAKE_SLICE_MS) == OK)
         {
           return;   /* 有新触发/解除，回主循环立刻处理 */
         }

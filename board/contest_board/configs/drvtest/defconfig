@@ -1,0 +1,233 @@
+#
+# Driver bring-up test - SF32LB52-DevKit-LCD / contest board
+# Derived from configs/sf32lb52_ai with everything that is NOT a driver
+# removed: LVGL, robot_ui, hello_app, zhi_ai, ai_agent, MiMo, RNDIS and the
+# rest of the network stack, TLS / mbedtls, the CJK font tables.
+#
+# What is kept: NSH, board bringup, the SiFli audio driver + codec, the
+# CO5300 panel and its framebuffer, the FT6146 touchscreen, RTC + alarm,
+# buttons, I2C0 / I2C1, PSRAM and the rest of the memory setup, syslog and
+# the serial console.
+#
+# The standalone test app is app/drvtest (NSH command drvtest); its Kconfig
+# symbol is CONFIG_LVX_USE_CONTEST2026_233_DRVTEST, set at the bottom.
+#
+# ---------------------------------------------------------------------------
+# READ THIS BEFORE EDITING THIS FILE
+# ---------------------------------------------------------------------------
+# 1. Keep every comment on this file ASCII-only, with no double quotes and no
+#    semicolons. CMake reads the defconfig with file(STRINGS) and then expands
+#    each line WITHOUT quotes; a line that is not pure ASCII can collapse into
+#    an empty element and the configure step dies with
+#    "string sub-command REGEX, mode MATCH needs at least 5 arguments".
+#    The Chinese notes for this configuration live in app/drvtest/CMakeLists.txt
+#    instead, where the file is parsed as CMake code and CJK is harmless.
+# 2. The serial console baud rate is 1000000 on purpose. Do not change it.
+#
+
+# ---- Architecture & Chip ----
+CONFIG_ARCH="arm"
+CONFIG_ARCH_ARM=y
+CONFIG_ARCH_ARMV8M=y
+CONFIG_ARCH_CORTEXM33=y
+CONFIG_ARCH_FPU=y
+CONFIG_ARCH_BOARD_CUSTOM=y
+CONFIG_ARCH_BOARD_CUSTOM_DIR="../vendor/sifli/boards/sf32lb52/sf32lb52_devkit_lcd"
+CONFIG_ARCH_BOARD_CUSTOM_DIR_RELPATH=y
+CONFIG_ARCH_BOARD_CUSTOM_NAME="sf32lb52_ai"
+CONFIG_ARCH_CHIP_ARM_CUSTOM=y
+CONFIG_ARCH_CHIP_CUSTOM=y
+CONFIG_ARCH_CHIP_CUSTOM_DIR="../vendor/sifli/chips/sf32lb52"
+CONFIG_ARCH_CHIP_CUSTOM_DIR_RELPATH=y
+CONFIG_ARCH_CHIP_CUSTOM_NAME="sf32lb52"
+CONFIG_ARCH_CHIP_DEBUG_H=y
+CONFIG_ARCH_CHIP_SF32LB52=y
+CONFIG_ARCH_SETJMP_H=y
+CONFIG_ARCH_STDARG_H=y
+CONFIG_ARMV8M_SYSTICK=y
+
+# ---- Board Init ----
+CONFIG_BOARD_EARLY_INITIALIZE=y
+CONFIG_BOARD_LATE_INITIALIZE=y
+CONFIG_BOARD_LOOPSPERMSEC=8499
+
+# ---- BSP Peripherals ----
+CONFIG_ADC=y
+CONFIG_ANALOG=y
+CONFIG_BSP_ENABLE_MPI1=y
+CONFIG_BSP_ENABLE_MPI2=y
+CONFIG_BSP_MPI1_MODE_3=y
+CONFIG_BSP_QSPI2_MEM_SIZE=16
+CONFIG_BSP_UART1_RX_USING_DMA=y
+CONFIG_BSP_UART2_RX_USING_DMA=y
+CONFIG_BSP_USING_BTIM1=y
+CONFIG_BSP_USING_I2C1=y
+CONFIG_BSP_USING_I2C2=y
+CONFIG_BSP_USING_I2C=y
+CONFIG_BSP_USING_LCDC=y
+CONFIG_BSP_USING_PWM2=y
+CONFIG_BSP_USING_PWM=y
+CONFIG_BSP_USING_SPI1=y
+CONFIG_BSP_USING_SPI=y
+CONFIG_BSP_USING_TIM=y
+CONFIG_BSP_USING_UART1=y
+CONFIG_BSP_USING_UART2=y
+
+# ---- Bluetooth (not needed here) ----
+# CONFIG_BT is not set
+# CONFIG_DRIVERS_BLUETOOTH is not set
+
+# ---- Display (AMOLED, CO5300 over QSPI) ----
+CONFIG_LCD=y
+CONFIG_LCD_DEV=y
+CONFIG_LCD_FRAMEBUFFER=y
+CONFIG_LCD_MAXPOWER=100
+CONFIG_LCD_USING_CO5300=y
+CONFIG_SIFLI_LCD=y
+CONFIG_VIDEO_FB=y
+CONFIG_DRIVERS_VIDEO=y
+
+# ---- Touch Screen (FT6146 on I2C0, INT on PA31) ----
+CONFIG_INPUT=y
+CONFIG_INPUT_FT6146=y
+CONFIG_INPUT_TOUCHSCREEN=y
+CONFIG_TOUCH_IRQ_PIN=31
+
+# ---- Audio (codec + DMA, /dev/audio/audio0) ----
+CONFIG_AUDIO=y
+CONFIG_DRIVERS_AUDIO=y
+
+# ---- GPIO / buttons ----
+CONFIG_DEV_GPIO=y
+CONFIG_INPUT_BUTTONS=y
+
+# ---- Storage ----
+CONFIG_FS_FAT=y
+CONFIG_FS_LITTLEFS=y
+CONFIG_FS_LITTLEFS_PROGRAM_SIZE_FACTOR=1
+CONFIG_FS_LOCK_BUCKET_SIZE=4
+CONFIG_FS_PROCFS=y
+CONFIG_FS_ROMFS=y
+CONFIG_FS_TMPFS=y
+CONFIG_MMCSD=y
+CONFIG_MTD=y
+CONFIG_MTD_BYTE_WRITE=y
+
+# ---- Memory ----
+CONFIG_MM_REGIONS=2
+CONFIG_DEFAULT_TASK_STACKSIZE=16096
+CONFIG_IDLETHREAD_STACKSIZE=16096
+CONFIG_SYSTEM_WORKQUEUE_STACK_SIZE=32768
+
+# ---- Networking ----
+# Only the CONFIG_NET core stays on, and nothing else. This is not laziness:
+# nuttx/drivers/drivers_initialize.c includes <nuttx/usrsock/usrsock_rpmsg.h>
+# unconditionally, that header includes <nuttx/net/usrsock.h>, and the static
+# inline usrsock_sem_timedwait() in there calls net_sem_timedwait2(), whose
+# declaration sits behind #ifdef CONFIG_NET in <nuttx/net/net.h>. So with
+# CONFIG_NET unset the drivers library does not even compile:
+#     error: implicit declaration of function net_sem_timedwait2
+# This firmware does not carry upstream patches, so the core switch stays on
+# while every protocol, network device, DNS client, TLS stack and netutil is
+# turned off below. No netdev is ever registered, so there is no networking in
+# practice. Removing CONFIG_NET for real needs a nuttx patch that also guards
+# the usrsock.h inline with CONFIG_NET.
+CONFIG_NET=y
+CONFIG_NET_SOCKOPTS=y
+# CONFIG_NET_TCP is not set
+# CONFIG_NET_UDP is not set
+# CONFIG_NET_ICMP is not set
+# CONFIG_NET_IPv4 is not set
+# CONFIG_NET_IPv6 is not set
+# CONFIG_NETDEVICES is not set
+# CONFIG_NETDB_DNSCLIENT is not set
+# CONFIG_NETUTILS_CJSON is not set
+# CONFIG_RNDIS is not set
+# CONFIG_TLS is not set
+# CONFIG_CRYPTO is not set
+# CONFIG_CRYPTO_MBEDTLS is not set
+
+# ---- Scheduler ----
+CONFIG_SCHED_BACKTRACE=y
+CONFIG_SCHED_EVENTS=y
+CONFIG_SCHED_HPWORK=y
+CONFIG_SCHED_LPWORK=y
+CONFIG_SCHED_WAITPID=y
+CONFIG_RR_INTERVAL=10
+
+# ---- System ----
+CONFIG_ALLOW_BSD_COMPONENTS=y
+CONFIG_ALLSYMS=y
+CONFIG_BUILTIN=y
+CONFIG_CANCELLATION_POINTS=y
+CONFIG_DEV_URANDOM=y
+CONFIG_ELF=y
+CONFIG_ETC_ROMFS=y
+CONFIG_NSH_BUILTIN_APPS=y
+CONFIG_NSH_FILEIOSIZE=512
+CONFIG_NSH_LINELEN=64
+CONFIG_NSH_READLINE=y
+CONFIG_PIPES=y
+CONFIG_PTHREAD_MUTEX_TYPES=y
+CONFIG_RAW_BINARY=y
+CONFIG_RTC=y
+CONFIG_RTC_ALARM=y
+CONFIG_RTC_ARCH=y
+CONFIG_RTC_DATETIME=y
+CONFIG_RTC_DRIVER=y
+CONFIG_SENSORS=y
+CONFIG_SIG_EVTHREAD=y
+CONFIG_SPI=y
+CONFIG_SPI_DRIVER=y
+CONFIG_TIMER=y
+CONFIG_TIMER_ARCH=y
+CONFIG_WATCHDOG=y
+CONFIG_I2C_BITBANG=y
+CONFIG_I2C_SLAVE=y
+CONFIG_I2C=y
+
+# ---- Debug ----
+CONFIG_DEBUG_ASSERTIONS=y
+CONFIG_DEBUG_FEATURES=y
+CONFIG_DEBUG_SCHED=y
+CONFIG_DEBUG_SYMBOLS=y
+# Frame pointers stay OFF on purpose. See the long note in configs/sf32lb52_ai:
+# with -O2 and -fno-omit-frame-pointer, mbedtls asm trips over r7.
+# CONFIG_FRAME_POINTER is not set
+CONFIG_SYSLOG_COLOR_OUTPUT=y
+CONFIG_SYSTEM_DUMPSTACK=y
+# Keep optimization ON even though debug symbols are enabled, otherwise the
+# DEBUG_NOOPT choice silently builds the whole firmware with -O0.
+# CONFIG_DEBUG_NOOPT is not set
+CONFIG_DEBUG_CUSTOMOPT=y
+CONFIG_DEBUG_OPTLEVEL="-O2"
+
+# ---- Crash diagnostics ----
+CONFIG_DEBUG_HARDFAULT_ALERT=y
+CONFIG_DEBUG_BUSFAULT=y
+CONFIG_DEBUG_USAGEFAULT=y
+CONFIG_ARCH_STACKDUMP=y
+CONFIG_ARCH_STACKDUMP_MAX_LENGTH=4096
+
+# ---- NSH Shell ----
+CONFIG_SYSTEM_NSH=y
+CONFIG_SYSTEM_SYSTEM=y
+CONFIG_SYSTEM_POPEN=y
+CONFIG_INIT_ENTRYPOINT="nsh_main"
+CONFIG_SYSTEM_I2CTOOL=y
+
+# ---- UART (serial console, DO NOT CHANGE THE BAUD RATE) ----
+CONFIG_UART_BAUD=1000000
+CONFIG_UART_BUFSZ=1024
+CONFIG_UART_SERIAL_CONSOLE=y
+
+# ==== Driver test firmware ====
+# The standalone driver test app: NSH command drvtest
+CONFIG_LVX_USE_CONTEST2026_233_DRVTEST=y
+
+# Second, independent audio tool kept around on purpose so drvtest results can
+# be cross-checked against a program that shares no code with it.
+CONFIG_EXAMPLES_AUDIO_TEST=y
+
+CONFIG_SYSLOG_BUFFER=y
+CONFIG_STACK_COLORATION=y

@@ -1,0 +1,25 @@
+# 文件名规则: 归一化(丢首尾空白/连续空白折成一个 0x20) -> FNV-1a 32 -> %08x.pcm
+# 口径: 16 kHz / 单声道 / s16le 裸 PCM（无 WAV 头），由 _flash/gen_tts_cache.py 生成
+# 模型: mimo-v2.5-tts
+# 生成时间: 2026-09-19 20:39:12
+# 本次进 ROMFS 的组: care-default,spoken
+#
+# #    组            文件                    字节 文案                                     说明
+0     spoken       fd0d2ce6.pcm       46080 请问需要帮助吗？                               ai_companion_main.c:3537 追问第 1 轮
+1     spoken       88acbaf4.pcm       76800 您还好吗？需要我帮忙吗？                           ai_companion_main.c:3538 追问第 2 轮
+2     spoken       14f2be70.pcm       56320 那就好，有事再叫我。                             ai_companion_main.c:3448 追问：判为没事时的安抚句
+3     spoken       a1da5f71.pcm       46080 您摔到了吗？                                 robot_ui/fall_alarm.h:40 跌倒询问(FALL_ALARM_QUESTION)
+4     spoken       38f9a6af.pcm       40960 好，灯打开了                                 ai_companion_main.c:173 LIGHT_REPLY_ON
+5     spoken       b352c842.pcm       51200 好，灯关掉了                                 ai_companion_main.c:174 LIGHT_REPLY_OFF
+6     spoken       f7475488.pcm       76800 网络没连上，灯没打开                             ai_companion_main.c:177 LIGHT_FAIL_ON
+7     spoken       7966f363.pcm       71680 网络没连上，灯没关掉                             ai_companion_main.c:178 LIGHT_FAIL_OFF
+8     spoken       ad232c3b.pcm       30720 该吃药了                                   robot_ui/main.c:4642 默认提醒: 吃药 08:00
+9     spoken       9469545d.pcm       25600 该喝水了                                   robot_ui/main.c:4643 默认提醒: 喝水 10:00
+10    spoken       8ebce133.pcm       30720 该散步了                                   robot_ui/main.c:4644 默认提醒: 散步 16:00
+11    care-default 5d2d14c7.pcm      143360 早上好！新的一天开始了，祝您今天心情愉快！                  ai_care.c:68 那句 g_default_greetings[0]；默认任务 ai_care.c:1042 早安 07:30
+12    care-default 74c85e6c.pcm       66560 该吃午餐了，记得按时吃饭！                          ai_care.c:984 snprintf 拼出；默认任务 ai_care.c:1051 午餐 11:30
+13    care-default 575500ac.pcm      102400 下午好！下午茶时间到了，休息一下吧。                     ai_care.c:71 那句 g_default_greetings[3]；默认任务 ai_care.c:1061 午后 14:00
+14    care-default 5bef0883.pcm       66560 该吃晚餐了，记得按时吃饭！                          ai_care.c:984 snprintf 拼出；默认任务 ai_care.c:1070 晚餐 17:30
+15    care-default 9b7a80c1.pcm       97280 晚上好！今天辛苦了，好好休息。                        ai_care.c:72 那句 g_default_greetings[4]；默认任务 ai_care.c:1080 晚安 21:30
+16    care-default f7dd8a02.pcm       97280 记得喝杯水，保持身体水分充足。                        ai_care.c:1095 喝水提醒(每 2 小时)
+17    care-default 0dcb7e2a.pcm       87040 坐久了要站起来活动活动，对腰椎好。                      ai_care.c:1107 活动提醒(每 1 小时)

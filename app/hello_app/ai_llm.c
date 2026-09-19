@@ -9,6 +9,7 @@
  ****************************************************************************/
 
 #include "ai_llm.h"
+#include <nuttx/semaphore.h>   /* nxsem_wait/nxsem_post：等 ai_agent 回包那条等待的心跳 */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -369,6 +370,25 @@ static void llm_add_to_history(llm_context_t *ctx,
 }
 
 #ifdef CONFIG_HELLO_APP_LLM_AI_AGENT
+/**
+ * @brief  等 ai_agent 回包那片等待的心跳到点了
+ *
+ * 与 sf32lb52_audio.c 的 rx/tx_wait_wdog、sf32lb52_alarm.c 的 wake_wdog 一致：
+ * 跑在 systick 中断里，只做两件**与 TCB 无关**的事 —— 立 backend_wait_to 旗
+ * （告诉等待方这次是到点了）＋ **无条件** post 一次 backend_sem（★ 必须无条件：
+ * 这记心跳就是到点叫醒的那一下，加上条件等待就没有上界了）。
+ * **不打日志**（中断里碰串口会抢控制台锁把整机挂住）。
+ */
+
+static void llm_ai_agent_wait_timeout(wdparm_t arg)
+{
+  llm_context_t *ctx = (llm_context_t *)arg;
+
+  ctx->backend_wait_to = true;
+
+  (void)nxsem_post(&ctx->backend_sem);
+}
+
 static void llm_ai_agent_callback(int status, const char *text, void *cookie)
 {
   llm_context_t *ctx = (llm_context_t *)cookie;
@@ -396,7 +416,6 @@ static int llm_do_ai_agent_request(llm_context_t *ctx, const char *text,
                                    char *response, size_t response_size)
 {
   velaclaw_ask_req_t req;
-  struct timespec deadline;
   int ret;
 
   if (ctx->backend_client == NULL)
@@ -409,6 +428,10 @@ static int llm_do_ai_agent_request(llm_context_t *ctx, const char *text,
         }
     }
 
+  /* 收掉上一次心跳多出来的那一次 post：不清的话这一次等待会立刻返回、把一次
+   * 陈旧回包当成新回包。 */
+
+  ctx->backend_wait_to = false;
   while (sem_trywait(&ctx->backend_sem) == 0)
     {
     }
@@ -425,24 +448,48 @@ static int llm_do_ai_agent_request(llm_context_t *ctx, const char *text,
       return ret;
     }
 
-  clock_gettime(CLOCK_REALTIME, &deadline);
-  deadline.tv_sec += LLM_HTTP_TIMEOUT_MS / 1000;
-  deadline.tv_nsec += (LLM_HTTP_TIMEOUT_MS % 1000) * 1000000L;
-  if (deadline.tv_nsec >= 1000000000L)
-    {
-      deadline.tv_sec++;
-      deadline.tv_nsec -= 1000000000L;
-    }
+  /* 为什么不再用内核的 sem_timedwait：那条路是内核定时等待的超时与别人的 post
+   * 抢同一份 TCB 字段（rtcb->waitdog / rtcb->waitobj），本板临界区是 BASEPRI 型
+   * （dump 里 BASEPRI=0x80）挡不住优先级 0 的异常，真机上抓到的断言正是：
+   *     ASSERT sem_waitirq.c:137  task robot_ui
+   *     nxsem_wait_irq <- nxsem_timeout <- wd_timer <- timer_callback <- systick_interrupt
+   * 本函数等待的 backend_sem 正是由 **ai_agent 那条线程**（它的 message_bus tap
+   * 回调走 llm_ai_agent_callback）post 的 —— 与别的线程并发 post 同一个信号量，
+   * 形状和已换成私有心跳的音频 read/write、报警出声那几处完全一样。心跳从不读也
+   * 不写 TCB，那条断言路径在这条等待上不会被走到；而心跳是本 ctx 私有的看门狗，
+   * 对方 post 取消不了它，所以 LLM_HTTP_TIMEOUT_MS 是真的上界。
+   *
+   * 返回值语义**与原来那句 sem_timedwait + errno 判定逐字一致**：
+   *   OK         = 收到回包；-ETIMEDOUT = 到点（本模块自己的心跳叫醒的）；
+   *   -EINTR     = 被信号打断且已 request_cancel（原样透传）。
+   * 超时时长也一致：原来是在 velaclaw_ask() 返回之后才取"现在 + 超时"这个绝对
+   * 时刻，现在是在同一位置起一记同样时长的 tick 心跳（顺带不再受 SNTP 改绝对
+   * 时钟的影响）。EINTR 重试沿用的是同一份期限，两边都不会被重试拖长。 */
+
+  (void)wd_start(&ctx->backend_wdog, MSEC2TICK(LLM_HTTP_TIMEOUT_MS),
+                 llm_ai_agent_wait_timeout, (wdparm_t)ctx);
 
   do
     {
-      ret = sem_timedwait(&ctx->backend_sem, &deadline);
+      ret = nxsem_wait(&ctx->backend_sem);
     }
-  while (ret < 0 && errno == EINTR && !ctx->request_cancel);
+  while (ret == -EINTR && !ctx->request_cancel);
+
+  /* wd_cancel 对已经到点的心跳只返回 -EINVAL：那正是 backend_wait_to 为真的那一刻。 */
+
+  if (wd_cancel(&ctx->backend_wdog) != OK)
+    {
+      ctx->backend_wait_to = true;
+    }
+
+  if (ret == OK && ctx->backend_wait_to)
+    {
+      ret = -ETIMEDOUT;
+    }
 
   if (ret < 0)
     {
-      return errno == ETIMEDOUT ? -ETIMEDOUT : -errno;
+      return ret;
     }
   if (ctx->backend_reply_status < 0)
     {

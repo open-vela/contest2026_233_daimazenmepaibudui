@@ -130,10 +130,10 @@ CONFIG_NET_TCP=y
 # TCP connection pool must be able to grow. With PREALLOC=8 and ALLOC=0 the
 # NuttX Kconfig help says that is the maximum number of connections available
 # to the system at all times, i.e. 8 in total. MQTT keep-alive, a TLS time-sync
-# every 60 s, mobile push and 3-4 HTTPS requests per voice round exhaust it;
+# every 60 s, mobile push and 3-4 HTTPS requests per voice round exhaust it；
 # after that socket fails with MBEDTLS_ERR_NET_SOCKET_FAILED 0x42, which shows
 # up as ASR failure while the old MQTT connection keeps working. ALLOC=1
-# allocates a connection on demand and frees it when unused; MAX=32 is only a
+# allocates a connection on demand and frees it when unused； MAX=32 is only a
 # safety cap, each tcp_conn_s is a few hundred bytes.
 CONFIG_NET_TCP_PREALLOC_CONNS=8
 CONFIG_NET_TCP_ALLOC_CONNS=1
@@ -199,7 +199,7 @@ CONFIG_DEBUG_SYMBOLS=y
 #     error: r7 cannot be used in 'asm' here
 # Dropping frame pointers frees r7 and also saves a register for the
 # compiler. CONFIG_DEBUG_SYMBOLS (-g3) is still on, so addr2line/backtrace
-# via DWARF still works; only the frame-pointer chain walking is lost.
+# via DWARF still works； only the frame-pointer chain walking is lost.
 # CONFIG_FRAME_POINTER is not set
 CONFIG_SYSLOG_COLOR_OUTPUT=y
 CONFIG_SYSTEM_DUMPSTACK=y
@@ -214,6 +214,17 @@ CONFIG_SYSTEM_DUMPSTACK=y
 # CONFIG_DEBUG_NOOPT is not set
 CONFIG_DEBUG_CUSTOMOPT=y
 CONFIG_DEBUG_OPTLEVEL="-O2"
+
+# ---- Crash diagnostics (2026-09-14) ----
+# Hard fault / bus fault / usage fault reporting plus a stack dump, so that
+# the next silent hang prints PC/LR/CFSR/HFSR/BFAR and the faulting task on
+# the serial console instead of dying without a word.
+# Costs: format strings only (a few KB), no symbol table is embedded.
+CONFIG_DEBUG_HARDFAULT_ALERT=y
+CONFIG_DEBUG_BUSFAULT=y
+CONFIG_DEBUG_USAGEFAULT=y
+CONFIG_ARCH_STACKDUMP=y
+CONFIG_ARCH_STACKDUMP_MAX_LENGTH=4096
 
 # ---- NSH Shell ----
 CONFIG_SYSTEM_NSH=y
@@ -249,11 +260,15 @@ CONFIG_AI_AGENT_TLS_CONN_POOL_SIZE=2
 # ==== 智爱陪伴自定义应用 ====
 CONFIG_LVX_USE_CONTEST2026_233_ZHI_AI=y
 CONFIG_LVX_USE_CONTEST2026_233_HELLO_APP=y
+# Local sound-event recognition: mel front-end + DSCNN-lite in sound_event.c.
+# Gate: CONFIG_HELLO_APP_SOUND_EVENT in app/hello_app/Kconfig, default y.
+# Keep in sync here so a fresh configure keeps it enabled.
+CONFIG_HELLO_APP_SOUND_EVENT=y
 # hello_app stack. The original 16384 was too small because ai_companion_main
 # reserved a 32KB frame in its prologue:
 #     sub.w sp, sp, #32000
 # The real culprit was a 16000-sample (32KB) local test buffer that GCC hoisted
-# into the prologue; it is only used by --sound-self-test. That buffer is now
+# into the prologue； it is only used by --sound-self-test. That buffer is now
 # "static" (see app/hello_app/ai_companion_main.c), which brings the entry frame
 # down to 88 bytes:
 #     sub sp, #88
@@ -263,12 +278,12 @@ CONFIG_LVX_USE_CONTEST2026_233_HELLO_APP=y
 CONFIG_HELLO_APP_STACKSIZE=32768
 # Stack coloration: makes "ps" report each thread's stack high-water mark, which
 # is how we verify that a stack size is actually sufficient instead of guessing.
-# Cheap; can be turned off for the final release build if desired.
+# Cheap； can be turned off for the final release build if desired.
 CONFIG_STACK_COLORATION=y
 # LPWORK carries the USB RNDIS send/receive work. The UI task (robot_ui) was
 # raised to 110, which sits right on top of the worker threads at 100 and can
 # starve the RNDIS data path. Put the low-priority work queue above the app
-# threads so USB/network work always wins; hpwork (224, used by the touch
+# threads so USB/network work always wins； hpwork (224, used by the touch
 # driver) is still higher than both.
 CONFIG_SCHED_LPWORKPRIORITY=120
 CONFIG_I2C=y
@@ -286,13 +301,13 @@ CONFIG_EXAMPLES_AUDIO_TEST=y
 # OpenAI-compatible endpoint: https://api.xiaomimimo.com/v1/chat/completions
 # Model: mimo-v2-flash
 # Depends on CONFIG_NETUTILS_CJSON, CONFIG_NETUTILS_WEBCLIENT, CONFIG_CRYPTO_MBEDTLS.
-# CJSON and MBEDTLS are already enabled on this board; WEBCLIENT is auto-selected.
+# CJSON and MBEDTLS are already enabled on this board； WEBCLIENT is auto-selected.
 # NSH usage: mimo "hello"   (run `mimo` with no args for interactive mode)
 CONFIG_DEMOS_MIMO=y
 CONFIG_MIMO_MODEL="mimo-v2.5"
 # Token Plan endpoint (contest-provided free plan). A "tp-" key MUST use this
-# host; an "sk-" pay-as-you-go key uses https://api.xiaomimimo.com/v1 instead.
-# Both take the same OpenAI-compatible body; model mimo-v2.5.
+# host； an "sk-" pay-as-you-go key uses https://api.xiaomimimo.com/v1 instead.
+# Both take the same OpenAI-compatible body； model mimo-v2.5.
 CONFIG_MIMO_API_BASE_URL="https://token-plan-cn.xiaomimimo.com/v1/chat/completions"
 # NOTE: the API key is intentionally NOT committed here. Put it in the local
 # build config instead (cmake_out/<build>/.config):
@@ -323,12 +338,12 @@ CONFIG_SYSLOG_BUFFER=y
 # 补上之后 defconfig 才是完整可复现的配置源（否则重新 configure 会丢网络功能）
 CONFIG_DEBUG_USB=y
 CONFIG_DEBUG_USB_ERROR=y
-CONFIG_DEBUG_USB_WARN=y
-CONFIG_DEBUG_USB_INFO=y
+CONFIG_DEBUG_USB_WARN=n
+CONFIG_DEBUG_USB_INFO=n
 CONFIG_RNDIS_EPINTIN=5
 CONFIG_NET_ETH_PKTSIZE=1514
 CONFIG_NET_ICMP_SOCKET=y
-CONFIG_NETDB_DNSSERVER_IPv4ADDR=0xc0a88901
+CONFIG_NETDB_DNSSERVER_IPv4ADDR=0xdf050505
 CONFIG_NETINIT_IPADDR=0xc0a88902
 CONFIG_NETINIT_DRIPADDR=0xc0a88901
 CONFIG_NETUTILS_PING=y

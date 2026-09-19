@@ -1,0 +1,69 @@
+{
+  "schema_version": "1.0",
+  "team_id": "contest2026_233_daimazenmepaibudui",
+  "github_login": "zhan9xiaohu1",
+  "generator": "kimi-code-collector@1.0.0",
+  "updated_at": "2026-09-19T11:33:28.721Z",
+  "sessions": [
+    {
+      "session_id": "494c16f7-35ac-4eec-a2b2-e0b073e54d8d",
+      "tool": "kimi-code",
+      "started_at": "2026-08-23T12:51:41.502Z",
+      "last_event_at": "2026-08-23T15:36:40.338Z",
+      "event_count": 1315,
+      "raw_event_count": 4346,
+      "file_path": "logs/zhan9xiaohu1/2026-08-23/kimi-code__wsl.jsonl",
+      "collection_mode": "cli",
+      "health": "ok",
+      "model": "deepseek-v4-flash"
+    },
+    {
+      "session_id": "716f7593-5f5c-4055-b5a3-5053d0f8e360",
+      "tool": "kimi-code",
+      "started_at": "2026-08-25T18:31:28.583Z",
+      "last_event_at": "2026-09-10T13:52:16.447Z",
+      "event_count": 7599,
+      "raw_event_count": 21229,
+      "file_path": "logs/zhan9xiaohu1/2026-08-25/kimi-code__wsllocalhostUbuntuhomeyoudiancontest2026.jsonl",
+      "collection_mode": "cli",
+      "health": "ok",
+      "model": "deepseek-v4-flash"
+    },
+    {
+      "session_id": "f0629bb0-e550-4cf5-9346-f830774a7a5a",
+      "tool": "kimi-code",
+      "started_at": "2026-09-08T04:36:55.764Z",
+      "last_event_at": "2026-09-08T05:03:39.409Z",
+      "event_count": 274,
+      "raw_event_count": 602,
+      "file_path": "logs/zhan9xiaohu1/2026-09-08/kimi-code__httpsgithubcomopen-velamanifestsopenvela.jsonl",
+      "collection_mode": "cli",
+      "health": "ok",
+      "model": "deepseek-v4-flash"
+    },
+    {
+      "session_id": "33b2f719-08f5-49e8-9be4-22ec5f9c4c39",
+      "tool": "kimi-code",
+      "started_at": "2026-09-10T13:54:52.359Z",
+      "last_event_at": "2026-09-16T13:13:42.227Z",
+      "event_count": 17509,
+      "raw_event_count": 52492,
+      "file_path": "logs/zhan9xiaohu1/2026-09-10/kimi-code__Dapplyclawkey-pathsmdusb.jsonl",
+      "collection_mode": "cli",
+      "health": "ok",
+      "model": "deepseek-v4-flash"
+    },
+    {
+      "session_id": "66aa7759-0a72-4d24-a59a-be12093fec66",
+      "tool": "kimi-code",
+      "started_at": "2026-09-11T15:04:54.978Z",
+      "last_event_at": "2026-09-11T15:05:30.273Z",
+      "event_count": 42,
+      "raw_event_count": 138,
+      "file_path": "logs/zhan9xiaohu1/2026-09-11/kimi-code__Dapplyclawkey-pathsmd.jsonl",
+      "collection_mode": "cli",
+      "health": "ok",
+      "model": "deepseek-v4-flash"
+    }
+  ]
+}

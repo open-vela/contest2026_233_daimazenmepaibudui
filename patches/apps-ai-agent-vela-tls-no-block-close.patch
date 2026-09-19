@@ -1,0 +1,40 @@
+--- a/src/infra/vela_tls.c
++++ b/src/infra/vela_tls.c
+@@ -123,7 +123,18 @@
+ 
+ static void tls_ctx_free(tls_ctx_t* ctx)
+ {
+-    mbedtls_ssl_close_notify(&ctx->ssl);
++    /* ★ 不要发 close_notify（2026-09-14 实测卡死根因）。
++     *
++     * mbedtls_ssl_close_notify() 内部是 mbedtls_ssl_flush_output() → mbedtls_net_send()
++     * → write()，**一次阻塞的 TCP 发送**；而本文件的 socket 只在
++     * CONFIG_AI_AGENT_NET_RPMSG 下才设 SO_SNDTIMEO（我们这版没开），所以对端已经
++     * 不在了的时候它就是死等 TCP 重传超时（分钟级）。实测栈：
++     *   mimo_asr_recognize → vela_tls_pool_cleanup → tls_ctx_free
++     *     → mbedtls_ssl_flush_output → mbedtls_net_send → psock_tcp_send（卡住）
++     * 现象就是"语音识别永远停在处理中、连握手日志都打不出来"。
++     *
++     * 池子里这些都是**要丢掉的旧连接**，本地直接拆掉就行：服务端收到 FIN/RST
++     * 自己会回收，keep-alive 池子里也不再留它。 */
+     mbedtls_net_free(&ctx->net);
+     mbedtls_ssl_free(&ctx->ssl);
+     mbedtls_ssl_config_free(&ctx->cfg);
+@@ -306,6 +317,17 @@
+ #endif
+         setsockopt(ctx->net.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+ 
++        /* 发送也要有超时（2026-09-14 补）：原来只在 CONFIG_AI_AGENT_NET_RPMSG
++         * 下才设 SO_SNDTIMEO，我们这版没开 → TLS 的 write 没有上限。对端失联时
++         * 一次 send 会一直等 TCP 重传（分钟级），表现是"识别/AI 回复卡在
++         * 处理中、连握手日志都没有"。30s 对 1.5MB 的 TTS/ASR 请求体也绰绰有余
++         * （USB RNDIS 链路上传 MB 级只要一两秒），超时就让它报错走失败分支。 */
++
++        {
++            struct timeval stv = { .tv_sec = 30, .tv_usec = 0 };
++            setsockopt(ctx->net.fd, SOL_SOCKET, SO_SNDTIMEO, &stv, sizeof(stv));
++        }
++
+ #ifdef CONFIG_AI_AGENT_NET_RPMSG
+         {
+             int timeout_sec = network_get_connect_timeout();

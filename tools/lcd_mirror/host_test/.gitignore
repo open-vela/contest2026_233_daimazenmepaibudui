@@ -1,0 +1,9 @@
+# run.sh / run_uart.sh 跑出来的产物（都是可再生的，别进仓库）
+frames.bin
+frames_after_reconnect.bin
+uart_frames.bin
+touch_sent.txt
+c_test_output.txt
+uart_c_output.txt
+lcd_mirror_host_test
+uart_test

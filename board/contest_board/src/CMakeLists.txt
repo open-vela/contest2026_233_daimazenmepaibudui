@@ -18,7 +18,7 @@
 #
 # ##############################################################################
 
-set(SRCS sifli_ap.c sifli_gpio.c sf32lb52_buttons.c bsp_init.c bsp_lcd_tp.c bsp_pinmux.c bsp_power.c sf32lb52_audio.c sf32lb52_alarm.c sf32lb52_rtc_alarm.c sf32lb52_audio_in.c sf32lb52_backlight.c sf32lb52_boardbtn.c sf32lb52_status.c )
+set(SRCS sifli_ap.c sifli_gpio.c sf32lb52_buttons.c bsp_init.c bsp_lcd_tp.c bsp_pinmux.c bsp_power.c sf32lb52_audio.c sf32lb52_alarm.c sf32lb52_rtc_alarm.c sf32lb52_audio_in.c sf32lb52_backlight.c sf32lb52_boardbtn.c sf32lb52_status.c lcd_mirror.c )
 
 nuttx_add_romfs(
   NAME

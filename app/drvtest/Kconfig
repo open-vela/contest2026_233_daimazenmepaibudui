@@ -1,0 +1,17 @@
+# contest2026_233/app/drvtest/Kconfig
+#
+# Standalone driver test firmware.
+#
+# This symbol is deliberately NOT the team-wide switch that robot_ui and
+# hw_test hang off. It is only set by board/contest_board/configs/drvtest,
+# so the normal firmware (configs/sf32lb52_ai) never grows this app.
+
+config LVX_USE_CONTEST2026_233_DRVTEST
+	bool "Driver test firmware - drvtest"
+	default n
+	help
+		Enable the standalone driver test app for the standalone
+		driver-test board configuration (configs/drvtest).
+		Adds the NSH command drvtest with the subcommands audio,
+		audiolong, play, lcd, lcdfill, touch, rtc, btn, heap, i2c
+		and all. Depends on the board support files only.

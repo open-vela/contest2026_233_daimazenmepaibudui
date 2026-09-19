@@ -30,9 +30,14 @@
  *        （add_reminder 默认开、get_weather 默认关，见 MIMO_CFG_KEY_*）：
  *        两个都关（默认单轮）
  *        {"model":"<配置里的 model>",
- *         "messages":[{"role":"system","content":"<当前时间 + 说话要求>"},
+ *         "messages":[{"role":"system","content":"<当前时间 + 用户所在城市
+ *                     + 说话要求>"},
  *                     {"role":"user","content":"<转义文本>"}],
  *         "max_tokens":1024}
+ *        "用户所在城市"是板子自己用 IP 定位查的（mimo_location.c，结果缓存
+ *        6 小时）；查不到那一段就不写，模型也就不会编一个城市。问天气时
+ *        这个城市优先于配置里的 default_city（提示里让它用的城市和板子真去
+ *        查的城市必须是同一个）。
  *        至少开一个时多一段 tools（数组里的成员按开关拼，见 MIMO_TOOL_*_JSON）：
  *        "tools":[{"type":"function","function":{"name":"add_reminder",...}},
  *                 {"type":"function","function":{"name":"get_weather",...}}]
@@ -71,10 +76,14 @@
  *     ASR   : pcm(调用方) + wav(44+n) + body(约 1.34*n) + resp(16 KB)
  *     chat  : msgs(约 10 KB，system+user+每轮追加的 tool_calls/tool 两条)
  *             + body(约 msgs + 1 KB) + resp(64 KB)；问天气时中间还会过两个
- *             8 KB 的天气响应（用完立刻还，不叠加）
- *     TTS   : body(小) + resp(MIMO_TTS_RESP_CAP，就地 base64 解码 → 重采样直接
- *             写进调用方的 PCM 缓冲，不再额外要 decoded / pcm16 两块)
- *   TTS 单次可合成的字数由 MIMO_TTS_TEXT_MAX / MIMO_TTS_RESP_CAP 决定，见宏注释。
+ *             8 KB 的天气响应（用完立刻还，不叠加）；IP 定位最多一次 4 KB
+ *             的响应，而且只在缓存过期 / 退避到期时才打（见 mimo_location.c）
+ *     TTS   : body(不到 2 KB) + resp(MIMO_TTS_RESP_CAP，**一块**的量，就地
+ *             base64 解码 → 重采样直接追加写进调用方的 PCM 缓冲，不再额外
+ *             要 decoded / pcm16 两块)
+ *   TTS 是**分块**合成的（一次送 MIMO_TTS_CHUNK_CHARS 个字），所以响应缓冲
+ *   只要装得下一块就行；整段能念多少字由 MIMO_TTS_TEXT_MAX 和调用方的 PCM
+ *   缓冲一起决定，见宏注释和 mimo_voice.h 里给调用方的缓冲建议。
  *
  ****************************************************************************/
 
@@ -125,26 +134,52 @@
 #define MIMO_PCM_BITS     16
 #define MIMO_WAV_HDR_LEN  44
 
-/* ASR 响应很小（就是一段文字），TTS 响应是一条 base64 音频。
+/* ASR 响应很小（就是一段文字）；TTS 响应是一条 base64 音频。
  * 实测（PC 上真打这个接口）：13 个汉字的 MiMo TTS 回包 143907 字节
  * （base64 143420 字符 -> WAV 107564 字节 = 24 kHz 的 2.24 秒），
- * 也就是每字约 11 KB base64。于是：
+ * 也就是每字约 11 KB base64。
  *
- *   MIMO_TTS_RESP_CAP = 1536 KB / 11 KB ≈ 139 字，
- *   而 MIMO_TTS_TEXT_MAX 只送 120 个字（≈ 1.32 MB，占 cap 的 86%），留出余量。
+ * **一次不送整段**：两三百字的回复，整段响应是 2~3 MB，光这一块就把 8 MB
+ * 用户堆吃掉三分之一，再叠上调用方的 PCM 和 ai_audio 的播放缓冲（见下面），
+ * 必炸。所以按 MIMO_TTS_CHUNK_CHARS 个字一块、一块一块地合成，base64 就地
+ * 解码、重采样后**追加**写进调用方的 PCM 缓冲（各块顺序拼起来 = 整段音频）。
+ * 响应缓冲只要装得下**一块**：
  *
- * 为什么不是 1 MB：406 字节的回复（约 130 汉字）要 1.4 MB 左右，1 MB 装不下，
- * JSON 会被 tls 层截成半个、白跑一趟还把整轮对话卡死（真机现场）。
- * 喂进去之前先按 MIMO_TTS_TEXT_MAX 截断，见 tts_truncate()。
+ *   MIMO_TTS_RESP_CAP = 896 KB，一块最多 64 字 × 约 11 KB/字 ≈ 704 KB，
+ *   留 27% 余量（每个字的实际音频长度跟语速有关，留够免得响应被 cap 截掉）。
  *
- * 峰值：以前是 resp(cap) + decoded(cap*3/4) + pcm16(完整时长) 三层叠在一起，
+ * 块尽量切在一句话的末尾（tts_split_len 优先在句末标点处切），所以拼接处的
+ * 停顿听起来是自然的。代价是整段要分几次 HTTPS（每次一次握手 + 一次合成），
+ * 比一次送完慢几秒 —— 换来的是"整段都念得完"。
+ *
+ * 峰值：resp(896 KB) + body(不到 2 KB) + 调用方 PCM 缓冲（几 MB 的那块在
+ * 调用方手里，见 mimo_voice.h 的缓冲建议）。
+ * 以前是 resp(cap) + decoded(cap*3/4) + pcm16(完整时长) 三层叠在一起，
  * 现在 base64 就地解码（省掉 decoded）、重采样直接写进调用方的 PCM 缓冲
- * （省掉 pcm16），峰值 ≈ resp + 调用方缓冲，比原来少 1 MB 以上。 */
+ * （省掉 pcm16）。 */
 #define MIMO_ASR_RESP_CAP (16 * 1024)
-#define MIMO_TTS_RESP_CAP (1536 * 1024)
+#define MIMO_TTS_RESP_CAP (896 * 1024)
 
-/* 一次最多送多少个字去合成（UTF-8 码点，不是字节）。见上面 11 KB/字的实测值。 */
-#define MIMO_TTS_TEXT_MAX 120
+/* 一次最多念多少个字（UTF-8 码点，不是字节）。超过就只念前这么多，剩下的
+ * 字数和原因打到串口日志上（见 mimo_tts_synthesize），对话区显示的回复
+ * 不受影响（那边是另一份完整文本）。
+ *
+ * 300 字 ≈ 60 秒音频 ≈ 2 MB PCM：调用方的 TTS 缓冲和 ai_audio 的播放缓冲
+ * 都要有这么大才装得下（数字见 mimo_voice.h 里给 robot_ui 的建议）。
+ * 用户原来报的"回复没读完就停了"，主因是调用方只有 8 秒缓冲（约 35 字），
+ * 这个上限保证常规回复（几十到两三百字）能整段合出来。 */
+#define MIMO_TTS_TEXT_MAX 300
+
+/* 一块送多少个字（也是响应缓冲的尺寸依据）。只是**上限**：切块优先切在
+ * 一句话的末尾（见 tts_split_len），所以实际块一般比这个小。 */
+#define MIMO_TTS_CHUNK_CHARS 64
+
+/* 估算一个字念出来占多少字节 PCM（16k 单声道 16bit）：实测 13 字 = 107564
+ * 字节的 24 kHz WAV，转成 16 kHz 约 71700 字节 ≈ 5.5 KB/字（那一段语速偏快，
+ * 约 5.8 字/秒）；按常见语速 4.6 字/秒算是 7 KB/字。这里取 7 KB 做**保守**
+ * 估算，只用来在合成前算"调用方的缓冲还放得下几个字"，宁可少念一个字，
+ * 也绝不写到缓冲外面。 */
+#define MIMO_TTS_PCM_PER_CHAR 7000
 
 /* 应答里最多往串口打多少字节（只在出错时打） */
 
@@ -168,11 +203,14 @@
 /* 对话（chat/completions）：和 ASR/TTS 共用 host / path / api_key，只有
  * model 不同。请求体在运行时拼（model 从配置的 "model" 键读，不写死）：
  *   {"model":"<model>",
- *    "messages":[{"role":"system","content":"<时间 [+ 默认城市] + 说话要求>"},
+ *    "messages":[{"role":"system","content":"<时间 [+ 用户所在城市 + 默认城市]
+ *                + 说话要求>"},
  *                {"role":"user","content":"<转义文本>"},
  *                ... 开了工具才有后续轮次：assistant(tool_calls) / tool ...],
  *    "tools":[{...get_weather...}],        <- enable_weather_tool 才带这段
  *    "max_tokens":1024}
+ * "用户所在城市"是 mimo_location.c 的 IP 定位结果（查不到就不写这一段），
+ * 问天气时它优先于配置里的 default_city。
  * 默认不带 tools（用户反馈查出来的天气不准），messages 就 system + user 两条，
  * 一轮就完事；要开就在配置里把 enable_weather_tool 设成 1。
  * max_tokens 给 1024 —— 这个模型是推理模型，思维链会吃掉一部分 token，
@@ -401,16 +439,212 @@ static void mimo_free_logged(const char *what, void *p, size_t bytes)
 }
 
 /****************************************************************************
+ * Name: utf8_char_len / utf8_count
+ *
+ * Description:
+ *   utf8_char_len 取 src 开头那个 UTF-8 字符占几个字节（remain 是剩下的字节
+ *   数）。非法首字节、或者多字节序列被截断在末尾，都按 1 个字节算 —— 吃掉
+ *   一个脏字节，别把后面整串带偏。
+ *   utf8_count 数整串有几个字（UTF-8 码点），两个版本：utf8_count_n 按给定
+ *   长度数，utf8_count 按 '\0' 结尾数。日志里"截掉了多少字"就靠它。
+ *
+ ****************************************************************************/
+
+static size_t utf8_char_len(const char *src, size_t remain)
+{
+  unsigned char c;
+  size_t used = 1;
+
+  if (src == NULL || remain == 0)
+    {
+      return 0;
+    }
+
+  c = (unsigned char)src[0];
+
+  if (c < 0x80)
+    {
+      used = 1;
+    }
+  else if ((c & 0xe0) == 0xc0)
+    {
+      used = 2;
+    }
+  else if ((c & 0xf0) == 0xe0)
+    {
+      used = 3;
+    }
+  else if ((c & 0xf8) == 0xf0)
+    {
+      used = 4;
+    }
+  else
+    {
+      used = 1;                  /* 非法首字节：吃掉一个 */
+    }
+
+  if (used > remain)
+    {
+      used = 1;
+    }
+
+  return used;
+}
+
+static size_t utf8_count_n(const char *src, size_t len)
+{
+  size_t i = 0;
+  size_t n = 0;
+
+  if (src == NULL)
+    {
+      return 0;
+    }
+
+  while (i < len)
+    {
+      i += utf8_char_len(src + i, len - i);
+      n++;
+    }
+
+  return n;
+}
+
+static size_t utf8_count(const char *src)
+{
+  return (src == NULL) ? 0 : utf8_count_n(src, strlen(src));
+}
+
+/****************************************************************************
+ * Name: tts_punct_rank
+ *
+ * Description:
+ *   给一个字符的字节串（p 是它的起点，n 是它的字节数）打分，决定这里适不适合
+ *   切块：
+ *     2 = 句末（。！？；!?; 和换行）—— 最自然的切点；
+ *     1 = 句内（，、：,）—— 次选；
+ *     0 = 不切。
+ *   标点本身算在前一块里（念出来那一块的收尾才自然）。
+ *
+ ****************************************************************************/
+
+static int tts_punct_rank(const char *p, size_t n)
+{
+  if (n == 1)
+    {
+      if (p[0] == '.' || p[0] == '!' || p[0] == '?' || p[0] == ';'
+          || p[0] == '\n')
+        {
+          return 2;
+        }
+
+      if (p[0] == ',' || p[0] == ':')
+        {
+          return 1;
+        }
+
+      return 0;
+    }
+
+  if (n == 3)
+    {
+      if (memcmp(p, "\xe3\x80\x82", 3) == 0      /* 。 */
+          || memcmp(p, "\xef\xbc\x81", 3) == 0   /* ！ */
+          || memcmp(p, "\xef\xbc\x9f", 3) == 0   /* ？ */
+          || memcmp(p, "\xef\xbc\x9b", 3) == 0)  /* ； */
+        {
+          return 2;
+        }
+
+      if (memcmp(p, "\xef\xbc\x8c", 3) == 0      /* ， */
+          || memcmp(p, "\xe3\x80\x81", 3) == 0   /* 、 */
+          || memcmp(p, "\xef\xbc\x9a", 3) == 0)  /* ： */
+        {
+          return 1;
+        }
+
+      return 0;
+    }
+
+  return 0;
+}
+
+/****************************************************************************
+ * Name: tts_split_len
+ *
+ * Description:
+ *   在 src 的前 max_chars 个字里找一个适合切块的位置，返回它的**字节**偏移
+ *   （返回值 > 0）。优先切在句末标点后面，其次切在逗号 / 顿号后面；都没有
+ *   就硬切在第 max_chars 个字处。
+ *
+ *   为什么要挑标点：分块合成是"一块一次请求"，切在一句话中间听起来就是
+ *   半句话断掉；切在句末的停顿本来就有，拼起来跟一次合成差不多。
+ *   切点还不能太靠前（否则一句话被切成一堆碎块、多打好几次网络）：句末 /
+ *   句内标点都只在前半段之后才算数，最靠前的可接受切点是 max_chars / 2。
+ *
+ ****************************************************************************/
+
+static size_t tts_split_len(const char *src, size_t len, size_t max_chars)
+{
+  size_t i = 0;
+  size_t chars = 0;
+  size_t soft_end = 0;
+  size_t hard_end = 0;
+  size_t min_chars = (max_chars > 4) ? (max_chars / 2) : 1;
+
+  if (src == NULL || len == 0 || max_chars == 0)
+    {
+      return 0;
+    }
+
+  while (i < len && chars < max_chars)
+    {
+      size_t n = utf8_char_len(src + i, len - i);
+      int rank;
+
+      i += n;
+      chars++;
+
+      if (chars < min_chars)
+        {
+          continue;
+        }
+
+      rank = tts_punct_rank(src + i - n, n);
+
+      if (rank == 2)
+        {
+          hard_end = i;
+        }
+      else if (rank == 1)
+        {
+          soft_end = i;
+        }
+    }
+
+  if (hard_end != 0)
+    {
+      return hard_end;
+    }
+
+  if (soft_end != 0)
+    {
+      return soft_end;
+    }
+
+  return i;
+}
+
+/****************************************************************************
  * Name: tts_truncate
  *
  * Description:
  *   按"字"（UTF-8 码点）把要合成的文本截到 max_chars 个，超长时在末尾补一个
  *   省略号（U+2026，"…"）。返回写进 dst 的字节数，*truncated 记下有没有截。
  *
- *   为什么要截：MiMo TTS 回的是音频文件的 base64，每字约 11 KB。回复一长
- *   （真机那次是 406 字节 ≈ 130 个汉字），响应就超过 MIMO_TTS_RESP_CAP，
- *   tls 读缓冲被塞满、JSON 少了尾巴，白等一场还把整轮对话卡住。
- *   让 TTS 只念前面一段，比什么都不出声强得多。
+ *   为什么要截：MiMo TTS 回的是音频文件的 base64，每字约 11 KB，而板子的
+ *   响应缓冲和调用方的 PCM 缓冲都是有上限的（见宏注释）。宁可少念后面一段
+ *   （并在日志里报出截了多少字），也好过整段卡死一声不出。
  *
  *   ⚠️ 只截 TTS 这一路。对话区显示和 ASR 都不截（显示当然要完整）。
  *
@@ -435,36 +669,9 @@ static size_t tts_truncate(const char *src, char *dst, size_t dst_cap,
 
   while (i < len)
     {
-      unsigned char c = (unsigned char)src[i];
-      size_t used;
+      size_t used = utf8_char_len(src + i, len - i);
 
-      if (c < 0x80)
-        {
-          used = 1;
-        }
-      else if ((c & 0xe0) == 0xc0)
-        {
-          used = 2;
-        }
-      else if ((c & 0xf0) == 0xe0)
-        {
-          used = 3;
-        }
-      else if ((c & 0xf8) == 0xf0)
-        {
-          used = 4;
-        }
-      else
-        {
-          used = 1;              /* 非法首字节：吃掉一个，别把后面全带偏 */
-        }
-
-      if (used > len - i)
-        {
-          used = 1;
-        }
-
-      if (chars >= max_chars || o + used + 1 > dst_cap)
+      if (used == 0 || chars >= max_chars || o + used + 1 > dst_cap)
         {
           *truncated = true;
           break;
@@ -1495,32 +1702,43 @@ static int mimo_asr_recognize(const unsigned char *pcm_data, size_t pcm_len,
 }
 
 /****************************************************************************
- * Name: mimo_tts_synthesize
+ * Name: tts_synth_chunk
  *
  * Description:
- *   voice_tts_ops_t.synthesize：POST 文本给 MiMo TTS，取
- *   choices[0].message.audio.data（base64 WAV，24 kHz），
- *   解码 + 重采样成 16 kHz / 单声道 / s16le 写进 pcm_out。
+ *   POST **一块**文本（一句话左右，不超过 MIMO_TTS_CHUNK_CHARS 个字）给 MiMo
+ *   TTS，取 choices[0].message.audio.data（base64 WAV，24 kHz），解码 + 重采样
+ *   成 16 kHz / 单声道 / s16le 写进 pcm_out。
  *
  *   内存上的三处收紧（见文件头）：
- *     - 送出去的文本先按 MIMO_TTS_TEXT_MAX 截断（响应大小 ≈ 11 KB/字）；
  *     - base64 就地解码，不再额外要一份 3/4 大小的解码缓冲；
- *     - 重采样直接写进 pcm_out，不再先建一份"完整时长"的 pcm16 再 memcpy。
+ *     - 重采样直接写进 pcm_out，不再先建一份"完整时长"的 pcm16 再 memcpy；
+ *     - 一块的文字量有限，所以响应缓冲（MIMO_TTS_RESP_CAP）只要装得下一块。
  *   每一步的块大小都打日志（mimo_alloc_logged / mimo_free_logged）。
+ *
+ * Input Parameters:
+ *   text      - 这一块的文本（不需要 '\0' 结尾，按 text_len 算）；
+ *   text_len  - 这一块的字节数；
+ *   pcm_out   - 输出：这一块的 16k / 单声道 / s16le PCM（调用方给的剩余空间）；
+ *   pcm_cap   - pcm_out 的字节数；
+ *   pcm_len   - 输出：实际写进去的字节数；
+ *   full_bytes- 输出：这块音频**完整**要多少字节（允许传 NULL）。比 *pcm_len
+ *               大就说明 pcm_out 装不下这一块。
+ *
+ * Returned Value:
+ *   OK on success; a negated errno value on failure（网络 / 响应被 cap 截断 /
+ *   WAV 解析失败）。
  *
  ****************************************************************************/
 
-static int mimo_tts_synthesize(const char *text, unsigned char *pcm_out,
-                               size_t pcm_cap, size_t *pcm_len)
+static int tts_synth_chunk(const char *text, size_t text_len,
+                           unsigned char *pcm_out, size_t pcm_cap,
+                           size_t *pcm_len, size_t *full_bytes)
 {
   const char *prefix = MIMO_TTS_JSON_PREFIX;
   const char *suffix = MIMO_TTS_JSON_SUFFIX;
   size_t pfx_len = strlen(prefix);
   size_t sfx_len = strlen(suffix);
-  char tts_text[MIMO_TTS_TEXT_MAX * 4 + 8];   /* 一个字最多 4 字节 + 省略号 */
-  size_t text_len;
   size_t body_len;
-  bool truncated = false;
   size_t esc_cap;
   size_t esc_len;
   char *body;
@@ -1535,40 +1753,14 @@ static int mimo_tts_synthesize(const char *text, unsigned char *pcm_out,
   int status;
   int ret;
 
-  if (text == NULL || pcm_out == NULL || pcm_len == NULL || pcm_cap == 0)
-    {
-      return -EINVAL;
-    }
-
   *pcm_len = 0;
 
-  if (mimo_load_config() != OK)
+  if (full_bytes != NULL)
     {
-      syslog(LOG_ERR, "[%s] TTS: 配置里缺 llm_host / api_key，MiMo 不可用\n",
-             TAG);
-      return -ENOENT;
+      *full_bytes = 0;
     }
 
-  text_len = strlen(text);
-  if (text_len == 0)
-    {
-      return -EINVAL;
-    }
-
-  /* 0. 太长就只念前面一段：TTS 回的是 base64 音频，响应大小和字数成正比
-   *    （实测约 11 KB/字），130 个字的回复会超过 MIMO_TTS_RESP_CAP，
-   *    卡满一整轮对话。对话区显示的还是完整回复，这里只截送去合成的那份。 */
-
-  text_len = tts_truncate(text, tts_text, sizeof(tts_text),
-                          MIMO_TTS_TEXT_MAX, &truncated);
-  if (truncated)
-    {
-      syslog(LOG_WARNING,
-             "[%s] TTS: 合成文本过长（%zu 字节），只念前 %d 个字，后面省略\n",
-             TAG, strlen(text), MIMO_TTS_TEXT_MAX);
-    }
-
-  if (text_len == 0)
+  if (text == NULL || text_len == 0 || pcm_out == NULL || pcm_cap == 0)
     {
       return -EINVAL;
     }
@@ -1586,13 +1778,10 @@ static int mimo_tts_synthesize(const char *text, unsigned char *pcm_out,
     }
 
   memcpy(body, prefix, pfx_len);
-  esc_len = json_escape(tts_text, text_len, body + pfx_len, esc_cap);
+  esc_len = json_escape(text, text_len, body + pfx_len, esc_cap);
   memcpy(body + pfx_len + esc_len, suffix, sfx_len + 1);
 
-  syslog(LOG_INFO, "[%s] TTS: 请求 %zu 字节文本（原文 %zu 字节%s）\n", TAG,
-         text_len, strlen(text), truncated ? "，已截断" : "");
-
-  /* 2. 请求（响应可能有几十万到一两 MB，缓冲走堆） */
+  /* 2. 请求（一块的响应也要几百 KB，缓冲走堆） */
 
   resp = mimo_calloc_logged("tts.resp", MIMO_TTS_RESP_CAP);
   if (resp == NULL)
@@ -1629,15 +1818,13 @@ static int mimo_tts_synthesize(const char *text, unsigned char *pcm_out,
   if (b64 == NULL)
     {
       syslog(LOG_ERR,
-             "[%s] TTS: 响应里没有完整的 audio.data（合成文本太长、响应超过 "
-             "%d 字节被截断？）: %.*s\n",
-             TAG, MIMO_TTS_RESP_CAP, MIMO_ERR_DUMP_LEN,
+             "[%s] TTS: 响应里没有完整的 audio.data（这一块 %zu 字节文本的响应"
+             "超过 %d 字节被截断？）: %.*s\n",
+             TAG, text_len, MIMO_TTS_RESP_CAP, MIMO_ERR_DUMP_LEN,
              resp[0] != '\0' ? resp : "(空)");
       mimo_free_logged("tts.resp", resp, MIMO_TTS_RESP_CAP);
       return -EPROTO;
     }
-
-  syslog(LOG_INFO, "[%s] TTS: 收到 base64 音频 %zu 字节\n", TAG, b64_len);
 
   /* 4. base64 **就地**解码（decoded 就在 resp 里），省掉一份 3/4 大小的
    *    解码缓冲。resp 必须活到重采样结束，之后才能 free。 */
@@ -1651,9 +1838,9 @@ static int mimo_tts_synthesize(const char *text, unsigned char *pcm_out,
       return ret;
     }
 
-  /* 5. WAV -> 16k 单声道 s16le（MiMo 回的是 24 kHz），直接写进调用方的
-   *    pcm_out：装不下就只填满前面一段（和原来"装得下多少给多少"一致，
-   *    调用方看 *pcm_len 就知道被截了）。 */
+  /* 5. WAV -> 16k 单声道 s16le（MiMo 回的是 24 kHz），直接写进调用方给的
+   *    那块空间：装不下就填满到哪儿算哪儿（调用方拿 *pcm_len 和 *full_bytes
+   *    一比就知道被截了）。 */
 
   ret = wav_extract_16k_into(decoded, decoded_len, (int16_t *)pcm_out,
                              pcm_cap / sizeof(int16_t),
@@ -1666,18 +1853,199 @@ static int mimo_tts_synthesize(const char *text, unsigned char *pcm_out,
       return (ret != OK) ? ret : -EINVAL;
     }
 
-  if (full_frames > pcm_cap / sizeof(int16_t))
-    {
-      syslog(LOG_WARNING,
-             "[%s] TTS: 输出缓冲只有 %zu 字节，只放得下 %zu/%zu 字节\n",
-             TAG, pcm_cap, out_frames * sizeof(int16_t),
-             full_frames * sizeof(int16_t));
-    }
-
   *pcm_len = out_frames * sizeof(int16_t);
 
-  syslog(LOG_INFO, "[%s] TTS: 输出 16k PCM %zu 字节（约 %zu ms）\n", TAG,
-         *pcm_len, *pcm_len * 1000 / (MIMO_PCM_RATE * 2));
+  if (full_bytes != NULL)
+    {
+      *full_bytes = full_frames * sizeof(int16_t);
+    }
+
+  return OK;
+}
+
+/****************************************************************************
+ * Name: mimo_tts_synthesize
+ *
+ * Description:
+ *   voice_tts_ops_t.synthesize：把整段回复合成成 16 kHz / 单声道 / s16le，
+ *   全部写进调用方的 pcm_out。
+ *
+ *   分四步：
+ *     1. 按 MIMO_TTS_TEXT_MAX 截断（超过就在日志里报出"后面还有多少字没念"）；
+ *     2. 按**句子边界**切块（一块最多 MIMO_TTS_CHUNK_CHARS 个字），一块一次
+ *        HTTPS —— 一次送整段的话，两三百字的响应就有两三 MB，堆里放不下；
+ *     3. 每一块的 PCM 直接追加在上一块后面（顺序拼接 = 整段音频），中间不再
+ *        多一份"完整时长"的临时缓冲；
+ *     4. 调用方的缓冲装不下时**停下来并报出念到第几个字**，绝不越界写。
+ *
+ *   失败处理：第一块就失败 → 返回负值（调用方会告诉用户合成失败）；后面的块
+ *   失败 → 只保留已经合好的前面几段（能念多少念多少），返回 OK 并打警告。
+ *   一路的块大小、字数、时长都在日志里。
+ *
+ ****************************************************************************/
+
+static int mimo_tts_synthesize(const char *text, unsigned char *pcm_out,
+                               size_t pcm_cap, size_t *pcm_len)
+{
+  char spoken[MIMO_TTS_TEXT_MAX * 4 + 8];   /* 一个字最多 4 字节 + 省略号 */
+  size_t text_len;
+  size_t spoken_len;
+  size_t total_chars;
+  size_t spoken_chars;
+  size_t done_chars = 0;      /* 已经合出去的字数 */
+  size_t offset = 0;          /* spoken 里当前这一块的起点（字节） */
+  size_t used = 0;            /* 已经写进 pcm_out 的字节数 */
+  size_t chunk_no = 0;
+  bool truncated = false;
+  int ret;
+
+  if (text == NULL || pcm_out == NULL || pcm_len == NULL || pcm_cap == 0)
+    {
+      return -EINVAL;
+    }
+
+  *pcm_len = 0;
+
+  if (mimo_load_config() != OK)
+    {
+      syslog(LOG_ERR, "[%s] TTS: 配置里缺 llm_host / api_key，MiMo 不可用\n",
+             TAG);
+      return -ENOENT;
+    }
+
+  text_len = strlen(text);
+  if (text_len == 0)
+    {
+      return -EINVAL;
+    }
+
+  /* 1. 太长就只念前面一段，并**明确报出截掉了多少字**：调用方（robot_ui）
+   *    拿不到这里的细节，用户只能从串口日志里看。 */
+
+  total_chars = utf8_count(text);
+
+  spoken_len = tts_truncate(text, spoken, sizeof(spoken), MIMO_TTS_TEXT_MAX,
+                            &truncated);
+  if (spoken_len == 0)
+    {
+      return -EINVAL;
+    }
+
+  if (truncated)
+    {
+      /* tts_truncate 末尾补的省略号不算"念出来的字"，按上限算更贴近实际 */
+      spoken_chars = MIMO_TTS_TEXT_MAX;
+
+      syslog(LOG_WARNING,
+             "[%s] TTS: 回复 %zu 字超过一次能念的上限 %d 字，只念前 %d 字，"
+             "后面 %zu 字不念（对话区显示的仍是完整回复）\n",
+             TAG, total_chars, MIMO_TTS_TEXT_MAX, MIMO_TTS_TEXT_MAX,
+             total_chars - MIMO_TTS_TEXT_MAX);
+    }
+  else
+    {
+      spoken_chars = total_chars;
+    }
+
+  syslog(LOG_INFO,
+         "[%s] TTS: 待合成 %zu 字 / %zu 字节，输出缓冲 %zu 字节（约 %zu 秒，"
+         "按 %d 字节每字估）\n",
+         TAG, spoken_chars, spoken_len, pcm_cap,
+         (pcm_cap / (MIMO_PCM_RATE * 2)), MIMO_TTS_PCM_PER_CHAR);
+
+  /* 2. 一块一块合成：每块的长度由"调用方还剩多少空间"和 MIMO_TTS_CHUNK_CHARS
+   *    一起定，再按句子边界收一收（见 tts_split_len）。 */
+
+  while (offset < spoken_len)
+    {
+      size_t remain = pcm_cap - used;
+      size_t fit_chars;
+      size_t chunk_len;
+      size_t chunk_chars;
+      size_t got = 0;
+      size_t full = 0;
+
+      /* 按保守估算算"还放得下几个字"：放不下一整字就收工（宁可不念，
+       * 也不写到缓冲外面） */
+      fit_chars = remain / MIMO_TTS_PCM_PER_CHAR;
+      if (fit_chars == 0)
+        {
+          syslog(LOG_WARNING,
+                 "[%s] TTS: 输出缓冲只剩 %zu 字节，放不下下一个字，"
+                 "只念了前 %zu 字（共 %zu 字）\n",
+                 TAG, remain, done_chars, spoken_chars);
+          break;
+        }
+
+      if (fit_chars > MIMO_TTS_CHUNK_CHARS)
+        {
+          fit_chars = MIMO_TTS_CHUNK_CHARS;
+        }
+
+      chunk_len = tts_split_len(spoken + offset, spoken_len - offset,
+                                fit_chars);
+      if (chunk_len == 0)
+        {
+          break;
+        }
+
+      chunk_chars = utf8_count_n(spoken + offset, chunk_len);
+      chunk_no++;
+
+      ret = tts_synth_chunk(spoken + offset, chunk_len, pcm_out + used,
+                            remain, &got, &full);
+      if (ret != OK)
+        {
+          if (used == 0)
+            {
+              /* 第一块就没合出来：整段没声，让调用方按失败处理 */
+              return ret;
+            }
+
+          syslog(LOG_WARNING,
+                 "[%s] TTS: 第 %zu 块（从第 %zu 字起）合成失败 %d，"
+                 "只播前面已经合好的 %zu 字\n",
+                 TAG, chunk_no, done_chars + 1, ret, done_chars);
+          break;
+        }
+
+      used += got;
+      offset += chunk_len;
+      done_chars += chunk_chars;
+
+      if (got < full)
+        {
+          /* 缓冲被这一块填满了（估算偏乐观，或者调用方缓冲本来就小）：
+           * 写到哪儿算哪儿，后面不再合 */
+          syslog(LOG_WARNING,
+                 "[%s] TTS: 输出缓冲放不下第 %zu 块，只写进去 %zu/%zu 字节，"
+                 "大约念到第 %zu 字（共 %zu 字）\n",
+                 TAG, chunk_no, got, full, done_chars, spoken_chars);
+          break;
+        }
+
+      syslog(LOG_INFO, "[%s] TTS: 第 %zu 块 %zu 字 -> %zu 字节 PCM（累计 %zu）\n",
+             TAG, chunk_no, chunk_chars, got, used);
+    }
+
+  if (used == 0)
+    {
+      syslog(LOG_ERR, "[%s] TTS: 一段都没合成出来（文本 %zu 字）\n", TAG,
+             spoken_chars);
+      return -EIO;
+    }
+
+  if (done_chars < spoken_chars)
+    {
+      syslog(LOG_WARNING,
+             "[%s] TTS: 只念了 %zu/%zu 字（输出缓冲 %zu 字节不够）\n",
+             TAG, done_chars, spoken_chars, pcm_cap);
+    }
+
+  *pcm_len = used;
+
+  syslog(LOG_INFO, "[%s] TTS: 输出 16k PCM %zu 字节（约 %zu ms，%zu 块）\n",
+         TAG, *pcm_len, *pcm_len * 1000 / (MIMO_PCM_RATE * 2), chunk_no);
   return OK;
 }
 
@@ -2317,18 +2685,22 @@ static bool chat_config_flag_on(const char *key, bool missing_default)
  * Name: chat_weather_tool_enabled
  *
  * Description:
- *   天气工具（get_weather）开不开：配置键 enable_weather_tool，**键缺省算关**。
- *   没开的时候请求体里没有这个工具，system prompt 里也不提城市和工具，
- *   模型拿不到就只能好好聊天（用户反馈 open-meteo 查出来的天气不准）。
+ *   天气工具（get_weather）开不开：配置键 enable_weather_tool。
+ *
+ *   2026-09-14 改成**缺省开**：当初默认关是因为"open-meteo 查出来的实况跟用户
+ *   所在地对不上"—— 那时用户只说"今天天气"时模型只能用写死的 default_city。
+ *   现在有了 IP 定位（mimo_location.c），默认城市被真实定位到的城市顶替，
+ *   这条前提没了，工具就该能用（用户也要求"把天气加进去"）。
+ *   想关还是配 "0" / "false" / "off"。
  *
  * Returned Value:
- *   true = 带 get_weather 工具；false = 不带（默认）。
+ *   true = 带 get_weather 工具（默认）；false = 不带。
  *
  ****************************************************************************/
 
 static bool chat_weather_tool_enabled(void)
 {
-  return chat_config_flag_on(MIMO_CFG_KEY_WEATHER_TOOL, false);
+  return chat_config_flag_on(MIMO_CFG_KEY_WEATHER_TOOL, true);
 }
 
 /****************************************************************************
@@ -2361,15 +2733,17 @@ static bool chat_reminder_tool_enabled(void)
  * Name: chat_default_city / chat_build_system_prompt
  *
  * Description:
- *   系统提示是"让模型靠谱"的关键，由四段拼成（prompt_append 逐段追加）：
+ *   系统提示是"让模型靠谱"的关键，由几段拼成（prompt_append 逐段追加）：
  *     1) 说话要求 —— 口语化中文、不要 emoji / markdown（屏幕字库没有 emoji，
  *        TTS 也念不出来）。跟工具开不开无关；
  *     2) 当前北京时间 —— 本构建里 localtime 就是 gmtime（romfs 没有 zoneinfo），
  *        所以自己 +8 小时再格式化（星期也一并给）。时间写在提示里而不是做成
  *        工具："今天几号 / 现在几点 / 今天星期几"照抄就行，不用再打一次网络；
- *     3) 提醒工具（use_reminder）—— 让模型把口语时间折算成 24 小时制再调
+ *     3) 用户所在城市（loc_city）—— 板子自己用 IP 定位查的（mimo_location.c），
+ *        **查到了才写，查不到一个字都不提**（模型不知道就不会瞎编一个城市）；
+ *     4) 提醒工具（use_reminder）—— 让模型把口语时间折算成 24 小时制再调
  *        add_reminder，并复述一遍确认。没给这个工具时这段必须拿掉；
- *     4) 默认城市 + 天气工具（use_weather）—— 只有开了 get_weather 才加配置库
+ *     5) 默认城市 + 天气工具（use_weather）—— 只有开了 get_weather 才加配置库
  *        的 default_city（读不到用 MIMO_DEFAULT_CITY），并写明"实时天气必须查
  *        工具"；没开时改成"这类你答不了，别编"。
  *
@@ -2413,8 +2787,8 @@ static size_t prompt_append(char *out, size_t out_cap, size_t used,
 }
 
 static void chat_build_system_prompt(bool use_weather, bool use_reminder,
-                                     const char *city, char *out,
-                                     size_t out_cap)
+                                     const char *city, const char *loc_city,
+                                     char *out, size_t out_cap)
 {
   static const char *WEEKDAY[] = { "日", "一", "二", "三", "四", "五", "六" };
   struct tm tm_bj;
@@ -2452,6 +2826,34 @@ static void chat_build_system_prompt(bool use_weather, bool use_reminder,
            "今天星期几时，直接用上面给你的时间回答，不要说不知道。",
            now, WEEKDAY[tm_bj.tm_wday]);
   used = prompt_append(out, out_cap, used, tmp);
+
+  /* 用户所在城市（板子用 IP 定位查的，见 mimo_location.c）：**只有查到才写
+   * 这一段**，查不到一个字都不提 —— 不写它，模型就只会说不知道，不会编一个
+   * 城市出来。接口给的城市名可能是英文或拼音（例如 Hangzhou），让模型自己
+   * 换成中文再说，免得对着老人冒出个英文地名。
+   * 天气那半句只在开着 get_weather 时写：工具关着时提示下面明说了"实时天气
+   * 你答不了"，这里再提"以这个城市为准"就是让它编一个天气出来。 */
+
+  if (loc_city != NULL && loc_city[0] != '\0')
+    {
+      if (use_weather)
+        {
+          snprintf(tmp, sizeof(tmp),
+                   "用户所在城市：%s（IP 定位得到）。用户问“我在哪”这类问题时，"
+                   "就用这个城市回答；问天气而没说城市时，也以这个城市为准。"
+                   "这个城市名可能是英文或者拼音，回答时换成对应的中文城市名，"
+                   "别直接念英文。", loc_city);
+        }
+      else
+        {
+          snprintf(tmp, sizeof(tmp),
+                   "用户所在城市：%s（IP 定位得到）。用户问“我在哪”这类问题时，"
+                   "就用这个城市回答。这个城市名可能是英文或者拼音，回答时换成"
+                   "对应的中文城市名，别直接念英文。", loc_city);
+        }
+
+      used = prompt_append(out, out_cap, used, tmp);
+    }
 
   /* 提醒工具：让模型自己把口语时间折算成 24 小时制（提示里刚给了当前日期
    * 时间，"明天早上八点"它能算）。不提工具时这段必须拿掉，否则模型会去调
@@ -2875,6 +3277,7 @@ int mimo_chat(const char *text, char *reply_out, size_t reply_cap)
 {
   char sys[2048];
   char city[MIMO_CITY_BUF_MAX];
+  char loc_city[MIMO_CITY_BUF_MAX];
   char city_hint[MIMO_CITY_BUF_MAX];
   char tool_result[384];
   char prefix[128];
@@ -2934,17 +3337,43 @@ int mimo_chat(const char *text, char *reply_out, size_t reply_cap)
   use_reminder = chat_reminder_tool_enabled();
   use_tools    = use_weather || use_reminder;
 
+  /* 用户在哪：板子自己查一次 IP 定位（mimo_location.c，结果在里面缓存，
+   * 6 小时内不会重复联网）。查不到就留空 —— 系统提示里那段"用户所在城市"
+   * 一个字都不写，模型问不出来也编不出来。这一步只在非 LVGL 线程里做，
+   * mimo_chat() 本来就是这么用的。 */
+
+  loc_city[0] = '\0';
+
+  if (mimo_location_get(loc_city, sizeof(loc_city), NULL, NULL) != OK)
+    {
+      loc_city[0] = '\0';       /* 失败：当没有这回事（原因在定位模块里打过了） */
+    }
+
   if (use_weather)
     {
       chat_default_city(city, sizeof(city));
+
+      /* 开了天气工具时，配置里的 default_city 只是"IP 定位没查到时"的兜底：
+       * 定位查到了就用它 —— 提示里让模型用的城市，必须和板子真去查的城市
+       * 是同一个（get_weather 的兜底名额就是这里的 city）。 */
+
+      if (loc_city[0] != '\0')
+        {
+          snprintf(city, sizeof(city), "%s", loc_city);
+          syslog(LOG_INFO, "[%s] chat: 天气默认城市用 IP 定位的 %s\n", TAG,
+                 city);
+        }
     }
   else
     {
       city[0] = '\0';
     }
 
-  chat_build_system_prompt(use_weather, use_reminder, city, sys, sizeof(sys));
+  chat_build_system_prompt(use_weather, use_reminder, city, loc_city, sys,
+                           sizeof(sys));
   sys_len = strlen(sys);
+  syslog(LOG_INFO, "[%s] chat: 用户所在城市=%s\n", TAG,
+         (loc_city[0] != '\0') ? loc_city : "(没查到，提示里不提)");
 
   /* tools 表：单个工具是"一个函数对象"（见 MIMO_TOOL_*_JSON），这里用一个
    * 逗号连成数组。关掉的那个不参与拼接，所以四种组合都是合法 JSON ——
@@ -2967,10 +3396,10 @@ int mimo_chat(const char *text, char *reply_out, size_t reply_cap)
         }
     }
 
-  /* 1. 先拼 messages 数组：system（当前时间 [+ 默认城市] + 说话要求）+ user。
-   *    开了工具时之后每轮最多再追加 assistant(tool_calls) + tool 两条
-   *    （1 KB 量级），余量按最多 3 轮 + 最坏 6 倍放大留，装不下由 sjoin 的
-   *    ovf 兜住；工具关着就固定两条消息。 */
+  /* 1. 先拼 messages 数组：system（当前时间 + 用户所在城市 + [默认城市]
+   *    + 说话要求）+ user。开了工具时之后每轮最多再追加
+   *    assistant(tool_calls) + tool 两条（1 KB 量级），余量按最多 3 轮 +
+   *    最坏 6 倍放大留，装不下由 sjoin 的 ovf 兜住；工具关着就固定两条消息。 */
 
   msgs_cap = (sys_len + text_len) * 6 + 4096;
   msgs = mimo_alloc_logged("chat.msgs", msgs_cap);

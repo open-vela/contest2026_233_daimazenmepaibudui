@@ -69,12 +69,32 @@ report_device_status(&st);
 report_alarm("fall", "检测到摔倒，位置：客厅");
 ```
 
-### 3.2 AI 交互
+### 3.2 AI 交互 —— ⚠️ 已废弃，不要调用
 
-```c
-ai_send_text("今天天气怎么样", my_reply_cb);      // 主题 zhi_ai/<id>/chat
-ai_send_voice_data(buf, len, my_reply_cb);        // 主题 zhi_ai/<id>/voice
-```
+> **本节原来的 `ai_send_text()` / `ai_send_voice_data()` 已废弃。** 两个原因：
+>
+> 1. **这是跨 task group 直发 socket 的危险路径。** 两个函数在 `network_comm.c`
+>    里直接调 `mqtt_publish()`，用的是 `network_comm` 自己那份
+>    `mqtt_config` / `mqtt_socket`。NuttX 的 fd 属于 task group：socket 是
+>    `network_task` 建的、只存在于那个组的 fd 表里，从别的组（比如 hello_app 的
+>    线程）拿同一个编号去 `send()`，要么 `EBADF`，要么发到本组里恰好占了这个编号
+>    的别的文件上。真机日志里那条
+>    `MQTT publish failed: -1, marked disconnected for reconnect` 就是这条路。
+> 2. **它们现在零调用者**，而且 `callback` 参数是纯占位：函数体里只有
+>    `TODO: 实际项目中需要等待云端回复并调用 callback`，**永远不回调**。
+>
+> 要发消息一律走**排队发布**，由 `network_task` 那条 socket 真正发出去：
+>
+> | 场景 | 用这个 |
+> |------|--------|
+> | 任意 topic | `mqtt_publish_queued(topic, payload, qos, retain)` |
+> | 报警 | `report_alarm_queued()` |
+> | 异常声音 | `report_abnormal_sound_queued()` |
+> | 设备命令 | `send_device_command_queued()` |
+>
+> 语音对话链路的现状：语音入口在 `ai_companion`（hello_app）那边走框架的
+> `llm_send_text()`；回传由 `ai_network_send_ai_reply()` 等 publish 到
+> `zhi_ai/<id>/command`。界面 `robot_ui` 不再自己开麦。收云端消息看第 3.4 节。
 
 ### 3.3 手机推送（走 HTTP，和 MQTT 是两条路）
 
@@ -189,3 +209,4 @@ listening on zhi_ai/# for 120s ...
 | `report_*` 一直返回 -1 | `mqtt_is_connected()` 是 false，先解决连接 |
 | `MQTT connected` 打印了但云端收不到 | 它**不等 CONNACK**，打印是"乐观成功"；用 `_flash/mqtt_watch.py` 在 PC 上订阅验证 |
 | **所有 DNS 都解析失败**（MQTT `DNS 解析失败`、MiMo 连不上、推送发不出） | ★ **先查 PC 侧 ICS 的 DNS 代理**，不是板子的问题：在 PC 上跑 `nslookup api.day.app 192.168.137.1`。返回 IP = 代理活着；`No response from server` = **代理已死** → 重做 ICS 共享，或管理员 `Restart-Service SharedAccess -Force`。**注意必须问 `192.168.137.1` 这个地址**——默认 DNS 走 PC 自己的 Wi-Fi，它一直是好的，光看"PC 能上网"会被完全带偏。**换 Wi-Fi / 换路由器之后高发**（ICS 的 NAT/DNS 代理还绑在旧网络上），详见 `README.md` 第 6 节 |
+| RNDIS 网卡显示「**200Mbps 已连接**」却**一个包都不通**、板子侧 `connect: Error 101` | ★ 先查**录音是不是已经断流了**：录音 RX 永久停死会把 USB/RNDIS 一起拖死，特征就是"链路在、流量死"。串口如果在刷 `read 等 DMA 失败（ret=-110 …）` 就是这个——见 `docs/audio_driver_usage.md` 第 11 节。**这种状态只能真断电恢复**，别在 ICS/DNS/MQTT 上耗时间 |

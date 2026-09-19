@@ -12,6 +12,7 @@
  ****************************************************************************/
 
 #include <nuttx/config.h>
+#include <nuttx/wdog.h>      /* 私有心跳：等 ai_agent 回包那片等待，见 ai_llm.c */
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -171,6 +172,8 @@ typedef struct
   /* openvela ai_agent本地客户端 */
   void            *backend_client;
   sem_t            backend_sem;
+  struct wdog_s    backend_wdog;    /* 等 ai_agent 回包那片等待的私有心跳 */
+  volatile bool    backend_wait_to; /* 这次醒是心跳到点叫的（不是有人 post） */
   bool             backend_sem_valid;
   int              backend_reply_status;
   char             backend_reply[LLM_MAX_OUTPUT_LENGTH];

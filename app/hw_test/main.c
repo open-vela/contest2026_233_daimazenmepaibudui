@@ -22,6 +22,47 @@
  *                            超时是 FAIL —— 单独运行
  *   hw_test status           打印统一外设状态（board_status_get）：网络拿
  *                            到 IPv4 地址才算 PASS，其它设备只提示 —— 单独运行
+ *   hw_test kws enroll <slot> [秒]  录唤醒词模板（命令词识别，MFCC+DTW）：
+ *                            slot 0..3（0=「你好，openvela」、1=「Hello，openvela」），
+ *                            秒数默认 4（钳到 2..8），存 /data/kws/slotN.tpl
+ *                            —— 单独运行，且必须先停掉 ai_companion
+ *   hw_test kws test         打印唤醒词模板数 / 阈值 / 每个槽位是否可用
+ *                            —— 单独运行
+ *   hw_test kws selftest     唤醒词模块自检（合成 1kHz 查 FFT/Mel 表、
+ *                            模板自比对和互距离、实测 MFCC/DTW 耗时），
+ *                            并打印算出来的**推荐阈值** —— 单独运行，
+ *                            且**必须先停掉 ai_companion**（它和正在跑的
+ *                            唤醒词共享 kws_dtw 的全局状态）
+ *   hw_test kws threshold <值|default>  当场改判定阈值（默认 1800，单位见
+ *                            kws_dtw.h），打印新旧值；`default` = 恢复 1800 ——
+ *                            只对本次运行有效，重启回到默认；只写一个全局
+ *                            变量、不开麦克风，可以趁着 ai_companion 在跑
+ *                            直接改 —— 单独运行
+ *   hw_test kws live [秒]    实时听唤醒词，命中就打一行（默认 10 秒）
+ *                            —— 单独运行，且必须先停掉 ai_companion
+ *   hw_test lcdreinit        面板重新初始化（黑屏救回）：重发一遍面板初始化
+ *                            序列 + 拉一次 RESET 脚，再请界面全屏重绘一次
+ *                            —— 单独运行；整屏黑但串口/触摸还活着时敲它
+ *   hw_test lcdmirror [start|stop|status|uart|tcp] [ip|节点] [port]
+ *                            屏幕镜像（板端 -> PC）+ **鼠标当触摸**（反向通道）：
+ *                            把界面像素发到电脑上显示，同时把电脑上的鼠标
+ *                            当成板子的触摸（本机触摸 IC 已经不应答、
+ *                            /dev/input0 都没了，这是唯一能操作界面的路）。
+ *                            协议 v2：20 字节头，载荷可 RLE（见 lcd_mirror.h）。
+ *                            **开机自动起**（传输默认 TCP），目标默认
+ *                            192.168.137.1:5600；不给参数就打印状态。
+ *                            `uart [节点]` 切到控制台串口那条腿（不依赖 USB
+ *                            网络，帧格式一模一样，默认 /dev/console）；
+ *                            `tcp <ip> [port]` 切回来。PC 端跑
+ *                            D:/apply/claw/_flash/lcd_mirror.py
+ *                            —— 单独运行
+ *   hw_test lcdtap <x> <y> <0|1>
+ *                            注入一次触摸（x/y 是面板坐标，越界会钳住；
+ *                            1=按下 0=抬起）。**串口模式下的触摸入口**：
+ *                            PC 往串口里写这一行文本，NSH 执行它 ——
+ *                            反向触摸不走帧的字节流（二进制包会被行输入吃掉）。
+ *                            拖动就是连着发 `lcdtap x y 1`，最后 `lcdtap x y 0`
+ *                            —— 单独运行，且镜像要在跑
  *
  * 设计约定：
  *   - 每一步失败都只打印 FAIL，不中断后面的步骤，也不会卡死
@@ -31,6 +72,18 @@
  *     设 alarm、开麦克风、响喇叭、等按键），所以放在子命令里；而且它们
  *     **不跑**上面那套 5 步自检，只跑自己，免得每次验 IMU 还要先等
  *     10 秒触摸 + 5 秒按键
+ *   - kws 各子命令都会碰 kws_dtw 的全局状态（模块没有锁），enroll / live 还
+ *     要**独占麦克风**：本板半双工，且整机是单一大镜像（ai_companion 开机
+ *     自启后会一直持有麦克风、在自己的线程里喂 kws_feed），所以跑之前必须
+ *     先停掉 ai_companion，否则 audio_in_start() 直接 -EBUSY。
+ *     enroll / live / selftest 都**先把麦克风拿到手**，拿不到就整条子命令
+ *     FAIL、一个 kws_dtw 接口都不碰（kws_init/kws_enroll/kws_selftest 会清或
+ *     改那些全局状态，先动它会把正在跑的唤醒词链路悄悄搞坏，而 -EBUSY 要到
+ *     数完倒计时才发现）。selftest 不录音，拿麦只是确认"没有别的会话在跑"，
+ *     确认完立刻还回去
+ *     例外是 `kws threshold`：它只写模块里那个阈值全局变量，不碰流式状态、
+ *     也不开麦克风，**可以趁着 ai_companion 在跑**直接改 —— 同一镜像里共享
+ *     那个变量，改完立刻对正在跑的唤醒词生效（现场标定最常用的就是它）
  *   - 默认自检里的按键步骤是"非交互"的（没人按也算 PASS，只证明能读）；
  *     要真的验证按键，跑 `hw_test button`，它超时会 FAIL
  *   - **按键一律走板级 GPIO 模块 `sf32lb52_boardbtn`，不碰 /dev/buttons**：
@@ -79,6 +132,13 @@
 #include "sf32lb52_backlight.h"        /* 板级亮度封装 backlight_set/get */
 #include "sf32lb52_boardbtn.h"         /* 板级按键：GPIO 轮询 + 回调（不用 /dev/buttons） */
 #include "sf32lb52_status.h"           /* 板级统一外设状态 board_status_get/dump */
+#include "lcd_mirror.h"                /* 板级屏幕镜像（屏幕坏了拿 PC 当显示器） */
+/* 面板重新初始化（黑屏救回）：实现在 robot_ui 那个 app 的 robot_ui_bridge.c，
+ * 它自己再去调 vendor 面板驱动的 sf32lb_lcd_panel_reinit()。
+ * 走 robot_ui 这一跳而不是在 hw_test 里直接调驱动，是因为"重初始化之后要重绘"
+ * 必须由 LVGL 线程去做（lv_async_call 投递），而 LVGL 只有 robot_ui 在跑。
+ * 头文件路径由 CMakeLists.txt 的 `../robot_ui` 提供。 */
+#include "robot_ui_bridge.h"
 
 /* tts 子命令要**播**声音：板级只封了录音（sf32lb52_audio_in），所以这里直接开
  * /dev/audio/audio0，ioctl 顺序照 app/audio_test 和 ai_audio.c 真机验证过的那套
@@ -97,6 +157,17 @@
 #  include "voice/voice_asr.h"
 #  include "voice/voice_tts.h"
 #  include "mimo_voice.h"
+#endif
+
+/* 唤醒词自检（kws 子命令）要用 hello_app 的命令词识别模块 kws_dtw.c：
+ * 它只在 hello_app 被编进固件时才有符号，而 hw_test 的 CMakeLists 里已经用
+ * `../hello_app` 拿到了头文件（跨 app 的符号在最终链接时解析 —— 和 tts/asr
+ * 借 hello_app 的 MiMo 后端是同一套做法），所以这里判一下总开关：
+ * 没开 hello_app 时 kws 子命令只打印"本配置不支持"，其余子命令不受影响。 */
+
+#if defined(CONFIG_LVX_USE_CONTEST2026_233_HELLO_APP)
+#  define HW_TEST_HAS_KWS 1
+#  include "kws_dtw.h"
 #endif
 
 /* IMU：本板的 LSM6DS3 走的是 NuttX **老式字符驱动**（不是 uORB），
@@ -200,6 +271,57 @@
 
 #define BTN_DEFAULT_WAIT_SEC  15    /* 默认等待秒数 */
 
+/* kws 子命令（唤醒词「你好，openvela」/「Hello，openvela」的命令词识别，
+ * 模块本体在 app/hello_app/kws_dtw.c）。
+ *
+ * 模板落盘约定（见 kws_dtw.h）：/data/kws/slotN.tpl，N = 0..3，
+ * 其中 slot0 =「你好，openvela」、slot1 =「Hello，openvela」。
+ * ⚠ 本板 /data 是 tmpfs —— 重启就丢，要长期保留得靠别的手段搬走/重录。
+ *
+ * ⚠ 半双工 + 单一大镜像：ai_companion 开机自启后会一直持有麦克风（听唤醒词）
+ *   并在自己的线程里喂 kws_feed，所以跑 kws 子命令之前必须先把它停掉，
+ *   否则 audio_in_start() 直接 -EBUSY。
+ *   enroll / live / selftest 都**先确认麦克风拿到手**（kws_mic_acquire），
+ *   拿不到立刻 FAIL、一个 kws_dtw 接口都不碰 —— 否则 kws_init/kws_enroll/
+ *   kws_selftest 会先清掉/改掉 ai_companion 录音线程正在用的那些全局状态。
+ *   **例外是 `kws threshold`**：它只写 kws_dtw 的阈值全局变量、不初始化模块
+ *   也不开麦克风，可以趁 ai_companion 在跑时直接改（同一镜像共享那个变量，
+ *   改完立刻对正在跑的唤醒词生效）—— 现场标定就该这么用。 */
+
+#define KWS_ENROLL_DEFAULT_SEC 4    /* 录模板默认时长；1~2 秒的短语 + 尾静音够用 */
+#define KWS_ENROLL_MIN_SEC     2    /* 再短就可能把短语截掉，录出个残模板 */
+#define KWS_ENROLL_MAX_SEC     8    /* 再长没意义（整句上限 2 秒），而且缓冲会变大：
+                                     * 8 秒 = 256 KB，和 TTS 缓冲同量级（那一块
+                                     * 在真机上分得到） */
+#define KWS_LIVE_DEFAULT_SEC   10   /* kws live 默认听多久 */
+#define KWS_LIVE_MAX_SEC       30   /* 最长听多久：别把唯一的麦克风占太久 */
+#define KWS_PREP_SEC           3    /* 录音前的准备时间（数 3..1 再开始录） */
+
+/* 100ms 一块：远小于封装建议的 1 秒上限，而且 live 模式喂帧的粒度就是它
+ * （拆成 1 秒一块的话，命中最多要等 1 秒才报出来） */
+
+#define KWS_READ_CHUNK_BYTES   (AUDIO_SAMPLE_RATE * 2 / 10)
+#define KWS_READ_TASK_STACK    4096   /* 同 AUDIO_READ_TASK_STACK */
+
+/* 阈值的"再往上就没意义了"那条线，等于 kws_dtw.c 里的 KWS_DP_CAP_DIST_MIN。
+ * 那个宏在 .c 里（没导出到 .h），这里照抄一份常量：
+ * 距离被 DTW 的 DP 上限钉住，qn+tn=200 时最大也就 9690 —— 阈值设过它，
+ * "最不像的东西"也会被判命中，唤醒词等于变成「随便什么都唤醒」。
+ * kws_dtw.c 那边只警告不拒绝（标定的人可能故意），但这里是给人手敲的入口，
+ * 多打一个 0（1800 → 18000）就会静默废掉判别力，所以本子命令直接拒绝设置。 */
+
+#define KWS_TH_MAX_SAFE        9690
+
+/* kws 子命令的动作（main 解析参数时用；0 = 没选 kws）。
+ * 阈值标定占两个：selftest 算推荐值，threshold 当场改（见 step_kws_*）。 */
+
+#define KWS_CMD_NONE      0
+#define KWS_CMD_ENROLL    1
+#define KWS_CMD_TEST      2
+#define KWS_CMD_LIVE      3
+#define KWS_CMD_SELFTEST  4
+#define KWS_CMD_THRESHOLD 5
+
 /****************************************************************************
  * Private Types
  ****************************************************************************/
@@ -229,6 +351,21 @@ static volatile int     g_arec_done;
 static volatile ssize_t g_arec_n;
 static FAR int16_t     *g_arec_buf;
 static int              g_arec_len;
+
+/* kws 子命令：录音读任务和主任务之间的交接状态。
+ * 和 audio 子命令同一套写法（task_create 只能带一个参数，所以用文件级全局 +
+ * volatile 标志）。g_krec_buf 只在 enroll 模式（整段 PCM 要交给 kws_enroll）
+ * 里用 malloc 拿；live 模式用下面那块静态缓冲边读边喂，不攒 PCM。 */
+
+static volatile int  g_krec_done;    /* 读任务结束 */
+static volatile int  g_krec_got;     /* 已读字节数 */
+static volatile int  g_krec_err;     /* 读任务停下时 read 的返回值 */
+static volatile int  g_krec_hits;    /* live 模式：命中次数（每命中一次打一行） */
+static FAR int16_t  *g_krec_buf;     /* enroll 模式：攒 PCM 的缓冲（live 模式为 NULL） */
+static int           g_krec_len;     /* 一共要读多少字节 */
+static int           g_krec_live;    /* 1 = 边读边喂 kws_feed */
+
+static int16_t g_krec_live_buf[AUDIO_SAMPLE_RATE / 10];   /* 100ms（KWS_READ_CHUNK_BYTES） */
 
 /* alarm 子命令：模块工作线程里回调，这里只累计事件给主任务打印 */
 
@@ -331,6 +468,27 @@ static void usage(void)
          "持续秒数默认 3（单独运行）\n");
   printf("  hw_test lcd [0..100]  设屏幕亮度并回读，默认 100（单独运行）；"
          "中间值走面板亮度寄存器（需 vendor 补丁，见 patches/README.md）\n");
+  printf("  hw_test lcdreinit    面板重新初始化（黑屏救回）：重发面板初始化"
+         "序列 + 拉一次 RESET 脚，\n"
+         "                       再请界面全屏重绘一次。整屏黑、"
+         "但串口还活着时敲它（单独运行）\n");
+  printf("  hw_test lcdmirror [start|stop|status|uart|tcp] [ip|节点] [port]\n"
+         "                       屏幕镜像（屏幕坏了拿 PC 当显示器）：开机"
+         "**自动起**，传输默认 TCP，目标默认\n"
+         "                       %s:%d；不给参数就打印状态（含当前传输、"
+         "节点名/目标地址、收到多少条触摸）。\n"
+         "                       协议 v2（20 字节头 + RLE 载荷）。`uart [节点]` "
+         "切控制台串口那条腿（默认\n"
+         "                       /dev/console，帧格式一模一样，不依赖 USB 网络；"
+         "每 3 秒发一次整屏关键帧），\n"
+         "                       `tcp <ip> [port]` 切回来。PC 端 "
+         "_flash/lcd_mirror.py 里按住鼠标 = 点屏幕\n",
+         LCD_MIRROR_DEFAULT_IP, LCD_MIRROR_DEFAULT_PORT);
+  printf("  hw_test lcdtap <x> <y> <0|1>   注入一次触摸（面板坐标，1=按下 "
+         "0=抬起）。**串口模式下的触摸入口**：\n"
+         "                       PC 往串口里写这行文本、由 NSH 执行；"
+         "拖动就连续发 `lcdtap x y 1`，\n"
+         "                       最后一条 `lcdtap x y 0` 抬手（镜像要在跑）\n");
   printf("  hw_test button [秒]  等按键按下（板级 GPIO：PA11=KEY / PA34=HOME），"
          "默认 15 秒，超时算 FAIL（单独运行）\n");
   printf("  hw_test status       打印统一外设状态（board_status_get/dump）；"
@@ -340,6 +498,33 @@ static void usage(void)
          "（要联网 + 配好 api_key/llm_host，单独运行）\n");
   printf("  hw_test asr <文件>   读一个 WAV（16bit PCM，采样率不限，内部转 16k）"
          "做 MiMo 云端语音识别并打印结果（单独运行）\n");
+  printf("  hw_test kws enroll <slot> [秒]  录唤醒词模板：slot 0..3"
+         "（0=「你好，openvela」、1=「Hello，openvela」），秒数默认 4（2..8），"
+         "存到 /data/kws/slotN.tpl（单独运行）\n");
+  printf("  hw_test kws test     打印唤醒词模板数/阈值/每个槽位是否可用"
+         "（单独运行）\n");
+  printf("  hw_test kws selftest 唤醒词模块自检（合成 1kHz 查 FFT/Mel 表、"
+         "模板自比对/互距离、\n"
+         "                       实测 MFCC/DTW 耗时）并打印推荐阈值"
+         "（单独运行）\n"
+         "                       **必须先停 ai_companion**：它和正在跑的"
+         "唤醒词共享 kws_dtw\n"
+         "                       的全局状态（没模板时不报 PASS，会提示先 enroll）\n");
+  printf("  hw_test kws threshold <值|default>  当场改判定阈值，打印新旧值；"
+         "默认 1800，只对本次运行有效、\n"
+         "                       重启回默认（可以趁 ai_companion 在跑时改，"
+         "改完立刻生效）（单独运行）\n"
+         "                       大于 9690 会让任何输入都判命中，直接拒绝；"
+         "`threshold default` 恢复 1800\n");
+  printf("  hw_test kws live [秒]  实时听唤醒词，命中就打一行，默认 10 秒"
+         "（单独运行）\n");
+  printf("      注意：kws 各子命令都碰 kws_dtw 的全局状态，enroll/live/selftest"
+         " 还会先开一下麦克风确认它\n"
+         "            空闲（拿不到就整条命令 FAIL，一个 kws 接口都不动）——"
+         " ai_companion 开机自启后会\n"
+         "            一直持有它（半双工），跑之前必须先停掉 ai_companion，"
+         "否则 audio_in_start 直接 -EBUSY\n"
+         "            （例外：threshold 只写一个全局变量，不用停 ai_companion）\n");
 }
 
 /****************************************************************************
@@ -1847,6 +2032,898 @@ static int step_audio(int seconds)
 }
 
 /****************************************************************************
+ * kws 子命令：唤醒词「你好，openvela」/「Hello，openvela」的命令词识别
+ *            （MFCC + DTW，模块本体在 app/hello_app/kws_dtw.c）
+ *
+ * 模块本身是纯计算：不开麦、不起线程、不碰设备。所以"录模板"这一步必须由
+ * 外面来做 —— 就是这里：用板级录音封装（sf32lb52_audio_in，和 audio 子命令
+ * 同一套）把 PCM 录出来交给 kws_enroll()。**本子命令是唯一的录模板入口**，
+ * 没有它，唤醒词功能等于开不了。
+ *
+ * 模板约定（kws_dtw.h）：/data/kws/slotN.tpl，N = 0..3，
+ *   slot0 =「你好，openvela」、slot1 =「Hello，openvela」（slot2/3 空着备用）。
+ * ⚠ /data 是 tmpfs：模板重启就丢，长期保留得把它搬走或重新录。
+ *
+ * ⚠ 麦克风是半双工、整机又是单一大镜像：ai_companion 开机自启后会一直持有
+ *   麦克风（听唤醒词），而且它和这里共享 kws_dtw 的全局状态（模块没有锁，
+ *   见 .h 的"线程安全"）。所以跑 kws 子命令之前**必须先停掉 ai_companion**，
+ *   否则 audio_in_start() 直接返回 -EBUSY，并且两边同时调 KWS 接口会互相踩。
+ ****************************************************************************/
+
+#ifdef HW_TEST_HAS_KWS
+
+/* 槽位个数必须和 kws_dtw.h 的 KWS_MAX_TEMPLATES 一致（下面按槽位写死了提示词） */
+
+#if KWS_MAX_TEMPLATES != 4
+#  error "kws 槽位提示词表是 4 条，KWS_MAX_TEMPLATES 改了要一起改"
+#endif
+
+/****************************************************************************
+ * Name: kws_slot_word
+ *
+ * Description:
+ *   slot 对应的唤醒词（方便提示用户"这一槽该念什么"）。
+ *   slot2/slot3 是 .h 里留的实验槽（比如改成只念 "openvela"），没有固定词。
+ *
+ ****************************************************************************/
+
+static FAR const char *kws_slot_word(int slot)
+{
+  switch (slot)
+    {
+      case 0:
+        return "你好，openvela";
+
+      case 1:
+        return "Hello，openvela";
+
+      case 2:
+        return "（自定义槽位，想录什么就录什么）";
+
+      case 3:
+        return "（自定义槽位，想录什么就录什么）";
+
+      default:
+        return "（未知槽位）";
+    }
+}
+
+/****************************************************************************
+ * Name: kws_mic_acquire
+ *
+ * Description:
+ *   把麦克风拿到手：audio_in_start()，成功返回 OK 并**保持持有**，调用方
+ *   负责在收尾前 audio_in_stop()（幂等）。
+ *
+ *   为什么要单独一步、而且要排在所有 kws_dtw 调用之前：
+ *   kws_dtw 的全局状态（预滚环 / 待判句子 / 自适应本底 / 冷却、模板、以及
+ *   selftest 和判定共用的 DTW 暂存）正是 ai_companion 录音线程在用的，而
+ *   kws_init() 一进去就 kws_reset() + 重载模板、kws_enroll() 还会再 reset。
+ *   以前是"先动 kws 再去开麦"，所以 ai_companion 还跑着时敲一嗓子
+ *   enroll/selftest，会把正在跑的唤醒词链路先搞坏，最后才拿到 -EBUSY。
+ *   反过来先开麦就干净：驱动只放行"持有者已消失的残留会话"，能开成 = 现在
+ *   确实没有别的会话在用麦克风；开不成 = 整个子命令 FAIL，一个 kws_dtw
+ *   接口都不碰，正在跑的唤醒词链路一个字节都不会被动到。
+ *
+ *   ⚠ 拿不到时 audio_in_start() **不会**发 AUDIOIOC_STOP（板级封装的约定：
+ *     对面还活着就不打断），所以这条路径也不会踩别人正在录/正在放的通路。
+ *
+ * Returned Value:
+ *   OK = 麦克风已持有（调用方必须 audio_in_stop）；-1 = 拿不到（原因已打印）。
+ *
+ ****************************************************************************/
+
+static int kws_mic_acquire(void)
+{
+  int ret;
+
+  ret = audio_in_start(AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, AUDIO_BITS);
+
+  if (ret < 0)
+    {
+      printf("      audio_in_start(%d, %d, %d) 失败: %d\n",
+             AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, AUDIO_BITS, ret);
+      printf("      （-EBUSY = 麦克风被别人占着：ai_companion 开机自启后会一直"
+             "持有它；\n");
+      printf("        跑 kws 子命令前先停掉它 —— 这里到这一步就收手，"
+             "不会去碰 kws_dtw）\n");
+      return -1;
+    }
+
+  return OK;
+}
+
+/****************************************************************************
+ * Name: kws_reader_task
+ *
+ * Description:
+ *   kws 子命令的读任务：按 KWS_READ_CHUNK_BYTES（100ms）分块读。
+ *   live 模式顺手在**本任务**里喂 kws_feed（模块没有锁，只允许一个线程调它，
+ *   所以喂帧和 kws_enroll 都在这个线程里，主任务只管计时/收尾）。
+ *
+ ****************************************************************************/
+
+static int kws_reader_task(int argc, FAR char *argv)
+{
+  int offset = 0;
+
+  (void)argc;
+  (void)argv;
+
+  while (offset < g_krec_len)
+    {
+      int chunk = g_krec_len - offset;
+      FAR int16_t *dst;
+      ssize_t n;
+
+      if (chunk > KWS_READ_CHUNK_BYTES)
+        {
+          chunk = KWS_READ_CHUNK_BYTES;
+        }
+
+      if (g_krec_live)
+        {
+          dst = g_krec_live_buf;
+        }
+      else
+        {
+          dst = g_krec_buf + offset / 2;    /* offset 是字节，缓冲按采样点算 */
+        }
+
+      n = audio_in_read((FAR char *)dst, (size_t)chunk);
+
+      if (n <= 0)
+        {
+          /* <=0 必须跳出：0 = 被 STOP 打断或下层 5 秒超时（不是"再读一次
+           * 就有数据"），负值 = fd 已失效（没 start / 已被 stop）。 */
+
+          g_krec_err = (int)n;
+          break;
+        }
+
+      /* kws_feed 的负返回值只有"没初始化(-ENOSYS)/参数非法(-EINVAL)"两种，
+       * 这里前面一定 kws_init 过、参数也是固定的合法 buffer，所以不会发生
+       * （真发生了也只是这一路不喂帧，不影响录音/还设备）。 */
+
+      if (g_krec_live && kws_feed(dst, (size_t)n / 2) == 1)
+        {
+          /* kws_feed 命中时它自己会打一条 "[KWS] 命中唤醒词（slotN…）"，
+           * 这里再补一条带"第几次/第几毫秒"的，方便当验收判据 */
+
+          g_krec_hits++;
+          printf("      [命中] 第 %d 次（已录 %d ms）\n", g_krec_hits,
+                 (int)((long)offset * 1000 / (AUDIO_SAMPLE_RATE * 2)));
+        }
+
+      offset += (int)n;
+    }
+
+  g_krec_got  = offset;
+  g_krec_done = 1;
+  return 0;
+}
+
+/****************************************************************************
+ * Name: kws_record
+ *
+ * Description:
+ *   kws 子命令的录音。live != 0 时边读边喂 kws_feed（不攒 PCM）；
+ *   live == 0 时攒进一块 malloc 的缓冲，由调用方拿去 kws_enroll。
+ *   超时救场和缓冲归属的判断与 step_audio 完全一致（同一套驱动的坑）：
+ *   read 没在预期时间内返回就 audio_in_stop()（它会唤醒阻塞在 read 里的任务），
+ *   读任务真卡死时**故意不释放缓冲**（免得它醒来写已释放内存）。
+ *
+ *   mic_held != 0：麦克风已经由 kws_mic_acquire() 拿到手了，本函数**不再
+ *   audio_in_start()**（同线程重入会被板级封装判成 -EBUSY），直接开始读。
+ *   这样调用方就能把"确认拿到麦克风"这一步提到所有 kws_dtw 调用之前。
+ *
+ *   ⚠ 麦克风是单一大镜像里共享的一份全局：**只要麦克风是我们的，本函数每个
+ *     return 之前都调了 audio_in_stop()**（幂等），一次泄漏就会把后面所有
+ *     录音都锁死。反过来，start 本身失败的路径**故意不调 stop** —— 那意味着
+ *     这次会话不是我们的，stop 会把别人（比如 ai_companion）正在录的会话
+ *     一起 STOP + close 掉；start 自己的失败路径已经把它 open 出来的 fd 关干净。
+ *
+ * Returned Value:
+ *   0 = 录满（*pcm_out 拿到 malloc 的缓冲，调用方负责 free；live 模式给 NULL）；
+ *   -1 = 失败（原因已经打印，设备已经还给板级封装）。
+ *
+ ****************************************************************************/
+
+static int kws_record(int seconds, int live, int mic_held,
+                      FAR int16_t **pcm_out)
+{
+  int nsamples = AUDIO_SAMPLE_RATE * seconds;
+  FAR int16_t *buf = NULL;
+  clock_t t0;
+  uint32_t elapsed_ms;
+  int ret;
+
+  *pcm_out = NULL;
+
+  if (!live)
+    {
+      buf = (FAR int16_t *)malloc((size_t)nsamples * sizeof(int16_t));
+      if (buf == NULL)
+        {
+          printf("      malloc %d 字节失败（把录音秒数调小一点再试）\n",
+                 nsamples * 2);
+
+          /* 这条路径在 start 之前，但 mic_held 模式下设备是调用方交到我们
+           * 手上的 —— 必须在这儿还回去，漏一次后面所有录音就都别想开了 */
+
+          if (mic_held)
+            {
+              audio_in_stop();
+            }
+
+          return -1;
+        }
+    }
+
+  if (!mic_held)
+    {
+      ret = audio_in_start(AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, AUDIO_BITS);
+      if (ret < 0)
+        {
+          printf("      audio_in_start(%d, %d, %d) 失败: %d\n",
+                 AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, AUDIO_BITS, ret);
+          printf("      （-EBUSY = 麦克风被别人占着：ai_companion 开机自启后会一直"
+                 "持有它，跑 kws 子命令前先停掉它）\n");
+          free(buf);
+          return -1;
+        }
+    }
+
+  /* 到这里麦克风才是我们的：下面每个 return 之前都必须 audio_in_stop() */
+
+  g_krec_buf  = buf;
+  g_krec_len  = nsamples * 2;
+  g_krec_live = live;
+  g_krec_done = 0;
+  g_krec_got  = 0;
+  g_krec_err  = 0;
+  g_krec_hits = 0;
+
+  if (task_create("kws_rec", 100, KWS_READ_TASK_STACK,
+                  (main_t)kws_reader_task, NULL) < 0)
+    {
+      printf("      task_create 失败: %d\n", errno);
+      audio_in_stop();
+      free(buf);
+      return -1;
+    }
+
+  /* 计时同样用单调时钟（理由见 step_rtc 里的注释） */
+
+  t0 = clock_systime_ticks();
+  elapsed_ms = 0;
+
+  while (!g_krec_done &&
+         elapsed_ms < (uint32_t)(seconds + AUDIO_WAIT_SLACK_SEC) * 1000)
+    {
+      usleep(100 * 1000);
+      elapsed_ms = (uint32_t)TICK2MSEC(clock_systime_ticks() - t0);
+    }
+
+  if (!g_krec_done)
+    {
+      /* audio_in_stop() 里的 AUDIOIOC_STOP 能让阻塞在 read() 里的任务返回 */
+
+      audio_in_stop();
+      t0 = clock_systime_ticks();
+      while (!g_krec_done &&
+             (uint32_t)TICK2MSEC(clock_systime_ticks() - t0) < 1000)
+        {
+          usleep(100 * 1000);
+        }
+
+      printf("      read 没在 %d 秒内返回，已调 audio_in_stop()\n",
+             seconds + AUDIO_WAIT_SLACK_SEC);
+
+      if (g_krec_done)
+        {
+          free(buf);
+        }
+      else
+        {
+          /* 读任务还活着：**故意不释放缓冲**。它可能仍挂在驱动的 read()
+           * 里持有这块地址，一 free 就是 use-after-free。
+           * fd 已由 audio_in_stop() 关闭，读任务下次进 audio_in_read()
+           * 会直接拿到 -EINVAL 跳出，不会再往这块内存写。
+           * 一次失败的自检，漏一块缓冲是可以接受的代价。 */
+          printf("      （读任务还活着，故意不释放缓冲，避免它醒来写已释放内存）\n");
+        }
+
+      return -1;
+    }
+
+  /* 读任务已经结束（正常或 read 出错），把设备还回去 */
+
+  audio_in_stop();
+  g_krec_buf = NULL;
+
+  if (g_krec_got < g_krec_len)
+    {
+      printf("      只读到 %d/%d 字节（read 返回 %d）\n", (int)g_krec_got,
+             g_krec_len, (int)g_krec_err);
+      free(buf);
+      return -1;
+    }
+
+  *pcm_out = buf;
+  return 0;
+}
+
+/****************************************************************************
+ * Name: step_kws_enroll
+ *
+ * Description:
+ *   `hw_test kws enroll <slot> [秒]`：录一段麦克风音频交给 kws_enroll()
+ *   做成模板，并落盘到 /data/kws/slotN.tpl。
+ *
+ *   参数（非法一律打中文提示 + FAIL，绝不越界写）：
+ *     slot   必给，0..KWS_MAX_TEMPLATES-1（越界或没给都直接 FAIL）；
+ *     秒数   可选，默认 KWS_ENROLL_DEFAULT_SEC，钳到
+ *            [KWS_ENROLL_MIN_SEC, KWS_ENROLL_MAX_SEC]。
+ *
+ *   顺序**必须是**：参数检查 → kws_mic_acquire() → kws_init() → 倒计时 →
+ *   录音（kws_record，麦已在手）→ kws_enroll()。麦克风拿到之前不碰任何
+ *   kws_dtw 接口，拿不到就整条 FAIL（理由见 kws_mic_acquire）。
+ *   录音期间设备一直握在手里，kws_record 返回时已经 audio_in_stop() 还回去了。
+ *
+ * Returned Value:
+ *   OK = 模板已经在 RAM 里（落盘成功与否见打印）；
+ *   -1 = 参数非法 / 拿不到麦克风 / 初始化失败 / 录音失败 / kws_enroll 失败。
+ *
+ ****************************************************************************/
+
+static int step_kws_enroll(int slot, int seconds)
+{
+  FAR int16_t *pcm = NULL;
+  char detail[128];                 /* 失败原因里带中文，留够（避免 snprintf 截在
+                                     * 一个多字节字符中间变成乱码） */
+  int peak;
+  int got;
+  int n;
+  int ret;
+  int i;
+
+  if (slot < 0)
+    {
+      printf("hw_test kws enroll: 缺 slot 参数。用法 "
+             "hw_test kws enroll <slot> [秒]，slot 取 0..%d"
+             "（slot0 =「你好，openvela」、slot1 =「Hello，openvela」）\n",
+             KWS_MAX_TEMPLATES - 1);
+      report("唤醒词录模板", 0, "缺 slot 参数");
+      return -1;
+    }
+
+  if (slot >= KWS_MAX_TEMPLATES)
+    {
+      printf("hw_test kws enroll: slot %d 越界，只允许 0..%d"
+             "（slot0 =「你好，openvela」、slot1 =「Hello，openvela」）\n",
+             slot, KWS_MAX_TEMPLATES - 1);
+      report("唤醒词录模板", 0, "slot 越界（只允许 0..3）");
+      return -1;
+    }
+
+  if (seconds < KWS_ENROLL_MIN_SEC || seconds > KWS_ENROLL_MAX_SEC)
+    {
+      int clamp = seconds;
+
+      if (clamp < KWS_ENROLL_MIN_SEC)
+        {
+          clamp = KWS_ENROLL_MIN_SEC;
+        }
+
+      if (clamp > KWS_ENROLL_MAX_SEC)
+        {
+          clamp = KWS_ENROLL_MAX_SEC;
+        }
+
+      printf("      提示：录音秒数 %d 不在 %d..%d 里，按 %d 秒录\n",
+             seconds, KWS_ENROLL_MIN_SEC, KWS_ENROLL_MAX_SEC, clamp);
+      seconds = clamp;
+    }
+
+  printf("[KWS] 录模板 slot%d：请念「%s」；录 %d 秒（%d Hz/单声道/16bit）\n",
+         slot, kws_slot_word(slot), seconds, AUDIO_SAMPLE_RATE);
+  printf("      前提：麦克风必须空闲 —— ai_companion 开机自启后会一直占着它\n");
+  printf("            （半双工 + 单一大镜像），跑之前先停掉 ai_companion\n");
+
+  /* 先把麦克风拿到手，再碰 kws_dtw：kws_init() 会 kws_reset()，kws_enroll()
+   * 还会再 reset 一次，而 ai_companion 的录音线程正在用那些全局状态。
+   * 拿不到就在这里收手（一个 kws 接口都不调），而不是数完 3 秒才发现 -EBUSY。 */
+
+  if (kws_mic_acquire() < 0)
+    {
+      report("KWS 麦克风", 0, "拿不到麦克风（先停 ai_companion）");
+      return -1;
+    }
+
+  ret = kws_init();
+  if (ret < 0)
+    {
+      audio_in_stop();
+      printf("      kws_init() 失败: %d（内部表建不起来，属异常）\n", ret);
+      report("KWS 模块初始化", 0, "kws_init 失败");
+      return -1;
+    }
+
+  snprintf(detail, sizeof(detail), "模板 %d 条，目录 " KWS_DATA_DIR,
+           kws_ready_count());
+  report("KWS 模块初始化", 1, detail);
+
+  /* 给用户一点准备时间（录音是"数完才开始"的，免得开头几个字被吃掉） */
+
+  printf("      请准备：%d 秒后开始录音，然后把这一整句清楚地念一遍\n",
+         KWS_PREP_SEC);
+
+  for (i = KWS_PREP_SEC; i > 0; i--)
+    {
+      printf("      %d...\n", i);
+      usleep(1000 * 1000);
+    }
+
+  printf("      >>> 开始录音，请说：「%s」 <<<\n", kws_slot_word(slot));
+
+  ret = kws_record(seconds, 0, 1, &pcm);    /* mic_held=1：麦已经在手里 */
+  if (ret < 0)
+    {
+      report("KWS 录音", 0, "录音失败（原因见上面）");
+      return -1;
+    }
+
+  got  = (int)(g_krec_got / 2);             /* 采样点个数 */
+  peak = audio_level(pcm, got);             /* 打印 peak/avg + 有没有声音 */
+
+  snprintf(detail, sizeof(detail), "%d 采样点（%dms），peak=%d%s", got,
+           got * 1000 / AUDIO_SAMPLE_RATE, peak,
+           peak > AUDIO_SOUND_PEAK ? " 有声音" : " 静音");
+  report("KWS 录音", 1, detail);
+
+  /* 特征提取 + 端点检测走的是识别那一套（kws_dtw.h 保证口径一致） */
+
+  ret = kws_enroll(pcm, (size_t)got, slot);
+  n   = kws_template_frames(slot);
+
+  if (ret == 0)
+    {
+      snprintf(detail, sizeof(detail),
+               "%d 个特征点（%dms），已落盘 " KWS_DATA_DIR "/slot%d.tpl",
+               n, n * KWS_FEAT_MS, slot);
+      report("唤醒词模板", 1, detail);
+      printf("      提示：跑 `hw_test kws test` 看全部槽位状态，"
+             "`hw_test kws live 10` 当场试唤醒\n");
+    }
+  else if (ret == 1)
+    {
+      /* 模板进 RAM 了，只是 /data 写失败：现在能用，重启会丢（kws_dtw.h
+       * 明确说落盘失败不算致命，所以这里算 PASS，但要把话说明白） */
+
+      snprintf(detail, sizeof(detail),
+               "%d 个特征点（%dms），但没落盘（重启会丢）",
+               n, n * KWS_FEAT_MS);
+      report("唤醒词模板", 1, detail);
+      printf("      注意：本次唤醒词已经能用（模板在 RAM 里），但写 " KWS_DATA_DIR
+             " 失败（原因见上面 [KWS] 行）—— 重启后要重录\n");
+    }
+  else
+    {
+      FAR const char *why;
+
+      if (ret == -EINVAL)
+        {
+          why = "有效语音太短/太安静（整句念完整、前后留一点安静再试）";
+        }
+      else if (ret == -ENOSPC)
+        {
+          why = "有效语音超过 2.0 秒上限（短语说短一点）";
+        }
+      else if (ret == -ENOSYS)
+        {
+          why = "模块没初始化";
+        }
+      else
+        {
+          why = "kws_enroll 返回负值";
+        }
+
+      snprintf(detail, sizeof(detail), "kws_enroll=%d：%s", ret, why);
+      report("唤醒词模板", 0, detail);
+    }
+
+  free(pcm);
+
+  return (ret == 0 || ret == 1) ? OK : -1;
+}
+
+/****************************************************************************
+ * Name: step_kws_test
+ *
+ * Description:
+ *   `hw_test kws test`：打印当前已登记的模板数、判定阈值、每个槽位是否可用
+ *   （数据都来自 kws_dtw.c 的查询接口）。
+ *
+ *   没有模板算 FAIL —— 那种情况下 kws_feed() 永远不会返回 1，唤醒词等于没开。
+ *
+ ****************************************************************************/
+
+static int step_kws_test(void)
+{
+  char detail[96];
+  int ready;
+  int s;
+  int n;
+  int ret;
+
+  printf("[KWS] 模板状态（目录 %s，约定 %d Hz/单声道/16bit）\n",
+         KWS_DATA_DIR, AUDIO_SAMPLE_RATE);
+
+  ret = kws_init();
+  if (ret < 0)
+    {
+      printf("      kws_init() 失败: %d（内部表建不起来，属异常）\n", ret);
+      report("KWS 模块初始化", 0, "kws_init 失败");
+      return -1;
+    }
+
+  ready = kws_ready_count();
+
+  printf("      阈值          : %d（每维每帧 RMS 距离 ×1000；"
+         "kws_set_threshold 可改）\n", kws_get_threshold());
+  printf("      一个特征点    : %dms\n", KWS_FEAT_MS);
+
+  /* 这里不打印 kws_get_last_distance()：kws_init() 内部会 kws_reset()，
+   * 那个值必然是 -1（要看"差多少"请用 kws live，它跑完会打出来） */
+
+  for (s = 0; s < KWS_MAX_TEMPLATES; s++)
+    {
+      n = kws_template_frames(s);
+
+      if (n > 0)
+        {
+          printf("      slot%d : 可用 —— %d 个特征点（%dms），应念「%s」\n",
+                 s, n, n * KWS_FEAT_MS, kws_slot_word(s));
+        }
+      else
+        {
+          printf("      slot%d : 空   —— 应念「%s」\n", s, kws_slot_word(s));
+        }
+    }
+
+  snprintf(detail, sizeof(detail), "模板 %d/%d 条可用，阈值 %d", ready,
+           KWS_MAX_TEMPLATES, kws_get_threshold());
+  report("唤醒词模板", ready > 0, detail);
+
+  if (ready == 0)
+    {
+      printf("      提示：还没有模板，kws_feed 永远不会返回 1 —— 先录一条：\n");
+      printf("            hw_test kws enroll 0 4   （念「你好，openvela」）\n");
+      printf("            hw_test kws enroll 1 4   （念「Hello，openvela」）\n");
+    }
+  else
+    {
+      printf("      提示：/data 是 tmpfs —— 模板重启就丢，"
+             "重启后要重录（或从别处拷回 " KWS_DATA_DIR "）\n");
+    }
+
+  return ready > 0 ? OK : -1;
+}
+
+/****************************************************************************
+ * Name: step_kws_live
+ *
+ * Description:
+ *   `hw_test kws live [秒]`：边录音边实时喂 kws_feed，命中就打印一行。
+ *   用途是**在没有语音应用的情况下单独验收唤醒词** —— 因为它不依赖
+ *   ai_companion/LVGL，只看"说了唤醒词会不会报命中"。
+ *
+ *   ⚠ 只能在 ai_companion 没跑的时候用：它开机自启时会独占麦克风（半双工），
+ *     而且和这里共享 KWS 的全局状态。使用提示里也打了这句话。
+ *   和 enroll 一样先 kws_mic_acquire()：拿不到麦克风就整条 FAIL，
+ *   kws_init()/kws_reset() 一个都不调（否则先把正在跑的唤醒词链路清掉了，
+ *   最后才拿到 -EBUSY）。
+ *
+ ****************************************************************************/
+
+static int step_kws_live(int seconds)
+{
+  char detail[96];
+  FAR int16_t *pcm = NULL;
+  int hits;
+  int ret;
+
+  if (seconds < 1 || seconds > KWS_LIVE_MAX_SEC)
+    {
+      int clamp = (seconds < 1) ? KWS_LIVE_DEFAULT_SEC : KWS_LIVE_MAX_SEC;
+
+      printf("      提示：听音秒数 %d 不在 1..%d 里，按 %d 秒听\n",
+             seconds, KWS_LIVE_MAX_SEC, clamp);
+      seconds = clamp;
+    }
+
+  printf("[KWS] 实时听 %d 秒：请说「你好，openvela」或「Hello，openvela」\n",
+         seconds);
+  printf("      注意：本板半双工 + 整机单一大镜像 —— ai_companion 开机自启后\n");
+  printf("            会一直独占麦克风，所以本命令只能在它没跑的时候用，\n");
+  printf("            否则 audio_in_start() 直接失败 -EBUSY。\n");
+  printf("      命中延迟：说完最后一个字后还要等 ~300ms 的尾静音才判（正常）\n");
+
+  /* 先拿麦克风：拿不到就一个 kws_dtw 接口都不碰（见 kws_mic_acquire） */
+
+  if (kws_mic_acquire() < 0)
+    {
+      report("KWS 麦克风", 0, "拿不到麦克风（先停 ai_companion）");
+      return -1;
+    }
+
+  ret = kws_init();
+  if (ret < 0)
+    {
+      audio_in_stop();
+      printf("      kws_init() 失败: %d（内部表建不起来，属异常）\n", ret);
+      report("KWS 模块初始化", 0, "kws_init 失败");
+      return -1;
+    }
+
+  report("KWS 模块初始化", 1, "见上面的 [KWS] 初始化行");
+
+  if (kws_ready_count() <= 0)
+    {
+      audio_in_stop();
+      printf("      还没有模板（kws_feed 永远不会返回 1）—— 先跑 "
+             "hw_test kws enroll 0 4\n");
+      report("唤醒词实时听音", 0, "还没有模板（先 kws enroll）");
+      return -1;
+    }
+
+  /* 交给过别人（ASR）之后再听，预滚环/自适应本底/冷却都是旧的，清一下 */
+
+  kws_reset();
+
+  ret = kws_record(seconds, 1, 1, &pcm);    /* mic_held=1：麦已经在手里 */
+  hits = (int)g_krec_hits;
+
+  if (ret < 0)
+    {
+      report("唤醒词实时听音", 0, "录音失败（原因见上面）");
+      return -1;
+    }
+
+  snprintf(detail, sizeof(detail), "命中 %d 次 / 听 %d 秒，最近距离 %d（阈值 %d）",
+           hits, seconds, kws_get_last_distance(), kws_get_threshold());
+  report("唤醒词实时听音", hits > 0, detail);
+
+  if (hits == 0)
+    {
+      printf("      没命中怎么查：距离 -1 = 那句话被长度差挡在 DTW 带宽外；\n");
+      printf("      距离明显大于阈值 = 模板和现场口音/音量差得远，重录一次模板\n");
+    }
+  else
+    {
+      printf("      命中过 %d 次 —— 唤醒词功能在这台板子上转起来了\n", hits);
+    }
+
+  return hits > 0 ? OK : -1;
+}
+
+/****************************************************************************
+ * Name: step_kws_selftest
+ *
+ * Description:
+ *   `hw_test kws selftest`：跑 kws_dtw.c 的自检 —— 它拿合成 1kHz 查 FFT/Mel
+ *   表，再拿模板 0 自己跟自己、跟"时间拉伸 1.25 倍"的副本、跟"帧序打乱"的
+ *   假句子算 DTW 距离，最后打印**推荐阈值**（推荐值 = 同句侧上限和结构打乱侧
+ *   下限的中点，有第二条模板再往"不同词"那侧拉一半）。
+ *
+ *   自检本身只吃合成数据 + /data 里的模板，不录音；但模块没初始化时它直接
+ *   返回 KWS_ERR_STATE，所以这里要 kws_init()（它顺便把模板读进来）。
+ *
+ *   ⚠ 会 kws_reset()（kws_init 内部）—— 会和正在听的 ai_companion 抢模块的
+ *     流式状态，所以这里**先** kws_mic_acquire() 确认麦克风没人用：拿不到就
+ *     整条 FAIL、一个 kws_dtw 接口都不碰。确认到了立刻 audio_in_stop() 还回去
+ *     （本子命令不录音，开机只为拿到"没有别的会话在跑"这个证据）。
+ *
+ *   返回 OK / -1：每个失败项的原因由 kws_selftest() 自己 printf，这里只把它
+ *   折成 PASS/FAIL 记进总账。**没有模板时不报 PASS**：那种情况下自检会跳过
+ *   第 2/3 项、没有推荐阈值，标定根本做不下去 —— 报 PASS 会误导现场。
+ *
+ ****************************************************************************/
+
+static int step_kws_selftest(void)
+{
+  char detail[96];
+  int ready;
+  int ret;
+
+  /* 先确认麦克风没人用，再碰 kws_dtw（见 kws_mic_acquire） */
+
+  if (kws_mic_acquire() < 0)
+    {
+      report("KWS 麦克风", 0, "拿不到麦克风（先停 ai_companion）");
+      return -1;
+    }
+
+  ret = kws_init();
+  if (ret < 0)
+    {
+      audio_in_stop();
+      printf("      kws_init() 失败: %d（内部表建不起来，属异常）\n", ret);
+      report("KWS 模块初始化", 0, "kws_init 失败");
+      return -1;
+    }
+
+  /* 麦只是拿来当"没有别的会话"的证据，后面的自检全是纯计算，早点还回去 */
+
+  audio_in_stop();
+
+  ret   = kws_selftest();
+  ready = kws_ready_count();            /* kws_dtw.h 的现成接口：可用模板条数 */
+
+  if (ret != 0)
+    {
+      printf("      自检有失败项（原因见上面的 [KWS] 行）\n");
+      snprintf(detail, sizeof(detail), "有失败项（当前阈值 %d）",
+               kws_get_threshold());
+      report("唤醒词自检", 0, detail);
+      return -1;
+    }
+
+  if (ready == 0)
+    {
+      /* 没有模板时 kws_selftest() 跳过第 2/3 项、fails 仍是 0 → 返回 0。
+       * 那个 0 只说明"能查的几项没查出问题"，不代表唤醒词能用：没有模板就
+       * 没有推荐阈值，标定无从谈起（kws_feed 也永远不会返回 1）。 */
+
+      printf("      无法自检：一条模板都没有 —— 自检会跳过「模板自比对」和"
+             "「互距离」两项，\n");
+      printf("      也就算不出推荐阈值，标定做不下去。先录一条：\n");
+      printf("            hw_test kws enroll 0 4   （念「你好，openvela」）\n");
+      snprintf(detail, sizeof(detail), "没有模板，无法自检（先 kws enroll 0）");
+      report("唤醒词自检", 0, detail);
+      return -1;
+    }
+
+  printf("      提示：推荐阈值在上面的 [KWS] 推荐阈值 那一行，"
+         "当场改就 `hw_test kws threshold <值>`\n");
+
+  snprintf(detail, sizeof(detail), "自检全通过（当前阈值 %d）",
+           kws_get_threshold());
+  report("唤醒词自检", 1, detail);
+
+  return OK;
+}
+
+/****************************************************************************
+ * Name: step_kws_threshold
+ *
+ * Description:
+ *   `hw_test kws threshold <值|default>`：当场改判定阈值（现场标定的入口）。
+ *   单位是"每维每帧 RMS 距离 ×1000"，默认 KWS_THRESHOLD_MILLI = 1800；
+ *   参数写 `default`（大小写敏感，和子命令同一个小写风格）就是恢复 1800 ——
+ *   免去为了回默认重启一次（重启还会把刚标定的一起清掉）。
+ *
+ *   这里**故意不调 kws_init()**：阈值就是 kws_dtw.c 里那个全局变量，同一
+ *   镜像里 ai_companion 和这里共享它 —— 不初始化就等于不碰流式状态，所以
+ *   可以在 ai_companion 正常跑着（正在听唤醒词）的时候改，改完下一次判定
+ *   就用新值。标定时本来就该这么用：一边试唤醒，一边调阈值。
+ *
+ *   值合法不合法交给 kws_set_threshold() 自己判（它会 printf 原因，
+ *   非法的直接忽略），这里只按"读回来的值是不是我要的那个数"判断有没有生效。
+ *
+ *   额外多一道闸：**大于 KWS_TH_MAX_SAFE（9690）时本子命令直接拒绝设置**，
+ *   报 FAIL 并说清"这个值会让任何输入都判命中"，阈值保持原来的不动。
+ *   理由：kws_dtw.c 那边只警告不拒绝（标定的人可能故意），但这里是给人手敲
+ *   的入口，`1800` 多打一个 0 就静默把唤醒词变成"随便什么都唤醒" —— 现场
+ *   演示时这种"改完还报 PASS"的事故代价太大。真想试饱和区，得走模块接口。
+ *
+ *   ⚠ 只改 RAM：kws_dtw.c 不落盘，重启回默认 —— 打印里明确说了这句。
+ *
+ ****************************************************************************/
+
+static int step_kws_threshold(int th)
+{
+  char detail[96];
+  int old;
+  int now;
+
+  old = kws_get_threshold();
+
+  if (th > KWS_TH_MAX_SAFE)
+    {
+      printf("      拒绝设置：%d 大于 %d（DTW 饱和距离的下限）——\n",
+             th, KWS_TH_MAX_SAFE);
+      printf("      那个区间里距离被 DTW 的上限钉住，**任何输入都会被判命中**，\n");
+      printf("      也就是唤醒词变成「随便什么都唤醒」（阈值实际失效）。\n");
+      printf("      阈值保持 %d 不变；要回默认值用："
+             "hw_test kws threshold default\n", old);
+      snprintf(detail, sizeof(detail), "%d 会让任何输入都命中，已拒绝（仍是 %d）",
+               th, old);
+      report("唤醒词阈值", 0, detail);
+      return -1;
+    }
+
+  kws_set_threshold(th);
+  now = kws_get_threshold();
+
+  if (now != th)
+    {
+      printf("      设置失败：阈值还是 %d（模块拒了这个值，"
+             "原因见上面 [KWS] 那行）\n", now);
+      snprintf(detail, sizeof(detail), "%d 被拒绝（仍是 %d）", th, now);
+      report("唤醒词阈值", 0, detail);
+      return -1;
+    }
+
+  printf("      阈值 %d -> %d（每维每帧 RMS 距离 ×1000）\n", old, now);
+  printf("      注意：只对本次运行有效 —— kws_dtw 不落盘，重启回到默认 %d，"
+         "要长期生效得把 %d 写进代码/开机脚本\n", KWS_THRESHOLD_MILLI, now);
+  printf("      提示：越高越容易命中、也越容易误唤醒；当场看效果就读"
+         " ai_companion 打的\n");
+  printf("            `[KWS] 命中唤醒词` 那行日志；要单独听唤醒词"
+         "（kws live）得先停掉\n");
+  printf("            ai_companion，否则 audio_in_start 直接 -EBUSY\n");
+
+  snprintf(detail, sizeof(detail), "%d -> %d（重启回 %d）", old, now,
+           KWS_THRESHOLD_MILLI);
+  report("唤醒词阈值", 1, detail);
+
+  return OK;
+}
+
+/****************************************************************************
+ * Name: step_kws
+ *
+ * Description:
+ *   kws 子命令的入口（main 里只认 cmd/slot/seconds/threshold 四个数）。
+ *   没编 hello_app 的配置下只打印一句"本配置不支持"。
+ *
+ ****************************************************************************/
+
+static int step_kws(int cmd, int slot, int seconds, int threshold)
+{
+  switch (cmd)
+    {
+      case KWS_CMD_ENROLL:
+        return step_kws_enroll(slot, seconds);
+
+      case KWS_CMD_TEST:
+        return step_kws_test();
+
+      case KWS_CMD_LIVE:
+        return step_kws_live(seconds);
+
+      case KWS_CMD_SELFTEST:
+        return step_kws_selftest();
+
+      case KWS_CMD_THRESHOLD:
+        return step_kws_threshold(threshold);
+
+      default:
+        return -1;
+    }
+}
+
+#else  /* !HW_TEST_HAS_KWS */
+
+static int step_kws(int cmd, int slot, int seconds, int threshold)
+{
+  (void)cmd;
+  (void)slot;
+  (void)seconds;
+  (void)threshold;
+
+  printf("[KWS] 本配置没有启用 hello_app"
+         "（CONFIG_LVX_USE_CONTEST2026_233_HELLO_APP），"
+         "命令词识别模块 kws_dtw.c 不在固件里\n");
+  report("唤醒词自检", 0, "编译时未启用");
+  return -1;
+}
+
+#endif /* HW_TEST_HAS_KWS */
+
+/****************************************************************************
  * Name: audio_out_play
  *
  * Description:
@@ -2288,6 +3365,88 @@ static bool arg_is_number(FAR const char *s)
 }
 
 /****************************************************************************
+ * Name: arg_tail_ws / arg_is_word / arg_is_number_ws / arg_copy_trimmed
+ *
+ * Description:
+ *   **串口那条路必须容忍尾随空白**，尤其是 '\r'：PC 端写 nsh 命令时习惯发
+ *   "\r\n" 结束一行（板子自己的 _flash/raw_cap.py 也是这么敲回车的），而 NSH
+ *   的 readline 只把 '\n' 当行尾 —— 前面那个 '\r' 会留在行缓冲里、粘在
+ *   **最后一个参数**后面（`hw_test lcdtap 100 200 1\r\n` 的最后一个参数就成了
+ *   "1\r"）。不处理的话，PC 端 --serial 模式下一按鼠标，板子就会回一行
+ *   "用法 hw_test lcdtap ..."，看着像命令名写错了。
+ *
+ *   所以 lcdmirror / lcdtap 这两个子命令的参数判定都走下面这几个（子命令名、
+ *   数字都容忍尾随空白；节点名/IP 先拷进本地缓冲再去掉尾随空白）。
+ *   其它子命令没这问题：它们是人在终端里敲的，不经过 PC 端那个脚本。
+ *
+ ****************************************************************************/
+
+static size_t arg_tail_ws(FAR const char *s)
+{
+  size_t n = strlen(s);
+
+  while (n > 0 &&
+         (s[n - 1] == '\r' || s[n - 1] == '\n' ||
+          s[n - 1] == ' ' || s[n - 1] == '\t'))
+    {
+      n--;
+    }
+
+  return n;
+}
+
+static bool arg_is_word(FAR const char *s, FAR const char *word)
+{
+  size_t n = arg_tail_ws(s);
+
+  return strlen(word) == n && strncmp(s, word, n) == 0;
+}
+
+static bool arg_is_number_ws(FAR const char *s)
+{
+  size_t n = arg_tail_ws(s);
+  size_t i = 0;
+
+  if (n == 0)
+    {
+      return false;
+    }
+
+  if (s[0] == '-' || s[0] == '+')
+    {
+      if (n == 1)
+        {
+          return false;
+        }
+
+      i = 1;
+    }
+
+  for (; i < n; i++)
+    {
+      if (s[i] < '0' || s[i] > '9')
+        {
+          return false;
+        }
+    }
+
+  return true;
+}
+
+static void arg_copy_trimmed(FAR char *dst, size_t cap, FAR const char *src)
+{
+  size_t n = arg_tail_ws(src);
+
+  if (n >= cap)
+    {
+      n = cap - 1;
+    }
+
+  memcpy(dst, src, n);
+  dst[n] = '\0';
+}
+
+/****************************************************************************
  * Name: step_backlight
  *
  * Description:
@@ -2375,6 +3534,72 @@ static int step_backlight(int percent)
 }
 
 /****************************************************************************
+ * Name: step_panel_reinit
+ *
+ * Description:
+ *   lcdreinit 子命令：面板重新初始化（黑屏救回）。
+ *
+ *   救的是哪一种黑屏：**整屏黑，但应用完全正常** —— LVGL 还在响应触摸、
+ *   还在 20~30 帧/s 往面板推画面（`hw_test status` / [ui] 仪表都能证明），
+ *   `hw_test lcd 80` 下发亮度也成功，可屏幕就是不亮；reset 无效，只有真断电
+ *   才恢复。那是"面板自己丢了配置"，不是 CPU/LCDC 挂了，所以重发一遍面板
+ *   初始化序列就该回来。
+ *
+ *   这个子命令做的就是：调 robot_ui_bridge_panel_reinit() —— 面板侧重发配置
+ *   （含拉一次 RESET 脚）+ 请 LVGL 线程把整屏判脏重推一次。
+ *
+ *   打印里那句"看屏幕"是给用户看的判断依据：这个命令**没法自己知道**屏幕
+ *   亮没亮（面板没有回读"我在显示"的寄存器），所以只能报告下发是否成功，
+ *   亮不亮得用户自己看。
+ *
+ ****************************************************************************/
+
+static int step_panel_reinit(void)
+{
+  clock_t  t0;
+  uint32_t elapsed_ms;
+  int      ret;
+
+  printf("[LCD ] 面板重新初始化（整屏黑的救回动作）\n");
+  printf("      会做的事：重发一遍面板初始化序列（含拉一次 RESET 脚）"
+         "+ 重设像素格式/亮度/DisplayOn，\n");
+  printf("                然后请 LVGL 线程把整屏重绘一次。"
+         "期间画面会闪一下、触摸停约 0.5 秒，正常。\n");
+
+  t0  = clock_systime_ticks();
+  ret = robot_ui_bridge_panel_reinit();
+  elapsed_ms = (uint32_t)TICK2MSEC(clock_systime_ticks() - t0);
+
+  printf("      robot_ui_bridge_panel_reinit() -> %d，耗时 %u ms\n",
+         ret, (unsigned)elapsed_ms);
+
+  if (ret != OK)
+    {
+      report("面板重新初始化", 0,
+             ret == -ENODEV
+                 ? "面板驱动还没绑上（开机 lcd_init 线程没跑完？）"
+                 : (ret == -ENOSYS
+                        ? "本固件把 SF32LB_LCD_PANEL_REINIT 编成了 0"
+                        : "驱动侧拒绝了这次调用（见上面 [Bridge] 日志）"));
+      return -1;
+    }
+
+  report("面板重新初始化", 1, "初始化序列已下发（亮不亮要看屏幕）");
+
+  printf("      看屏幕：\n");
+  printf("        救回来了 -> 1~2 秒内整屏闪一下然后恢复画面，"
+         "触摸也恢复响应；\n");
+  printf("                   这时不用再敲别的，界面自己会继续刷。\n");
+  printf("        没救回来 -> 屏幕仍然全黑。串口里应该能看到\n");
+  printf("                   `[Bridge] 面板已重初始化，已投一次全屏重绘`\n");
+  printf("                   + 驱动侧的 `panel reinit: 完成，亮度 N%%`；\n");
+  printf("                   要是这两行也在、屏幕还是黑的，"
+         "那基本是硬件侧（面板供电/排线）。\n");
+
+  return OK;
+}
+
+/****************************************************************************
  * Name: step_status
  *
  * Description:
@@ -2451,6 +3676,223 @@ static int step_status(void)
 }
 
 /****************************************************************************
+ * Name: step_lcdmirror
+ *
+ * Description:
+ *   lcdmirror 子命令：屏幕镜像（板子 -> PC）的开关与状态，
+ *   以及"PC 鼠标当触摸"这条反向通道（都跟着镜像任务走）。
+ *
+ *   `hw_test lcdmirror [start|stop|status|uart|tcp] [ip|节点] [port]`
+ *     - 不给子命令、或给 status：打印状态（只读）；会打印**当前传输**、
+ *       节点名/目标地址、收到多少条触摸消息、最后坐标、当前是按下还是抬起
+ *       —— 现场判断"鼠标到底通没通"看它；
+ *     - uart [dev]：切到**控制台串口**那条腿（默认 /dev/console）。帧格式
+ *       和 TCP 一模一样，所以 PC 端不用改解析器 —— 只是不再依赖 USB 网络。
+ *       **不会自动开**：串口和控制台日志共用一条线，必须手动切；
+ *     - tcp <ip> [port]：切回 TCP（顺带换目标地址）；
+ *     - start [ip] [port]：可选先换目标地址，再起镜像任务；
+ *       **开机本来就是自动起的**，所以正常情况这里只会打印"已经在跑"；
+ *     - stop：停掉镜像任务。**鼠标模拟触摸也一起停**（反向通道在镜像是哪个
+ *       循环里，镜像不在跑就不再注入），刷屏路径同时完全绕开、一行开销都不留。
+ *
+ *   ⚠ 本命令**不烧屏、不碰 LVGL**：镜像任务自己开 socket/串口、自己收自己发。
+ *   像素是 robot_ui 的 flush 钩子喂进来的，所以只有界面在刷的东西才会出现在
+ *   镜像里（比如 `hw_test lcdcolor` 那种直接写 /dev/fb0 的刷色不会进镜像）。
+ *   反过来，鼠标注入是喂给 robot_ui 里那个虚拟输入设备的，也只有界面在跑才
+ *   点得动。
+ *
+ *   协议是 **v2**（见 board/contest_board/src/lcd_mirror.h 的文件头注释）：
+ *   20 字节小端头 + 载荷，flags bit0=1 时载荷是 RLE 压缩流，压不小就退回原样；
+ *   一帧最多 LCD_MIRROR_MAX_ROWS_PER_FRAME 行，更长的脏区拆成多帧。
+ *   status 会把协议版本、RLE/原样帧数、压掉多少字节一起打出来。
+ *   ⚠ PC 端脚本要跟着 v2：老的只认 16 字节头（ver1）的客户端收不下现在的帧。
+ *
+ ****************************************************************************/
+
+static int step_lcdmirror(FAR const char *sub, FAR const char *ip, int port,
+                          FAR const char *dev, int resend_y0, int resend_rows)
+{
+  int ret;
+
+  printf("[LCDMIRROR] 屏幕镜像（板端 -> PC）\n\n");
+
+  /* `resend <y0> <rows>`：把这几行重新标脏、下一轮再发一遍。
+   * PC 侧发现某条带子被日志字节插坏（它已经解出帧头、知道是哪一段）时发它 —— 
+   * 这是"精确自愈"，取代了原来每 3 秒一趟的整屏关键帧（那趟会把 1.4 秒的线时
+   * 全占掉，用户的即时更新只能排队）。 */
+
+  if (sub != NULL && strcmp(sub, "resend") == 0)
+    {
+      lcd_mirror_resend_rows((uint16_t)resend_y0, (uint16_t)resend_rows);
+      printf("      已请求补发 y=%d 起 %d 行\n", resend_y0, resend_rows);
+      return OK;
+    }
+
+  if (sub != NULL && strcmp(sub, "keyframe") == 0)
+    {
+      lcd_mirror_resend_all();
+      printf("      已请求整屏关键帧（全部行重新标脏）\n");
+      return OK;
+    }
+
+  /* 先看子命令是不是换传输：这两条都只是置标志，任务下一轮自己重开。 */
+
+  if (sub != NULL && strcmp(sub, "uart") == 0)
+    {
+      ret = lcd_mirror_use_uart(dev);
+      if (ret < 0)
+        {
+          printf("      串口节点名太长: %d\n", ret);
+          report("切换到串口传输", 0, "lcd_mirror_use_uart 失败");
+          return -1;
+        }
+
+      printf("      传输已切到串口 %s（帧格式和 TCP 完全一样；"
+             "反向触摸改用 `hw_test lcdtap <x> <y> <0|1>`）\n",
+             lcd_mirror_uart_dev());
+      printf("      ⚠ 串口上帧的二进制字节会和控制台日志交错，"
+             "PC 端会丢掉坏帧、靠每 %d 秒一次的整屏关键帧自愈；\n"
+             "        想停就 `hw_test lcdmirror tcp %s %d` 或 "
+             "`hw_test lcdmirror stop`\n",
+             LCD_MIRROR_UART_KEYFRAME_MS / 1000,
+             LCD_MIRROR_DEFAULT_IP, LCD_MIRROR_DEFAULT_PORT);
+
+      /* 没在跑就顺手起一个：切了传输却什么都没发生最容易被当成"没生效"。
+       * （已经在跑的话 start 是幂等的，不重启任务。） */
+      ret = lcd_mirror_start();
+      if (ret < 0)
+        {
+          report("切换到串口传输", 0, "镜像任务起不来");
+          return -1;
+        }
+
+      report("切换到串口传输", 1, lcd_mirror_uart_dev());
+      lcd_mirror_status();
+      return OK;
+    }
+
+  if (sub != NULL && strcmp(sub, "tcp") == 0)
+    {
+      ret = lcd_mirror_use_tcp(ip, (uint16_t)port);
+      if (ret < 0)
+        {
+          printf("      目标地址设置失败: %d\n", ret);
+          report("切换回 TCP 传输", 0, "lcd_mirror_use_tcp 失败");
+          return -1;
+        }
+
+      printf("      传输已切回 TCP，目标 %s:%d\n",
+             lcd_mirror_target_ip(), (int)lcd_mirror_target_port());
+      report("切换回 TCP 传输", 1, NULL);
+      lcd_mirror_status();
+      return OK;
+    }
+
+  if (ip != NULL || port > 0)
+    {
+      ret = lcd_mirror_set_target(ip, (uint16_t)port);
+      if (ret < 0)
+        {
+          printf("      目标地址设置失败: %d\n", ret);
+          report("设置目标地址", 0, "lcd_mirror_set_target 失败");
+          return -1;
+        }
+
+      printf("      目标已设为 %s:%d\n", lcd_mirror_target_ip(),
+             (int)lcd_mirror_target_port());
+    }
+
+  if (sub != NULL && strcmp(sub, "stop") == 0)
+    {
+      ret = lcd_mirror_stop();
+      if (ret < 0)
+        {
+          printf("      停止请求已发但任务还没退完: %d\n", ret);
+          report("屏幕镜像已停止", 0, "任务退出超时（1 秒）");
+          lcd_mirror_status();
+          return -1;
+        }
+
+      report("屏幕镜像已停止", 1, NULL);
+      lcd_mirror_status();
+      return OK;
+    }
+
+  if (sub != NULL && strcmp(sub, "start") == 0)
+    {
+      ret = lcd_mirror_start();
+      if (ret < 0)
+        {
+          printf("      启动失败: %d\n", ret);
+          report("屏幕镜像已启动", 0, "task_create / 影子缓冲分配失败");
+          return -1;
+        }
+
+      report("屏幕镜像已启动", 1, NULL);
+      lcd_mirror_status();
+      return OK;
+    }
+
+  if (sub != NULL && strcmp(sub, "status") != 0)
+    {
+      printf("      lcdmirror: 未知子命令 '%s'"
+             "（start / stop / status / uart [dev] / tcp <ip> [port]）\n", sub);
+      usage();
+      return -1;
+    }
+
+  /* status：只读。镜像没在跑不算 FAIL —— 它就是可以关的。 */
+
+  lcd_mirror_status();
+  printf("      在 PC 上跑：py -3.10 D:/apply/claw/_flash/lcd_mirror.py\n");
+  report("屏幕镜像状态查询", 1, lcd_mirror_is_running() ? "运行中" : "已停止");
+  return OK;
+}
+
+/****************************************************************************
+ * Name: step_lcdtap
+ *
+ * Description:
+ *   `hw_test lcdtap <x> <y> <0|1>`：往镜像的触摸状态里注一次触摸。
+ *
+ *   这是**串口模式下的触摸入口**：串口那条线上，板子的帧是二进制、PC 的命令
+ *   是文本，反向触摸没法像 TCP 那样塞一个 8 字节二进制包进去（会被 NSH 的行
+ *   输入解析吃掉），所以改成 PC 写一行命令、由 NSH 执行。
+ *
+ *   参数必给（缺了直接报错退出，不靠 atoi 的 0 蒙过去）；x/y 是面板坐标，
+ *   负数和越界都会被钳到 0..389 / 0..449（钳位在 lcd_mirror_inject_touch 里）。
+ *   **镜像没在跑时注入是无效的**（界面那边根本不会来取），所以这里提示一句，
+ *   但不算 FAIL —— 这条命令本身是成功的。
+ *
+ ****************************************************************************/
+
+static int step_lcdtap(int x, int y, int down)
+{
+  printf("[LCDTAP] 注入触摸 (%d, %d) %s\n", x, y, down ? "按下" : "抬起");
+
+  if (x < 0)
+    {
+      x = 0;
+    }
+
+  if (y < 0)
+    {
+      y = 0;
+    }
+
+  lcd_mirror_inject_touch((uint16_t)x, (uint16_t)y, down != 0);
+
+  if (!lcd_mirror_is_running())
+    {
+      printf("      注意：镜像没在跑，这条触摸到不了界面"
+             "（先 `hw_test lcdmirror uart` 或 `hw_test lcdmirror start`）\n");
+    }
+
+  report("注入触摸", 1, NULL);
+  return OK;
+}
+
+/****************************************************************************
  * Name: append_arg
  *
  * Description:
@@ -2500,9 +3942,11 @@ int main(int argc, FAR char *argv[])
   int do_alarm      = 0;
   int do_button     = 0;
   int do_backlight  = 0;
+  int do_lcdreinit  = 0;
   int do_status     = 0;
   int do_tts        = 0;
   int do_asr        = 0;
+  int do_kws        = KWS_CMD_NONE;
   int standalone;
   int imu_frames    = IMU_DEFAULT_FRAMES;
   int rtc_sec       = RTC_DEFAULT_ALARM_SEC;
@@ -2518,6 +3962,25 @@ int main(int argc, FAR char *argv[])
   int touch_set     = 0;
   char tts_text[TTS_MAX_TEXT];
   FAR const char *asr_path = NULL;
+  int kws_slot      = -1;             /* -1 = 没给（enroll 必给，缺了要 FAIL） */
+  int kws_sec       = KWS_ENROLL_DEFAULT_SEC;
+  int kws_th        = 0;              /* threshold 子命令要在解析时就给全，
+                                       * 0 不是合法阈值，漏掉一眼能看出来 */
+  int do_lcdmirror  = 0;
+  int lcdmirror_resend_y0   = 0;   /* `lcdmirror resend <y0> <rows>` 用 */
+  int lcdmirror_resend_rows = 0;
+  FAR const char *lcdmirror_sub  = NULL;   /* NULL = 只打印状态 */
+  FAR const char *lcdmirror_ip   = NULL;
+  FAR const char *lcdmirror_dev  = NULL;   /* 只给 uart 用：串口节点名 */
+  int lcdmirror_port = 0;                  /* 0 = 不改，用板端默认 */
+  /* IP / 节点名先拷进这两个缓冲再去掉尾随 '\r'（串口上 PC 发来的命令行带
+   * "\r\n"，详细原因见 arg_tail_ws 的注释）。 */
+  char lcdmirror_ip_buf[32];
+  char lcdmirror_dev_buf[LCD_MIRROR_UART_DEV_MAX];
+  int do_lcdtap     = 0;
+  int lcdtap_x      = 0;
+  int lcdtap_y      = 0;
+  int lcdtap_down   = 0;
   int i;
 
   g_pass  = 0;
@@ -2586,9 +4049,135 @@ int main(int argc, FAR char *argv[])
           do_button  = 1;
           button_sec = (i + 1 < argc) ? atoi(argv[++i]) : BTN_DEFAULT_WAIT_SEC;
         }
+      else if (strcmp(argv[i], "lcdreinit") == 0)
+        {
+          do_lcdreinit = 1;
+        }
       else if (strcmp(argv[i], "status") == 0)
         {
           do_status = 1;
+        }
+      else if (strcmp(argv[i], "lcdmirror") == 0)
+        {
+          /* `hw_test lcdmirror [start|stop|status|uart|tcp] [ip|节点] [port]`
+           * 位置参数都可省：不给子命令 = 只打印状态；给了 IP 就顺手换目标
+           * （start 会重连到新地址）；`uart [节点]` 切控制台串口那条腿
+           * （不依赖 USB 网络），`tcp <ip> [port]` 切回来。
+           * 参数判定一律走 arg_is_word / arg_is_number_ws：串口那条路上 PC
+           * 发来的命令行末尾带着 '\r'（见那几个函数的注释）。 */
+
+          do_lcdmirror = 1;
+
+          if (i + 1 < argc)
+            {
+              /* 命中就钉一个**字面量**给 step_lcdmirror：argv 里那个可能带着
+               * 尾随 '\r'（"uart\r"），直接往下传的话后面 strcmp 全对不上。 */
+              if (arg_is_word(argv[i + 1], "start"))
+                {
+                  lcdmirror_sub = "start";
+                  i++;
+                }
+              else if (arg_is_word(argv[i + 1], "stop"))
+                {
+                  lcdmirror_sub = "stop";
+                  i++;
+                }
+              else if (arg_is_word(argv[i + 1], "status"))
+                {
+                  lcdmirror_sub = "status";
+                  i++;
+                }
+              else if (arg_is_word(argv[i + 1], "uart"))
+                {
+                  lcdmirror_sub = "uart";
+                  i++;
+                }
+              else if (arg_is_word(argv[i + 1], "tcp"))
+                {
+                  lcdmirror_sub = "tcp";
+                  i++;
+                }
+              else if (arg_is_word(argv[i + 1], "resend"))
+                {
+                  /* `lcdmirror resend <y0> <rows>`：PC 侧报"这条带子坏了"时发它。
+                   * 两个参数都必给、必须是数字（末尾可能粘着 PC 发来的 '\r'）。 */
+
+                  if (i + 3 >= argc || !arg_is_number_ws(argv[i + 2]) ||
+                      !arg_is_number_ws(argv[i + 3]))
+                    {
+                      printf("hw_test lcdmirror resend: 用法 "
+                             "hw_test lcdmirror resend <y0> <rows>\n");
+                      usage();
+                      return EXIT_FAILURE;
+                    }
+
+                  lcdmirror_sub = "resend";
+                  i++;
+                  lcdmirror_resend_y0   = atoi(argv[++i]);
+                  lcdmirror_resend_rows = atoi(argv[++i]);
+                }
+              else if (arg_is_word(argv[i + 1], "keyframe"))
+                {
+                  lcdmirror_sub = "keyframe";
+                  i++;
+                }
+            }
+
+          if (lcdmirror_sub != NULL && strcmp(lcdmirror_sub, "uart") == 0)
+            {
+              /* uart 后面那个位置是**设备节点**，只认以 '/' 开头的 —— 免得
+               * `hw_test lcdmirror uart status` 把 "status" 当成节点名去 open。
+               * 不给就用板端默认（/dev/console）。 */
+              if (i + 1 < argc && argv[i + 1][0] == '/')
+                {
+                  arg_copy_trimmed(lcdmirror_dev_buf, sizeof(lcdmirror_dev_buf),
+                                   argv[++i]);
+                  lcdmirror_dev = lcdmirror_dev_buf;
+                }
+            }
+          else if (i + 1 < argc && !arg_is_number_ws(argv[i + 1]))
+            {
+              arg_copy_trimmed(lcdmirror_ip_buf, sizeof(lcdmirror_ip_buf),
+                               argv[++i]);
+              lcdmirror_ip = lcdmirror_ip_buf;
+            }
+
+          if (i + 1 < argc && arg_is_number_ws(argv[i + 1]))
+            {
+              lcdmirror_port = atoi(argv[++i]);
+            }
+
+          if (i + 1 < argc)
+            {
+              printf("hw_test lcdmirror: 多余的参数 '%s'"
+                     "（用法 start|stop|status|uart [dev]|tcp <ip> [port]）\n",
+                     argv[i + 1]);
+              usage();
+              return EXIT_FAILURE;
+            }
+        }
+      else if (strcmp(argv[i], "lcdtap") == 0)
+        {
+          /* `hw_test lcdtap <x> <y> <0|1>`：注入一次触摸。
+           * **串口模式下的触摸入口** —— PC 往串口里写这一行文本（_flash/
+           * lcd_mirror.py 的 touch_cmd()，结尾是 "\r\n"），NSH 执行它
+           * （反向触摸不走帧的字节流，二进制包会被行输入解析吃掉）。
+           * 三个参数都必给：缺了/不是数字直接报错退出，不能拿 atoi 的 0
+           * 蒙过去（照 asr 缺文件路径那套写法）；数字判定用 arg_is_number_ws,
+           * 因为最后一个参数后面粘着 PC 发来的那个 '\r'。 */
+
+          if (i + 3 >= argc || !arg_is_number_ws(argv[i + 1]) ||
+              !arg_is_number_ws(argv[i + 2]) || !arg_is_number_ws(argv[i + 3]))
+            {
+              printf("hw_test lcdtap: 用法 hw_test lcdtap <x> <y> <0|1>\n");
+              usage();
+              return EXIT_FAILURE;
+            }
+
+          do_lcdtap   = 1;
+          lcdtap_x    = atoi(argv[++i]);
+          lcdtap_y    = atoi(argv[++i]);
+          lcdtap_down = atoi(argv[++i]);
         }
       else if (strcmp(argv[i], "tts") == 0)
         {
@@ -2621,6 +4210,92 @@ int main(int argc, FAR char *argv[])
           do_asr   = 1;
           asr_path = argv[++i];
         }
+      else if (strcmp(argv[i], "kws") == 0)
+        {
+          /* `hw_test kws <enroll|test|live|selftest|threshold> [...]`。
+           * slot / 秒数都只在"下一个参数是数字"时才吃掉 —— 和 lcd 子命令
+           * 同一个理由：`hw_test kws enroll abc` 要报"缺 slot"，
+           * 不能把 atoi("abc") = 0 当成 slot0 照录。
+           * threshold 是反过来的：值**必须**给，缺了/不是数字直接报错退出
+           * （照 asr 缺文件路径那套写法），不能拿 atoi("abc") = 0 去设阈值。
+           * 只多认一个字面量 `default`（换成默认阈值），别的一律走数字那条。 */
+
+          if (i + 1 >= argc)
+            {
+              printf("hw_test kws: 缺子命令"
+                     "（enroll <slot> [秒] / test / selftest / "
+                     "threshold <值|default> / live [秒]）\n");
+              usage();
+              return EXIT_FAILURE;
+            }
+
+          i++;
+
+          if (strcmp(argv[i], "enroll") == 0)
+            {
+              do_kws = KWS_CMD_ENROLL;
+
+              if (i + 1 < argc && arg_is_number(argv[i + 1]))
+                {
+                  kws_slot = atoi(argv[++i]);
+                }
+
+              if (i + 1 < argc && arg_is_number(argv[i + 1]))
+                {
+                  kws_sec = atoi(argv[++i]);
+                }
+            }
+          else if (strcmp(argv[i], "test") == 0)
+            {
+              do_kws = KWS_CMD_TEST;
+            }
+          else if (strcmp(argv[i], "selftest") == 0)
+            {
+              do_kws = KWS_CMD_SELFTEST;
+            }
+          else if (strcmp(argv[i], "threshold") == 0)
+            {
+              /* `default` = 一键恢复默认阈值（现场标定完想回默认，不用重启） */
+
+              if (i + 1 < argc && strcmp(argv[i + 1], "default") == 0)
+                {
+                  i++;
+                  kws_th = KWS_THRESHOLD_MILLI;
+                }
+              else if (i + 1 < argc && arg_is_number(argv[i + 1]))
+                {
+                  kws_th = atoi(argv[++i]);
+                }
+              else
+                {
+                  printf("hw_test kws: threshold 要一个数字或 default。用法 "
+                         "hw_test kws threshold <值|default>"
+                         "（default = 恢复 %d）\n", KWS_THRESHOLD_MILLI);
+                  usage();
+                  return EXIT_FAILURE;
+                }
+
+              do_kws = KWS_CMD_THRESHOLD;
+            }
+          else if (strcmp(argv[i], "live") == 0)
+            {
+              do_kws = KWS_CMD_LIVE;
+              kws_sec = KWS_LIVE_DEFAULT_SEC;
+
+              if (i + 1 < argc && arg_is_number(argv[i + 1]))
+                {
+                  kws_sec = atoi(argv[++i]);
+                }
+            }
+          else
+            {
+              printf("hw_test kws: 未知子命令 '%s'"
+                     "（enroll <slot> [秒] / test / selftest / "
+                     "threshold <值|default> / live [秒]）\n", argv[i]);
+              usage();
+              return EXIT_FAILURE;
+            }
+        }
       else
         {
           printf("hw_test: 未知参数 '%s'\n", argv[i]);
@@ -2629,12 +4304,14 @@ int main(int argc, FAR char *argv[])
         }
     }
 
-  /* imu / rtc / rtcday / audio / alarm / lcd / button / status / tts / asr
-   * 是各自独立的子命令：只跑自己，不跑那套 5 步自检
-   * （tts / asr 要联网，是全自检里唯一会等网络的，所以也放单独模式）。 */
+  /* imu / rtc / rtcday / audio / alarm / lcd / lcdreinit / button / status /
+   * tts / asr / kws / lcdmirror / lcdtap 是各自独立的子命令：只跑自己，
+   * 不跑那套 5 步自检（tts / asr 要联网，是全自检里唯一会等网络的，
+   * 所以也放单独模式）。 */
 
   standalone = do_imu || do_rtc || do_rtcday || do_audio || do_alarm ||
-               do_backlight || do_button || do_status || do_tts || do_asr;
+               do_backlight || do_lcdreinit || do_button || do_status ||
+               do_tts || do_asr || do_kws || do_lcdmirror || do_lcdtap;
 
   /* lcdcolor 只是刷个屏，别让它再干等 10 秒触摸 */
 
@@ -2648,8 +4325,8 @@ int main(int argc, FAR char *argv[])
   printf("   SF32LB52-DevKit-LCD 硬件自检 (hw_test)\n");
   if (standalone)
     {
-      printf("   子命令模式：只跑 imu/rtc/rtcday/audio/alarm/lcd/button/status/"
-             "tts/asr，不做 5 步自检\n");
+      printf("   子命令模式：只跑 imu/rtc/rtcday/audio/alarm/lcd/lcdreinit/"
+             "button/status/tts/asr/kws/lcdmirror/lcdtap，不做 5 步自检\n");
     }
   else
     {
@@ -2696,6 +4373,12 @@ int main(int argc, FAR char *argv[])
           printf("\n");
         }
 
+      if (do_lcdreinit)
+        {
+          step_panel_reinit();
+          printf("\n");
+        }
+
       if (do_button)
         {
           step_button_wait(button_sec);
@@ -2717,6 +4400,26 @@ int main(int argc, FAR char *argv[])
       if (do_asr)
         {
           step_asr(asr_path);
+          printf("\n");
+        }
+
+      if (do_kws != KWS_CMD_NONE)
+        {
+          step_kws(do_kws, kws_slot, kws_sec, kws_th);
+          printf("\n");
+        }
+
+      if (do_lcdmirror)
+        {
+          step_lcdmirror(lcdmirror_sub, lcdmirror_ip, lcdmirror_port,
+                         lcdmirror_dev, lcdmirror_resend_y0,
+                         lcdmirror_resend_rows);
+          printf("\n");
+        }
+
+      if (do_lcdtap)
+        {
+          step_lcdtap(lcdtap_x, lcdtap_y, lcdtap_down);
           printf("\n");
         }
     }

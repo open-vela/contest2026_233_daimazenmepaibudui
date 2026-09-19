@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <math.h>
 #include <pthread.h>
+#include <sched.h>
 #include <time.h>
 #include <errno.h>
 #include <syslog.h>
@@ -1183,4 +1184,623 @@ void sound_detect_init_default_classes(sound_detect_context_t *ctx)
   ctx->class_count = SOUND_TYPE_MAX;
 
   SOUND_DEBUG("初始化默认分类: %d 个", ctx->class_count);
+}
+
+/****************************************************************************
+ * 任务四：PCM 旁路 + 人声/非人声门控（实现）
+ *
+ * 详细设计见 ai_sound_detect.h 里那一段。这里只强调三条硬约束：
+ *   1) tap（录音线程调用）只做一次 memcpy，锁用 trylock，**绝不等待**；
+ *   2) 门控线程独立、优先级低于 app，慢了只丢窗；
+ *   3) 播放态（板子自己喇叭在响）整窗跳过 —— 自己的 TTS 不是异常声。
+ ****************************************************************************/
+
+/* 门限：全部按 sensitivity 缩放（sens 越大越敏感 = 门限越低）*/
+#define SOUND_GATE_SILENCE_RMS       0.004f  /* 静音底噪（-48dBFS 量级）*/
+#define SOUND_GATE_ANOMALY_RMS       0.020f  /* 喂本地模型的最小能量（-34dBFS）*/
+#define SOUND_GATE_VOICED_ZCR_MAX    0.35f   /* 浊音帧过零率上限 */
+#define SOUND_GATE_VOICED_AC_MIN     0.30f   /* 单帧"浊音样"的自相关峰下限 */
+#define SOUND_GATE_VOICED_AC_STRONG  0.60f   /* 整窗强周期性判据 */
+#define SOUND_GATE_VOICED_RATIO_MIN  0.25f   /* 浊音帧占比下限 */
+#define SOUND_GATE_FRAME_SAMPLES     512     /* 32ms 分析帧（自相关用它）*/
+#define SOUND_GATE_LAG_MIN           40      /* 16k/400Hz：人声基频上界 */
+#define SOUND_GATE_LAG_MAX           200     /* 16k/80Hz：人声基频下界 */
+#define SOUND_GATE_LAG_STEP          2
+#define SOUND_GATE_SENS_MIN          0.3f
+#define SOUND_GATE_SENS_MAX          3.0f
+
+/* 旁路环形缓冲与门控线程状态（单麦克风 → 单实例）*/
+static int16_t        *g_gate_ring;
+static size_t          g_gate_ring_head;
+static size_t          g_gate_ring_count;
+static pthread_mutex_t g_gate_lock;
+static bool            g_gate_lock_valid;
+static pthread_t       g_gate_thread;
+static bool            g_gate_thread_valid;
+static volatile bool   g_gate_stop;
+static volatile bool   g_gate_enabled;
+static volatile float  g_gate_sensitivity = 1.0f;
+static sound_detect_busy_cb_t  g_gate_busy_cb;
+static void                   *g_gate_busy_arg;
+static sound_detect_voice_cb_t g_gate_voice_cb;
+static void                   *g_gate_voice_arg;
+static sound_gate_stats_t      g_gate_stats;
+
+/* 任务三 / robot_ui 的弱实现兜底：对方落地后强符号覆盖（见 ai_sound_detect.h）。
+ *
+ * ⚠️ sound_event 这两个弱桩必须**只在对方根本没进构建**时存在。原因不是
+ * 「强符号覆盖弱符号」不够灵，而是静态库的懒加载：libapps_ai_companion.a 里
+ * ai_sound_detect.c.o 排在 sound_event.c.o 前面，链接器找 sound_event_init
+ * 时先命中的就是这里的弱定义，于是 sound_event.c.o **整个成员都不会被拉进
+ * 镜像**，强符号从来没机会参与竞争 —— 结果是编过、链过、跑起来模型却是死的。
+ * 所以按构建开关分家：开了 CONFIG_HELLO_APP_SOUND_EVENT 就把强符号留给
+ * sound_event.c 独占，只有没开时才拿这里的弱桩顶住链接。
+ *
+ * （ui_post_ask_alarm 不存在这个问题：它的强符号在 robot_ui/main.c，那个
+ * 成员因为别的符号必然被拉进镜像，弱定义能被正常覆盖。） */
+
+#ifndef CONFIG_HELLO_APP_SOUND_EVENT
+
+__attribute__((weak))
+int sound_event_init(void)
+{
+  return -ENOSYS;
+}
+
+__attribute__((weak))
+int sound_event_feed(const int16_t *pcm, size_t nsamples)
+{
+  (void)pcm;
+  (void)nsamples;
+  return -ENOSYS;
+}
+
+#endif /* !CONFIG_HELLO_APP_SOUND_EVENT */
+
+__attribute__((weak))
+void ui_post_ask_alarm(const char *reason)
+{
+  printf("[门控] ui_post_ask_alarm() 还没落地，询问框请求只能打串口: %s\n",
+         reason != NULL ? reason : "(无)");
+}
+
+__attribute__((weak))
+void ui_post_ask_standdown(const char *src)
+{
+  /* 询问页本来就不在这个镜像里，没有页面可撤 —— 这不是错，只是无从说起。 */
+  (void)src;
+}
+
+__attribute__((weak))
+bool robot_ui_alarm_claim(const char *src)
+{
+  /* robot_ui 没进镜像（或者那个模块还没落地）：屏幕上根本没有第二条确认入口，
+   * 没有谁能和本路重复报警，所以一律放行 —— 去重闸宁可多报一次也不能漏报。 */
+  (void)src;
+  return true;
+}
+
+/* ---- 环形缓冲（调者必须持锁）---- */
+
+static void gate_ring_drop(size_t n)
+{
+  if (n > g_gate_ring_count)
+    {
+      n = g_gate_ring_count;
+    }
+
+  g_gate_ring_head = (g_gate_ring_head + n) % SOUND_GATE_RING_SAMPLES;
+  g_gate_ring_count -= n;
+}
+
+static void gate_ring_push(const int16_t *pcm, size_t n)
+{
+  while (n > 0)
+    {
+      size_t space = SOUND_GATE_RING_SAMPLES - g_gate_ring_count;
+      size_t tail;
+      size_t first;
+
+      if (space == 0)
+        {
+          /* 队列满：丢最旧的样本（一次最多丢一个跳长，保住窗对齐）*/
+          gate_ring_drop(n < SOUND_GATE_HOP_SAMPLES ? n
+                                                     : SOUND_GATE_HOP_SAMPLES);
+          continue;
+        }
+
+      if (space > n)
+        {
+          space = n;
+        }
+
+      tail = (g_gate_ring_head + g_gate_ring_count) % SOUND_GATE_RING_SAMPLES;
+      first = SOUND_GATE_RING_SAMPLES - tail;
+      if (first > space)
+        {
+          first = space;
+        }
+
+      memcpy(&g_gate_ring[tail], pcm, first * sizeof(int16_t));
+      if (space > first)
+        {
+          memcpy(&g_gate_ring[0], pcm + first,
+                 (space - first) * sizeof(int16_t));
+        }
+
+      g_gate_ring_count += space;
+      pcm += space;
+      n -= space;
+    }
+}
+
+static void gate_ring_peek(int16_t *dst, size_t n)
+{
+  size_t first = SOUND_GATE_RING_SAMPLES - g_gate_ring_head;
+
+  if (first > n)
+    {
+      first = n;
+    }
+
+  memcpy(dst, &g_gate_ring[g_gate_ring_head], first * sizeof(int16_t));
+  if (n > first)
+    {
+      memcpy(dst + first, &g_gate_ring[0],
+             (n - first) * sizeof(int16_t));
+    }
+}
+
+/* ---- 门控判据（纯函数）---- */
+
+int sound_detect_voice_gate_ex(const int16_t *pcm, size_t n,
+                               sound_gate_features_t *out)
+{
+  sound_gate_features_t f;
+  uint64_t acc = 0;
+  size_t crossings = 0;
+  int frames = 0;
+  int voiced_frames = 0;
+  float ac_peak = 0.0f;
+  float sens;
+  float mean_sq;
+
+  if (pcm == NULL || n == 0)
+    {
+      return -EINVAL;
+    }
+
+  memset(&f, 0, sizeof(f));
+
+  /* 整窗能量 + 过零率 */
+
+  for (size_t i = 0; i < n; i++)
+    {
+      int32_t s = pcm[i];
+      acc += (uint64_t)((int64_t)s * s);
+
+      if (i > 0 && ((pcm[i - 1] < 0 && s >= 0) ||
+                    (pcm[i - 1] >= 0 && s < 0)))
+        {
+          crossings++;
+        }
+    }
+
+  mean_sq = (float)((double)acc / (double)n);
+  f.energy = mean_sq;
+  f.rms = sqrtf(mean_sq) / 32768.0f;
+  f.zcr = (n > 1) ? (float)crossings / (float)(n - 1) : 0.0f;
+
+  /* 逐 32ms 帧算自相关峰值比（浊音性）和帧过零率。
+   * 自相关对**周期性**敏感：人声浊音段高、宽带冲击/噪声低 —— 这正是
+   * "一声脆响"和"有人在说话"最好分的地方。 */
+
+  for (size_t off = 0; off + SOUND_GATE_FRAME_SAMPLES <= n;
+       off += SOUND_GATE_FRAME_SAMPLES)
+    {
+      float x[SOUND_GATE_FRAME_SAMPLES];
+      float r0 = 0.0f;
+      size_t fcross = 0;
+      float best = 0.0f;
+      float fzcr;
+
+      for (int i = 0; i < SOUND_GATE_FRAME_SAMPLES; i++)
+        {
+          x[i] = (float)pcm[off + i] / 32768.0f;
+          r0 += x[i] * x[i];
+
+          if (i > 0 && ((x[i - 1] < 0 && x[i] >= 0) ||
+                        (x[i - 1] >= 0 && x[i] < 0)))
+            {
+              fcross++;
+            }
+        }
+
+      frames++;
+
+      if (r0 < 1e-9f)
+        {
+          continue;    /* 静音帧：没有周期可谈，也不算浊音 */
+        }
+
+      for (int lag = SOUND_GATE_LAG_MIN; lag <= SOUND_GATE_LAG_MAX;
+           lag += SOUND_GATE_LAG_STEP)
+        {
+          float r = 0.0f;
+          float norm;
+
+          for (int i = 0; i + lag < SOUND_GATE_FRAME_SAMPLES; i++)
+            {
+              r += x[i] * x[i + lag];
+            }
+
+          norm = r / r0;
+          if (norm > best)
+            {
+              best = norm;
+            }
+        }
+
+      if (best > ac_peak)
+        {
+          ac_peak = best;
+        }
+
+      fzcr = (float)fcross / (float)(SOUND_GATE_FRAME_SAMPLES - 1);
+      if (best >= SOUND_GATE_VOICED_AC_MIN &&
+          fzcr <= SOUND_GATE_VOICED_ZCR_MAX)
+        {
+          voiced_frames++;
+        }
+    }
+
+  f.ac_peak = ac_peak;
+  f.voiced_ratio = (frames > 0) ? (float)voiced_frames / (float)frames : 0.0f;
+
+  sens = g_gate_sensitivity;
+  if (sens < SOUND_GATE_SENS_MIN)
+    {
+      sens = SOUND_GATE_SENS_MIN;
+    }
+  else if (sens > SOUND_GATE_SENS_MAX)
+    {
+      sens = SOUND_GATE_SENS_MAX;
+    }
+
+  f.active = (f.rms >= SOUND_GATE_SILENCE_RMS / sens) ? 1 : 0;
+  f.voice = 0;
+
+  if (f.active)
+    {
+      /* 像人声的两条路：
+       *   ① 有一定比例的"浊音样"帧（正常说话）；
+       *   ② 整窗强周期性且过零率不高（长元音 / 拖长音的呼救）。 */
+      if (f.voiced_ratio >= SOUND_GATE_VOICED_RATIO_MIN / sens ||
+          (f.ac_peak >= SOUND_GATE_VOICED_AC_STRONG / sens &&
+           f.zcr <= SOUND_GATE_VOICED_ZCR_MAX))
+        {
+          f.voice = 1;
+        }
+    }
+
+  if (out != NULL)
+    {
+      *out = f;
+    }
+
+  return f.voice;
+}
+
+int sound_detect_voice_gate(const int16_t *pcm, size_t n)
+{
+  return sound_detect_voice_gate_ex(pcm, n, NULL);
+}
+
+/* ---- 旁路入口（录音线程里调）---- */
+
+int sound_detect_pcm_tap(const int16_t *pcm, size_t n)
+{
+  if (pcm == NULL || n == 0)
+    {
+      return -EINVAL;
+    }
+
+  if (!g_gate_enabled || g_gate_ring == NULL || !g_gate_lock_valid)
+    {
+      return 0;    /* 门控没开：静默丢掉，不影响主链路 */
+    }
+
+  /* 只**试**锁：录音线程在这里等门控线程 = 丢麦克风数据，绝不允许。
+   * 抢不到就当下这一小块不要了（下一帧 20ms 后还有）。 */
+
+  if (pthread_mutex_trylock(&g_gate_lock) != 0)
+    {
+      return 0;
+    }
+
+  gate_ring_push(pcm, n);
+  pthread_mutex_unlock(&g_gate_lock);
+  return 0;
+}
+
+/* ---- 门控线程 ---- */
+
+static void *sound_detect_gate_thread(void *arg)
+{
+  int16_t *win;
+
+  (void)arg;
+
+  win = (int16_t *)malloc(SOUND_GATE_WINDOW_SAMPLES * sizeof(int16_t));
+  if (win == NULL)
+    {
+      printf("[门控] 分配门控窗口失败，门控线程退出\n");
+      return NULL;
+    }
+
+  printf("[门控] 门控线程启动\n");
+
+  while (!g_gate_stop)
+    {
+      bool have = false;
+      uint32_t now;
+      sound_gate_features_t f;
+      int verdict;
+      float sens;
+
+      if (g_gate_lock_valid && pthread_mutex_trylock(&g_gate_lock) == 0)
+        {
+          if (g_gate_ring_count >= SOUND_GATE_WINDOW_SAMPLES)
+            {
+              gate_ring_peek(win, SOUND_GATE_WINDOW_SAMPLES);
+              gate_ring_drop(SOUND_GATE_HOP_SAMPLES);
+              have = true;
+            }
+
+          pthread_mutex_unlock(&g_gate_lock);
+        }
+
+      if (!have)
+        {
+          usleep(20000);    /* 20ms：攒够一个窗口再判 */
+          continue;
+        }
+
+      /* 播放态：板子自己喇叭在响 → 整窗不判。
+       * 半双工下录音本来就停了，这里是兜住"停之前灌进来的那几帧"。 */
+
+      if (g_gate_busy_cb != NULL && g_gate_busy_cb(g_gate_busy_arg))
+        {
+          g_gate_stats.mute_windows++;
+          continue;
+        }
+
+      verdict = sound_detect_voice_gate_ex(win, SOUND_GATE_WINDOW_SAMPLES, &f);
+      if (verdict < 0)
+        {
+          continue;
+        }
+
+      now = sound_detect_get_tick_ms();
+      g_gate_stats.windows++;
+      g_gate_stats.last = f;
+
+      if (verdict > 0)
+        {
+          /* 人声：交给云端语音链路（回调里只许置标志）*/
+
+          g_gate_stats.voice_windows++;
+          g_gate_stats.last_voice_ms = now;
+
+          if (g_gate_voice_cb != NULL)
+            {
+              g_gate_voice_cb(&f, g_gate_voice_arg);
+            }
+
+          continue;
+        }
+
+      /* 非人声 + 能量超阈：喂本地小模型（任务三的 sound_event）。
+       * 每 200ms 一个窗地喂（重叠窗），投票/不应期由那边做。 */
+
+      sens = sound_detect_gate_sensitivity();
+      if (f.active && f.rms >= SOUND_GATE_ANOMALY_RMS / sens)
+        {
+          g_gate_stats.anomaly_windows++;
+          g_gate_stats.last_anomaly_ms = now;
+
+          if (sound_event_feed(win, SOUND_GATE_WINDOW_SAMPLES) < 0 &&
+              g_gate_stats.anomaly_windows == 1)
+            {
+              printf("[门控] 本地小模型还没落地（sound_event_feed 返回 -ENOSYS），"
+                     "异常窗暂时只记账\n");
+            }
+        }
+    }
+
+  free(win);
+  printf("[门控] 门控线程退出\n");
+  return NULL;
+}
+
+/* ---- 启停 / 配置 ---- */
+
+int sound_detect_bypass_start(void)
+{
+  struct sched_param param;
+  pthread_attr_t attr;
+  int ret;
+
+  if (g_gate_thread_valid)
+    {
+      return OK;
+    }
+
+  if (g_gate_ring == NULL)
+    {
+      g_gate_ring = (int16_t *)malloc(SOUND_GATE_RING_SAMPLES *
+                                      sizeof(int16_t));
+      if (g_gate_ring == NULL)
+        {
+          printf("[门控] 分配环形缓冲失败\n");
+          return -ENOMEM;
+        }
+    }
+
+  if (!g_gate_lock_valid)
+    {
+      ret = pthread_mutex_init(&g_gate_lock, NULL);
+      if (ret != 0)
+        {
+          free(g_gate_ring);
+          g_gate_ring = NULL;
+          return -ret;
+        }
+
+      g_gate_lock_valid = true;
+    }
+
+  pthread_mutex_lock(&g_gate_lock);
+  g_gate_ring_head = 0;
+  g_gate_ring_count = 0;
+  memset(&g_gate_stats, 0, sizeof(g_gate_stats));
+  pthread_mutex_unlock(&g_gate_lock);
+
+  g_gate_stop = false;
+
+  /* 低优先级线程：比 app 低一档，抢不到 CPU 无所谓，丢窗不丢音频 */
+
+  pthread_attr_init(&attr);
+  pthread_attr_setstacksize(&attr, SOUND_GATE_THREAD_STACK);
+  pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
+  memset(&param, 0, sizeof(param));
+  param.sched_priority = SOUND_GATE_THREAD_PRIORITY;
+
+  if (pthread_attr_setschedparam(&attr, &param) != 0)
+    {
+      /* 有些系统（主机侧跑单测时的 Linux SCHED_OTHER）不接受非 0 优先级：
+       * 那就退回继承创建者的优先级，线程照样起来，别为了"低优先级"失败。 */
+      pthread_attr_setinheritsched(&attr, PTHREAD_INHERIT_SCHED);
+    }
+
+  ret = pthread_create(&g_gate_thread, &attr, sound_detect_gate_thread, NULL);
+  pthread_attr_destroy(&attr);
+
+  if (ret != 0)
+    {
+      printf("[门控] 创建门控线程失败: %d\n", ret);
+      return -ret;
+    }
+
+  g_gate_thread_valid = true;
+  g_gate_enabled = true;
+
+  printf("[门控] 旁路门控已启动: 窗口 %.2fs / 步长 %.2fs / 环形 %d 样本 / "
+         "优先级 %d\n",
+         (double)SOUND_GATE_WINDOW_SAMPLES / 16000.0,
+         (double)SOUND_GATE_HOP_SAMPLES / 16000.0,
+         (int)SOUND_GATE_RING_SAMPLES,
+         SOUND_GATE_THREAD_PRIORITY);
+
+  return OK;
+}
+
+void sound_detect_bypass_stop(void)
+{
+  if (!g_gate_thread_valid)
+    {
+      return;
+    }
+
+  g_gate_stop = true;
+  pthread_join(g_gate_thread, NULL);
+  g_gate_thread_valid = false;
+  g_gate_enabled = false;
+
+  if (g_gate_ring != NULL)
+    {
+      free(g_gate_ring);
+      g_gate_ring = NULL;
+    }
+
+  if (g_gate_lock_valid)
+    {
+      pthread_mutex_destroy(&g_gate_lock);
+      g_gate_lock_valid = false;
+    }
+
+  g_gate_ring_head = 0;
+  g_gate_ring_count = 0;
+
+  printf("[门控] 旁路门控已停止（判过 %u 窗 / 人声 %u / 播放跳过 %u / "
+         "异常 %u）\n",
+         (unsigned)g_gate_stats.windows,
+         (unsigned)g_gate_stats.voice_windows,
+         (unsigned)g_gate_stats.mute_windows,
+         (unsigned)g_gate_stats.anomaly_windows);
+}
+
+void sound_detect_gate_set_enabled(bool on)
+{
+  g_gate_enabled = on;
+  printf("[门控] 已%s（%s）\n", on ? "打开" : "关闭",
+         on ? "非人声异常交给本地模型" : "只出人声提示，不喂本地模型");
+}
+
+bool sound_detect_gate_enabled(void)
+{
+  return g_gate_enabled;
+}
+
+void sound_detect_gate_set_sensitivity(float sens)
+{
+  if (sens < SOUND_GATE_SENS_MIN)
+    {
+      sens = SOUND_GATE_SENS_MIN;
+    }
+  else if (sens > SOUND_GATE_SENS_MAX)
+    {
+      sens = SOUND_GATE_SENS_MAX;
+    }
+
+  g_gate_sensitivity = sens;
+  printf("[门控] 灵敏度 = %.2f（越大越容易判成人声/异常）\n", (double)sens);
+}
+
+float sound_detect_gate_sensitivity(void)
+{
+  float sens = g_gate_sensitivity;
+
+  if (sens < SOUND_GATE_SENS_MIN)
+    {
+      sens = SOUND_GATE_SENS_MIN;
+    }
+  else if (sens > SOUND_GATE_SENS_MAX)
+    {
+      sens = SOUND_GATE_SENS_MAX;
+    }
+
+  return sens;
+}
+
+void sound_detect_gate_set_busy_cb(sound_detect_busy_cb_t cb, void *arg)
+{
+  g_gate_busy_cb = cb;
+  g_gate_busy_arg = arg;
+}
+
+void sound_detect_gate_set_voice_cb(sound_detect_voice_cb_t cb, void *arg)
+{
+  g_gate_voice_cb = cb;
+  g_gate_voice_arg = arg;
+}
+
+const sound_gate_stats_t *sound_detect_gate_get_stats(void)
+{
+  return &g_gate_stats;
+}
+
+void sound_detect_gate_reset_stats(void)
+{
+  memset(&g_gate_stats, 0, sizeof(g_gate_stats));
 }

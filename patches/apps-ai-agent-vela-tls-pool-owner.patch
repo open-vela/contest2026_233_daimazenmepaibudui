@@ -1,0 +1,275 @@
+--- a/src/infra/vela_tls.c
++++ b/src/infra/vela_tls.c
+@@ -161,38 +161,82 @@
+     char port[8];
+     bool in_use; /* locked by a request */
+     bool valid; /* connection is alive */
++    pid_t owner; /* 归属的 task group；0 = 从未被占用过 */
+ } conn_slot_t;
+ 
+ static conn_slot_t s_pool[CONN_POOL_SIZE];
+ static pthread_mutex_t s_pool_lock = PTHREAD_MUTEX_INITIALIZER;
+ 
++/* 当前线程所属 task group 的编号，用作槽位的 owner。
++ *
++ * NuttX 下 getpid() 返回的是 **task group 的 pid**（libs/libc/sched/task_getpid.c
++ * 返回 group 的 tg_info->ta_pid，而 group_create 里 ta_pid = tg_pid）；pthread_create
++ * 出来的线程走 group_bind() 直接继承创建者的 group，不会新建 group，所以：
++ *   - 同一个 task group 里的所有线程（含 pthread）getpid() 完全一样；
++ *   - hello_app / robot_ui / ai_agent 这三个 app 是三个独立 task group，彼此不同。
++ * 这正是"fd 属于哪个组"的判据 —— fd 表就挂在 group 上。 */
++static pid_t pool_owner(void)
++{
++    return getpid();
++}
++
+ /* Acquire a slot for host:port.  Returns a locked, connected ctx or NULL. */
+ static conn_slot_t* pool_acquire(const char* host, const char* port)
+ {
++    /* ★ 为什么槽位必须按 task group（owner）隔离 —— 裸 fd 不能跨组用
++     *
++     * 槽位里存的是一个**裸 fd 号**（藏在 ctx.net.fd），而 NuttX 的 fd 号只在 task
++     * group 内有意义（每个 group 的 fd 各自从 3 开始编号），整机又是单一大镜像
++     * （本文件这些 static 对象、池子，全机只有一份）。于是"A 组的代码拿到 B 组的
++     * 槽位"就等于拿着一个只在 B 组里有意义的 fd 号在 A 组里用，两种坏结果：
++     *   ① 该号在 A 组不存在 → close() 报 EBADF、没人注意，对端的 keep-alive 永远
++     *      不回收；
++     *   ② 该号在 A 组恰好被别的活跃文件占着（MQTT/push socket、音频设备、lcd…
++     *      全都从 3 开始编）→ **误关了别人的 fd**；紧接着 A 组下一次 socket() 极可能
++     *      又拿回同一个号，别的持有者（比如每 100ms recv 一次的那个 network 任务）
++     *      继续用这个号收发，就和这条 TLS 连接**共享了同一个 socket** → mbedtls 读
++     *      到的是别人的协议字节流 → ssl_handshake ret=-0x7200（INVALID_RECORD）。
++     *      2026-09-14 20:10 真机那次"提醒人声丢播报"就是这个错误：hello_app 的
++     *      mimo_post() 调 vela_tls_pool_cleanup()，把 ai_agent 组（另一个 task group）
++     *      的池子连同 fd 一起在 hello_app 的组里关掉了。
++     * 同类教训工程里已经记过一次：app/robot_ui/network_comm.c 写着"跨任务 close() 会
++     * 和 network_task 里的 recv() 抢同一个 fd（关掉后 fd 号立刻被复用），实测会把
++     * 整机打复位"。
++     *
++     * 由此定下两条**不要简化回去**的规则：
++     *   ① 只有 owner == 本组 的槽位才能复用（别人的 fd 绝不借来用）；
++     *   ② **绝不 evict 别人的槽位** —— 那等于 tls_ctx_free() 在别人的组里 close 别人的
++     *      fd，正是上面那个事故。池子被别的组占满时宁可返回 NULL，让调用者走临时连接
++     *      （功能一样，只是多一次握手）。
++     */
++    pid_t me = pool_owner();
++
+     pthread_mutex_lock(&s_pool_lock);
+ 
+-    /* 1. Find an existing valid slot for this host:port */
++    /* 1. Find an existing valid slot for this host:port owned by us */
+     for (int i = 0; i < CONN_POOL_SIZE; i++) {
+         conn_slot_t* s = &s_pool[i];
+-        if (s->valid && !s->in_use && strcmp(s->host, host) == 0 && strcmp(s->port, port) == 0) {
++        if (s->valid && !s->in_use && s->owner == me && strcmp(s->host, host) == 0 && strcmp(s->port, port) == 0) {
+             s->in_use = true;
+             pthread_mutex_unlock(&s_pool_lock);
+             return s;
+         }
+     }
+ 
+-    /* 2. Find an empty slot */
++    /* 2. Find a slot that holds no live fd (valid==false 时 ctx 一定已经 free 过，
++     *    fd 早关了)，就认领它 —— 这种槽位换主人是安全的。 */
+     for (int i = 0; i < CONN_POOL_SIZE; i++) {
+         if (!s_pool[i].valid && !s_pool[i].in_use) {
++            s_pool[i].owner = me;
+             s_pool[i].in_use = true;
+             pthread_mutex_unlock(&s_pool_lock);
+             return &s_pool[i];
+         }
+     }
+ 
+-    /* 3. Evict the first non-in-use slot */
++    /* 3. Evict one of **our own** idle slots（别人的槽位一个都不许动，见上面 ②） */
+     for (int i = 0; i < CONN_POOL_SIZE; i++) {
+-        if (!s_pool[i].in_use) {
++        if (!s_pool[i].in_use && s_pool[i].owner == me) {
+             tls_ctx_free(&s_pool[i].ctx);
+             s_pool[i].valid = false;
+             s_pool[i].in_use = true;
+@@ -201,13 +245,18 @@
+         }
+     }
+ 
++    /* 剩下的全是别的组的槽位（或者都在用）：返回 NULL，调用者用临时连接。
++     * 池子默认只有 2 个槽位，本组的请求量远小于"被别的组占满"的概率。 */
+     pthread_mutex_unlock(&s_pool_lock);
+-    return NULL; /* all slots busy — caller falls back to ephemeral */
++    return NULL; /* all slots busy or owned elsewhere — caller falls back to ephemeral */
+ }
+ 
+ /* Return a slot to the pool.  keep=true means the connection is still alive. */
+ static void pool_release(conn_slot_t* s, const char* host, const char* port, bool keep)
+ {
++    /* owner 不在这里改：能走到 pool_release 的槽位一定是本组 pool_acquire 拿到的，
++     * 归属本来就对。（keep=false 时 ctx 已经 free、valid=false，这时槽位算"空的"，
++     * 别的组可以按 pool_acquire 第 2 步认领它。） */
+     pthread_mutex_lock(&s_pool_lock);
+     if (keep) {
+         strncpy(s->host, host, sizeof(s->host) - 1);
+@@ -224,11 +273,25 @@
+ 
+ void vela_tls_pool_cleanup(void)
+ {
++    pid_t me = pool_owner();
++
+     pthread_mutex_lock(&s_pool_lock);
+     for (int i = 0; i < CONN_POOL_SIZE; i++) {
++        /* ★ 只清自己 task group 的槽位。
++         *
++         * 这个函数现在被 mimo_post()/weather_http_get() 之类**每次请求前**调用
++         * （本意是"把旧连接扔掉、强制全新握手"，见 app/hello_app/mimo_voice.c），
++         * 而它跑在调用者自己的 task group 里。槽位里的 fd 号只在本组有意义，
++         * 顺手清别人的槽位就是 tls_ctx_free() → 在调用者的组里 close 别人的 fd：
++         * 要么静默 EBADF，要么误关本组另一个活文件，然后 fd 号被复用 →
++         * ssl_handshake -0x7200（细节见 pool_acquire 头上的长注释）。
++         * 别的组的槽位留给它们自己的主人（它们自己也会调这个函数）。 */
++        if (s_pool[i].owner != me) {
++            continue;
++        }
+         if (s_pool[i].in_use) {
+             syslog(LOG_WARNING,
+-                "[vela_tls] Pool slot %d still in use at shutdown, skipping\n", i);
++                "[vela_tls] Pool slot %d still in use, skipping\n", i);
+             continue;
+         }
+         if (s_pool[i].valid) {
+@@ -699,9 +762,88 @@
+     return http_status;
+ }
+ 
++/* ── 单次 HTTPS 请求串行化（廉价兜底） ───────────────────────── */
++
++/* 背景：这个文件里的池子、s_tls_raw_buf 都是全机一份的静态对象，而调用者分布在
++ * 多个 task group 的多个线程里。真正保证正确性的是"池按 owner 隔离 + raw buffer
++ * 自带 trylock"，这把锁只是把"两个线程同时做 TLS 而互相踩到共享状态"的概率再压
++ * 一层，代价很低，所以留着。
++ *
++ * 为什么是"带超时的 trylock + 拿不到就退化成不串行"，而不是老老实实
++ * pthread_mutex_lock：
++ *   ① 嵌套会自死锁。本构建 CONFIG_PTHREAD_MUTEX_TYPES=y、默认类型是
++ *      PTHREAD_MUTEX_NORMAL（非递归），NuttX 对"同线程再次 lock"是**故意死锁**的
++ *      （libs/libc/pthread/pthread_mutex_timedlock.c 里写着 "is required to
++ *      deadlock for the case of the non-robust NORMAL mutex"）。今天这条路没有
++ *      嵌套（结论见下），但 llm 那条以后很可能变成"工具调用里再发一次 HTTPS"，
++ *      那时同线程重入就是永久卡死一块板子。用 trylock 就永远不会死等：
++ *      拿不到 → 不加锁继续跑。
++ *   ② 等锁必须**有上界**。这把锁覆盖的区间里有 120s 的读超时和 30s 的写超时
++ *      （LLM 流式响应真的会占满），而提醒人声/语音播报这种"说到就到"的路径不能
++ *      被它拖住。所以只等 REQ_LOCK_WAIT_MS 就放弃，退化成并行发 —— 并行是安全的
++ *      （池按 owner 隔离、raw buffer 有锁），只是少了一层保险。
++ *
++ * 嵌套的结论（2026-09-14 顺着调用链查过，不是猜的）：
++ *   vela_https_request() 内部只会走到 pool_acquire / pool_release /
++ *   tls_ctx_connect / tls_write_request / tls_read_response，以及
++ *   http_proxy 的 proxy_open_tunnel() 和 network_manager 的
++ *   network_acquire_resource()。这些都不回调 vela_https_*（http_proxy.c 自己用
++ *   proxy_conn_* 那一套独立实现，不碰这个池子）。上层 llm_chat / llm_chat_tools /
++ *   各 tool / mimo_post 都是"这一次发完再发下一次"的串行写法，没有同线程重入。
++ *   所以当下不会自死锁；保留 trylock 只是为了以后不踩。
++ *
++ * 为什么**不**把 vela_tls_pool_cleanup() 也塞进这把锁：
++ *   ① 正确性不需要。请求在用着的槽位 in_use==true（pool_acquire 里在 s_pool_lock
++ *      下置位，pool_release 里清），cleanup 遇到 in_use 的槽位本来就跳过，所以
++ *      并发 cleanup 不可能 free 掉一个正在被请求使用的槽位；两边改槽位字段又都在
++ *      s_pool_lock 下，不会撕裂。
++ *   ② 反过来代价很实在。mimo_post() 是"先 cleanup 再 request"，如果 cleanup 也要
++ *      抢这把锁，那么语音链路上一次"立刻要出声"的请求就得先等一个正在跑的 LLM
++ *      请求（可能上百秒）放下锁 —— 白白把一个瞬间返回的调用变成长期阻塞。
++ *   ③ owner 隔离之后，cleanup 只动本组的槽位，剩下唯一的交错可能是"同组另一个
++ *      线程刚要 acquire 的槽位被清了"，最坏结果只是多一次握手（pool_acquire
++ *      看到 valid==false 会重连），无害。 */
++#define REQ_LOCK_WAIT_MS 500 /* 等锁上限：短请求够串上，长请求不拖累别人 */
++#define REQ_LOCK_POLL_MS 10
++
++static pthread_mutex_t s_req_lock = PTHREAD_MUTEX_INITIALIZER;
++static pthread_t s_req_holder; /* 持锁者，只在持锁期间有意义 */
++
++/* 拿到锁返回 true；被别人占着（或自己就是持锁者＝嵌套）返回 false，
++ * 调用者不加锁继续跑，绝不阻塞。 */
++static bool req_lock_try_acquire(void)
++{
++    /* 同线程重入（嵌套）时非递归锁永远拿不到，直接放弃，别白等 REQ_LOCK_WAIT_MS。
++     * s_req_holder 的读没有加锁保护，但最坏结果只是"把别人的持锁误判成自己的
++     * 嵌套 → 不加锁跑"，安全。 */
++    if (pthread_equal(pthread_self(), s_req_holder)) {
++        return false;
++    }
++
++    for (int waited = 0; waited < REQ_LOCK_WAIT_MS; waited += REQ_LOCK_POLL_MS) {
++        if (pthread_mutex_trylock(&s_req_lock) == 0) {
++            s_req_holder = pthread_self();
++            return true;
++        }
++        usleep(REQ_LOCK_POLL_MS * 1000);
++    }
++
++    syslog(LOG_INFO, "[%s] Another HTTPS request is in flight, running without serialization\n",
++        TAG);
++    return false;
++}
++
++static void req_lock_release(bool locked)
++{
++    if (locked) {
++        s_req_holder = (pthread_t)0;
++        pthread_mutex_unlock(&s_req_lock);
++    }
++}
++
+ /* ── Public API ──────────────────────────────────────────────── */
+ 
+-int vela_https_request(
++static int https_request_impl(
+     const char* host,
+     const char* port,
+     const char* method,
+@@ -758,8 +900,17 @@
+         /* Connection went stale — fall through to reconnect */
+     pool_reconnect:
+         syslog(LOG_INFO, "[%s] Pooled connection stale, reconnecting\n", TAG);
++        /* 这里原来是**无锁**地改 slot->valid/ctx。看字段本身是"安全"的：本槽位
++         * in_use=true，pool_acquire 拿不到它、pool_release 不会被别人调、
++         * vela_tls_pool_cleanup 也会跳过 in_use 的槽位。但"进池子的路径"
++         * （pool_acquire 第 2/3 步、cleanup）都是只看 valid/in_use 这几个字段来
++         * 决策的，等于用一个没有锁保护的状态去指挥别人；将来谁把 in_use 的语义
++         * 放松一点就会变成真的竞态。代价只是多一把已经持有的锁，顺手收进来：
++         * 槽位自身的字段（host/port/valid/in_use/owner）现在一律在 s_pool_lock 下改。 */
++        pthread_mutex_lock(&s_pool_lock);
+         tls_ctx_free(&slot->ctx);
+         slot->valid = false;
++        pthread_mutex_unlock(&s_pool_lock);
+     }
+ 
+     /* New connection */
+@@ -802,6 +953,29 @@
+     return ret;
+ }
+ 
++/* 对外入口：只在最外层套一次"单次请求"串行化（原因、粒度、为什么不把
++ * vela_tls_pool_cleanup 也套进来，都写在上面 s_req_lock 那段注释里）。
++ * 函数体原样搬进了 https_request_impl()，这样所有 return 路径都自动落在
++ * 解锁范围内，不用在每个失败分支加一次 release。 */
++int vela_https_request(
++    const char* host,
++    const char* port,
++    const char* method,
++    const char* path,
++    const vela_header_t* headers,
++    const char* body,
++    size_t body_len,
++    char* resp_buf,
++    size_t resp_cap,
++    size_t* out_body_len)
++{
++    bool locked = req_lock_try_acquire();
++    int ret = https_request_impl(host, port, method, path, headers, body,
++        body_len, resp_buf, resp_cap, out_body_len);
++    req_lock_release(locked);
++    return ret;
++}
++
+ int vela_https_get(const char* host, const char* port, const char* path,
+     char* resp_buf, size_t resp_cap)
+ {

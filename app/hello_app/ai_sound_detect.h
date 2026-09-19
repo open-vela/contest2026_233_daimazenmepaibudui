@@ -427,4 +427,159 @@ void sound_detect_init_default_classes(sound_detect_context_t *ctx);
 int edge_impulse_sound_classify(const int16_t *data, size_t frames,
                                 float *results, size_t result_count);
 
+/****************************************************************************
+ * 任务四：麦克风 PCM 旁路 + 「人声 / 非人声」门控
+ *
+ * 产品逻辑（用户拍板）：音频里**有人在说话** → 整段交给云端（现有
+ * VAD → ASR → 大模型那条路，本模块只负责"认出人声并提示一声"）；
+ * **没有人声但能量/形态异常** → 才喂给本地小模型（任务三的 sound_event）。
+ * 本机小模型因此不用认识"救命"两个字，"呼救"按人声走云端。
+ *
+ * 数据流（旁路，绝不碰主录音链路）：
+ *   ai_audio.c 录音线程 read() 到一帧
+ *     → sound_detect_pcm_tap()（**非阻塞**，只往有界环形缓冲 memcpy）
+ *     → 门控线程（独立、低优先级）每 200ms 取一个 0.64s 窗
+ *         ├─ 播放态（板子自己喇叭在响）→ 整窗丢弃，不判
+ *         ├─ 像人声 → voice_cb（接线方复用现有云端语音入口）
+ *         └─ 非人声且能量超阈 → sound_event_feed()（本地小模型）
+ *
+ * 为什么要有界 + 丢最旧：门控线程慢一点没关系，**绝不能**让录音线程的
+ * read() 等它 —— 麦克风是半双工、app 已常开独占，堵住录音就是"整机聋了"。
+ ****************************************************************************/
+
+/* 门控窗口口径（与任务三的 mel 前端契约一致）：
+ * 一个窗口 = 64 帧 × 160 样本 = 0.64s；滑窗步长 20 帧 = 200ms。 */
+#define SOUND_GATE_WINDOW_SAMPLES   10240
+#define SOUND_GATE_HOP_SAMPLES      3200
+
+/* 有界队列容量（样本数）：2 个窗 ≈ 40 KiB。满了丢最旧的样本，不阻塞写入方。 */
+#define SOUND_GATE_RING_SAMPLES     (2 * SOUND_GATE_WINDOW_SAMPLES)
+
+/* 门控线程优先级：数值比 CONFIG_HELLO_APP_PRIORITY(100) 大 = 更低优先级 */
+#define SOUND_GATE_THREAD_PRIORITY  110
+#define SOUND_GATE_THREAD_STACK     8192
+
+/* 门控一次判断用的特征（全部归一化到 0..1，便于打印和门限解释）*/
+typedef struct
+{
+  float energy;        /* 窗口平均能量（int16 幅度平方的均值，可 > 1） */
+  float rms;           /* 归一化 RMS（0..1，1.0 = 满量程） */
+  float zcr;           /* 过零率（0..1）：宽带冲击高，浊音低 */
+  float ac_peak;       /* 自相关峰值比（0..1）：周期性强（浊音）才高 */
+  float voiced_ratio;  /* "浊音样"分析帧占比（0..1） */
+  int   active;        /* 1 = 能量高于静音底噪 */
+  int   voice;         /* 1 = 判为像人声 */
+} sound_gate_features_t;
+
+/* 门控运行统计（调试入口 / 汇报用）*/
+typedef struct
+{
+  uint32_t windows;         /* 真正判过的窗口数（不含播放态跳过的）*/
+  uint32_t voice_windows;   /* 判为人声的窗口数 */
+  uint32_t mute_windows;    /* 因播放态被整窗跳过的数量 */
+  uint32_t anomaly_windows; /* 判为非人声异常、已喂本地模型的窗口数 */
+  uint32_t last_voice_ms;   /* 最近一次人声的单调毫秒 */
+  uint32_t last_anomaly_ms; /* 最近一次异常的单调毫秒 */
+  sound_gate_features_t last;  /* 最近一个判过的窗口的特征 */
+} sound_gate_stats_t;
+
+/**
+ * @brief  人声门控判据（纯函数，无副作用，可在主机上单测）
+ *
+ * 三个特征：整窗 RMS（能量）、过零率 ZCR、逐 32ms 帧自相关峰值比。
+ * 经验判据（灵敏度 sens 越大越容易判成人声）：
+ *   静音     : rms < 0.004/sens                  → 不活跃
+ *   像人声   : 活跃 且 （浊音帧占比 ≥ 0.25/sens
+ *                       或 自相关峰 ≥ 0.60/sens 且 zcr ≤ 0.35）
+ *   其余     : 非人声（宽带冲击/噪声/静音）
+ *
+ * @param  pcm   16kHz 单声道 s16le 样本
+ * @param  n     样本数（建议 ≥ SOUND_GATE_WINDOW_SAMPLES）
+ * @return 1 = 像人声, 0 = 不像, 负值 = 参数非法
+ */
+
+int sound_detect_voice_gate(const int16_t *pcm, size_t n);
+
+/**
+ * @brief  同上，但把中间特征也带出来（调试 / 打印 / 单测用）
+ * @param  out   非 NULL 时填入特征与判决
+ */
+
+int sound_detect_voice_gate_ex(const int16_t *pcm, size_t n,
+                               sound_gate_features_t *out);
+
+/**
+ * @brief  旁路喂入 PCM（**录音线程里调，绝不阻塞**）
+ * @return 0成功（可能因队列非空/满而丢样本，不算错）
+ */
+
+int sound_detect_pcm_tap(const int16_t *pcm, size_t n);
+
+/**
+ * @brief  启动/停止门控线程（幂等）。旁路在 stop 之后仍然安全可调（直接丢）
+ */
+
+int sound_detect_bypass_start(void);
+void sound_detect_bypass_stop(void);
+
+void        sound_detect_gate_set_enabled(bool on);
+bool        sound_detect_gate_enabled(void);
+void        sound_detect_gate_set_sensitivity(float sens);   /* 0.3 ~ 3.0 */
+float       sound_detect_gate_sensitivity(void);
+
+/**
+ * @brief  注册"板子自己正在出声"的判据（在门控线程里调，必须快、不加锁）
+ *
+ * 播放态返回 true → 整个窗口直接丢弃（不判、不喂本地模型）。这是历史误报的
+ * 直接来源：自己的 TTS/提示音被纯能量启发式判成"异常声"。
+ */
+
+typedef bool (*sound_detect_busy_cb_t)(void *arg);
+void sound_detect_gate_set_busy_cb(sound_detect_busy_cb_t cb, void *arg);
+
+/**
+ * @brief  注册"判到人声"的回调（在门控线程里调）
+ *
+ * ⚠️ 回调里**只许置标志**，不要在里面推状态机 / 做网络 / 播报 —— 它跑在
+ * 门控线程上，拖住它就等于丢门控窗口。接线方（ai_companion_main.c）只置一个
+ * 标志，真正的"送去云端"放到主循环 100ms 心跳里做。
+ */
+
+typedef void (*sound_detect_voice_cb_t)(const sound_gate_features_t *f,
+                                        void *arg);
+void sound_detect_gate_set_voice_cb(sound_detect_voice_cb_t cb, void *arg);
+
+const sound_gate_stats_t *sound_detect_gate_get_stats(void);
+void sound_detect_gate_reset_stats(void);
+
+/****************************************************************************
+ * 任务四：跨模块弱依赖声明
+ *
+ * 下面三个符号分别由**别的 agent** 负责落地（任务三的 sound_event.h /
+ * robot_ui 的询问框）。本文件先弱声明 + 在 ai_sound_detect.c 里给弱实现兜底：
+ * 对方还没落地时能编、能链、能跑（只是本地模型不生效 / 询问框打在串口里），
+ * 对方落地后强符号天然覆盖，这里一个字都不用改。
+ ****************************************************************************/
+
+/* 任务三：本地小模型入口（sound_event.h） */
+int sound_event_init(void);
+int sound_event_feed(const int16_t *pcm, size_t nsamples);
+
+/* robot_ui：弹「是否报警？」询问框。任何线程都可调，内部自己投到 LVGL 线程。
+ * （本该声明在 robot_ui/robot_ui.h，但那个头 include 了 LVGL，hello_app 编不了，
+ * 所以在这里弱声明。） */
+void ui_post_ask_alarm(const char *reason);
+
+/* robot_ui：语音追问那一路对这次异常已经有结论了 —— 屏幕上那页询问框让位。
+ * 语义是「作废」：撤页面，既不报警、也不记「用户否认」的静默期（它不代表用户
+ * 回答过）。声明在这里的理由同上（robot_ui.h 带 LVGL，hello_app 编不了）。
+ * 弱实现见 ai_sound_detect.c：robot_ui 没进镜像时什么都不做。 */
+void ui_post_ask_standdown(const char *src);
+
+/* robot_ui：报警去重闸（同一次异常的两条确认入口只许报一次警）。
+ * true = 这次报警由本路执行；false = 另一条确认入口（屏幕按钮 / MQTT）已经报过了，
+ * 本路放弃。声明在这里的理由同上。弱实现在 ai_sound_detect.c：robot_ui 那一侧
+ * 没进镜像时返回 true（没有第二条路可去重，照常报警）。 */
+bool robot_ui_alarm_claim(const char *src);
+
 #endif /* __AI_SOUND_DETECT_H */

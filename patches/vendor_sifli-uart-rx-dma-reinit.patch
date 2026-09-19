@@ -1,0 +1,93 @@
+--- a/vendor/sifli/chips/sf32lb52/sifli_uart.c
++++ b/vendor/sifli/chips/sf32lb52/sifli_uart.c
+@@ -474,6 +474,90 @@
+ 
+ 
+ /****************************************************************************
++ * Name: sifli_uart_reinit_rx_dma
++ *
++ * Description:
++ *   非 static 的"把这一路 UART 的 RX DMA 重新装回去"入口（板级用）。
++ *
++ *   为什么需要它（2026-09-17 真机踩到）：本驱动**只在"上一次 DMA 传输完成"的
++ *   中断回调里**才会重新武装 RX（sifli_dma_receive）。而 DMAC1 上同时挂着本串口
++ *   （UART1 控制台 = DMA1_Channel6/7）和音频的 AUDPRC RX0 —— 板级音频恢复里那记
++ *   "复位整块 DMAC1"（RSTR1 的 DMAC1 位）会把这一路的通道配置一并抹掉，之后
++ *   DMA 永远不会完成 → receive() 永远不会再被调用 → **串口 RX 永久聋**（现象是
++ *   nsh 收不到任何命令，板子看起来"死了"，其实还在打日志）。
++ *
++ *   所以板级在复位完 DMAC1 之后必须调用本函数，把每一路 UART 的 RX DMA 重新
++ *   配置 + 重新启动接收。idx 用 sifli_uart.c 里的 UARTx_INDEX 枚举（0 起，
++ *   UART1 是 0）。
++ *
++ *   Returned Value:
++ *     0       装回去了
++ *     -EINVAL idx 越界或该路没配 RX DMA
++ *     -ENODEV 这一路还没 attach（priv 为空），不用管
++ ****************************************************************************/
++
++int sifli_uart_reinit_rx_dma(int idx)
++{
++    struct sifli_uart *uart;
++    int ret;
++
++    if (idx < 0 || idx >= UART_MAX)
++    {
++        return -EINVAL;
++    }
++
++    uart = &uart_obj[idx];
++
++    if (uart->serial.priv == NULL)
++    {
++        return -ENODEV;
++    }
++
++    /* ★ 先把"残影"清干净 —— 这一步不做，等于把复位前的旧输入重放一遍：
++     *   - RX 的 DMA 直接写进 NuttX 的 recv.buffer，里面还留着复位前收到的旧字节；
++     *     重新武装之后驱动把这些字节当成"刚收到的新数据"上报，nsh 于是**反复重放
++     *     一条几分钟前的命令**（2026-09-17 真机踩到：控制台刷 125 KB 的同一条命令）。
++     *   - 环形的 head/tail 也必须一起归零：复位后 head 被 DMA 位置重新写成一个小值，
++     *     而 tail 还停在旧位置 → 上层认为"有一大段数据可读"，读到的全是垃圾。
++     *   顺序：先清缓冲 + 指针，再武装（sifli_dma_receive 内部会把 last_index 归零）。 */
++
++    memset(uart->serial.recv.buffer, 0, uart->serial.recv.size);
++    uart->serial.recv.head = 0;
++    uart->serial.recv.tail = 0;
++
++    /* ★★ 这一行才是"重新武装"能生效的关键（2026-09-17 用仪表定案）：
++     *
++     *   HAL_UART_Receive_DMA() 的守门条件是 `if (huart->RxState == HAL_UART_STATE_READY)`；
++     *   而串口开机 attach 之后 RxState 一直是 HAL_UART_STATE_BUSY_RX（UART 外设并没有被
++     *   DMAC1 的模块级复位动过，这个**软件状态**自然也不会回到 READY）—— 于是"重新武装"
++     *   会被静默跳过、返回 HAL_OK 却什么都不做：仪表实测这一路 CCR.EN=0、CNDTR=0、
++     *   CPAR/CM0AR=0，即传输根本没被启动。
++     *   （本驱动自己在 sifli_dma_receive 之前不做这一步，是因为 attach 时它本来就是 READY。）
++     *
++     *   顺序：先摆状态 → 再清缓冲/指针 → 最后武装。 */
++
++    uart->handle.RxState = HAL_UART_STATE_READY;
++
++    /* 关键的一步：先把这条通道**还回通道池**再重新分配。
++     *
++     * 本构建开了动态通道分配（DMA_SUPPORT_DYN_CHANNEL_ALLOC），HAL_DMA_Init() 内部
++     * 会先 DMA_AllocChannel()；如果池里还记着"这条通道被占着"，它直接返回 HAL_BUSY、
++     * **一个寄存器都不写**（HAL_DMA_Init 的返回值还经常被调用方丢掉）—— 表现就是
++     * "调了重新武装，但串口 RX 依然收不到任何东西"（2026-09-17 真机踩到）。
++     * HAL_DMA_DeInit() 会 CCR=0 + 清该通道标志 + 清 CSELR 映射 + 回收通道池
++     * （bf0_hal_dma.c:618-687），正是"还回去"的那一下。 */
++
++    if (uart->handle.hdmarx != NULL &&
++        uart->handle.hdmarx->State != HAL_DMA_STATE_READY)
++    {
++        HAL_DMA_DeInit(uart->handle.hdmarx);
++    }
++
++    return ret;
++}
++
++
++/****************************************************************************
+  * Name: nrf53_rxavailable
+  *
+  * Description:

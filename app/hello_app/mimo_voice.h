@@ -8,6 +8,16 @@
  * mimo_chat() 是给别的 app（robot_ui）用的跨 app 对话接口，不依赖 ai_agent
  * 进程状态。
  *
+ * 语音（voice_tts_speak 这条）对**调用方缓冲**的要求：一次能念多少字由
+ * mimo_voice.c 的 MIMO_TTS_TEXT_MAX（300 字）和调用方的 PCM 缓冲一起决定，
+ * 两块都要按"300 字 ≈ 60 秒 ≈ 2 MB"（16 kHz 单声道 s16le，32 KB/秒）准备：
+ *   - robot_ui 的 VOICE_TTS_BUF_BYTES 建议 (16000 * 2 * 70) = 2240000 字节；
+ *   - ai_audio 的 AUDIO_PLAY_BUFFER_MS 建议 70000（audio_play_start 会把
+ *     PCM 整段拷进自己的播放缓冲，装不下直接返回 -ENOSPC，所以它也得这么大）。
+ * 两块合起来约 4.3 MB，加上合成时那块 896 KB 的响应缓冲，一轮 TTS 的峰值
+ * 约 5.2 MB（用户堆约 8 MB）。缓冲给得比这小也不会越界：mimo_tts_synthesize()
+ * 按剩余空间自动少念几个字，并在日志里报"念到第几个字"。
+ *
  ****************************************************************************/
 
 #ifndef __APP_HELLO_APP_MIMO_VOICE_H
@@ -18,6 +28,13 @@
  ****************************************************************************/
 
 #include <stddef.h>
+
+/* IP 定位（用户所在城市）的接口：mimo_chat() 自己会用它查一次并写进 system
+ * prompt，跨 app 调 mimo_chat() 的人不用管；想自己预热缓存（比如联网之后先
+ * 查一次）可以直接调 mimo_location_get()，声明和用法见 mimo_location.h。
+ * 放在这里是为了"只 include mimo_voice.h 的调用方也能拿到这套接口"。 */
+
+#include "mimo_location.h"
 
 /****************************************************************************
  * Public Function Prototypes
@@ -59,11 +76,16 @@ int mimo_voice_available(void);
  *   同步跑完一次对话，把回复正文写进 reply_out。请求体（POST 到配置里的
  *   llm_host + llm_path）：
  *     {"model":"<配置里的 model>",
- *      "messages":[{"role":"system","content":"<当前北京时间 + 星期 + 说话要求>"},
+ *      "messages":[{"role":"system","content":"<当前北京时间 + 星期 +
+ *                  [用户所在城市] + 说话要求>"},
  *                  {"role":"user","content":"<转义后的文本>"}],
  *      "max_tokens":1024}
  *   当前时间是从系统时钟自己 +8 小时算的，放在 system prompt 里 —— 所以
  *   "今天几号 / 现在几点 / 今天星期几"不用联网，直接照时间答。
+ *   用户所在城市来自 mimo_location_get()（板子自己打免 key 的 HTTPS 接口问
+ *   IP 定位，结果缓存 6 小时）：**查到才写进提示**，查不到那一段一个字都没有。
+ *   本函数在开始对话前会**同步**调它一次（第一次要一次 TLS 请求，之后走缓存），
+ *   所以别在 LVGL 线程里调 mimo_chat()（本来也不行，见下面"会阻塞"那段）。
  *   Bearer = 配置里的 api_key。解析只取 choices[0].message.content，
  *   不取 reasoning_content（这个模型是推理模型，思维链在 reasoning_content，
  *   正文才在 content）。
@@ -78,8 +100,9 @@ int mimo_voice_available(void);
  *       复述确认。模型给的时间不合法就打回去让它自己换算重试（不猜）；
  *       落地失败（列表满等）也当成工具结果讲给用户听，不返回负值。
  *     get_weather(city) —— **默认关**：配置键 enable_weather_tool 开才带，
- *       开着时系统提示里会加默认城市（配置键 default_city）。模型要查天气时
- *       本函数自己去打 open-meteo（geocode + forecast 两个免 key 的 HTTPS GET）。
+ *       开着时系统提示里会加默认城市（配置键 default_city；IP 定位查到了就
+ *       用定位的城市，查不到才退回 default_city）。模型要查天气时本函数自己
+ *       去打 open-meteo（geocode + forecast 两个免 key 的 HTTPS GET）。
  *       默认不开是因为查出来的实况和用户所在地常对不上。
  *   两个工具查不到 / 执行失败都只管把原因喂回模型让它解释，只有网络层失败
  *   （TLS/DNS/连接 / HTTP 非 200）才返回负值。

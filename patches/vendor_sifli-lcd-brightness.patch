@@ -1,8 +1,56 @@
+diff --git a/boards/sf32lb52/drivers/lcd/co5300.c b/boards/sf32lb52/drivers/lcd/co5300.c
+index 0443fef..74a8665 100644
+--- a/boards/sf32lb52/drivers/lcd/co5300.c
++++ b/boards/sf32lb52/drivers/lcd/co5300.c
+@@ -123,11 +123,43 @@
+ 
+ #define QAD_SPI_ITF LCDC_INTF_SPI_DCX_4DATA
+ 
++/* ==================== 面板 QSPI 写时钟（降频 / 一键回退） ====================
++ * 这个 freq 不是面板自己的刷新率（CO5300 带 GRAM，自刷新由它内部振荡器驱动），
++ * 而是 SoC 往面板推像素的那条 QSPI 总线的时钟。它是全驱动里唯一的来源：
++ * HAL_LCDC_Init() → SetFreq() 拿它算分频写进 SPI_IF_CONF.CLK_DIV，读寄存器时
++ * 的降速/恢复（LCD_ReadMode）用的也是同一个值。
++ *
++ *     CLK_DIV = ceil(HCLK / freq)   （HAL 里那个除法向上取整，硬件最小分频 2）
++ *     面板时钟 = HCLK / CLK_DIV
++ *
++ * 本板 HCLK = 240MHz（bsp_init.c 的 HAL_RCC_HCPU_EnableDLL1(240000000)）：
++ *     50000000（CO5300 手册上限，改前）→ CLK_DIV = 5  → 面板时钟 48MHz
++ *     24000000（现在）               → CLK_DIV = 10 → 面板时钟 24MHz
++ *
++ * 为什么降：本板 USB 直供（不带电池），厂商提交 0a3cd0a 自己写着 "some panels
++ * do not respond reliably to ID queries on USB-only power where read timing is
++ * marginal" —— 48MHz 下这条总线在 USB 供电时处于边缘时序，症状是间歇性丢像素
++ * （大块背景丢、只剩细笔画，偶尔整屏黑），而应用/LCDC 侧一切正常。
++ *
++ * 代价：推送带宽减半（4 数据线 24MHz ≈ 12MB/s，全屏 390×450×2B ≈ 29ms/帧）；
++ * 面板自刷新不受影响，只有"往面板推画面"变慢。
++ *
++ * SF32LB_LCD_QSPI_CLK_SLOW 置 0 ⇒ 走下面 #else 分支，逐字回到改前的字面值
++ * 50000000（= 48MHz）。
++ */
++#define SF32LB_LCD_QSPI_CLK_SLOW 1
++
++#if SF32LB_LCD_QSPI_CLK_SLOW
++#define SF32LB_LCD_QSPI_CLK_HZ   24000000
++#endif
++
+ static LCDC_InitTypeDef lcdc_int_cfg_qadspi =
+ {
+     .lcd_itf = QAD_SPI_ITF, // LCDC_INTF_SPI_NODCX_1DATA
+ #if defined(LCD_MAX_CLK_FREQ)
+     .freq = LCD_MAX_CLK_FREQ,        //CO5300 RGB565 only support 50000000,  RGB888 support 60000000
++#elif SF32LB_LCD_QSPI_CLK_SLOW
++    .freq = SF32LB_LCD_QSPI_CLK_HZ,  //24000000 -> CLK_DIV 10 -> 24MHz @HCLK 240MHz
+ #else
+     .freq = 50000000, //CO5300 RGB565 only support 50000000,  RGB888 support 60000000
+ #endif
 diff --git a/boards/sf32lb52/drivers/lcd/sf32lb_lcd.c b/boards/sf32lb52/drivers/lcd/sf32lb_lcd.c
-index 66fcfc6..a93f21c 100644
+index 66fcfc6..3ffd0a5 100644
 --- a/boards/sf32lb52/drivers/lcd/sf32lb_lcd.c
 +++ b/boards/sf32lb52/drivers/lcd/sf32lb_lcd.c
-@@ -73,6 +73,12 @@ const void *_lcd_drv_ref_ili8688e
+@@ -73,6 +73,56 @@ const void *_lcd_drv_ref_ili8688e
   ****************************************************************************/
  #define lcd_debug_print lcdinfo
  
@@ -12,18 +60,261 @@ index 66fcfc6..a93f21c 100644
 +
 +#define SF32LB_LCD_BRIGHTNESS_MAX 100
 +
++/* ==================== 面板重新初始化（黑屏救回）总开关 ====================
++ * 1 = 编出 sf32lb_lcd_panel_reinit()（带逐步诊断日志），并把 panel_lock 打开：
++ *       - hw_test lcdreinit 用它把"面板丢了配置"造成的整屏黑救回来；
++ *       - 开机路径 lcd_hw_setup_thread_entry 的第三次面板复位拿同一把锁，
++ *         挡掉"面板正在被复位、外面却在写 0x29/0x28"这个竞态
++ *         （"重插有概率黑屏起不来"，理由写在该函数里）；
++ *       - sf32lb_lcd_setpower() 也拿它（外部来的 DisplayOn/Off 不能再插队）。
++ * 0 = 退回没加这个功能之前：sf32lb_lcd_panel_reinit() 直接回 -ENOSYS，
++ *     panel_lock 的三个宏变成空操作，刷新路径和开机路径一行不多。
++ *
++ * 为什么需要它 / 上板怎么用：docs/display_touch_gpio_usage.md 第 3.4 节。
++ */
++
++#define SF32LB_LCD_PANEL_REINIT 1
++
++/* 重初始化时把面板 RESET 脚拉低多久（ms）。开机路径只拉低 10ms（co5300.c 的
++ * LCD_Drv_Init），这里给 3 倍余量：面板"丢了配置"最常见的形状是复位不彻底/
++ * 电源塌陷，低电平时间给足才谈得上真的复位了一次。 */
++#define SF32LB_LCD_RESET_LOW_MS   30
++#define SF32LB_LCD_RESET_HIGH_MS  120
++
++/* 等 panel_lock 的上限（ms）。一次面板复位要 ~0.4s，等 1s 够用；
++ * 超时只打一行 WARN 然后照原样放行 —— 宁可少一层保护，也不能把调用方
++ * （NSH 命令、LVGL 那条路）永久挡住。 */
++#define SF32LB_LCD_PANEL_LOCK_WAIT_MS 1000
++
++/* ==================== 重初始化的逐步日志 ====================
++ * ⚠ 本驱动里原有的 lcdinfo / lcdwarn / lcderr 在**本板固件里全被编掉了**：
++ *   CONFIG_DEBUG_LCD 没开 ⇒ nuttx/include/debug.h:517-532 把它们展开成 _none，
++ *   驱动里那些现成的打点一行都不会出现在串口里。所以"每一步都看得见"只能走
++ *   syslog —— 本板 CONFIG_SYSLOG_DEFAULT_MASK=0xff，LOG_INFO/WARNING/ERR
++ *   三级都出得来。前缀统一成 [lcdreinit]，串口日志里直接 grep 它。
++ * ⚠ CONFIG_SYSLOG_BUFSIZE=196，一行别写太长（一个汉字 3 字节）。 */
++#define LCD_REINIT_TAG "[lcdreinit]"
++
++#define LCD_REINIT_STEP(fmt, ...) \
++  syslog(LOG_INFO, LCD_REINIT_TAG " " fmt "\n", ##__VA_ARGS__)
++#define LCD_REINIT_PASS(fmt, ...) \
++  syslog(LOG_INFO, LCD_REINIT_TAG " PASS " fmt "\n", ##__VA_ARGS__)
++#define LCD_REINIT_WARN(fmt, ...) \
++  syslog(LOG_WARNING, LCD_REINIT_TAG " WARN " fmt "\n", ##__VA_ARGS__)
++#define LCD_REINIT_FAIL(fmt, ...) \
++  syslog(LOG_ERR, LCD_REINIT_TAG " FAIL " fmt "\n", ##__VA_ARGS__)
++
  struct sf32lb_lcd_dev_s
  {
      struct lcd_dev_s dev;
-@@ -85,6 +91,7 @@ struct sf32lb_lcd_dev_s
+@@ -84,10 +134,29 @@ struct sf32lb_lcd_dev_s
+     FAR sem_t init_sem;
      FAR sem_t draw_sem;
  
++    /* "面板访问"互斥：putrun / putarea 推像素、sf32lb_lcd_panel_reinit()
++     * 重发面板配置、lcd_hw_setup_thread_entry 那次面板复位、以及外部进来的
++     * setpower（DisplayOn/Off）都要拿它。LVGL 线程一直在刷（真机 20~30 帧/s），
++     * 而 hw_test lcdreinit 是从 NSH 任务里调的 —— 不隔开的话，QSPI 上会
++     * 一边推像素一边插寄存器写，谁都不该指望结果。关掉 SF32LB_LCD_PANEL_REINIT
++     * 时这三个宏是空操作，热路径和改动前完全一样。 */
++    FAR sem_t panel_lock;
++
      int power;
 +    int contrast;               /* 亮度百分比 0..100，见 setcontrast/getcontrast */
      uint8_t bpp;
  };
  
-@@ -676,29 +683,56 @@ static int sf32lb_lcd_setpower(FAR struct lcd_dev_s *dev, int power)
++#if SF32LB_LCD_PANEL_REINIT
++#define SF32LB_LCD_PANEL_LOCK()   (void)sem_wait(&s_drv_lcd.panel_lock)
++#define SF32LB_LCD_PANEL_UNLOCK() (void)sem_post(&s_drv_lcd.panel_lock)
++#define SF32LB_LCD_PANEL_LOCK_WAIT(ms) sf32lb_lcd_panel_lock_timeout(ms)
++#else
++#define SF32LB_LCD_PANEL_LOCK()   do { } while (0)
++#define SF32LB_LCD_PANEL_UNLOCK() do { } while (0)
++#define SF32LB_LCD_PANEL_LOCK_WAIT(ms) (0)
++#endif
++
+ /* Configuration ************************************************************/
+ 
+ /****************************************************************************
+@@ -97,6 +166,47 @@ static struct sf32lb_lcd_dev_s s_drv_lcd;
+ static volatile bool s_fb_registering;
+ static volatile bool s_lcd_hw_ready;
+ 
++#if SF32LB_LCD_PANEL_REINIT
++static int sf32lb_lcd_panel_lock_timeout(uint32_t ms);
++
++/****************************************************************************
++ * Name:  sf32lb_lcd_panel_lock_timeout
++ *
++ * Description:
++ *   带超时地拿 panel_lock。返回 0 拿到、-1 超时（调用方自己决定：
++ *   重初始化是"从坏状态里往外捞"，超时也要继续；setpower 超时则照原样下发）。
++ *
++ *   为什么要带超时：一次面板复位会把锁按住 ~0.4 秒，而调用方可能是
++ *   "用户刚点了什么就要立刻生效"的路径。sem_wait 万一遇到没人释放的锁
++ *   就是永久卡死一块板子，这里给上界。
++ *
++ ****************************************************************************/
++
++static int sf32lb_lcd_panel_lock_timeout(uint32_t ms)
++{
++  struct timespec ts;
++
++  clock_gettime(CLOCK_REALTIME, &ts);
++  ts.tv_sec  += (time_t)(ms / 1000u);
++  ts.tv_nsec += (long)(ms % 1000u) * 1000000L;
++  if (ts.tv_nsec >= 1000000000L)
++    {
++      ts.tv_sec  += 1;
++      ts.tv_nsec -= 1000000000L;
++    }
++
++  while (sem_timedwait(&s_drv_lcd.panel_lock, &ts) < 0)
++    {
++      if (errno != EINTR)
++        {
++          return -1;
++        }
++    }
++
++  return 0;
++}
++#endif /* SF32LB_LCD_PANEL_REINIT */
++
+ static void sf32lb_lcd_ensure_display_on(FAR struct sf32lb_lcd_dev_s *dev)
+ {
+   if (dev == NULL || dev->p_drv_ops == NULL || dev->p_drv_ops->p_ops == NULL)
+@@ -337,6 +447,8 @@ static int sf32lb_lcd_putrun(FAR struct lcd_dev_s *dev,
+   lcd_debug_print("row: %d col: %d npixels: %d\n", row, col, npixels);
+   DEBUGASSERT(buffer && ((uintptr_t)buffer & 1) == 0);
+ 
++  SF32LB_LCD_PANEL_LOCK();
++
+   if (priv->bpp == 8)
+     {
+       FAR uint16_t *conv;
+@@ -345,6 +457,7 @@ static int sf32lb_lcd_putrun(FAR struct lcd_dev_s *dev,
+       conv = kmm_malloc(npixels * sizeof(uint16_t));
+       if (conv == NULL)
+         {
++          SF32LB_LCD_PANEL_UNLOCK();
+           return -ENOMEM;
+         }
+ 
+@@ -365,6 +478,7 @@ static int sf32lb_lcd_putrun(FAR struct lcd_dev_s *dev,
+                        col, row, col + npixels - 1, row);
+       sf32lb_lcd_ensure_display_on(priv);
+       kmm_free(conv);
++      SF32LB_LCD_PANEL_UNLOCK();
+       return OK;
+     }
+ 
+@@ -372,6 +486,8 @@ static int sf32lb_lcd_putrun(FAR struct lcd_dev_s *dev,
+   sf32lb_lcd_wrram(priv, buffer, col, row, col + npixels - 1, row);
+   sf32lb_lcd_ensure_display_on(priv);
+ 
++  SF32LB_LCD_PANEL_UNLOCK();
++
+   return OK;
+ }
+ 
+@@ -417,6 +533,8 @@ static int sf32lb_lcd_putarea(FAR struct lcd_dev_s *dev,
+ 
+   DEBUGASSERT(buffer && ((uintptr_t)buffer & 1) == 0);
+ 
++  SF32LB_LCD_PANEL_LOCK();
++
+   if (priv->bpp == 8)
+     {
+       fb_coord_t y;
+@@ -425,6 +543,7 @@ static int sf32lb_lcd_putarea(FAR struct lcd_dev_s *dev,
+ 
+       if (conv == NULL)
+         {
++          SF32LB_LCD_PANEL_UNLOCK();
+           return -ENOMEM;
+         }
+ 
+@@ -452,6 +571,7 @@ static int sf32lb_lcd_putarea(FAR struct lcd_dev_s *dev,
+ 
+       sf32lb_lcd_ensure_display_on(priv);
+       kmm_free(conv);
++      SF32LB_LCD_PANEL_UNLOCK();
+       return OK;
+     }
+ 
+@@ -495,6 +615,8 @@ static int sf32lb_lcd_putarea(FAR struct lcd_dev_s *dev,
+ 
+   sf32lb_lcd_ensure_display_on(priv);
+ 
++  SF32LB_LCD_PANEL_UNLOCK();
++
+   return OK;
+ }
+ 
+@@ -524,8 +646,13 @@ static int sf32lb_lcd_getrun(FAR struct lcd_dev_s *dev,
+   lcdinfo("row: %d col: %d npixels: %d\n", row, col, npixels);
+   DEBUGASSERT(buffer && ((uintptr_t)buffer & 1) == 0);
+ 
++  SF32LB_LCD_PANEL_LOCK();
++
+   sf32lb_lcd_setarea(priv, col, row, col + npixels - 1, row);
+   //sf32lb_lcd_rdram(priv, dest, npixels);
++
++  SF32LB_LCD_PANEL_UNLOCK();
++
+   DEBUGASSERT(0);
+   return OK;
+ }
+@@ -629,6 +756,20 @@ static int sf32lb_lcd_getpower(FAR struct lcd_dev_s *dev)
+ 
+ /****************************************************************************
+  * Name:  sf32lb_lcd_setpower
++ *
++ * Description:
++ *   开/关面板显示（**不是亮度**，亮度走 SETCONTRAST）。
++ *
++ *   为什么这里也要拿 panel_lock：开机路径会把面板复位三次
++ *   （find_right_driver → lcd_init_thread_entry → lcd_hw_setup_thread_entry），
++ *   而 /dev/lcd0 在第二次之后就已经存在、/dev/fb0 在第三次之前就注册好了，
++ *   上层随时可能进来调 SETPOWER。如果这时面板正被复位、寄存器序列写到一半，
++ *   插进去的 0x29/0x28 会让面板停在一个半配置状态 —— 之后一直黑，直到真断电。
++ *   拿同一把锁就把这个插队挡掉了。
++ *
++ *   注意 putrun/putarea 里调的 sf32lb_lcd_ensure_display_on() 是**直接**调
++ *   DisplayOn 回调、不走这里，所以不会自己锁自己。
++ *
+  ****************************************************************************/
+ 
+ static int sf32lb_lcd_setpower(FAR struct lcd_dev_s *dev, int power)
+@@ -638,6 +779,14 @@ static int sf32lb_lcd_setpower(FAR struct lcd_dev_s *dev, int power)
+   lcdinfo("power: %d\n", power);
+   DEBUGASSERT((unsigned)power <= CONFIG_LCD_MAXPOWER);
+ 
++#if SF32LB_LCD_PANEL_REINIT
++  if (SF32LB_LCD_PANEL_LOCK_WAIT(SF32LB_LCD_PANEL_LOCK_WAIT_MS) < 0)
++    {
++      LCD_REINIT_WARN("setpower(%d): 等面板空闲超时 %dms，照原样下发",
++                      power, SF32LB_LCD_PANEL_LOCK_WAIT_MS);
++    }
++#endif
++
+   /* Set new power level */
+ 
+   if (power > 0)
+@@ -669,6 +818,10 @@ static int sf32lb_lcd_setpower(FAR struct lcd_dev_s *dev, int power)
+       priv->power = 0;
+     }
+ 
++#if SF32LB_LCD_PANEL_REINIT
++  SF32LB_LCD_PANEL_UNLOCK();
++#endif
++
+   return OK;
+ }
+ 
+@@ -676,29 +829,56 @@ static int sf32lb_lcd_setpower(FAR struct lcd_dev_s *dev, int power)
   * Name:  sf32lb_lcd_getcontrast
   *
   * Description:
@@ -86,7 +377,75 @@ index 66fcfc6..a93f21c 100644
  }
  
                                
-@@ -922,6 +956,11 @@ int board_lcd_initialize(void)
+@@ -725,6 +905,29 @@ static int lcdc1_isr(int irq, void *context, void *arg)
+     return OK;
+ }
+ 
++/****************************************************************************
++ * Name:  sf32lb_lcd_lcdc_setup
++ *
++ * Description:
++ *   LCDC 侧那几步"面板初始化之后必须跟着做"的设置：背景色清零、默认层复位、
++ *   默认层像素格式设成 RGB565。开机路径（lcd_hw_setup_thread_entry）和
++ *   sf32lb_lcd_panel_reinit() 都调这一个函数 —— 抽出来就是为了不出现两份。
++ *
++ *   两个调用点都在 panel_lock 里。
++ *
++ *   不含 irq_attach/up_enable_irq：这两步只在开机时做一次就够，reinit 里
++ *   另外单独补（见 sf32lb_lcd_panel_reinit 的 STEP8）。
++ *
++ ****************************************************************************/
++
++static void sf32lb_lcd_lcdc_setup(void)
++{
++    HAL_LCDC_SetBgColor(&s_drv_lcd.hlcdc, 0, 0, 0);
++    HAL_LCDC_LayerReset(&s_drv_lcd.hlcdc, HAL_LCDC_LAYER_DEFAULT);
++    HAL_LCDC_LayerSetFormat(&s_drv_lcd.hlcdc, HAL_LCDC_LAYER_DEFAULT,
++                            LCDC_PIXEL_FORMAT_RGB565);
++}
++
+ static int lcd_hw_setup_thread_entry(int argc, FAR char *argv[])
+ {
+     lcd_drv_desc_t *p_drv_ops = s_drv_lcd.p_drv_ops;
+@@ -755,6 +958,20 @@ static int lcd_hw_setup_thread_entry(int argc, FAR char *argv[])
+       }
+ #endif
+ 
++    /* /dev/fb0 上面的 fb_register 已经跑完，/dev/lcd0 在 lcd_init_thread_entry
++     * 里也早就注册好了 —— 也就是说**从这一刻起，上层随时可能碰面板**。
++     * 而下面这一步会把面板整个复位 + 重发一遍寄存器（~0.4s）。这就是
++     * "重插有概率黑屏起不来"的窗口：
++     *   - putrun/putarea 有 s_lcd_hw_ready 挡着（此刻还是 false），丢帧无害；
++     *   - 但 sf32lb_lcd_setpower()（LCDDEVIO_SETPOWER）过去是不挡的：它会在
++     *     "面板 RESET 脚正被拉低、寄存器序列写到一半"的时候插一个 0x29/0x28
++     *     进去，面板就停在一个半配置状态 —— 之后整屏黑，直到真断电才好。
++     * 所以这里和 setpower 拿同一把 panel_lock，把这段复位变成"独占面板"。
++     * s_lcd_hw_ready 也在锁里才置位：保证第一个推像素的人一定看到复位后的面板。
++     * 关掉 SF32LB_LCD_PANEL_REINIT 时这两个宏是空操作，开机语义和以前一模一样。 */
++
++    SF32LB_LCD_PANEL_LOCK();
++
+     if (p_drv_ops && p_drv_ops->p_ops && p_drv_ops->p_ops->Init)
+     {
+         p_drv_ops->p_ops->Init(&s_drv_lcd.hlcdc);
+@@ -765,13 +982,12 @@ static int lcd_hw_setup_thread_entry(int argc, FAR char *argv[])
+     up_enable_irq(NX_IRQ(LCDC1_IRQn));
+ #endif /* SOC_BF0_HCPU */
+ 
+-    HAL_LCDC_SetBgColor(&s_drv_lcd.hlcdc, 0, 0, 0);
+-    HAL_LCDC_LayerReset(&s_drv_lcd.hlcdc, HAL_LCDC_LAYER_DEFAULT);
+-    HAL_LCDC_LayerSetFormat(&s_drv_lcd.hlcdc, HAL_LCDC_LAYER_DEFAULT,
+-                            LCDC_PIXEL_FORMAT_RGB565);
++    sf32lb_lcd_lcdc_setup();
+ 
+     s_lcd_hw_ready = true;
+ 
++    SF32LB_LCD_PANEL_UNLOCK();
++
+     return OK;
+ }
+ 
+@@ -922,6 +1138,11 @@ int board_lcd_initialize(void)
      
      memset(&s_drv_lcd, 0, sizeof(s_drv_lcd));
  
@@ -98,3 +457,365 @@ index 66fcfc6..a93f21c 100644
      s_drv_lcd.hlcdc.Instance = LCDC1;
  
      s_drv_lcd.select_layer = HAL_LCDC_LAYER_DEFAULT;
+@@ -929,6 +1150,9 @@ int board_lcd_initialize(void)
+ 
+     sem_init(&(s_drv_lcd.init_sem), 0, 0);
+     sem_init(&(s_drv_lcd.draw_sem), 0, 0);
++    /* 计数 1 = 二值信号量当互斥用。关掉 SF32LB_LCD_PANEL_REINIT 时它没人用，
++     * 初始化这一步本身无害，就不加 #if 了。 */
++    sem_init(&(s_drv_lcd.panel_lock), 0, 1);
+ 
+     /* Keep bringup non-blocking; init/register devices in a worker task. */
+ 
+@@ -947,6 +1171,351 @@ int board_lcd_initialize(void)
+     return OK;
+ }
+ 
++/****************************************************************************
++ * Name:  sf32lb_lcd_panel_reinit
++ *
++ * Description:
++ *   面板重新初始化 —— 把"面板丢了配置"造成的整屏黑救回来的入口
++ *   （复位不生效、只有真断电才好的那种黑，见 docs/display_touch_gpio_usage.md
++ *   第 3.4 节）。
++ *
++ *   做的事，就是开机那条路重走一遍（顺序也一样），但**每一步都打一行日志**：
++ *     STEP1  拿 panel_lock（挡住 putrun / putarea / setpower）
++ *     STEP2  进来时的状态快照：LCDC 的 State/Lock/ErrorCode/收发计数、四个关键
++ *            寄存器、显示时钟（HCLK + SPI_IF_CONF.CLK_DIV ⇒ 面板时钟）
++ *     STEP3  **动手之前先读一次面板 ID**（全流程最有判别力的一步，见下）
++ *     STEP4  坏状态归零：Lock→UNLOCKED、State→READY、ErrorCode→NONE
++ *     STEP5  BSP_LCD_PowerUp()：VADD_EN(PA37) 拉高 + LCD 那几根脚重新 pinmux
++ *     STEP6  自己拉一轮 RESET 脚，低电平比开机长（30ms vs 10ms）
++ *     STEP7  p_ops->Init()：**内含 HAL_LCDC_Init()** —— RCC_MOD_LCDC1 整模块
++ *            复位 → 接口选择/时钟分频/输出格式/TE/接口使能/释放 RSTB，随后拉
++ *            RESET 脚 + 重发整串面板寄存器（0xFE 页切换、密码锁、SPI 模式、0x3A
++ *            像素格式、0x2A/0x2B 窗口、0x11 出睡眠、0x29 DisplayOn）
++ *     STEP8  补开机那一步中断接线：irq_attach + up_enable_irq(LCDC1)（幂等）
++ *     STEP9  sf32lb_lcd_lcdc_setup()：LCDC 侧背景色/层复位/层像素格式；再按当前
++ *            bpp 显式设一次像素格式（SetColorMode）
++ *     STEP10 亮度按驱动里记着的值重下发（面板复位后 WBRIGHT 会回默认值），
++ *            再清 power 后 DisplayOn 一次，让 priv->power 和面板对齐
++ *     STEP11 收工后再读一次面板 ID
++ *     STEP12 结论 + 耗时/持锁时间（直接回答"挡了刷屏多久"）
++ *
++ *   === 怎么用日志判断卡在哪一层（STEP3 / STEP11 的 ReadID）===
++ *   面板 ID 是"QSPI 链路 + LCDC 出位 + 面板本身"同时活着的最好证据：
++ *     - 读回 == p_drv_ops->id（本板 0x331100）⇒ 送得出去也读得回来，问题不在
++ *       面板通路；去看 LCDC 出帧那一侧（层/格式/背景色）、面板自己的显示开关
++ *       （0x29/0x28）、亮度（0x51）、或者背光 PWM。
++ *     - 读不回（0 / 0xFFFFFF）⇒ QSPI 或面板那侧：LCDC 的 SPI 时钟分频/模块复位
++ *       没起来、State 卡在 BUSY（HAL_LCDC_ReadDatas 会直接返回 HAL_BUSY）、
++ *       RESET 脚没释放、VADD_EN(PA37) 没供上。
++ *   再配上 STEP2 的 State/Lock/寄存器快照，"哪一层卡住"就钉死了。
++ *
++ *   === 为什么不再单独调 HAL_LCDC_Reset() ===
++ *   读实现（bf0_hal_lcdc.c:2373）可以确认 HAL_LCDC_Reset() 就是
++ *   `LCDC_HW_Init(lcdc)` + `State = READY`，和 HAL_LCDC_Init() 的唯一区别是后者
++ *   还顺手置了一下 Layer[].disable；而 **LCDC_HW_Init() 每次都会
++ *   `HAL_RCC_EnableModule + HAL_RCC_ResetModule(RCC_MOD_LCDC1)`** —— 那一步就是
++ *   LCDC 整个模块的硬复位，正是"显示通路重来一遍"要的东西。两条都能重入也不是
++ *   靠猜：开机路径已经把 p_ops->Init()（= 内含 HAL_LCDC_Init）整整调了三次
++ *   （find_right_driver、lcd_init_thread_entry、lcd_hw_setup_thread_entry）。
++ *   既然 Init() 已经做了同样的模块复位，再插一次 HAL_LCDC_Reset() 只是多一次
++ *   全模块复位、多一个 ROM 函数的重入面，什么也不多给 —— 所以不加。
++ *   （要确认它真做了，看 STEP2 与 STEP7 之后那几行寄存器/时钟日志。）
++ *
++ *   === 显示时钟 / PMU 电源域 ===
++ *   LCDC1 的模块时钟来自 HCLK（本板 240MHz、由 bsp_init.c 的 DLL1 提供），分频写
++ *   进 SPI_IF_CONF.CLK_DIV，**没有独立的显示 PLL，也没有 PMU 里的显示电源域**要
++ *   开。面板的 VADD_EN 是板级 GPIO PA37，由 BSP_LCD_PowerUp() 拉（STEP5）。
++ *   所以 STEP2/STEP7 把 HCLK 和 CLK_DIV 都打出来，一眼看出时钟对不对。
++ *   （LCDC 那个 SPI/四线接口就是面板总线，**不是** flash 的 SFC 控制器，别去动 SFC。）
++ *
++ *   === 和"正在刷屏的 LVGL 线程"共存 ===
++ *   整个 STEP2~STEP11 都拿 s_drv_lcd.panel_lock，而 putrun/putarea 推像素、
++ *   setpower、以及开机那次面板复位拿的是同一把锁 —— 所以"重发配置"和"推一帧像素"
++ *   不会同时在 QSPI 上跑。代价是这段时间刷新会卡住（面板本来就在复位，卡住是应该
++ *   的）；STEP12 会把实际持锁时长打出来。更彻底的做法是"先让 LVGL 停刷再重初始
++ *   化"（LVGL 的刷新由它自己的定时器驱动，本项目没有现成的暂停接口），本轮没做，
++ *   影响见文档 3.4 节。
++ *
++ *   **只动面板和 LCDC，不碰 LVGL**：屏幕重绘由调用方负责
++ *   （robot_ui 的 robot_ui_bridge_panel_reinit() 会往 LVGL 线程投一次全屏失效）。
++ *
++ *   Returned Value:
++ *     OK       重新初始化下发完成
++ *     -ENODEV  面板驱动还没绑上（开机 lcd_init 线程还没跑到）
++ *     -EINVAL  在中断上下文里调的
++ *     -ENOSYS  编译期关掉了（SF32LB_LCD_PANEL_REINIT = 0）
++ *
++ ****************************************************************************/
++
++/****************************************************************************
++ * 重初始化用的两个小工具
++ ****************************************************************************/
++
++#if SF32LB_LCD_PANEL_REINIT
++
++/* 单调毫秒计时。用它量"持锁多久"，直接把"挡了刷屏多长时间"变成日志上的一行。 */
++static uint32_t sf32lb_lcd_now_ms(void)
++{
++  struct timespec ts;
++
++  clock_gettime(CLOCK_MONOTONIC, &ts);
++  return (uint32_t)((uint64_t)ts.tv_sec * 1000u
++                    + (uint64_t)ts.tv_nsec / 1000000u);
++}
++
++/* 读面板 ID（走面板驱动的 ReadID 回调，本板 = CO5300 的 0x04 寄存器）。
++ * 没实现 ReadID 时回 0xffffffff，调用方按"读不到"处理。 */
++static uint32_t sf32lb_lcd_read_panel_id(FAR lcd_drv_desc_t *p_drv_ops)
++{
++  if (p_drv_ops == NULL || p_drv_ops->p_ops == NULL ||
++      p_drv_ops->p_ops->ReadID == NULL)
++    {
++      return 0xffffffffu;
++    }
++
++  return p_drv_ops->p_ops->ReadID(&s_drv_lcd.hlcdc);
++}
++
++#endif /* SF32LB_LCD_PANEL_REINIT */
++
++int sf32lb_lcd_panel_reinit(void)
++{
++#if !SF32LB_LCD_PANEL_REINIT
++  LCD_REINIT_WARN("sf32lb_lcd_panel_reinit: 编译期已关闭（SF32LB_LCD_PANEL_REINIT=0）");
++  return -ENOSYS;
++#else
++  lcd_drv_desc_t *p_drv_ops = s_drv_lcd.p_drv_ops;
++  LCDC_HandleTypeDef *hlcdc = &s_drv_lcd.hlcdc;
++  LCD_IF_TypeDef *regs;
++  uint32_t id_before;
++  uint32_t id_after;
++  uint32_t hclk_mhz;
++  uint32_t clk_div;
++  uint32_t t_enter;
++  uint32_t t_locked;
++  uint32_t t_done;
++
++  if (p_drv_ops == NULL || p_drv_ops->p_ops == NULL ||
++      p_drv_ops->p_ops->Init == NULL)
++    {
++      LCD_REINIT_FAIL("面板驱动还没绑上，先等开机 lcd_init 线程跑完");
++      return -ENODEV;
++    }
++
++  if (up_interrupt_context())
++    {
++      LCD_REINIT_FAIL("不能在中断上下文里调");
++      return -EINVAL;
++    }
++
++  t_enter = sf32lb_lcd_now_ms();
++
++  LCD_REINIT_STEP("===== 开始 (面板 %s bpp %d power %d 亮度 %d%%) =====",
++                  p_drv_ops->name, s_drv_lcd.bpp, s_drv_lcd.power,
++                  s_drv_lcd.contrast);
++
++  /* STEP1：等"面板空闲"。LVGL 20~30 帧/s 地推像素，这里可能真要等一会儿。 */
++  if (SF32LB_LCD_PANEL_LOCK_WAIT(SF32LB_LCD_PANEL_LOCK_WAIT_MS) < 0)
++    {
++      LCD_REINIT_WARN("STEP1 等 panel_lock 超时 %dms（推屏太密？）——继续",
++                      SF32LB_LCD_PANEL_LOCK_WAIT_MS);
++    }
++
++  t_locked = sf32lb_lcd_now_ms();
++  LCD_REINIT_STEP("STEP1 拿到面板锁（等了 %u ms），之后刷屏会被挡住",
++                  (unsigned)(t_locked - t_enter));
++
++  regs = hlcdc->Instance;
++
++  /* STEP2：状态快照 —— "动手之前长什么样"的唯一记录。 */
++  LCD_REINIT_STEP("STEP2 LCDC: State=%d Lock=%d ErrorCode=0x%08x 起帧=%u 完帧=%u",
++                  (int)hlcdc->State, (int)hlcdc->Lock,
++                  (unsigned)hlcdc->ErrorCode,
++                  (unsigned)hlcdc->debug_cnt0, (unsigned)hlcdc->debug_cnt2);
++  LCD_REINIT_STEP("STEP2 寄存器: LCD_CONF=0x%08x SPI_IF_CONF=0x%08x LCD_IF_CONF=0x%08x",
++                  (unsigned)regs->LCD_CONF, (unsigned)regs->SPI_IF_CONF,
++                  (unsigned)regs->LCD_IF_CONF);
++  LCD_REINIT_STEP("STEP2 寄存器: TE_CONF=0x%08x STATUS=0x%08x LCD_SINGLE=0x%08x",
++                  (unsigned)regs->TE_CONF, (unsigned)regs->STATUS,
++                  (unsigned)regs->LCD_SINGLE);
++
++  hclk_mhz = HAL_RCC_GetHCLKFreq(CORE_ID_HCPU) / 1000000u;
++  clk_div  = (regs->SPI_IF_CONF & LCD_IF_SPI_IF_CONF_CLK_DIV_Msk)
++             >> LCD_IF_SPI_IF_CONF_CLK_DIV_Pos;
++  LCD_REINIT_STEP("STEP2 显示时钟: HCLK=%uMHz CLK_DIV=%u ⇒ 面板时钟≈%uMHz",
++                  (unsigned)hclk_mhz, (unsigned)clk_div,
++                  (unsigned)(clk_div != 0u ? hclk_mhz / clk_div : 0u));
++
++  /* STEP3：**动手之前**读一次面板 ID —— 全流程最有判别力的一条。 */
++  id_before = sf32lb_lcd_read_panel_id(p_drv_ops);
++  if (id_before == p_drv_ops->id)
++    {
++      LCD_REINIT_PASS("STEP3 读回面板 ID=0x%08x (期望 0x%08x) ⇒ QSPI 链路和面板都活着",
++                      (unsigned)id_before, (unsigned)p_drv_ops->id);
++    }
++  else
++    {
++      LCD_REINIT_WARN("STEP3 读回面板 ID=0x%08x (期望 0x%08x) ⇒ QSPI/面板那侧有问题",
++                      (unsigned)id_before, (unsigned)p_drv_ops->id);
++      if (hlcdc->State != HAL_LCDC_STATE_READY || hlcdc->Lock != HAL_UNLOCKED)
++        {
++          LCD_REINIT_WARN("STEP3 注意 State=%d Lock=%d：读寄存器走 HAL_LCDC_ReadDatas，"
++                          "State!=READY 时它直接回 HAL_BUSY，读失败未必是 QSPI 坏",
++                          (int)hlcdc->State, (int)hlcdc->Lock);
++        }
++    }
++
++  /* STEP4：把上一次留下的坏状态归零。 */
++  if (hlcdc->Lock != HAL_UNLOCKED)
++    {
++      LCD_REINIT_WARN("STEP4 Lock 残留=%d ⇒ 强置 UNLOCKED（否则 WriteDatas 里会死等）",
++                      (int)hlcdc->Lock);
++      hlcdc->Lock = HAL_UNLOCKED;
++    }
++  else
++    {
++      LCD_REINIT_PASS("STEP4 Lock 干净 (HAL_UNLOCKED)");
++    }
++
++  if (hlcdc->State != HAL_LCDC_STATE_READY)
++    {
++      /* HAL_LCDC_ReadDatas / WriteDatas / SendLayerData2Reg_IT 开头都会判
++       * `HAL_LCDC_STATE_READY != lcdc->State` 然后直接返回 HAL_BUSY —— State
++       * 卡在 BUSY 时**每一次寄存器写都静默失败**，正好是整屏黑的形状。
++       * State 只是软件标志，强置 READY 没有硬件副作用（Init 自己也会置回 READY）。 */
++      LCD_REINIT_WARN("STEP4 State=%d 不是 READY ⇒ 强置 READY（否则寄存器读写全 HAL_BUSY）",
++                      (int)hlcdc->State);
++      hlcdc->State = HAL_LCDC_STATE_READY;
++    }
++  else
++    {
++      LCD_REINIT_PASS("STEP4 State=READY");
++    }
++
++  if (hlcdc->ErrorCode != HAL_LCDC_ERROR_NONE)
++    {
++      LCD_REINIT_WARN("STEP4 ErrorCode=0x%08x 清零", (unsigned)hlcdc->ErrorCode);
++      hlcdc->ErrorCode = HAL_LCDC_ERROR_NONE;
++    }
++
++  /* STEP5：板级上电（幂等）：等 500us → LCD/QSPI 那几根脚重新 pinmux →
++   * PA10(LCD 供电使能)=1、PA37(VADD_EN)=1。PA00 是面板 RESET，STEP6 自己拉。 */
++  BSP_LCD_PowerUp();
++  LCD_REINIT_PASS("STEP5 BSP_LCD_PowerUp 完成（PA10 供电、PA37 VADD_EN=1、QSPI 脚 pinmux）");
++
++  /* STEP6：RESET 脚时序。开机只拉低 10ms（co5300.c 的 LCD_Drv_Init），这里给 30ms：
++   * 面板"丢配置"最常见的形状就是复位不彻底。之后 Init() 自己还会按 10ms 再拉
++   * 一轮，无害。 */
++  BSP_LCD_Reset(1);
++  up_mdelay(10);
++  BSP_LCD_Reset(0);
++  up_mdelay(SF32LB_LCD_RESET_LOW_MS);
++  BSP_LCD_Reset(1);
++  up_mdelay(SF32LB_LCD_RESET_HIGH_MS);
++  LCD_REINIT_PASS("STEP6 RESET 脚: 1→10ms→0→%dms→1→%dms（开机只拉低 10ms）",
++                  SF32LB_LCD_RESET_LOW_MS, SF32LB_LCD_RESET_HIGH_MS);
++
++  /* STEP7：面板 Init —— 内部第一步就是 HAL_LCDC_Init() → LCDC_HW_Init()：
++   * RCC_MOD_LCDC1 使能 + 硬复位 → SelectIntf → SetFreq（写 SPI_IF_CONF.CLK_DIV）
++   * → SetOutFormat → SetupTE → EnableInf → 释放 RSTB。这就是"显示通路重初始化"
++   * 的 SoC 侧那一步，之后才是面板那一串寄存器。 */
++  p_drv_ops->p_ops->Init(hlcdc);
++  LCD_REINIT_STEP("STEP7 面板 Init 完成（含 HAL_LCDC_Init: RCC_MOD_LCDC1 复位→接口/分频/格式/TE）");
++
++  clk_div = (regs->SPI_IF_CONF & LCD_IF_SPI_IF_CONF_CLK_DIV_Msk)
++            >> LCD_IF_SPI_IF_CONF_CLK_DIV_Pos;
++  if (clk_div == 0u)
++    {
++      LCD_REINIT_WARN("STEP7 SPI_IF_CONF.CLK_DIV=0（硬件不支持分频 1）⇒ 时钟没配好");
++    }
++  else
++    {
++      LCD_REINIT_PASS("STEP7 SPI_IF_CONF.CLK_DIV=%u ⇒ 面板时钟≈%uMHz",
++                      (unsigned)clk_div, (unsigned)(hclk_mhz / clk_div));
++    }
++
++  if ((regs->LCD_IF_CONF & LCD_IF_LCD_IF_CONF_LCD_RSTB) == 0u)
++    {
++      LCD_REINIT_WARN("STEP7 LCDC 的 LCD_RSTB 位没起来（LCD_IF_CONF=0x%08x）",
++                      (unsigned)regs->LCD_IF_CONF);
++    }
++
++  /* STEP8：补开机那一步中断接线（幂等）。LCDC1 的中断没接/没使能时，
++   * HAL_LCDC_SendLayerData2Reg_IT 永远等不到完成，State 会卡在 BUSY。 */
++#ifdef SOC_BF0_HCPU     /* gpio1 only work on hcpu */
++  irq_attach(NX_IRQ(LCDC1_IRQn), lcdc1_isr, (void *)hlcdc);
++  up_enable_irq(NX_IRQ(LCDC1_IRQn));
++  LCD_REINIT_PASS("STEP8 irq_attach + up_enable_irq(LCDC1_IRQn=%d)", NX_IRQ(LCDC1_IRQn));
++#else
++  LCD_REINIT_WARN("STEP8 本核不接 LCDC1 中断（非 HCPU），跳过");
++#endif /* SOC_BF0_HCPU */
++
++  /* STEP9：LCDC 侧层配置 + 按当前 bpp 重设像素格式。 */
++  sf32lb_lcd_lcdc_setup();
++  if (p_drv_ops->p_ops->SetColorMode != NULL)
++    {
++      p_drv_ops->p_ops->SetColorMode(hlcdc,
++                                     s_drv_lcd.bpp == 24
++                                         ? LCDC_PIXEL_FORMAT_RGB888
++                                         : LCDC_PIXEL_FORMAT_RGB565);
++      LCD_REINIT_PASS("STEP9 层复位/背景色清零 + SetColorMode(%s)",
++                      s_drv_lcd.bpp == 24 ? "RGB888" : "RGB565");
++    }
++  else
++    {
++      LCD_REINIT_WARN("STEP9 该面板没有 SetColorMode 回调，只做了层复位/背景色");
++    }
++
++  /* STEP10：亮度 + DisplayOn。面板被复位过，WBRIGHT 会回到上电默认值，
++   * 所以按驱动里记着的百分比重下发一次。 */
++  if (p_drv_ops->p_ops->SetBrightness != NULL)
++    {
++      p_drv_ops->p_ops->SetBrightness(hlcdc, (uint8_t)s_drv_lcd.contrast);
++      LCD_REINIT_PASS("STEP10 亮度重下发 %d%%", s_drv_lcd.contrast);
++    }
++  else
++    {
++      LCD_REINIT_WARN("STEP10 该面板没有 SetBrightness 回调，亮度没重下发");
++    }
++
++  s_drv_lcd.power = 0;
++  sf32lb_lcd_ensure_display_on(&s_drv_lcd);
++  LCD_REINIT_PASS("STEP10 DisplayOn 已下发 (0x29)，power=%d", s_drv_lcd.power);
++
++  /* STEP11：收工后再读一次 ID —— 和 STEP3 配对，就是"这次救没救回来"的答案。 */
++  id_after = sf32lb_lcd_read_panel_id(p_drv_ops);
++  if (id_after == p_drv_ops->id)
++    {
++      LCD_REINIT_PASS("STEP11 重发配置后读回面板 ID=0x%08x", (unsigned)id_after);
++      if (id_before == p_drv_ops->id)
++        {
++          LCD_REINIT_STEP("STEP12 结论: 动手前/后 ID 都读得回 ⇒ 面板通路本来就是通的，"
++                          "黑屏不在这层；接着看背光/亮度、LCDC 层格式或面板显示开关");
++        }
++      else
++        {
++          LCD_REINIT_STEP("STEP12 结论: 动手前读不回、动手后读回 ⇒ 原本是 QSPI/面板侧的"
++                          "问题，这次重初始化把它救回来了");
++        }
++    }
++  else
++    {
++      LCD_REINIT_WARN("STEP11 重发配置后仍读不回面板 ID=0x%08x", (unsigned)id_after);
++      LCD_REINIT_WARN("STEP12 结论: 不是面板丢配置这么简单 —— LCDC 时钟/复位、"
++                      "VADD_EN(PA37) 供电、或 RESET 脚(PA00) 那侧还没起来。"
++                      "断电可恢复说明面板本身没坏");
++    }
++
++  SF32LB_LCD_PANEL_UNLOCK();
++
++  t_done = sf32lb_lcd_now_ms();
++  LCD_REINIT_STEP("===== 结束: 总耗时 %u ms，其中持锁 %u ms（这段时间刷屏被挡） =====",
++                  (unsigned)(t_done - t_enter), (unsigned)(t_done - t_locked));
++
++  return OK;
++#endif /* !SF32LB_LCD_PANEL_REINIT */
++}
++
+ /****************************************************************************
+  * Name:  board_lcd_getdev
+  *

@@ -41,9 +41,35 @@ if(CONFIG_LVX_USE_CONTEST2026_233_ZHI_AI)
   # SRCS 里的 reminder_sched.c：提醒的软调度（硬件只有一个 RTC 日循环 alarm 槽，
   # 多个提醒要在软件层排队）。提醒列表的数据也放在那里，touch_ui.c 只通过
   # reminder_sched_* 增删查；到点回调在工作线程里，main.c 用 lv_async_call 弹窗。
+  # 环境听音（工作流 C）：常态听音 + 突发大音量检测 -> ASR -> 大模型判断。
+  # 实现在 ambient_listen.c，默认**关**（配置键 enable_ambient_listen），
+  # 打开后才起线程占麦克风、才分配那约 250 KiB 堆缓冲。
   nuttx_add_application(
     NAME robot_ui
     SRCS main.c robot_ui.c touch_ui.c reminder_sched.c network_comm.c time_sync.c
+         ambient_listen.c
+         # 跨线程"投到 LVGL 线程"的唯一投递口：内部把 lv_async_call 用一把
+         # 互斥锁包住（LVGL 9.1 的 timer 链表插入本身没有锁，多线程同时插会
+         # 插坏链表 -> LVGL 线程跳到垃圾地址 -> 整机硬故障）。原因和残余风险
+         # 写在 ui_async.h 里，调用点见 main.c / touch_ui.c。
+         ui_async.c
+         # 语音链路推界面的跨 app 直调入口（ai_companion 直接函数调用，不再只靠
+         # MQTT 绕公网）。头文件是自给自足的，hello_app 那边只 include 它。
+         robot_ui_bridge.c
+         # 刷屏/渲染耗时仪表（工作用）：只把慢 flush 和慢帧打到串口。总开关在
+         # ui_perf.h 的 UI_PERF_LOG，置 0 时这个文件编译成空翻译单元，main.c 里
+         # 那几处调用也被 #if 掉。不想要了就删这一行 + 删两个文件。
+         ui_perf.c
+         # 屏幕镜像的 LVGL 侧（真机屏幕坏了，拿电脑当显示器）：
+         # 只挂一个 LV_EVENT_FLUSH_START 把它们交给驱动的那块脏区拷进板级
+         # 影子帧缓冲，socket/协议/任务/nsh 全在 board/.../lcd_mirror.c。
+         # 拿掉这个功能：删这一行 + 删两个文件 + 删 main.c 里那一句调用。
+         lcd_mirror_glue.c
+         # TTS 预缓存（app/hello_app/tts_cache.c）**不在这一行里**：main.c 只是
+         # include 它的头文件、调 tts_cache_load()，实现已经属于 hello_app 那个 app
+         # （和上面 robot_ui_bridge.c / ai_companion_req.h 同一套跨 app 处理：
+         #  头文件路径由下面 `../hello_app` 提供，符号在最终链接时解析，
+         #  重复编译会让同一批符号被编两遍）。
          lv_font_ui_16.c lv_font_ui_20.c lv_font_ui_24.c
     STACKSIZE 32768
     PRIORITY 100

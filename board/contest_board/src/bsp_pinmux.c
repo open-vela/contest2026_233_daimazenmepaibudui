@@ -213,9 +213,13 @@ static void BSP_PIN_Common(void)
 
 void BSP_PIN_Touch(void)
 {
+    // FT6146 的 INT（PA31）是**开漏输出**：必须上拉，NOPULL 会让它悬空、
+    // EXTI 永不触发（厂商提交 8c6cd18 修的就是这一行）。RESET 是推挽输出，
+    // 保持 NOPULL。
+
     // Touch
     HAL_PIN_Set(PAD_PA09, GPIO_A9,  PIN_NOPULL, 1);    // CTP_RESET
-    HAL_PIN_Set(PAD_PA31, GPIO_A31, PIN_NOPULL, 1);    // CTP_INT
+    HAL_PIN_Set(PAD_PA31, GPIO_A31, PIN_PULLUP, 1);    // CTP_INT（开漏，要上拉）
     HAL_PIN_Set(PAD_PA30, I2C1_SCL, PIN_PULLUP, 1);
     HAL_PIN_Set(PAD_PA33, I2C1_SDA, PIN_PULLUP, 1);
 }
