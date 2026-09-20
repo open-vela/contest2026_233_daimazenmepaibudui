@@ -21,7 +21,7 @@
 ```
 ## 三、目录结构
 
-```
+```test
 contest2026_233_daimazenmepaibudui/
 ├── .github/                         # GitHub 配置、Issue 模板与 CLA 工作流
 │
