@@ -19,27 +19,111 @@
 ## 三、目录结构
 
 ```
+## 三、目录结构
+
+```
 contest2026_233_daimazenmepaibudui/
-├── app/                          # 应用代码目录
-│   ├── hello_app/                # AI陪伴系统核心模块
-│   │   ├── ai_companion_main.c   # 主程序入口
-│   │   ├── ai_llm.c/h           # 大语言模型接口
-│   │   ├── ai_audio.c/h         # 音频处理模块
-│   │   ├── ai_care.c/h          # 智爱守护核心逻辑
-│   │   ├── ai_sound_detect.c/h  # 声音检测模块
-│   │   └── ai_state_machine.c/h # 状态机管理
-│   ├── robot_ui/                 # 机器人界面模块
-│   └── zhi_ai/                   # 智爱应用模块
-├── board/                        # 板级适配代码
-│   └── contest_board/            # SF32LB52-DevKit-LCD适配
-├── quickapp/                     # 快应用代码
-│   └── hello_quickapp/           # 快应用示例
-├── logs/                         # AI Coding 日志
-│   └── gaoxiaoying0207/          # 开发者日志目录
-├── nuttx/                        # OpenVeLA内核（通过repo sync获取）
-├── vendor/                       # 厂商适配代码（通过repo sync获取）
-├── apps/                         # 系统应用（通过repo sync获取）
-└── README.md                     # 本文件
+├── .github/                         # GitHub 配置、Issue 模板与 CLA 工作流
+│
+├── app/                             # 作品应用代码
+│   ├── hello_app/                   # AI 陪伴、语音交互与声音事件检测
+│   │   ├── ai_companion_main.c      # AI 陪伴系统主程序
+│   │   ├── ai_audio.c/h             # 麦克风录音、音频播放与音频资源管理
+│   │   ├── ai_sound_detect.c/h      # VAD、人声门控与声音检测
+│   │   ├── sound_event.c/h          # 端侧异常声音分类推理
+│   │   ├── sound_event_model.h      # 端侧声音模型权重
+│   │   ├── sound_event_model.json   # 模型参数、类别和验证信息
+│   │   ├── ai_llm.c/h               # ai_agent 大语言模型接口
+│   │   ├── mimo_voice.c/h           # 云端 ASR、LLM 与 TTS 语音链路
+│   │   ├── mimo_location.c/h        # 网络定位功能
+│   │   ├── ai_care.c/h              # 主动关怀与健康提醒逻辑
+│   │   ├── ai_state_machine.c/h     # AI 陪伴状态机
+│   │   ├── ai_tools_provider.c/h    # ai_agent 工具调用能力
+│   │   ├── kws_dtw.c/h              # 端侧唤醒词匹配
+│   │   └── tts_cache.c/h            # TTS 音频缓存
+│   │
+│   ├── robot_ui/                    # LVGL 图形界面与交互模块
+│   │   ├── main.c                   # 界面应用入口
+│   │   ├── robot_ui.c/h             # 主界面、状态页和报警页面
+│   │   ├── touch_ui.c/h             # 触摸交互
+│   │   ├── network_comm.c/h         # MQTT 通信、报警和手机推送
+│   │   ├── reminder_sched.c/h       # 提醒任务调度
+│   │   ├── ambient_listen.c/h       # 环境声音监听
+│   │   ├── sound_classifier.c/h     # 声音分类接口
+│   │   ├── sound_fusion.c/h         # 多模态声音结果融合
+│   │   ├── time_sync.c/h            # 网络时间同步
+│   │   ├── lcd_mirror_glue.c/h      # 屏幕镜像适配
+│   │   └── lv_font_ui_*.c           # 中文 LVGL 字库
+│   │
+│   ├── zhi_ai/                      # 智爱应用与设备端业务入口
+│   ├── audio_test/                  # 音频录制、播放和循环测试命令
+│   ├── hw_test/                     # 显示、按键、RTC、音频等硬件自检
+│   └── drvtest/                     # 驱动与网络诊断测试
+│
+├── board/                           # 比赛开发板适配代码
+│   ├── contest_board/               # SF32LB52-DevKit-LCD 板级实现
+│   │   ├── configs/sf32lb52_ai/     # 比赛固件 defconfig
+│   │   ├── scripts/                 # 板级映射与辅助脚本
+│   │   └── src/                     # 音频、显示、按键、RTC 等板级驱动
+│   ├── Kconfig.proj                 # 板级 Kconfig 配置入口
+│   ├── SConstruct                   # SiFli SDK 构建入口
+│   ├── SConscript                   # SiFli SDK 构建规则
+│   ├── proj.conf                    # 板级工程配置
+│   └── rtconfig.py                  # RT-Thread/SDK 构建配置
+│
+├── docs/                            # 开发、使用和测试文档
+│   ├── ai_agent_usage.md            # ai_agent 配置与使用说明
+│   ├── audio_driver_usage.md        # 音频驱动使用说明
+│   ├── network_api_usage.md         # 网络通信接口说明
+│   ├── alarm_usage.md               # 报警功能说明
+│   ├── rtc_alarm_usage.md           # RTC 定时报警说明
+│   ├── display_touch_gpio_usage.md  # 显示、触摸和 GPIO 使用说明
+│   └── test_logs/                   # 真机测试与验证日志
+│
+├── flash/                           # 固件烧录材料
+│   ├── README.md                    # 烧录步骤与地址说明
+│   ├── flash_openvela.bat           # Windows 烧录脚本
+│   ├── flash_openvela.sh            # Linux 烧录脚本
+│   ├── ftab.bin                     # SF32LB52 启动分区表
+│   └── ptab.json                    # 分区表源配置
+│
+├── logs/                            # AI Coding 对话日志
+│   ├── gaoxiaoying0207/             # 成员 AI Coding 日志
+│   ├── Shlyx-ctrl/                  # 成员 AI Coding 日志
+│   └── zhan9xiaohu1/                # 成员 AI Coding 日志
+│
+├── model_output/                    # 声音模型离线训练产物
+│   ├── labels.json                  # 模型类别定义
+│   ├── model_info.json              # 模型结构和训练指标
+│   ├── sound_model.onnx             # ONNX 模型
+│   ├── sound_model.onnx.data        # ONNX 外部权重数据
+│   ├── best_model.pth               # 最优 PyTorch 模型
+│   └── final_model.pth              # 最终 PyTorch 模型
+│
+├── patches/                         # openvela 公共仓库修改补丁
+│   ├── README.md                    # 补丁用途、顺序和应用方法
+│   ├── nuttx-*.patch                # NuttX 网络相关补丁
+│   ├── vendor_sifli-*.patch         # SiFli 板级及驱动补丁
+│   └── apps-ai-agent-*.patch        # ai_agent 功能修复补丁
+│
+├── quickapp/
+│   └── hello_quickapp/              # 仓库初始快应用示例
+│
+├── src/                             # SiFli SDK 工程入口代码
+│
+├── tools/                           # PC 侧工具、模型训练与测试脚本
+│   ├── audio_event/                 # 声音数据采集、训练、导出和对拍
+│   ├── lcd_mirror/                  # 屏幕镜像和鼠标触摸工具
+│   ├── pc_env/                      # 网络、串口和诊断工具
+│   ├── audio_dataset_scraper.py     # 音频数据集整理工具
+│   └── collect_fall_sounds.py       # 异常声音数据采集工具
+│
+├── .gitignore                       # Git 忽略规则
+├── .gitignore.example               # Git 忽略规则示例
+├── README.md                        # 作品介绍、构建、烧录和验收说明
+├── contest2026_233_daimazenmepaibudui.xml
+│                                    # 专属仓库 manifest 映射文件
+└── openvela.xml                     # openvela 工程清单文件
 ```
 
 ## 四、运行方式
@@ -624,7 +708,7 @@ git push
 
 ---
 
-**项目地址**: https://github.com/gaoxiaoying0207/contest2026_233_daimazenmepaibudui  
-**开发者**: gaoxiaoying0207  
+**项目地址**: https://github.com/openvela/contest2026_233_daimazenmepaibudui
+**开发者**: 代码怎么跑不队  
 **开发板**: SF32LB52-DevKit-LCD  
 **系统**: OpenVeLA (NuttX RTOS)
