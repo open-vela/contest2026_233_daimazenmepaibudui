@@ -585,7 +585,7 @@ git push
 - [ ] `hw_test tts "你好，今天天气不错"`：打印合成字节数，并**从喇叭放出来**。
 - [ ] 端到端：对着板子说话 → 串口出现 `识别结果: …` 与 `AI 回复: …` → 听到 TTS。
 
-**屏幕镜像**（本队现场就是靠它演示的）
+**屏幕镜像**
 
 - [ ] PC 端 `py -3.10 tools/lcd_mirror/lcd_mirror.py --scale 1.5` 出现板子画面
       （板子开机默认就是 TCP 腿，不用先在板子上敲命令）。
@@ -594,7 +594,7 @@ git push
       （LVGL 本身推屏 20~30 帧/s；面板 QSPI 降到 24MHz 之后上界约 34）。
 - [ ] **鼠标当触摸**：在画布上按住 / 拖动 → 板子界面跟着动。
 - [ ] **串口腿可用**（断网 / 换地方时的备胎）：`--serial <COM口>` 能连上，整屏切换约 1~1.5 秒。
-- [ ] **主机侧协议测试（不需要板子）**：`cd tools/lcd_mirror/host_test && bash run.sh`，
+- [ ] **主机侧协议测试**：`cd tools/lcd_mirror/host_test && bash run.sh`，
       再 `py -3.10 check_frames.py …` / `py -3.10 check_mapping.py`：
       前者出 `PASS: 全屏逐像素一致 + v2 头部/RLE 载荷…`，后者出 `PASS: 4 个旋转 × 4 个缩放…`。
 
