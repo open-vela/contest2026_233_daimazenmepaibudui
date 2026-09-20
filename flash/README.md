@@ -55,3 +55,16 @@ cmake --build cmake_out/sf32lb52_devkit_lcd
 
 - `sftool`:建议 0.2.5(<https://github.com/OpenSiFli/sftool/releases>);SDK 自带的 0.1.16 也可用
 - 串口终端:Windows 用 PowerShell/串口助手,Linux 用 `picocom -b 1000000 --noreset --lower-rts --lower-dtr /dev/ttyUSB0`(RTS 控制板子供电负载开关,普通 minicom/screen 可能把板子按在复位态)
+
+## 厂商 GUI / 升级包(`pkg/`)
+
+`pkg/` 是一个**可直接烧的升级包**(`Impeller.exe` 选这个目录即可),内部就是上面那两个文件加一份地址表:
+
+| 文件 | 烧录地址 | 说明 |
+|------|---------|------|
+| `pkg/bootloader/bootloader.bin` | `0x12010000` | 即 `nuttx.bin`(本包 sha256 `c4400618dee58e25d87a28a32d50fa33610f5b490938f224e16a17acdfff21f8`) |
+| `pkg/ftab/ftab.bin` | `0x12000000` | 与上面 `ftab.bin` 同一个文件 |
+| `pkg/ImgBurnList.ini` | — | 给 GUI 读的地址表(`FILE0`/`FILE1` + `ADDR0`/`ADDR1`) |
+
+步骤与判据见根目录 `README.md` 的「5. 烧录 → 5.1 另一条路:厂商 GUI(Impeller)」。三个要点:
+**① 烧之前先断开占用 COM 口的串口工具;② 失败就硬断电 10 秒;③ 烧完拔插一次原生 USB。**

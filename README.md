@@ -362,6 +362,33 @@ sftool -p <COM口> -c SF32LB52 -m nor --before default_reset --after soft_reset 
   **按一下板子 RESET，或硬断电 10 秒再来一次**（实测这是最有效的解药，别写循环空转重试）。
   另外，**板子上电 / 复位时不要插着原生 USB**（见下一节）。
 
+#### 5.1 另一条路：厂商 GUI（Impeller）+ 仓库自带的升级包
+
+不想手敲参数就用这条路。仓库里**已经带了一个可直接烧的升级包**：
+
+| | |
+|---|---|
+| 包目录 | `flash/pkg/`（`Impeller.exe` 直接选这个目录） |
+| 包内容 | `ImgBurnList.ini` + `bootloader/bootloader.bin @0x12010000` + `ftab/ftab.bin @0x12000000` |
+| 这份固件 | sha256 `c4400618dee58e25d87a28a32d50fa33610f5b490938f224e16a17acdfff21f8`（7 199 492 B） |
+
+步骤：
+
+1. **先断开占用 `<COM口>` 的串口工具。** `Impeller.exe` 和 `sftool` 都要用这个口给芯片发
+   下载协议，被占着时的报错很像"进不去下载模式"（实测踩过：串口工具还连着，怎么烧都失败）。
+2. 打开 `Impeller.exe`（SIFLI Impeller，实测 3.6.2）→ 选 `flash/pkg` 目录
+   （它读 `ImgBurnList.ini` 里的地址，不用手敲）。
+3. 板子进下载模式：**按一下 RESET**（或硬断电 10 秒后上电）。
+4. 点烧录，直到进度走完。
+5. 中途失败（`timeout while waiting for RAM command response` / `Failed to download stub`）
+   → **硬断电 10 秒**再来一次（最有效，别写循环空转重试）。
+6. 烧完**停下，拔插一次原生 USB**（判据：`Get-PnpDevice *VID_584E*` 两个设备都 `OK`，
+   且 `ping 192.168.137.2` 通）。
+
+> 这条路与上面 sftool 那条**完全等价**（写的是同样的两个地址）。升级包随仓库带上来，
+> 是为了"拿到仓库就能烧出一版跑得起来的固件"；自己要编新固件时，仍旧走第 4 节 →
+> 上面那条 sftool 命令。
+
 ### 6. 上电顺序与首次运行现象
 
 **顺序是铁律，反了就会得到一堆"看起来像固件坏了"的现象**：
