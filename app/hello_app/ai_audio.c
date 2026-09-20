@@ -641,10 +641,13 @@ static void *audio_record_thread(void *arg)
           break;
         }
 
-      /* 返回值怎么读（三种，处理方式都在下面）：
+      /* 返回值怎么读（处理方式都在下面）：
        *   > 0                      → 真读到了这么多字节，走数据通路；
-       *   = 0                      → EOF：被 STOP 打断 / 设备没在跑 / 会话换代。
+       *   = 0                      → EOF：被 STOP 打断 / 会话换代（别人把设备拿走了）。
        *                              维持原行为（按 record_stop 分岔，跳出循环）；
+       *   < 0 且 errno = ENODEV    → 驱动侧说"设备没在跑"（**不是**被抢走，2026-09-20
+       *                              晚从 EOF 里拆出来的）：这一支收尾必须 STOP + close，
+       *                              理由见下面 -ENODEV 那一支的注释；
        *   < 0 且 errno = ETIMEDOUT → **只是这一次没等到数据**（下层那一次等待
        *                              5 秒超时）。跳过这一帧接着读，连续超到
        *                              AUDIO_RECORD_TIMEOUT_TOLERANCE 次才当会话死；
@@ -859,14 +862,19 @@ static void *audio_record_thread(void *arg)
                * 两种死因的正确收尾正好相反，所以这里不能只置一个"死了"：
                *
                *   - nbytes == 0（EOF）：是**别人**把这一代停掉的。本层没让它停
-               *     （上面的 record_stop 已经把自己排除了），而 EOF 只有三个来源
-               *     —— 被 AUDIOIOC_STOP 打断 / 设备没在跑 / 会话换代 —— 三个都
-               *     说明设备已经不在我们手里了。此时发设备级 STOP 只会把刚接管
-               *     设备的那个会话打死（半双工），所以走 stolen → 只 close。
-               *   - 其余（连续读超时到上限，或 -EINVAL/fd 失效这类真错误）：
-               *     **没有任何人发过 STOP**，这一代很可能就是我们自己在用，
-               *     走 starved → 先 STOP 再 close，把设备收干净。
-               *     这两种归到一类是因为判据一致：都没有"别人把我停了"的实证，
+               *     （上面的 record_stop 已经把自己排除了），而 0 只有两个来源
+               *     —— 被 AUDIOIOC_STOP 打断 / 会话换代 —— 两个都说明设备已经
+               *     不在我们手里了。此时发设备级 STOP 只会把刚接管设备的那个
+               *     会话打死（半双工），所以走 stolen → 只 close。
+               *     （2026-09-20 晚修正：原来这里把"**设备没在跑**"也算作 0 的
+               *       来源之一，于是把"需要 STOP 才能收干净"的那一类归进了
+               *       "绝不能 STOP"那一类 —— 现场那个"1.8 秒一轮、永远起不来"的
+               *       自锁就是这么来的。现在驱动把"设备没在跑"单独用 -ENODEV
+               *       说出来，见下面那一支。）
+               *   - 其余（连续读超时到上限，-ENODEV "设备没在跑"，或 -EINVAL/fd
+               *     失效这类真错误）：**没有任何人发过 STOP**，这一代就是我们自己
+               *     在用，走 starved → 先 STOP 再 close，把设备收干净。
+               *     这几种归到一类是因为判据一致：都没有"别人把我停了"的实证，
                *     而那正是 stolen 唯一成立的理由。 */
 
               if (nbytes == 0)
@@ -875,6 +883,19 @@ static void *audio_record_thread(void *arg)
 
                   printf("[录音] 录音被外部停掉（read 返回 0/EOF，不是本层在停）："
                          "设备已被别人接手，收尾只关自己的 fd、不发 STOP\n");
+                }
+              else if (nbytes == -ENODEV)
+                {
+                  /* 驱动明确说"设备压根没在跑"（不是被抢走）。这一支必须**发 STOP**：
+                   * 框架那份共享 status（可能正钉在 DRAINING）只有 STOP 或"最后一个
+                   * fd 被关"才放得掉；不发它，下一个会话的 CONFIGURE/START 会被
+                   * 上层静默吞掉（返回 OK、驱动一次没被调），于是每次 read 又立刻
+                   * -ENODEV —— 现场那个自锁。 */
+
+                  starved = true;
+
+                  printf("[录音] 设备没在跑（read 返回 -ENODEV，驱动侧确认，"
+                         "不是被抢走）：按最后使用者停掉设备\n");
                 }
               else
                 {
@@ -1524,23 +1545,39 @@ int audio_record_start(audio_context_t *ctx,
  * 界面整块挂住 —— 实测过一次：提交按钮一直绿着不变色、整机像死机。
  *
  * 做法：先自己轮询 ctx->record_exited（usleep 自旋，**不依赖任何内核超时**），
- * 最多 300ms；正常路径（设备已经停了、驱动那次 read 已经返回、线程正在收尾）
- * 到这里就等到了，随后 join 立刻返回。
+ * 最多 AUDIO_RECORD_REAP_MS；正常路径（设备已经停了、驱动那次 read 已经返回、
+ * 线程正在收尾）到这里就等到了，随后 join 立刻返回。
  *
- * ★ 这次的改动（驱动录音 read 改成一次成型之后配套的那一刀）：**300ms 等不到
- * 也不再放弃 join**。原来那条兜底（放弃 join、保留一个残影读者）是围着"驱动
- * read 可以永久阻塞"设计的 —— 现场连 5 秒的超时都没回来过，见 sf32lb52_audio.c
- * 的 read。现在驱动录音 read 是**一次成型 + 5 秒硬上界**
- * （SF32LB52_AUDIO_RX_READ_TIMEOUT_MS，形状见那个文件顶部"录音 RX 通路"那段），
- * 而且驱动 hw_stop() 会
- * **无条件** post 一次 rx_sem 并作废会话代号，所以"先停设备再 join"里的 join
- * 已经是一个**确定会返回**的等待。
+ * ★ 2026-09-20 真机定案：**等不到就放弃 join，绝不在这里无限期等下去。**
  *
- * 留着残影读者的代价反而更大：它是一个"上一代"的 reader，会和新一代抢同一个
- * 设备 fd 和同一块 record_buf —— 本文件里那整套 stale / record_died /
- * audio_record_thread_is_current / abandoned 的判据有一大半是为它写的。
- * 所以这里让它闭环：等不到就照原样 join，线程的出口由驱动的上界兜。
+ * 上一版注释（2026-09-19 写的）的前提是"驱动录音 read 有 5 秒硬上界，所以这个
+ * join 确定会返回"，据此把原来那条"放弃 join"的兜底删掉了。当天现场就把这个
+ * 前提否掉 —— 板子卡死时抓的 dumpstack（串口 `dumpstack 55/56/51`）：
+ *
+ *   main_loop_task     → audio_record_stop → pthread_join → nxsem_wait_slow
+ *   care_announce_task → audio_play_start → audio_record_stop → pthread_join
+ *   audio_record_thread→ sf32lb52_audio_read+0x5d3 → nxsem_wait_slow
+ *                        （落在 sf32lb52_audio_rx_wait_slice 那次
+ *                          nxsem_wait_uninterruptible 上，而驱动的 timeout
+ *                          计数恒 0 ⇒ 那记"私有心跳"根本没把它叫醒）
+ *
+ * 后果不是"收尾慢"，而是 **join 把调用它的整条线程一起永久钉住**：
+ * main_loop_task 一死，监听守护 / 状态机 / 追问流程全停；而界面、MQTT、关怀
+ * 这些别的任务照常打日志 —— 从外面看像"app 还活着、只是说话没反应"，
+ * 只能断电重来。
+ *
+ * 所以恢复那条兜底，形状与播放线程的 audio_reap_play_thread 逐条对齐：等不到就
+ * 把它 detach 掉（内核在它真退出时回收 TCB）、清掉 record_thread_valid
+ * （= 我们不再持有它），重开会话的事交回上层（监听守护）。
+ * 代价是可能留下一个"上一代"的 reader —— 本文件里那整套 stale / record_died /
+ * audio_record_thread_is_current 的判据本来就是为它写的，它退出时自己安静收场。
  */
+
+/* 放弃 join 的门槛。比原来那个 300ms 宽：300ms 是"收尾慢了要报一行"的诊断线，
+ * 不是"可以放弃它"的线，拿它当门槛会把正常但稍慢的收尾误判成卡死
+ * （播放那条 AUDIO_PLAY_REAP_MS 也是同样的取值理由）。 */
+
+#define AUDIO_RECORD_REAP_MS   1000
 
 static void audio_reap_record_thread(audio_context_t *ctx, const char *who)
 {
@@ -1560,20 +1597,24 @@ static void audio_reap_record_thread(audio_context_t *ctx, const char *who)
       return;
     }
 
-  for (i = 0; i < 30 && !ctx->record_exited; i++)
+  for (i = 0; i < AUDIO_RECORD_REAP_MS / 10 && !ctx->record_exited; i++)
     {
-      usleep(10000);                    /* 10ms × 30 = 300ms 上限 */
+      usleep(10000);                    /* 10ms × 100 = 1000ms 上限 */
     }
 
   if (!ctx->record_exited)
     {
-      /* 还没退出 = 线程此刻还在设备调用里。照原样 join（理由见上面那段）：
-       * 驱动那次 read 最坏等满它自己的 5 秒上界就会返回。这一行日志是留给
-       * 上板判读的 —— "收尾比 300ms 慢"本身就该被看见，正常路径不该出现。 */
+      /* 还没退出 = 线程此刻还卡在设备调用里（理由与现场证据见上面那段）。
+       * **放弃 join**：继续等下去就是把调用者一起钉死，而调用者里包括主循环。 */
 
       syslog(LOG_ERR,
-             "[AUDIO] %s: 录音线程 300ms 内没退出（仍在设备调用里），"
-             "继续等 join —— 驱动 read 现在有 5 秒上界，不会无限阻塞\n", who);
+             "[AUDIO] %s: 录音线程 %dms 内没退出，放弃 join"
+             "（它卡在设备调用里；detach 交给内核回收，账本交回上层）\n",
+             who, AUDIO_RECORD_REAP_MS);
+
+      (void)pthread_detach(ctx->record_thread);
+      ctx->record_thread_valid = false;
+      return;
     }
 
   pthread_join(ctx->record_thread, NULL);
@@ -1661,9 +1702,22 @@ void audio_record_stop(audio_context_t *ctx)
 
   ctx->record_stop = true;
 
+  /* 设备那一层与线程那一层**分开**收（2026-09-20 真机定案）。
+   *
+   * 原来 audio_in_stop() 被关在 `if (record_thread_valid)` 里：只有当"还有一条线程
+   * 等着回收"时才会给设备发 AUDIOIOC_STOP。而现场那种死循环恰好是反过来的 ——
+   * 每次重开的会话**立刻** EOF、录音线程当场自己退干净并被回收（valid 变假），
+   * 于是**一次 STOP 都没发出去**，设备一直停在"没在跑"的状态，下一轮重开照样
+   * 起不来：串口里 60 多次循环、一条 `AUDIO: 通路位 adc_path_on -> 0` 都没有，
+   * 表现就是"说话永远没反应"（只能断电）。
+   *
+   * 所以 STOP 无条件发：设备那一层必须有人收干净，跟"有没有线程要 join"无关。
+   * 线程那一层依旧只在 valid 时才回收（没线程就不用 join）。 */
+
+  audio_in_stop();
+
   if (ctx->record_thread_valid)
     {
-      audio_in_stop();
       audio_reap_record_thread(ctx, "stop");
     }
 

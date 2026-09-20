@@ -1272,6 +1272,17 @@ void ui_post_ask_standdown(const char *src)
 }
 
 __attribute__((weak))
+int robot_ui_alarm_ring(const char *reason)
+{
+  /* robot_ui 没进镜像（或者那个模块还没落地）：板级警音归它那条路，这里起不了铃。
+   * 这一行是给 host / 别的小镜像兜底的，真机上永远走不到 —— 真机里 robot_ui 一定
+   * 在镜像里，强符号覆盖这里。 */
+  printf("[门控] robot_ui_alarm_ring() 还没落地，这一记铃起不了: %s\n",
+         reason != NULL ? reason : "(无)");
+  return -ENOSYS;
+}
+
+__attribute__((weak))
 bool robot_ui_alarm_claim(const char *src)
 {
   /* robot_ui 没进镜像（或者那个模块还没落地）：屏幕上根本没有第二条确认入口，

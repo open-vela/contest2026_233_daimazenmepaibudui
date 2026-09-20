@@ -383,7 +383,11 @@ int audio_record_wait_ms(const audio_context_t *ctx);
  *                      录音线程会跳过这一帧接着读，只有连续超时超过
  *                      ai_audio.c 的 AUDIO_RECORD_TIMEOUT_TOLERANCE(5) 次才收摊；
  *         -ECANCELED = 最近一次 read 返回 0（EOF：被 AUDIOIOC_STOP 打断 /
- *                      设备没在跑 / 会话换代），这一代会话到此为止；
+ *                      会话换代 —— "别人把设备拿走了"），这一代会话到此为止，
+ *                      收尾只 close、**不发 STOP**；
+ *         -ENODEV    = 最近一次 read 报"设备没在跑"（驱动侧确认，**不是**被抢走）。
+ *                      处置和上面一条正好相反：收尾要 STOP + close 把设备收干净，
+ *                      否则框架那份共享 status 一直被钉着，后面每个会话都起不来；
  *         其他负值 = read 原样返回的负值（未 start 的 -EINVAL、fd 失效等）。
  *
  * 用途：回答"为什么断了"。diag 快照（ai_companion_main.c）把它和

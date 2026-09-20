@@ -145,6 +145,17 @@ typedef void (*voice_mirror_submit_cb_t)(void *user_data);
 void touch_ui_set_voice_mirror_submit_cb(voice_mirror_submit_cb_t cb,
                                          void *user_data);
 
+/* 底部「重置」：卡死时用户唯一的自救入口。
+ *
+ * 语义、以及"为什么只投一个请求、剩下交给 board 侧看护"写在
+ * app/hello_app/ai_companion_req.h 里那段（自动接管已经删掉，机器不猜"它卡了没"，
+ * 由人按）。回调同样在 **LVGL 线程**里被调：里面只许 `ai_companion_request_takeover()`
+ * 那一下（置一个位）然后立刻返回 —— 不碰设备、不等任何人。 */
+typedef void (*voice_mirror_reset_cb_t)(void *user_data);
+
+void touch_ui_set_voice_mirror_reset_cb(voice_mirror_reset_cb_t cb,
+                                        void *user_data);
+
 /* 镜像面板状态行的四种状态：听=蓝、想=橙、说=绿、空闲=灰（颜色比字更早看出在干什么） */
 typedef enum {
     TOUCH_VOICE_STATE_IDLE = 0,     /* 「录制中」灰 */

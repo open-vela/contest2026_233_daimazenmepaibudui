@@ -74,7 +74,23 @@ static void test_sound_detector(void)
                            SOUND_DETECT_FRAMES_PER_WINDOW,
                            &type, &confidence) == OK);
   assert(type == SOUND_TYPE_FALL);
+
+  /* 回调（上报）不是"这一窗判到什么"就发：同一个类别要**连续
+   * SOUND_DETECT_CONFIRM_WINDOWS（=2，见 ai_sound_detect.c 里
+   * sound_detect_run_model 的那段确认逻辑）个窗口都超阈值才发一次。那是有意加的 ——
+   * 单窗口就报的话，一声脆响（点击声、关门声、喇叭自己的提示音）都会被判成
+   * "跌倒"，现场就是这个误报；真跌倒的声音是持续的，代价只是确认慢约 1 秒。
+   * 所以第 1 窗只进"待确认"、回调 0 次，第 2 窗才该出 1 次。
+   * （2026-09-21 修：原来这里只有一次 once() 就断言回调 1 次，是确认逻辑加进来
+   *   之前的写法 —— 它挂的从来不是"检测坏了"，是测试没跟上这条规则。） */
+
+  assert(g_sound_callbacks == 0);
+
+  assert(sound_detect_once(&ctx, samples,
+                           SOUND_DETECT_FRAMES_PER_WINDOW,
+                           &type, &confidence) == OK);
   assert(g_sound_callbacks == 1);
+
   assert(strcmp(sound_detect_get_type_name((sound_type_t)-1),
                 "UNKNOWN") == 0);
   sound_detect_deinit(&ctx);

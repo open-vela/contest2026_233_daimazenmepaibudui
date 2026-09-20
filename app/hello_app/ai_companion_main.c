@@ -9,6 +9,7 @@
  ****************************************************************************/
 
 #include <nuttx/config.h>
+#include <nuttx/clock.h>     /* clock_systime_ticks / TICK2MSEC：开机起算的运行时长 */
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -183,6 +184,16 @@
  * 超过就按"拿不准"处理，直接退回大模型。 */
 #define LIGHT_TEXT_MAX           512
 
+/* 本进程镜像里 main() 进来过几次（2026-09-20 加的诊断量）。
+ *
+ * 它回答的是"这次重初始化到底是新任务，还是整个镜像重新加载了一遍"：
+ *   - 同一大镜像里被别人 task_create 再拉一次（比如看护线程）→ **.data 还在**，
+ *     计数接着涨（第 2 次、第 3 次…），配合同一行里的 up=（系统运行秒数，
+ *     来自 clock_systime_ticks，不受本进程影响）能看得很清楚；
+ *   - 芯片真的复位了 → .data 被重新初始化，**计数回到 1**，而且 up= 也很小。
+ * （CONFIG_BUILD_FLAT 单一大镜像，所以这条 static 就是"这份镜像里的计数"。） */
+static int g_start_seq;
+
 /* 程序退出标志 */
 static volatile sig_atomic_t g_running = 1;
 static bool g_audio_started;
@@ -217,6 +228,144 @@ static volatile bool g_listen_wanted;
  * 所以第二次启动一律不初始化，只把参数交给调试入口（--sounddetect）。 */
 
 static volatile bool g_app_inited;
+
+/* 主循环心跳（2026-09-20 加）。
+ *
+ * 它是"这个实例还在往前走"的**唯一**证据：main_loop_task 每一拍的最开头落一次
+ * 时间戳（g_beat_ms），单位是"开机以来毫秒"（TICK2MSEC(clock_systime_ticks())，
+ * 和串口里那个 up= / 驱动那几条指纹日志是同一个基准，两条日志能直接对表）。
+ *
+ * 为什么会需要它：原来的"这个 app 还活着吗"用的是两种间接判据，两边都错过 ——
+ *   - board 侧看护用 nxsched_get_tcb(pid) 查主线程 TCB：NuttX 里主线程退出
+ *     不等于任务组没了（sched/group/group_leave.c：HAVE_GROUP_MEMBERS 下只有
+ *     tg_members 空了才 group_release），ps 里真出现过"主线程睡在 sleep(1)、
+ *     而它查不到 TCB"的形状；
+ *   - main() 里那道 g_app_inited 门：一置真就永久挡（见下面那段注释）。
+ *   两个一起作用就是现场那个形状：每 5 秒拉起一个新实例、每个都被挡回，
+ *   而真正在跑的那个早就聋了 —— 从外面看像"机器好好的、就是不理人"。
+ *
+ * 为什么不用 main_now_ms()（本文件其它定时器用的那个）：它走 CLOCK_MONOTONIC，
+ * 而本机有 TimeSync 在跑（clock_settime 改系统钟）。心跳要的是一个只会涨的量，
+ * 墙钟被改一次就可能让"多久没心跳"算出荒唐值。
+ *
+ * 只有 main_loop_task 写，别的线程只读；判据本身留了几十倍余量，读到慢半拍的
+ * 值没有任何影响，所以不加锁（和本文件那套诊断量一个口径）。 */
+
+static volatile uint32_t g_beat_ms;
+
+/* "位子是什么时候被认领的"：main() 里把 g_app_inited 置真的那一刻。
+ * 给心跳当兜底：从认领到主循环第一次 ping 之间有 1~3 秒的初始化窗口，这段
+ * 窗口里 g_beat_ms 还是上一代留下的旧值 —— 拿这一格当"最后一次活着"的证据，
+ * 那段时间算出来的年龄就是"刚认领"，而不是"上一代死多久了"。 */
+
+static volatile uint32_t g_inited_at_ms;
+
+/* ★ 2026-09-20 晚定：**心跳只当仪表，不做任何决策**（用户拍板："没用的东西不要拖累
+ * 软件"）。原来的形状是"主循环心跳超过 60 秒没动 ⇒ 判定停摆 ⇒ 看护拉起新实例 +
+ * 新实例接管"，那个阈值已经删掉了，理由写在下面这段，值得下一个人先读：
+ *
+ *   主循环里**同步**跑着一整轮对话（sm_run() → sm_ai_talking_enter() →
+ *   process_ai_dialogue() → 云端 ASR → 大模型最多 3 轮工具调用（每轮 30 秒超时）
+ *   → TTS 合成（读超时 120 秒））。也就是说**"这一拍很长"和"这一拍卡死"在时间上
+ *   长得一模一样**，任何"多久没动就算死"的窗口都会在正常但被网络拖慢的一轮里误判 ——
+ *   而误判的代价是把正在说话的一个实例当场拆掉（见 g_app_inited 那段里
+ *   sem_waitirq 那条断言）。
+ *   把窗口缩到看护的轮询间隔（"这一轮心跳还在不在走"）只会更糟：ASR 单次就几秒。
+ *   所以：**不设阈值 = 不做决策**。要"卡住就自动换一个"，得先把那段阻塞从主循环里
+ *   挪到线程里，否则只能用猜。
+ *
+ * 代价（明明白白写在这里）：主循环真卡死时不会自己恢复，得靠 nsh 里敲
+ * `ai_companion --assume-dead`（手动把一个卡住的实例换掉）或者断电。
+ * 而"它到底是卡死、还是就在慢慢跑"这件事，现在**看得见**：
+ *   - 串口：`[看护] …（位子空着…）` 那类行、以及 MQTT 快照里的 `lbeat`；
+ *   - 不开串口：`py -3.10 tools/pc_env/diag_query.py` 直接读 `lbeat`
+ *     （正常几十~几百毫秒；涨到几万就是那一拍真的在慢慢跑或卡住了）。 */
+
+/* 落一跳心跳。**只在 main_loop_task 里调**，而且是每一拍的第一句：
+ * 写在所有 tick 之前是刻意的 —— 这一拍卡在哪个 tick 里，时间戳也已经落下去了，
+ * 判读的是"上一拍什么时候开始的"，不会出现"卡住的那一拍不算数"的盲区。 */
+
+static void app_beat_ping(void)
+{
+  g_beat_ms = (uint32_t)TICK2MSEC(clock_systime_ticks());
+}
+
+/* 心跳的"年龄"，毫秒；-1 = 这份镜像里没有活着的实例（还没认领位子 / 已经退场）。
+ *
+ * ★ 唯一的调用者/判据是**"位子空着"这一件事**（board 侧看护：-1 ⇒ 上一个实例已经
+ *   退场、没有任何人在跑 ⇒ 把它重新拉起来）。这是**零窗口**的判据 —— 不带任何时间
+ *   阈值，也就没有任何误判余地；"心跳多大算太久"那种判断一律不做（理由见上）。
+ *
+ * 任何线程可调：只读两个 volatile 量 + 一个 tick 计数，不阻塞、不碰设备。 */
+
+int ai_companion_beat_age_ms(void)
+{
+  uint32_t last;
+
+  if (!g_app_inited)
+    {
+      return -1;
+    }
+
+  last = g_beat_ms != 0 ? g_beat_ms : g_inited_at_ms;
+  if (last == 0)
+    {
+      return -1;
+    }
+
+  return (int)((uint32_t)TICK2MSEC(clock_systime_ticks()) - last);
+}
+
+/* 「重置」请求位（2026-09-20 晚加）：界面那个按钮 → 语义与两步流程写在
+ * ai_companion_req.h 那一段里，这里只存一个位。
+ *
+ * 为什么动手的不是本文件：要换掉一个**卡在设备调用里**的实例，只能再起一个实例
+ * 去接（卡住的正是这个实例的主循环，它已经推不动任何东西了）。所以真正拉新实例的
+ * 是 board 侧看护线程（sifli_ap.c 的 hello_app_watchdog）—— 下面两个函数就是给它
+ * 的：requested() 是它每 5 秒看一眼的位，accept() 是它认领后清的。 */
+
+static volatile bool g_takeover_req;
+
+void ai_companion_request_takeover(void)
+{
+  g_takeover_req = true;
+}
+
+int ai_companion_takeover_requested(void)
+{
+  return g_takeover_req ? 1 : 0;
+}
+
+void ai_companion_takeover_accept(void)
+{
+  g_takeover_req = false;
+}
+
+/* 「接管后自检」的时刻（0 = 没有待做的自检）。
+ *
+ * 为什么需要它：接管（不管是手动 --assume-dead 还是界面「重置」）最要紧的问题是
+ * **"设备到底起没起来"**。而接管那一刻看不出来 —— audio_record_start() 成功只说明
+ * 板级封装把 START 发下去了，上层框架完全可能把 CONFIGURE/START 静默吞掉
+ * （钉住的共享 status），于是要等第一次 read 才能看出真相。
+ * 所以接管路径埋一个 3 秒后的检查点，由主循环那一拍打一行**证据**出来：
+ * 录音 active / idle / lres + 驱动那四个计数（irq/half/armed/busy）。
+ * 判读写在那一行里，不用回来翻代码。 */
+
+#define APP_TAKEOVER_SELFCHECK_MS   3000
+
+static volatile uint32_t g_takeover_check_at_ms;
+
+/* 开机以来的毫秒数（和 g_beat_ms 同一个基准：只涨、不受改墙钟影响）。 */
+
+static uint32_t app_now_ms(void)
+{
+  return (uint32_t)TICK2MSEC(clock_systime_ticks());
+}
+
+/* 主循环每拍调一次；没排自检时它只是一次判断。函数体放在主循环那一段
+ * （它要用 g_audio_ctx，而那个 static 在这下面才声明）。 */
+
+static void takeover_selfcheck_tick(void);
 
 /****************************************************************************
  * Private Data
@@ -348,6 +497,8 @@ static void print_usage(const char *program)
   printf("  --sounddetect <子命令> [n]\n"
          "                        任务四门控调试：status（打印统计）/\n"
          "                        on / off / sensitivity <n>（默认 1.0，越大越敏感）\n");
+  printf("  --assume-dead         手动接管：把当前跑着的实例拆掉、按全新启动重来\n"
+         "                        （没有自动接管了；这是不用断电把卡住的实例换掉的入口）\n");
   printf("  --help                显示帮助\n");
 }
 
@@ -525,15 +676,10 @@ static void voice_state_tick(sm_context_t *ctx)
     }
 }
 
-/**
- * @brief  信号处理函数
- */
-
-static void signal_handler(int signo)
-{
-  (void)signo;
-  g_running = 0;
-}
+/* 这里原来有一个 signal_handler()，只做一件事：收到 SIGINT/SIGTERM 就
+ * `g_running = 0`。**2026-09-19 已连同 signal() 注册一并删除** ——
+ * 它让这个开机常驻的 app 能被外部信号整台关掉、而且关掉之后没人拉起来。
+ * 完整理由见 ai_companion_main() 里那段"不注册 SIGINT / SIGTERM"的说明。 */
 
 /**
  * @brief  开始累积一句话（VAD 报"人开始说话" 和 唤醒词命中 共用这一段）
@@ -1010,7 +1156,7 @@ void ai_companion_state_snapshot_impl(char *buf, size_t len)
   n = snprintf(buf, len,
                "run=%d audio=%d start=%d rec=%d ract=%d died=%d exit=%d "
                "idle=%d lres=%d wait=%d empty=%u want=%d "
-               "net=%d nrt=%u cap=%d sp=%u kws=%d sm=%s",
+               "net=%d nrt=%u cap=%d sp=%u kws=%d sm=%s lbeat=%d",
                g_running ? 1 : 0,
                g_audio_ctx.initialized ? 1 : 0,
                g_audio_started ? 1 : 0,
@@ -1028,7 +1174,8 @@ void ai_companion_state_snapshot_impl(char *buf, size_t len)
                g_speech_capturing ? 1 : 0,
                (unsigned)g_speech_frames,
                g_kws_ready,
-               sm_get_state_name(sm_get_state(&g_sm_ctx)));
+               sm_get_state_name(sm_get_state(&g_sm_ctx)),
+               ai_companion_beat_age_ms());
 
   /* 驱动侧那六个分诊计数接在最后（见上面字段表里 rxi..rxl 那一条）。
    *
@@ -1699,12 +1846,13 @@ static void rxstuck_watch_tick(void)
       printf("[rxstuck] 录音标志说在录、但已 %d ms 没读到数据"
              "（wait=%d）："
              "irq=%u half=%u read=%u timeout=%u dma_err=%u lost=%u "
-             "armed=%d busy=%d\n",
+             "armed=%d busy=%d up=%us\n",
              idle, wait,
              (unsigned)rxst.irq, (unsigned)rxst.half,
              (unsigned)rxst.read, (unsigned)rxst.timeout,
              (unsigned)rxst.dma_err, (unsigned)rxst.lost,
-             rxst.armed, rxst.busy);
+             rxst.armed, rxst.busy,
+             (unsigned)(TICK2MSEC(clock_systime_ticks()) / 1000u));
     }
   else
     {
@@ -1892,8 +2040,22 @@ static void sound_event_cb(int cls, float conf, void *arg)
   snprintf(reason, sizeof(reason), "%s %d%%", what,
            (int)(conf * 100.0f + 0.5f));
 
-  printf("[门控] 本地小模型命中: %s（%s, 置信度 %.2f）\n",
-         what, sound_event_class_name(cls), (double)conf);
+  printf("[门控] 本地小模型命中: %s（%s → %s, 置信度 %.2f）→ 先响铃\n",
+         what, sound_event_class_name(cls),
+         sound_detect_get_type_name(type), (double)conf);
+
+  /* ★ 2026-09-20 晚（用户拍板："命中先响铃，用户点了不用了再停"）：
+   * **先起铃** —— 板级报警模块的 EMERGENCY 级（高低交替警报音、每 5 秒重复一次），
+   * 本地、立刻、**一个网络字节都不需要**（断网也照样响）。
+   *
+   * 停铃**不在这里**：由 robot_ui 的 ask_finish(confirmed == 0) 在
+   * "用户点「不用了」/ 20 秒无人应答"那一刻做（见 robot_ui/main.c）。
+   * 完整时序：命中起铃（这里）→ 红屏询问页弹出来 → 
+   *   点「不用了」 ⇒ 停铃、不报警（这一下就是用户要的"再停"）；
+   *   点「是的，报警」 ⇒ 走既有报警页那条收口，铃不停、连着一路响。
+   * 起铃失败也不拦流程：询问页照旧会弹，只是这一次不响（那一行日志会说明原因）。 */
+
+  (void)robot_ui_alarm_ring(reason);
 
   /* 复用既有的「异常声 → 追问流程」：和 sound_detect_callback() 一样只置标志，
    * 相位由 main_loop_task 的 ask_flow_tick() 推（那边是唯一的相位推进者）。
@@ -1908,7 +2070,7 @@ static void sound_event_cb(int cls, float conf, void *arg)
   g_ask_answer[0] = '\0';
   g_ask_phase = ASK_PHASE_PENDING;
 
-  /* 「是否报警？」询问框：任何线程可调，内部自己投到 LVGL 线程 */
+  /* 「是否报警？」询问框（红屏）：任何线程可调，内部自己投到 LVGL 线程 */
 
   ui_post_ask_alarm(reason);
 }
@@ -3913,6 +4075,46 @@ static void net_retry_tick(void)
 }
 
 /**
+ * @brief  接管后自检（主循环每拍一次判断，接管后 3 秒那一拍才真打日志）
+ *
+ * 见 g_takeover_check_at_ms 那段的说明：接管那一刻看不出"设备起没起来"，
+ * 要等第一次 read 才知道真相，所以埋在 3 秒后打一行**证据**。
+ */
+
+static void takeover_selfcheck_tick(void)
+{
+  struct sf32lb52_audio_rx_stats_s rxst;
+  uint32_t at = g_takeover_check_at_ms;
+
+  if (at == 0 || (int32_t)(app_now_ms() - at) < 0)
+    {
+      return;
+    }
+
+  g_takeover_check_at_ms = 0;
+
+  if (sf32lb52_audio_rx_stats(&rxst) != OK)
+    {
+      memset(&rxst, 0, sizeof(rxst));
+    }
+
+  printf("[启动] 接管后自检（+%u ms）：录音 active=%d idle=%dms lres=%d | "
+         "RX irq=%u half=%u armed=%d busy=%d\n",
+         (unsigned)APP_TAKEOVER_SELFCHECK_MS,
+         audio_record_is_active(&g_audio_ctx) ? 1 : 0,
+         audio_record_idle_ms(&g_audio_ctx),
+         audio_record_last_result(&g_audio_ctx),
+         (unsigned)rxst.irq, (unsigned)rxst.half, rxst.armed, rxst.busy);
+
+  printf("[启动]   └─ 判读：active=1 且 irq/half 在涨 = 设备真起来了；"
+         "active=0 / idle 一直涨 / lres=%d（-ENODEV = 设备没在跑）"
+         "= 设备没起来 ⇒ 还有别的 fd 占着这台设备 / 共享 status 还钉着，"
+         "该走 C2（放干净）或 C3（整机重启）。"
+         "（本行打出来时可以再采一次，隔十几秒对比 irq/half 有没有涨。）\n",
+         -ENODEV);
+}
+
+/**
  * @brief  主循环任务
  */
 
@@ -3924,6 +4126,10 @@ static void *main_loop_task(void *arg)
 
   while (g_running)
     {
+      /* 0. 心跳（见 g_beat_ms 那段）：写在所有 tick 之前，这一拍就一定是"活过"的 */
+
+      app_beat_ping();
+
       /* 1. 运行状态机（检查超时等） */
 
       sm_run(ctx);
@@ -3971,6 +4177,12 @@ static void *main_loop_task(void *arg)
 
       net_retry_tick();
 
+      /* 5.6 接管后自检（一次性，见 takeover_selfcheck_tick）：接管（--assume-dead
+       *     或界面「重置」）之后 3 秒那一拍打一行"设备到底起没起来"的证据，
+       *     平时它就是一次判断就返回。 */
+
+      takeover_selfcheck_tick();
+
       /* 6. 休眠等待 */
 
       usleep(MAIN_LOOP_INTERVAL_MS * 1000);
@@ -4013,8 +4225,27 @@ int main(int argc, char *argv[])
   const char *mqtt_client_id = NULL;
   bool sound_self_test = false;
   bool ask_self_test = false;
+  bool assume_dead = false;             /* --assume-dead：手动接管（拆掉当前实例重来） */
   const char *sounddetect_sub = NULL;   /* 任务四：门控调试子命令 */
   float sounddetect_sens = -1.0f;       /* sensitivity <n> 的可选数值 */
+
+  /* 每次进 main() 先自报一行（2026-09-20 加的诊断，判读见 g_start_seq 的说明）。
+   * 放在参数解析**之前**：调试子命令那条"第二次启动"的路也要留下痕迹 ——
+   * 真机上要区分"看护线程又拉了一次"和"整机复位过"，就是看这一行的计数与 up=。
+   * 纯日志，不改任何行为。 */
+
+  {
+    /* up 用 clock_systime_ticks()（开机以来的 tick 数），和 robot_ui 那条
+     * `[ui] 慢统计 …, up=%u s` 是**同一个基准**，两条日志能直接对表。 */
+
+    unsigned long up_ms = (unsigned long)TICK2MSEC(clock_systime_ticks());
+
+    g_start_seq++;
+
+    printf("[启动] hello_app 第 %d 次启动 (pid=%d, 系统已运行 %lu.%03lu s)\n",
+           g_start_seq, (int)getpid(),
+           up_ms / 1000UL, up_ms % 1000UL);
+  }
 
   for (int i = 1; i < argc; i++)
     {
@@ -4038,6 +4269,14 @@ int main(int argc, char *argv[])
       else if (strcmp(argv[i], "--ask-self-test") == 0)
         {
           ask_self_test = true;
+        }
+      else if (strcmp(argv[i], "--assume-dead") == 0)
+        {
+          /* 手动接管（2026-09-20 加，晚些时候从"自测入口"改成"唯一的手动恢复入口"）：
+           * 把当前跑着的实例拆掉、按全新启动重来。自动接管已删除（见 g_beat_ms 那段），
+           * 所以这是**不用断电**把卡住的实例换掉的唯一办法；顺带它也是验这条拆卸路径
+           * 本身的手段（在活实例上把设备与会话收掉再重建，是唯一有风险的那段）。 */
+          assume_dead = true;
         }
       else if (strcmp(argv[i], "--sounddetect") == 0 && i + 1 < argc)
         {
@@ -4068,9 +4307,22 @@ int main(int argc, char *argv[])
    * 门控那几个量（g_gate_enabled / g_gate_sensitivity / g_gate_stats）都是
    * ai_sound_detect.c 的 file-static，单一大镜像里只有一份，所以这里读到、改到的
    * 就是**那个正在跑的实例**的实时门控状态 —— 这不是巧合，是这条调试入口能成立的
-   * 前提（status 读到的是它的真数，on/off/sensitivity 改的也是它）。 */
+   * 前提（status 读到的是它的真数，on/off/sensitivity 改的也是它）。
+   *
+   * ★ 2026-09-20 晚：**这里原来那套"心跳停了就自动接管"已删除**（用户拍板：
+   *   "没用的东西不要拖累软件"）。理由见上面 g_beat_ms 那段 —— 主循环里
+   *   "这一拍很长"和"这一拍卡死"在时间上长得一模一样，任何时间阈值都会在正常但被
+   *   网络拖慢的一轮里误判，而误判要把**正在说话的那个实例当场拆掉**。
+   *   所以这道门恢复原来的语义：**占着就挡，只放行 --sounddetect**；要主动换掉一个
+   *   卡住的实例，用 `ai_companion --assume-dead`（手动，见下面那一段）。
+   *
+   *   那 2026-09-20 现场那个"每 5 秒拉起一个新实例、每个都被挡回"怎么办？
+   *   它的**源头不在这道门，在看护**：看护当时的判据（nxsched_get_tcb 查主线程）
+   *   本身就错 —— NuttX 里主线程退出 ≠ 任务组没了。现在看护只看"位子空着"
+   *   （见 sifli_ap.c 的 hello_app_watchdog），位子被占着时它一个字都不做，
+   *   所以这里不再需要"自己猜那个实例是不是死了"。 */
 
-  if (g_app_inited)
+  if (g_app_inited && !assume_dead)
     {
       printf("[启动] 已经有实例在跑（PID %d），本次只处理调试命令后退出\n",
              (int)getpid());
@@ -4088,7 +4340,102 @@ int main(int argc, char *argv[])
       return 0;
     }
 
+  if (g_app_inited)
+    {
+      /* 手动接管（`ai_companion --assume-dead`，没有自动接管了 —— 见上面那道门的
+       * 注释）。这是"不用断电就能把一个卡住的实例换掉"的唯一入口，顺带也是验这条
+       * 拆卸路径本身的手段。走到这里只可能是这个参数。
+       *
+       * 先把设备从它手里收回来，再按全新启动往下走一遍。
+       *
+       * **为什么必须先把设备收回来**：它那条半截录音会话还挂在设备上。不收就直接
+       * 重开麦，等于同意一台半双工设备上有两个 read 客户端 —— 板级/驱动那两层的
+       * 持有者与残留判据（见 sf32lb52_audio_in.h 头上那段）只认"持有线程查不到 TCB
+       * 且它的任务组也查不到 TCB"，而这里的情况恰恰是"线程还在、任务组也还在"，
+       * 所以谁也抢不过来；真抢过来就是 sem_waitirq.c:137 那条断言
+       * （本文件 g_app_inited 那一段记着那次崩溃）。
+       *
+       * **只收设备，别的什么都不释放**：
+       *   - stop_audio_listening() → audio_record_stop()：有界（1 秒上限回收录音
+       *     线程）+ **无条件** AUDIOIOC_STOP（2026-09-20 已上板的那一刀），设备那
+       *     一层一定被收干净，卡在 read 里的那条线程也会被 STOP 唤醒；
+       *   - audio_play_stop()：有界（一块 + 500ms + 有界回收），同样只置标志、不动 fd；
+       *   - **不调 audio_deinit / llm_deinit / sm_deinit，也不 free 任何缓冲**：那几个
+       *     会 free（audio_deinit 真会 free record_buf/play_buf），而上一代那条卡在
+       *     设备调用里的线程**可能还活着、手里还捏着那块缓冲**（DMA 可能正往里写）——
+       *     那正是 ai_audio.c 的 audio_deinit 里写着的那条纪律："绝不能 free，线程会
+       *     踩到已释放的缓冲，比漏一点内存严重得多"。代价是接管一次漏几百 KB 的堆，
+       *     换的是"绝不会踩已释放内存"，这笔账在这个场景下是划算的。
+       *     上下文随后由新实例的 sm_init / audio_init / llm_init 自己 memset + 重建
+       *     （这三个 init 都是"清零 + 置 initialized"，没有"已经初始化过就报错"的守卫，
+       *     所以不清也能接上），上一代那些线程随后会在自己的 loop 里看到被清零的
+       *     ctx、按它们本来就有的 stale/收尾路径安静退出。
+       *
+       * 关怀 / 声音检测那两条线程**只立停止标志、不 join**：它们的 stop
+       * （care_stop / sound_detect_stop）里是无上界的 pthread_join，而恢复路径上
+       * 不能引入"可能永不返回"的等待（本文件已经栽过一次，见 ai_audio.c 的
+       * audio_reap_record_thread 头上那段）。它们只发消息 / 只看数据、不持有设备，
+       * 下一拍自查标志就收场。 */
+
+      int age = ai_companion_beat_age_ms();
+      int i;
+
+      printf("[启动] 手动接管（--assume-dead）：先请上一个实例收摊，再按全新启动重来"
+             "（它已经 %d ms 没有心跳；这个数只是告诉你它当时在干什么）\n", age);
+
+      /* ★ 2026-09-20 晚（真机 ps + dumpstack 实锤 —— 这一步原来漏了）：
+       * **先把上一个实例的主循环停下来。**
+       *
+       * 现场：`ps` 里 group 14 的 main_loop_task（线程 55）还活着，`dumpstack 55`
+       * 显示它正在 usleep 里一拍一拍地正常转（不是卡住），而新实例（group 134）
+       * 已经起来了。两个实例共享同一批 static（g_listen_wanted / g_audio_ctx /
+       * g_sound_ctx …），于是两个"监听守护"同时抢同一台半双工设备：一个 start、
+       * 另一个 stop，谁都拿不到一次完整会话 —— 串口里每秒好几轮的
+       * `AUDIO_IN: started / stopped / read -ENODEV` 就是它；而旧实例一直握着板级
+       * 那份录音会话的**持有者身份**（"会话属于 group 14 / 线程 55"），新实例每次
+       * start 只会拿到 -EBUSY。
+       *
+       * g_running 是共享 static，置 0 = "请所有实例的主循环收摊"：旧 loop 一拍之内
+       * 跳出 while，旧 main() 顺着它自己的退出路径把 audio/sm/llm 收干净（那正是
+       * 我们要的：它会关掉设备 fd、收掉 care / 声音检测 / 录音线程），最后把
+       * g_app_inited 置假 —— 我们就等这一个信号（有界：它那边每一步都是有界等待）。
+       * 等到了 = 旧实例彻底退场、设备也放干净了，下面才开始我们自己的初始化。 */
+
+      g_running = 0;
+
+      for (i = 0; i < 250 && g_app_inited; i++)     /* 最多等 ~2.5 秒 */
+        {
+          usleep(10 * 1000);
+        }
+
+      printf("[启动] 上个实例的收尾等待：%d ms%s\n", i * 10,
+             g_app_inited ? "（它没来收尾 —— 多半主线程早就不在了，下面自己兜底）"
+                          : "（它已退场，设备与各模块都由它收干净了）");
+
+      /* 兜底（幂等，和上面那条路做的是同一件事）：上一个实例的主线程早就没了、
+       * 或者它收尾卡住了，那就由我们自己把这几个收掉。
+       * "只收设备、什么都不释放"这条纪律不变，理由见下面那段长注释。 */
+
+      g_care_ctx.care_stop = true;
+      g_sound_ctx.detect_stop = true;
+
+      stop_audio_listening();
+      audio_play_stop(&g_audio_ctx);
+
+      /* 埋一个 3 秒后的自检点（见 takeover_selfcheck_tick）：接管那一刻看不出
+       * "设备起没起来"，要等第一次 read 才有真相 —— 那行日志就是给下一次定案用的。 */
+
+      g_takeover_check_at_ms = app_now_ms() + APP_TAKEOVER_SELFCHECK_MS;
+
+      g_app_inited = false;
+    }
+
   g_app_inited = true;
+
+  /* 心跳从"认领位子"这一刻起算：主循环起来之前那 1~3 秒的初始化窗口里，
+   * 心跳的年龄就是"刚认领"，看护不会在这段窗口里把新实例当成死的拉第二遍。 */
+
+  g_inited_at_ms = (uint32_t)TICK2MSEC(clock_systime_ticks());
   g_running = 1;
 
   printf("\n");
@@ -4098,10 +4445,27 @@ int main(int argc, char *argv[])
   printf("╚══════════════════════════════════════════╝\n");
   printf("\n");
 
-  /* 注册信号处理 */
-
-  signal(SIGINT, signal_handler);
-  signal(SIGTERM, signal_handler);
+  /* **不注册 SIGINT / SIGTERM**（2026-09-19 真机定案，用户拍板）。
+   *
+   * 为什么去掉：这个 app 是**开机常驻服务**（由 board_late_initialize() 的
+   * task_create 起，见 board/contest_board/src/sifli_ap.c，任务名 hello_app）。
+   * 而 signal_handler() 里只有一句 `g_running = 0` —— 主循环
+   * `while (g_running)` 一假就 `return NULL`，main() 随即 pthread_join 到它，
+   * 把 audio / sm / llm 全 deinit 掉，最后 `return 0`，
+   * **整个任务组就此消失，而且没有任何人负责把它拉起来**。
+   *
+   * 真机现象（当晚实测）：`ps` 里 hello_app 连同它的 5 条线程一起不见、
+   * 串口里**一条断言都没有**（是优雅退出，不是崩溃）、界面那边只觉得"没反应"
+   * —— app 都不在了，自然没人听麦克风，于是表现为"麦克风又坏了"。
+   *
+   * 全文件只有两处能清 g_running：
+   *   1) 这里注册的 SIGINT / SIGTERM（运行中唯一能关掉它的东西）；
+   *   2) pthread_create(main_loop_task) 失败（那条会打 [错误] 日志，不是本现象）。
+   * 所以从源头断掉第 1 条：常驻服务不该被 Ctrl+C 之类的外部信号整台关掉。
+   *
+   * 现在要主动停它只有一条路：把 g_running 置 0（目前没有任何代码这么做，
+   * 也就是说它设计上就是"一直跑"）。另有一层兜底：sifli_ap.c 里的看护线程
+   * 会在它万一消失后把它重新 task_create 起来。 */
 
   /* 1. 初始化状态机 */
 
@@ -4176,9 +4540,18 @@ int main(int argc, char *argv[])
       voice_tts_set_backend("volcengine");
     }
 
-  /* 分配语音段累积缓冲区 */
+  /* 分配语音段累积缓冲区。
+   *
+   * **没有才分配**（2026-09-20）：接管路径上上一代这块还留着，而这里**不许 free**
+   * —— 上一代可能还有线程（录音回调那条）在用同一块缓冲，free 掉就是让它踩已释放
+   * 内存，那比漏一点内存严重得多（同一条纪律见 ai_audio.c 的 audio_deinit）。
+   * 容量是常量、两个实例一样大，直接接着用就是对的。 */
 
-  g_speech_buf = malloc(SPEECH_BUF_MAX_FRAMES * sizeof(int16_t));
+  if (g_speech_buf == NULL)
+    {
+      g_speech_buf = malloc(SPEECH_BUF_MAX_FRAMES * sizeof(int16_t));
+    }
+
   if (g_speech_buf == NULL)
     {
       printf("[警告] 语音缓冲区分配失败\n");

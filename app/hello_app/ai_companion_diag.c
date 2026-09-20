@@ -227,7 +227,14 @@ static const char *const g_diag_keys[] =
    * TE 错误 / 被 DMA 覆盖的帧数）。名字和顺序跟 ai_companion_diag.h 的字段表、
    * 以及 ai_companion_main.c 那一行的写法一致；impl 那边取不到（驱动还没起来）
    * 时不写这几个键，这里就自动输出 -1。 */
-  "rxi", "rxh", "rxr", "rxt", "rxe", "rxl"
+  "rxi", "rxh", "rxr", "rxt", "rxe", "rxl",
+  /* 2026-09-20 加：主循环心跳的年龄（毫秒，-1 = 没有实例 / 位子空着）。
+   * ⚠️ 它**只是仪表，不决定任何动作**（自动接管已删除，理由见 ai_companion_main.c
+   * 的 g_beat_ms 那一段）：正常时是几十~几百 ms（主循环一拍 100ms），
+   * 涨起来就是那一拍在处理一轮对话（ASR + 大模型 + TTS 都在这条线上、各自几十秒超时）、
+   * 或者真的卡住了 —— 这两个用时间分不开，所以谁也不许拿它当判据。
+   * 看护那边只用它的一件事：-1（位子空着）= 没有任何实例在跑 ⇒ 重新拉一个。 */
+  "lbeat"
 };
 
 int ai_companion_diag_snapshot(char *buf, size_t len)

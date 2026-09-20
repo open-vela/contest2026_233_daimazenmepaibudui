@@ -136,12 +136,20 @@ void ui_perf_frame_end(void)
         return;
     }
 
-    /* 这一秒里出现过"慢"才打一行；一切正常（不慢、也没在刷屏）时保持安静。 */
+    /* 这一秒里出现过"慢"才打一行；一切正常（不慢、也没在刷屏）时保持安静。
+     *
+     * ⚠️ 末尾那个 up= 是**系统开机以来的秒数**（`clock_systime_ticks()`，不是本
+     * 模块自己的计时），2026-09-20 加的：真机上出现过"跑着跑着整台机器重新初始
+     * 化一遍、而串口里一行原因都没有"，当时只能靠"两次冷启动的堆水位差 8 字节"
+     * 去推断到底有没有复位。有了 up= —— **它归零的那一秒就是复位发生的那一秒**，
+     * 而且这条每秒都在打，不用等抓取刚好盖住复位那一刻。
+     * 判读：up 一直涨 = 没复位；up 突然跳回个位数 = 整机重启过一次。 */
     if (g_sec_flush_slow > 0 || g_sec_handler_max >= UI_PERF_SLOW_MS)
     {
-        printf("[ui] 慢统计 1s: flush %u 次, 最慢 flush %u ms, lv_timer_handler 最慢 %u ms, 慢 flush %u 次\n",
+        printf("[ui] 慢统计 1s: flush %u 次, 最慢 flush %u ms, lv_timer_handler 最慢 %u ms, 慢 flush %u 次, up=%u s\n",
                (unsigned)g_sec_flush_cnt, (unsigned)g_sec_flush_max,
-               (unsigned)g_sec_handler_max, (unsigned)g_sec_flush_slow);
+               (unsigned)g_sec_handler_max, (unsigned)g_sec_flush_slow,
+               (unsigned)(TICK2MSEC(clock_systime_ticks()) / 1000u));
     }
 
     g_sec_flush_cnt   = 0;

@@ -576,6 +576,13 @@ void ui_post_ask_alarm(const char *reason);
  * 弱实现见 ai_sound_detect.c：robot_ui 没进镜像时什么都不做。 */
 void ui_post_ask_standdown(const char *src);
 
+/* robot_ui：异常声命中时的**先响铃**入口（本地起板级警音，不等网络）。任何线程可调、
+ * 非阻塞。声明在这里的理由同上（robot_ui.h 带 LVGL，hello_app 编不了）。
+ * 弱实现见 ai_sound_detect.c：robot_ui 没进镜像时只往串口打一行。
+ * 调用方：ai_companion_main.c 的 sound_event_cb()（本地小模型命中 → 先起铃，
+ * 用户点「不用了」才由 robot_ui 那边停）。 */
+int robot_ui_alarm_ring(const char *reason);
+
 /* robot_ui：报警去重闸（同一次异常的两条确认入口只许报一次警）。
  * true = 这次报警由本路执行；false = 另一条确认入口（屏幕按钮 / MQTT）已经报过了，
  * 本路放弃。声明在这里的理由同上。弱实现在 ai_sound_detect.c：robot_ui 那一侧

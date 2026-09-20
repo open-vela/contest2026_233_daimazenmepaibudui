@@ -3503,7 +3503,37 @@ static int sf32lb52_audio_rx_wait_slice(FAR struct sf32lb52_audio_s *priv,
 
   (void)wd_cancel(&priv->rx_wait_wdog);
 
-  return (ret == OK && priv->rx_wait_to) ? -ETIMEDOUT : ret;
+  /* 2026-09-20 加的判读用日志（限频 5 秒一行，正常录音每 20ms 一帧，不限频会淹串口）。
+   *
+   * 真机现场（dumpstack 定的案）：录音线程永久停在这句
+   * nxsem_wait_uninterruptible 上，而驱动自己的 timeout 计数恒 0 ——
+   * 也就是说"这次等待被自己的心跳叫醒"这件事**一次都没发生过**。
+   * 有了这一行，下次就能一句话分开两种可能：
+   *   串口里见过 "RX 等待由心跳收口"  → 心跳是响的，卡死另有原因；
+   *   一句都没有、却还卡在 read 里     → **心跳压根没响**，问题在
+   *                                     wd_start / 定时器那一侧（下一步就该把
+   *                                     rx_wait_wdog 从"每个 priv 一个槽"改成
+   *                                     "每次调用私有"，因为它现在会被同一条
+   *                                     priv 上的第二次等待 wd_cancel 掉）。
+   * 纯日志，不改任何行为。 */
+
+  if (ret == OK && priv->rx_wait_to)
+    {
+      static uint32_t s_rx_wdog_log_next;   /* 文件级限频锚点，够用且不动 struct */
+      uint32_t now = clock_systime_ticks();
+
+      if ((int32_t)(now - s_rx_wdog_log_next) >= 0)
+        {
+          s_rx_wdog_log_next = now + MSEC2TICK(5000);
+          syslog(LOG_WARNING,
+                 "AUDIO: RX 等待由心跳收口（wait_ms=%u）：这一帧没数据，"
+                 "但私有看门狗是响的\n", (unsigned)wait_ms);
+        }
+
+      return -ETIMEDOUT;
+    }
+
+  return ret;
 }
 
 /****************************************************************************
@@ -3513,10 +3543,14 @@ static int sf32lb52_audio_rx_wait_slice(FAR struct sf32lb52_audio_s *priv,
  *   直通读取，一次成型（形状与理由见文件顶部"录音 RX 通路"那段）：
  *     receive（调用者的 buffer, 本次长度）→ 在 rx_sem 上等一次 → 收干净通道。
  *
- *   返回值的三种语义（上层据此分岔，不能混）：
+ *   返回值的语义（上层据此分岔，不能混）：
  *     buflen       = 这一次采满了；
- *     0            = 会话结束（被 STOP 打断 / 设备没在跑 / 会话换代）—— EOF；
- *     -ETIMEDOUT   = 会话还活着，只是这一次没等到数据（上层跳过这一帧接着读）。
+ *     0            = 会话结束（被 AUDIOIOC_STOP 打断 / 会话换代）—— EOF；
+ *     -ETIMEDOUT   = 会话还活着，只是这一次没等到数据（上层跳过这一帧接着读）；
+ *     -ENODEV      = **设备没在跑**（`priv->running == 0`）。单独一个码，因为它的
+ *                    正确处置和 0 正好相反：0 = 别人把设备拿走了（上层只 close、
+ *                    绝不 STOP），-ENODEV = 设备根本没在跑（上层该 STOP + close
+ *                    把设备收干净）。2026-09-20 晚加的，理由见下面那一支的注释。
  ****************************************************************************/
 
 static ssize_t sf32lb52_audio_read(FAR struct audio_lowerhalf_s *dev,
@@ -3586,11 +3620,38 @@ static ssize_t sf32lb52_audio_read(FAR struct audio_lowerhalf_s *dev,
       priv->rx_fix_level = 0u;
     }
 
-  if (buffer == NULL || buflen == 0 || !priv->running)
+  if (buffer == NULL || buflen == 0)
     {
-      syslog(LOG_WARNING, "AUDIO: read 时设备没在跑（len=%zu running=%d）\n",
-             buflen, (int)priv->running);
+      /* 参数问题（不是"设备状态"）：沿用 0，不动它的语义。 */
+
       return 0;
+    }
+
+  if (!priv->running)
+    {
+      /* ★ 2026-09-20 晚（B 方案）：**把"设备没在跑"单独说出来**，不再和另外两种
+       * 会话结束共用 0。
+       *
+       * 上一版这里也是 0，当时的顾虑是"改它会连带改掉'正常被 STOP 打断'那条出口的
+       * 语义" —— 那个顾虑其实不成立：上面已经把"参数非法"拆掉了，而**被
+       * AUDIOIOC_STOP 打断 / 会话换代**这两条出口走的是后面那段等待路径
+       * （gen 变了 / rx_aborted），仍然返回 0，语义一个字没动。
+       *
+       * 为什么必须拆开：返回 0 到了上层就是 EOF，上层按"设备已被别人接手"处理 ——
+       * **只 close、绝不发 STOP**（见 app/hello_app/ai_audio.c 的 stolen 那一段）。
+       * 而 `running == 0` 这件事恰恰相反：它说明**驱动这一层根本没在跑**，
+       * 谁也没拿着设备，这时候需要的正是"把设备收干净"（发 STOP + close）。
+       * 2026-09-20 真机现场就是这么自锁的：
+       *   AUDIO_IN: started → read 立刻返回 0（running=0）→ 上层判"被接管"、只关 fd
+       *   → 没有任何人发过 STOP → 1.8 秒一轮，永远起不来。
+       * 于是这里给一个**明确不同的**负值，让上层能按事实分岔（而不是从 0 去猜）：
+       * 上层的 -ENODEV 分支会把这一支归到"自己断粮"，走 STOP + close。
+       * -ENODEV 同时也是 diag 快照 lres 那一栏里一眼可读的证据。 */
+
+      syslog(LOG_WARNING, "AUDIO: read 时设备没在跑（len=%zu running=%d）→ "
+             "返回 -ENODEV，请上层按'设备没在跑'收（不是被抢走）\n",
+             buflen, (int)priv->running);
+      return -ENODEV;
     }
 
   /* 队列模式（enqueuebuffer 真起过 RX DMA）时 RX 通道归那条路，本函数不插手 ——

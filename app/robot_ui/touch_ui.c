@@ -169,6 +169,16 @@ static void *g_voice_cancel_user_data = NULL;
 static voice_mirror_submit_cb_t g_voice_mirror_submit_cb = NULL;
 static void *g_voice_mirror_submit_user_data = NULL;
 
+/* 镜像面板底部「重置」：main.c 注册进来的转发（请 hello_app 把一个卡住的实例
+ * 换成一个干净的）。为什么这个动作必须由人来按：2026-09-20 晚把"心跳超时自动
+ * 接管"整套删掉了（理由见 app/hello_app/ai_companion_main.c 的 g_beat_ms 那段：
+ * 主循环里"这一拍很长"和"这一拍卡死"用时间分不开，自动判定会误伤正在说话的
+ * 实例），所以"卡死没反应"只剩人工出口 —— 这个按钮就是它。
+ * 语义与两步流程（本按钮只投请求，换实例由 board 侧看护那一拍做）写在
+ * app/hello_app/ai_companion_req.h 那一段里。 */
+static voice_mirror_reset_cb_t g_voice_mirror_reset_cb = NULL;
+static void *g_voice_mirror_reset_user_data = NULL;
+
 /* 镜像面板模式：面板**只显示**，不开录音、不放提示音（语音入口在框架侧
  * ai_companion）。由 voice_panel_build(true) 置位、touch_ui_hide_voice_chat()
  * 清掉 —— 底部「提交」那支靠它分叉（PTT 走 g_voice_submit_cb 开工作线程，
@@ -2226,6 +2236,29 @@ static void voice_submit_event_handler(lv_event_t *e)
     }
 }
 
+/* 底部「重置」：请 hello_app 把一个卡住的实例换成一个干净的。
+ *
+ * 这个按钮**什么都不动**：不碰音频设备、不等任何人、也不关面板 —— 只投一个请求
+ * （g_voice_mirror_reset_cb → main.c → ai_companion_request_takeover()），
+ * 剩下由 board 侧看护那一拍（≤5 秒）去拉新实例、走既有的手动接管路径。
+ * 所以这里必须立刻给一句界面反馈：不然用户会以为按钮没反应、连点好几下。 */
+static void voice_reset_event_handler(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+        return;
+    }
+
+    touch_ui_play_sound("click");
+    printf("[VoiceChat] 镜像面板：重置（请 hello_app 换一个干净实例）\n");
+
+    if (g_voice_mirror_reset_cb != NULL) {
+        g_voice_mirror_reset_cb(g_voice_mirror_reset_user_data);
+    }
+
+    voice_post_text("正在重启语音服务…\n还不行就再按一次「重置」（会整机重启）",
+                    VOICE_TEXT_STATUS);
+}
+
 /* 一轮结束（成功或失败都用它收尾）：按钮变回可点的「再说一次」，
  * 用户不用关窗重开就能接着聊。 */
 static void voice_round_done_async(void *arg)
@@ -2410,20 +2443,64 @@ static void voice_panel_build(bool mirror)
     }
 
     /* 底部大按钮（≥60px，老人好按；绿色 = style_big_btn）。
-     * 两个面板上它都是「提交」（PTT 弹窗上是"结束录音、交出去"，镜像面板上是
-     * "我说完了，立刻送去识别"）；镜像面板那一路点下去走
-     * g_voice_mirror_submit_cb（请 hello_app 立刻收尾这一段），关窗靠右上角「×」。 */
-    voice_submit_btn = lv_btn_create(voice_panel);
-    lv_obj_set_width(voice_submit_btn, LV_PCT(90));
-    lv_obj_set_height(voice_submit_btn, 72);
-    lv_obj_add_style(voice_submit_btn, &style_big_btn, 0);
-    lv_obj_add_event_cb(voice_submit_btn, voice_submit_event_handler,
-                        LV_EVENT_CLICKED, NULL);
+     *
+     * 镜像面板上是一行两个：「提交」+「重置」——
+     *   提交 → g_voice_mirror_submit_cb（请 hello_app 立刻收尾这一段，送去识别）；
+     *   重置 → g_voice_mirror_reset_cb（请它换一个干净实例；卡死没反应时的自救入口，
+     *           自动接管删掉之后只能由人来按，见函数头上那段说明）。
+     * 关窗都靠右上角「×」。
+     * PTT 弹窗那一路保持原样（只有「提交」一个按钮），不因为这条改动而动它。 */
+    if (mirror) {
+        lv_obj_t *btn_row = lv_obj_create(voice_panel);
+        lv_obj_set_width(btn_row, LV_PCT(90));
+        lv_obj_set_height(btn_row, 72);
+        lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(btn_row, 0, 0);
+        lv_obj_set_style_pad_all(btn_row, 0, 0);
+        lv_obj_set_style_pad_column(btn_row, 10, 0);
+        lv_obj_remove_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_CENTER,
+                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
-    voice_submit_lbl = lv_label_create(voice_submit_btn);
-    lv_label_set_text(voice_submit_lbl, "提交");
-    lv_obj_set_style_text_font(voice_submit_lbl, &lv_font_ui_24, 0);
-    lv_obj_center(voice_submit_lbl);
+        voice_submit_btn = lv_btn_create(btn_row);
+        lv_obj_set_flex_grow(voice_submit_btn, 1);
+        lv_obj_set_height(voice_submit_btn, LV_PCT(100));
+        lv_obj_add_style(voice_submit_btn, &style_big_btn, 0);
+        lv_obj_add_event_cb(voice_submit_btn, voice_submit_event_handler,
+                            LV_EVENT_CLICKED, NULL);
+
+        voice_submit_lbl = lv_label_create(voice_submit_btn);
+        lv_label_set_text(voice_submit_lbl, "提交");
+        lv_obj_set_style_text_font(voice_submit_lbl, &lv_font_ui_24, 0);
+        lv_obj_center(voice_submit_lbl);
+
+        /* 「重置」：灰蓝 = 次要动作（和右上角那个「×」一个色系），
+         * 宽度够大、好按 —— 卡死时它是一个救命的按钮，不该让人戳不准。 */
+        lv_obj_t *reset_btn = lv_btn_create(btn_row);
+        lv_obj_set_size(reset_btn, 132, LV_PCT(100));
+        lv_obj_set_style_bg_color(reset_btn, lv_color_hex(0x607D8B), 0);
+        lv_obj_set_style_radius(reset_btn, 12, 0);
+        lv_obj_add_event_cb(reset_btn, voice_reset_event_handler,
+                            LV_EVENT_CLICKED, NULL);
+
+        lv_obj_t *reset_lbl = lv_label_create(reset_btn);
+        lv_label_set_text(reset_lbl, "重置");
+        lv_obj_set_style_text_font(reset_lbl, &lv_font_ui_20, 0);
+        lv_obj_center(reset_lbl);
+    } else {
+        voice_submit_btn = lv_btn_create(voice_panel);
+        lv_obj_set_width(voice_submit_btn, LV_PCT(90));
+        lv_obj_set_height(voice_submit_btn, 72);
+        lv_obj_add_style(voice_submit_btn, &style_big_btn, 0);
+        lv_obj_add_event_cb(voice_submit_btn, voice_submit_event_handler,
+                            LV_EVENT_CLICKED, NULL);
+
+        voice_submit_lbl = lv_label_create(voice_submit_btn);
+        lv_label_set_text(voice_submit_lbl, "提交");
+        lv_obj_set_style_text_font(voice_submit_lbl, &lv_font_ui_24, 0);
+        lv_obj_center(voice_submit_lbl);
+    }
 
     /* 镜像面板到这里就搭完了：不 voice_begin_round()（没有录音，也没有计时），
      * 更不回调 g_voice_chat_cb —— 它会去 audio_record_start()，
@@ -2522,6 +2599,13 @@ void touch_ui_set_voice_mirror_submit_cb(voice_mirror_submit_cb_t cb,
 {
     g_voice_mirror_submit_cb = cb;
     g_voice_mirror_submit_user_data = user_data;
+}
+
+void touch_ui_set_voice_mirror_reset_cb(voice_mirror_reset_cb_t cb,
+                                        void *user_data)
+{
+    g_voice_mirror_reset_cb = cb;
+    g_voice_mirror_reset_user_data = user_data;
 }
 
 void touch_ui_set_voice_state(touch_voice_state_t state)

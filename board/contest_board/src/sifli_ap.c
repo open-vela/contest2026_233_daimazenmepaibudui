@@ -27,6 +27,7 @@
 
 #include <fcntl.h>
 #include <syslog.h>
+#include <stdio.h>                /* snprintf：拼复位原因那一行 */
 #include <errno.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
@@ -40,6 +41,7 @@
 #include "arm_internal.h"
 #include "sf32lb52_devkit_lcd.h"
 #include "bf0_hal.h"
+#include "bf0_hal_pmu.h"          /* HAL_PMU_CheckBootMode：开机打复位原因 */
 #include "drv_io.h"
 #include "sifli_gpio.h"
 #include "sf32lb52_audio.h"
@@ -666,6 +668,106 @@ void board_early_initialize(void)
 #endif
 
 /****************************************************************************
+ * 开机复位原因（2026-09-20 新增，纯诊断）
+ *
+ * 为什么要它：真机上出现过"跑着跑着整台机器重新初始化一遍、而串口里一行
+ * 原因都没有"的现象（`_flash/long_cap.txt`：`[VAD] 检测到语音开始` 之后 4 秒
+ * 就整套重初始化，没有断言、没有 [退出]、也没有看护线程的 WARN）。没有这一行
+ * 就只能靠"堆水位像不像冷启动"去推断。
+ *
+ * HAL_PMU_CheckBootMode() 读的就是 PMU 里的复位/唤醒标志：
+ *   mode —— CR.HIBER_EN / CR.REBOOT 位；wsr —— WSR 里 RTC / WDT1 / WDT2 /
+ *   IWDT / PIN0 / PIN1 / PWRKEY / LOWBAT / CHG 各位。
+ * （WDT2 这一路是能记上的：bsp_init.c 里已经调过 HAL_PMU_SetWdt(hwp_wdt2)。）
+ *
+ * ⚠️ 只允许调一次：文档原话 "It should be called only once after boot. PMU
+ * status would be cleared afterwards." —— 所以放在 board_late_initialize()
+ * 的第一句，全工程没有第二个调用点。
+ *
+ * 判读（下次抓串口直接看这一行）：
+ *   mode=cold-boot 且 wsr 全 0      → 真上电（拔插电源 / 掉电）
+ *   mode=reboot                     → 软件重启（nsh 的 reboot 之类）
+ *   bits 里有 WDT2 或 IWDT          → **看门狗复位** ⇒ 系统是卡死被咬死的
+ *   bits 里有 PWRKEY / LOWBAT       → 按键 / 掉电，从电源那侧查，不是固件挂
+ ****************************************************************************/
+
+static const struct
+{
+  uint32_t    mask;
+  const char *name;
+} g_sf32lb52_wsr_bits[] =
+{
+  { PMUC_WSR_RTC,    "RTC"    },
+  { PMUC_WSR_WDT1,   "WDT1"   },
+  { PMUC_WSR_WDT2,   "WDT2"   },
+  { PMUC_WSR_IWDT,   "IWDT"   },
+  { PMUC_WSR_PIN0,   "PIN0"   },
+  { PMUC_WSR_PIN1,   "PIN1"   },
+  { PMUC_WSR_PWRKEY, "PWRKEY" },
+  { PMUC_WSR_LOWBAT, "LOWBAT" },
+  { PMUC_WSR_CHG,    "CHG"    },
+};
+
+#define SF32LB52_WDT_MASK (PMUC_WSR_WDT1 | PMUC_WSR_WDT2 | PMUC_WSR_IWDT)
+
+static const char *sf32lb52_boot_mode_name(PMU_BootModeTypeDef mode)
+{
+  switch (mode)
+    {
+      case PMU_HIBERNATE_BOOT: return "hibernate-boot";
+      case PMU_SHUTDOWN_BOOT:  return "shutdown-boot";
+      case PMU_REBOOT_BOOT:    return "reboot";
+      case PMU_COLD_BOOT:
+      default:                 return "cold-boot";
+    }
+}
+
+static void sf32lb52_log_boot_reason(void)
+{
+  PMU_BootModeTypeDef mode = PMU_COLD_BOOT;
+  uint32_t            wsr  = 0;
+  char                bits[96];
+  size_t              used = 0;
+  unsigned int        i;
+
+  if (HAL_PMU_CheckBootMode(&mode, &wsr) != HAL_OK)
+    {
+      syslog(LOG_WARNING, "[boot] BOOT-REASON 取不到（HAL_PMU_CheckBootMode 失败）\n");
+      return;
+    }
+
+  /* 把置位的唤醒/复位源拼成 `WDT2|LOWBAT` 这种短串；一个都没置位就写 none。 */
+
+  bits[0] = '\0';
+
+  for (i = 0; i < sizeof(g_sf32lb52_wsr_bits) / sizeof(g_sf32lb52_wsr_bits[0]); i++)
+    {
+      int n;
+
+      if ((wsr & g_sf32lb52_wsr_bits[i].mask) == 0)
+        {
+          continue;
+        }
+
+      n = snprintf(bits + used, sizeof(bits) - used, "%s%s",
+                   used > 0 ? "|" : "", g_sf32lb52_wsr_bits[i].name);
+
+      if (n < 0 || (size_t)n >= sizeof(bits) - used)
+        {
+          break;
+        }
+
+      used += (size_t)n;
+    }
+
+  syslog(LOG_INFO, "[boot] BOOT-REASON mode=%s wsr=0x%08x bits=%s%s\n",
+         sf32lb52_boot_mode_name(mode), (unsigned int)wsr,
+         used > 0 ? bits : "none",
+         (wsr & SF32LB52_WDT_MASK) != 0 ? " <= 看门狗复位（系统是卡死被咬死的）"
+                                        : "");
+}
+
+/****************************************************************************
  * Name: board_late_initialize
  *
  * Description:
@@ -684,9 +786,182 @@ void board_early_initialize(void)
  *
  ****************************************************************************/
 
+/****************************************************************************
+ * hello_app 看护线程（2026-09-19 新增）
+ *
+ * 为什么需要：hello_app（入口 ai_companion_main，任务名 "hello_app"）是**开机
+ * 常驻**的语音服务。它一旦退出，**没有任何人负责把它拉起来**。
+ * 真机实测过一次完整链条：主循环 `while (g_running)` 被清成 0 → main() 把
+ * audio / sm / llm 全 deinit → `return 0` → 整个任务组消失（`ps` 里 hello_app
+ * 连同它的 5 条线程一起不见、串口里**一条断言都没有**，因为它其实是优雅退出）。
+ * 界面那边只觉得"没反应" —— app 都不在了，自然没人听麦克风。
+ *
+ * 这里做一层与"它为什么退出"无关的兜底：每 5 秒看一次**hello_app 的位子还占不占着**
+ * （见下），空着就照原样重新 task_create 一个。
+ *
+ * ★ 2026-09-20 晚定：**判据只有一条 —— 位子空着就把它拉起来；别的一律不动。**
+ *
+ * 这一路换过两版判据、两版都错，所以新来的人先读这段：
+ *   1) 原来用 nxsched_get_tcb(g_hello_app_pid) 查主线程 TCB：**NuttX 里主线程退出
+ *      不等于任务组没了**（sched/group/group_leave.c 在 HAVE_GROUP_MEMBERS 下只有
+ *      tg_members 空了才 group_release()），所以"主线程 TCB 没了、几个 pthread 还在"
+ *      是完全合法的组合（真机 ps 里出现过：主线程睡在 sleep(1)、而这里查不到 TCB）。
+ *      拿它当判据会**乱管**：查到 NULL 就 task_create 一个新实例，而新实例被
+ *      ai_companion_main.c 的 g_app_inited 门当场挡回 → 每 5 秒拉一个、每 5 秒退一个，
+ *      串口里成对刷 `WARN: hello_app(n) 已退出` + `已经有实例在跑`
+ *      （_flash/run_submit.txt 现场），而真正在跑的那个一直聋着。
+ *   2) 然后改成"主循环心跳超过 60 秒没动就算停摆"：**"这一拍很长"和"这一拍卡死"
+ *      在时间上长得一模一样**（主循环里同步跑着云端 ASR + 最多 3 轮大模型 + TTS，
+ *      各自都是几十秒级的超时），于是正常但被网络拖慢的一轮会被判成死实例、
+ *      当场把**正在说话的那个实例**拆掉。用户拍板："没用的东西不要拖累软件。"
+ *      那个阈值已经删了，原因与分析见 ai_companion_main.c 的 g_beat_ms 那一段。
+ *
+ * 现在用的是**零窗口**判据：`ai_companion_beat_age_ms()` 返回 -1（= 这份镜像里
+ * 没有任何实例占着位子：已退场 / main() 半路失败）才动手。位子被占着时这里一个字
+ * 都不做 —— 不管它是在慢慢跑，还是真卡死了。
+ * 代价写在明处：**主循环真卡死时不会自动恢复**，得在 nsh 里敲
+ * `ai_companion --assume-dead`（手动换掉它）或者断电；而"卡死还是慢慢跑"看得见 ——
+ * 不开串口就看 MQTT 快照里的 `lbeat`。
+ *
+ * 下面那条 nxsched_get_tcb 的 TCB 诊断**保留**（一行日志，不决定任何动作）：它是
+ * "主线程到底还在不在"的唯一观测，2026-09-20 那次"主线程自己消失"就靠它才看得见。
+ * 为什么不用 kill(pid, 0)：NuttX 里线程退出会回收 pid，"查得到 TCB"才是"这个线程
+ * 真的还在"的直接判据 —— 语义干净，也不发信号。取到 TCB 必须配对 nxsched_put_tcb()。
+ ****************************************************************************/
+
+#ifdef CONFIG_BOARD_LATE_INITIALIZE
+static pid_t g_hello_app_pid = -1;
+
+/* 已经为哪个 pid 打过"主线程 TCB 查不到"那一行（防止每 5 秒刷一遍）。 */
+
+static pid_t g_hello_app_tcb_logged = -1;
+
+static int hello_app_watchdog(int argc, FAR char *argv[])
+{
+  extern int ai_companion_main(int argc, FAR char *argv[]);
+  extern int ai_companion_beat_age_ms(void);
+  extern int ai_companion_takeover_requested(void);
+  extern void ai_companion_takeover_accept(void);
+
+  for (;;)
+    {
+      FAR struct tcb_s *tcb;
+
+      sleep(5);
+
+      if (g_hello_app_pid <= 0)
+        {
+          continue;
+        }
+
+      /* 诊断（**不再当判据**，理由见本段头上）：主线程的 TCB 在不在。
+       * 只在第一次发现时留一行 —— 它回答的是"这个任务组的主线程还在不在"，
+       * 是排查"主线程为什么会自己消失"的唯一观测，但不决定要不要动手。 */
+
+      tcb = nxsched_get_tcb(g_hello_app_pid);
+      if (tcb != NULL)
+        {
+          nxsched_put_tcb(tcb);
+        }
+      else if (g_hello_app_tcb_logged != g_hello_app_pid)
+        {
+          g_hello_app_tcb_logged = g_hello_app_pid;
+          syslog(LOG_WARNING,
+                 "[看护] hello_app(%d) 的主线程 TCB 已经查不到（任务组可能还在）；"
+                 "判据只看主循环心跳，不看这一条\n", (int)g_hello_app_pid);
+        }
+
+      /* 界面上的「重置」按钮（2026-09-20 晚加，语义见 ai_companion_req.h 那一段）：
+       * 拉一个带 `--assume-dead` 的新实例，由它按**既有**那条手动接管路径把旧实例
+       * 拆掉重建 —— 这里只负责"谁来拉"，不新增任何拆卸逻辑。
+       * 位子被占着也要动手：那正是它存在的理由（卡住的实例正是占着位子那个）。 */
+
+      if (ai_companion_takeover_requested())
+        {
+          /* ⚠️ argv 里**不能**再放"程序名"：NuttX 的 task 启动会把 argv[0] 自己填成
+           * **任务名**（sched/task/task_setup.c 的 stackargv[0] = 任务名），这里给的
+           * 数组会整体后移一格变成 argv[1..]。2026-09-20 晚真机踩过：原来写的是
+           * {"ai_companion", "--assume-dead", NULL} → 新实例的 main() 把
+           * "ai_companion" 当成未知参数 → 打一行用法说明当场退出，"重置"看着没反应。
+           * 所以这里只放**真正的参数**。 */
+          static char *const takeover_argv[] =
+            {
+              "--assume-dead", NULL
+            };
+
+          ai_companion_takeover_accept();
+
+          syslog(LOG_WARNING,
+                 "WARN: 收到界面「重置」请求，重新拉起 hello_app（--assume-dead）\n");
+
+          g_hello_app_pid = task_create("hello_app", 100,
+                                        CONFIG_HELLO_APP_STACKSIZE,
+                                        ai_companion_main, takeover_argv);
+
+          g_hello_app_tcb_logged = -1;
+
+          if (g_hello_app_pid < 0)
+            {
+              syslog(LOG_ERR, "ERROR: 重置 hello_app 失败: %d\n",
+                     (int)g_hello_app_pid);
+              g_hello_app_pid = -1;
+            }
+          else
+            {
+              syslog(LOG_WARNING, "WARN: hello_app 已按「重置」重新拉起，新 pid=%d\n",
+                     (int)g_hello_app_pid);
+            }
+
+          continue;
+        }
+
+      /* 判据（零窗口，理由见本段头上）：位子还占着 → 一个字都不做。
+       * 不管它是在慢慢跑还是真卡死，这里都不动它 —— 那是刻意的。 */
+
+      if (ai_companion_beat_age_ms() >= 0)
+        {
+          continue;
+        }
+
+      /* 位子空着：上一个实例已经收场退场，或者它的 main() 半路失败退出。
+       * 这才动手，也正是本看护被造出来的理由。 */
+
+      syslog(LOG_ERR,
+             "WARN: hello_app(%d) 不在（位子空着：已退场/没起来），"
+             "看护线程重新拉起它\n", (int)g_hello_app_pid);
+
+      g_hello_app_pid = task_create("hello_app", 100,
+                                    CONFIG_HELLO_APP_STACKSIZE,
+                                    ai_companion_main, NULL);
+
+      g_hello_app_tcb_logged = -1;      /* 新实例：那行诊断要重新判一次 */
+
+      if (g_hello_app_pid < 0)
+        {
+          syslog(LOG_ERR, "ERROR: 重启 hello_app 失败: %d\n",
+                 (int)g_hello_app_pid);
+          g_hello_app_pid = -1;
+        }
+      else
+        {
+          syslog(LOG_ERR, "WARN: hello_app 已重新拉起，新 pid=%d\n",
+                 (int)g_hello_app_pid);
+        }
+    }
+
+  return OK;
+}
+#endif
+
 #ifdef CONFIG_BOARD_LATE_INITIALIZE
 void board_late_initialize(void)
 {
+  /* 第一件事：把"这次是冷启动，还是被谁复位/唤醒的"记一行下来。
+   * 只允许调一次（读一次就把 PMU 里的标志清掉），所以全工程就这一处调用点，
+   * 判读表见上面 sf32lb52_log_boot_reason() 的注释。 */
+
+  sf32lb52_log_boot_reason();
+
   /* Perform board-specific initialization */
 
   sf32lb52_lchspi_ulp_bringup();
@@ -830,6 +1105,22 @@ void board_late_initialize(void)
     if (ret < 0)
       {
         syslog(LOG_ERR, "ERROR: hello_app autostart failed: %d\n", ret);
+      }
+    else
+      {
+        /* 记下它的 pid，并起一个看护线程：它万一退出（2026-09-19 真机出现过
+         * 一次，整组消失、界面"没反应"），由看护负责把它重新拉起来。
+         * 看护优先级给低一点（110），不跟 app 抢 CPU；栈只要 2KB。 */
+
+        g_hello_app_pid = ret;
+
+        ret = task_create("hello_app_wd", 110, 2048,
+                          hello_app_watchdog, NULL);
+        if (ret < 0)
+          {
+            syslog(LOG_ERR, "ERROR: hello_app 看护线程创建失败: %d\n",
+                   (int)ret);
+          }
       }
   }
 #endif

@@ -7,6 +7,10 @@
 /* up_interrupt_context()：提醒出声前要挡一下中断上下文（在中断里等 hello_app
  * 把录音线程收摊是不可能的）。写法和 robot_ui_bridge.c 那道同类检查一致。 */
 #include <nuttx/arch.h>
+#include <sys/boardctl.h>   /* boardctl(BOARDIOC_RESET)：整机软重启的正式入口
+                             * （见 voice_mirror_reset_handler 里的 C3；这块板的
+                             *  CONFIG_BOARDCTL_RESET 没开，所以那条路会回 -ENOSYS，
+                             *  下一手是 up_systemreset() —— 就是上面这个头里的） */
 #include <stdio.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -665,6 +669,36 @@ static void ui_post_alarm(const char *content)
     ui_post_panel(1, content, NULL);
 }
 
+/* 框架侧（hello_app）判到异常声时的**先响铃**入口。
+ *
+ * 用户拍板的时序（2026-09-20 晚，原话："命中先响铃，用户点了不用了再停"）：
+ *   命中  → **先起铃**（就是这里：本地、立刻、一个网络字节都不需要）
+ *         → 红屏询问页照旧弹（hello_app 那边 ui_post_ask_alarm()）
+ *         → 用户点「不用了」→ **这里才停铃**（ask_finish(confirmed == 0) 里的 alarm_clear()）
+ *         → 用户点「是的，报警」→ 走既有报警页收口（alarm_escalate → robot_ui_show_alarm），
+ *           铃不停、连着一路响下去。
+ *
+ * 为什么由 robot_ui 提供这个入口、而不是让 hello_app 直接调板级 alarm_trigger()：
+ * "报警声用哪个级别、由谁负责"只该有一处答案，那一处就是这里（和 fall 链、报警页
+ * 用的是同一个 alarm_trigger / ALARM_LEVEL_EMERGENCY）。
+ *
+ * 线程：板级那个模块是非阻塞的（置状态 + post 一记信号量给自己的线程），所以调用方
+ * 在哪个线程都行 —— hello_app 是在门控线程里调的。**别在中断上下文里调**。
+ * 同级不重来：后面「是的，报警」再调一次 EMERGENCY 只更新文本，铃不会被打断重响
+ * （见板级 sf32lb52_alarm.c 的说明）。 */
+int robot_ui_alarm_ring(const char *reason)
+{
+    int ret = alarm_trigger(ALARM_LEVEL_EMERGENCY, "sound_gate",
+                            reason != NULL ? reason : "检测到异常声响");
+
+    if (ret != OK) {
+        printf("[Ask] 异常声起铃失败: %d（红屏询问页照旧会弹，但这一次不会响）\n",
+               ret);
+    }
+
+    return ret;
+}
+
 static void ui_post_close_alarm(void)
 {
     ui_post_panel(2, NULL, NULL);
@@ -976,7 +1010,15 @@ static void ask_finish(int confirmed, const char *src)
          * 报警页、铃声、上报三件事都不做，赢家那一路已经全做过了。 */
         alarm_escalate(src, false, "sound_abnormal", text);
     } else if (confirmed == 0) {
-        printf("[Ask] 确认未通过（原因=%s，来源=%s）：不报警；"
+        /* ★ 用户点了「不用了」（或者 20 秒没人应答 → 走 ui_post_ask_answer(0,"超时")，
+         * 也落到这里）：**到这一刻才停铃** —— 异常声命中时先起的那记铃
+         * （robot_ui_alarm_ring()）就是从这里被停掉的。
+         * confirmed == -1（页面被报警页顶掉）那一路**不停**：铃要连着响下去。 */
+        if (alarm_clear() != OK) {
+            printf("[Ask] 停铃：alarm_clear 返回非 OK（本来就没在响也是正常的）\n");
+        }
+
+        printf("[Ask] 确认未通过（原因=%s，来源=%s）：不报警、停铃；"
                "同一原因 %u 秒内不再询问\n",
                reason, src,
                (unsigned)(ROBOT_ASK_ALARM_DENY_HOLD_MS / 1000));
@@ -1828,6 +1870,78 @@ static void voice_mirror_submit_handler(void *user_data)
      * 界面要如实说一句，否则老人会以为按钮坏了。不刷屏、不弹窗，就改状态行。 */
     printf("[VoiceChat] 「提交」：当前没有听到人说话，只在状态行提示\n");
     touch_ui_set_voice_status("没听到你说什么\n直接说话，说完再点「提交」");
+}
+
+/* 镜像面板底部「重置」：请 hello_app 把一个卡住的实例换成一个干净的。
+ *
+ * 为什么要有这个按钮（用户原话："不行卡死了就没反应了，加个重置，就加在提交旁边"）：
+ * 2026-09-20 晚把"心跳超时自动接管"整套删掉了（理由见 app/hello_app/ai_companion_main.c
+ * 的 g_beat_ms 那段：主循环里"这一拍很长"和"这一拍卡死"用时间分不开，自动判定会
+ * 误伤正在说话的那个实例），于是"卡死 → 没反应"只剩断电或在 nsh 里敲
+ * `ai_companion --assume-dead` 两个出口。这个按钮就是后者的界面版 ——
+ * **由人判断"它卡了"，机器不猜**。
+ *
+ * 本回调在 **LVGL 线程**里被调，只做一件事：投一个请求位（非阻塞、不碰设备）。
+ * 真正换实例是 board 侧看护那一拍（≤5 秒）干的：它拉一个带 `--assume-dead` 的新
+ * 实例，新实例走既有的手动接管路径把旧实例拆掉重建。
+ * 所以按钮旁边那句"正在重启语音服务…"要先说出来 —— 别让用户以为按钮没反应。 */
+static void voice_mirror_reset_handler(void *user_data)
+{
+    static uint32_t prev_ms;
+    uint32_t now = lv_tick_get();
+
+    (void)user_data;
+
+    /* ★ 2026-09-20 晚（C3）：**30 秒内按第二次 = 整机软重启**。
+     *
+     * 为什么留这一手：接管（C1）能救的是"app 层卡住 + 旧实例能被请走"那一类；
+     * 万一还有更深的（设备层真的起不来、某个 fd 谁都关不掉），那只有整机重启能
+     * 清干净。判据**交给用户**而不是交给自检：一次按键 = 便宜路，两次 = 锤子，
+     * 免得自检判错就变成重启循环（第一次那半句状态行里写明了"还不行就再按一次"）。
+     *
+     * 复位走法：先试板级那条正式入口（boardctl(BOARDIOC_RESET)）—— 这块板的
+     * CONFIG_BOARDCTL_RESET 没开，它会回 -ENOSYS，那就直接 up_systemreset()，
+     * 板级 board_reset() 内部也就是它。 */
+
+    if (prev_ms != 0 && (uint32_t)(now - prev_ms) < 30000u) {
+        printf("[VoiceChat] 「重置」30 秒内第二次按下 → 整机软重启（C3）\n");
+
+        touch_ui_set_voice_status("整机重启中…\n（约十几秒后自己回来）");
+
+        if (boardctl(BOARDIOC_RESET, 0) != OK) {
+            printf("[VoiceChat]   boardctl 不可用，直接 up_systemreset()\n");
+            up_systemreset();
+        }
+
+        return;   /* 正常到不了这里：上面那一句必然复位 */
+    }
+
+    prev_ms = now;
+
+    printf("[VoiceChat] 「重置」已登记：先把铃/页收掉，再等看护换实例\n");
+
+    /* ★ 2026-09-20 晚（C1）：重置不只是"换一个 app 实例" —— 那台半双工设备
+     * （/dev/audio/audio0）上还有别的客户端，而 NuttX 那份**共享的** status 只在
+     * **最后一个 fd 被关掉**时才释放（nuttx/audio/audio.c:187 第一次 open 分配、
+     * :263 最后一个 priv 释放）。它一旦被钉在 DRAINING，后面每个会话的
+     * CONFIGURE/START 都被静默吞掉（返回 OK、驱动一次没被调）—— 现场那个
+     * "1.8 秒一轮、永远起不来"的自锁就是这么来的。
+     *
+     * 所以按下重置时，先把**我们能碰到的两个客户端**收掉：
+     *   ① 板级报警铃：它 active 期间每轮都 open 这台设备放警音（一轮 5 秒，
+     *      轮间几乎不留缝），于是"最后一个 fd"根本不是录音那一侧；
+     *   ② 询问页 / 报警页：它们属于那个马上要被换掉的旧实例，留着只会让人以为
+     *      还在报警（而且报警页上的"我没事"是发给死实例的）。
+     * `robot_ui_close_alarm()` 内部就是 alarm_clear() + 收出声线程 + 回主界面，
+     * 所以不用再单独调一次板级接口。
+     * 录音那条路不用管：接管里自己会 stop + close（audio_record_stop 无条件收设备）。
+     * 剩下来自"僵尸线程"（回收超时被 detach 掉的那些）的 fd，要靠 C2/C3 才能清 ——
+     * 见 ai_companion_main.c 里 g_beat_ms 那段与 ai_companion_req.h 的讨论。 */
+
+    robot_ui_ask_alarm_answer(-1);   /* 那次询问作废（-1 不记"用户否认"） */
+    robot_ui_close_alarm();          /* 报警页收掉 + 停铃 + 回主界面 */
+
+    ai_companion_request_takeover();
 }
 
 /* ==================== 镜像面板自动弹出 ==================== */
@@ -4210,6 +4324,10 @@ int main(int argc, char *argv[])
     /* 镜像面板（常开麦那一套的显示器）底部的「提交」：只转发一次"请立刻收尾
      * 这一段"给 hello_app，不起线程、不碰音频设备（见 voice_mirror_submit_handler）。 */
     touch_ui_set_voice_mirror_submit_cb(voice_mirror_submit_handler, NULL);
+    /* 同一个面板底部「提交」旁边的「重置」：也只投一个请求位给 hello_app
+     * （请它换一个干净实例）；真正动手是 board 侧看护那一拍，见
+     * voice_mirror_reset_handler 和 ai_companion_req.h 那一段。 */
+    touch_ui_set_voice_mirror_reset_cb(voice_mirror_reset_handler, NULL);
 
     /* ===== 摔倒询问面板的两个按钮（有 / 没有）=====
      * 面板本身是 touch_ui 的（touch_ui_show_fall_ask），点下去只回调一个

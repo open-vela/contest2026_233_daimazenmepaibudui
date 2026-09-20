@@ -89,6 +89,12 @@ void robot_ui_show_error(const char *title, const char *content);
 /* 显示报警 */
 void robot_ui_show_alarm(const char *content);
 
+/* 异常声命中时的**先响铃**入口（任意线程可调、非阻塞）：本地起板级警音，不等网络。
+ *   时序：命中起铃（这里）→ 红屏询问页 → 用户点「不用了」才停铃（robot_ui/main.c 的
+ *   ask_finish(0)）；点「是的，报警」就走报警页那条收口，铃连着响。
+ *   实现在 main.c（板级 alarm_trigger / ALARM_LEVEL_EMERGENCY 只有那一处用法）。 */
+int robot_ui_alarm_ring(const char *reason);
+
 /* 关闭报警 */
 void robot_ui_close_alarm(void);
 
