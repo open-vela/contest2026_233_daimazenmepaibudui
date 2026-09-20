@@ -3,7 +3,7 @@
   "team_id": "contest2026_233_daimazenmepaibudui",
   "github_login": "zhan9xiaohu1",
   "generator": "kimi-code-collector@1.0.0",
-  "updated_at": "2026-09-19T11:33:28.721Z",
+  "updated_at": "2026-09-20T06:32:43.845Z",
   "sessions": [
     {
       "session_id": "494c16f7-35ac-4eec-a2b2-e0b073e54d8d",
@@ -64,6 +64,54 @@
       "collection_mode": "cli",
       "health": "ok",
       "model": "deepseek-v4-flash"
+    },
+    {
+      "session_id": "d919d36f-5685-4496-a71d-408c8e8328ec",
+      "tool": "kimi-code",
+      "started_at": "2026-09-16T13:14:54.312Z",
+      "last_event_at": "2026-09-17T05:26:26.571Z",
+      "event_count": 452,
+      "raw_event_count": 1547,
+      "file_path": "logs/zhan9xiaohu1/2026-09-16/kimi-code__keypath.jsonl",
+      "collection_mode": "cli",
+      "health": "ok",
+      "model": "mimo-v2.5"
+    },
+    {
+      "session_id": "41b1d655-ba21-416c-a910-48960b9dbb8a",
+      "tool": "kimi-code",
+      "started_at": "2026-09-17T05:27:45.285Z",
+      "last_event_at": "2026-09-20T02:30:53.438Z",
+      "event_count": 4398,
+      "raw_event_count": 16130,
+      "file_path": "logs/zhan9xiaohu1/2026-09-17/kimi-code__contest-progress.jsonl",
+      "collection_mode": "cli",
+      "health": "ok",
+      "model": "mimo-v2.5"
+    },
+    {
+      "session_id": "1f0ab808-bf28-4928-8606-983e6158e527",
+      "tool": "kimi-code",
+      "started_at": "2026-09-20T02:31:55.811Z",
+      "last_event_at": "2026-09-20T03:12:04.060Z",
+      "event_count": 511,
+      "raw_event_count": 1940,
+      "file_path": "logs/zhan9xiaohu1/2026-09-20/kimi-code__keypath_app_AUDIO_RX_read1_VAD.jsonl",
+      "collection_mode": "cli",
+      "health": "ok",
+      "model": "mimo-v2.5"
+    },
+    {
+      "session_id": "3cfa652b-dbd0-4646-a49f-8984c0e2c3b5",
+      "tool": "kimi-code",
+      "started_at": "2026-09-20T03:12:43.615Z",
+      "last_event_at": "2026-09-20T06:15:07.735Z",
+      "event_count": 1363,
+      "raw_event_count": 4905,
+      "file_path": "logs/zhan9xiaohu1/2026-09-20/kimi-code__Dapplyclawdocs-notes_2026-09-20_md.jsonl",
+      "collection_mode": "cli",
+      "health": "ok",
+      "model": "mimo-v2.5"
     }
   ]
 }
