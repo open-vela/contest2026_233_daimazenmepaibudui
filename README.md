@@ -708,7 +708,7 @@ git push
 
 ---
 
-**项目地址**: https://github.com/openvela/contest2026_233_daimazenmepaibudui
+**项目地址**: https://github.com/open-vela/contest2026_233_daimazenmepaibudui
 **开发者**: 代码怎么跑不队  
 **开发板**: SF32LB52-DevKit-LCD  
 **系统**: OpenVeLA (NuttX RTOS)
