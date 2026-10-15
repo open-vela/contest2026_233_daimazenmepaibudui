@@ -3031,7 +3031,46 @@ static int sf32lb52_audio_start(FAR struct audio_lowerhalf_s *dev)
 #ifndef CONFIG_AUDIO_EXCLUDE_STOP
 static int sf32lb52_audio_stop(FAR struct audio_lowerhalf_s *dev)
 {
-  return sf32lb52_audio_hw_stop((FAR struct sf32lb52_audio_s *)dev);
+  FAR struct sf32lb52_audio_s *priv =
+    (FAR struct sf32lb52_audio_s *)dev;
+  int ret = sf32lb52_audio_hw_stop(priv);
+
+  /* 停成功后必须替上层把 DRAINING 收掉（2026-10-10 真机定案）。
+   *
+   * 上层 audio_stop 在调下来**之前**就把共享的 upper->status->state 置成
+   * AUDIO_STATE_DRAINING（nuttx/audio/audio.c:692），并且指望驱动用
+   * AUDIO_CALLBACK_COMPLETE 通知它清掉（audio.c:1558-1561 会把 DRAINING
+   * 落回 OPEN）。本板走 read()/write() 直通、从不走队列模式，那个回调全仓库
+   * 没有路径发 —— 于是 DRAINING 只剩"最后一个 fd 被关"一条释放路
+   * （audio.c:263-275，status 随之销毁重建）。
+   *
+   * 只要还有任何 app 持着 /dev/audio 的 fd（本板 robot_ui / hello_app /
+   * 录音守护 / audio_test 都会各开各的），DRAINING 就会无限期钉着，之后
+   * 每一个新会话的 CONFIGURE 与 START 都被上层**静默吞掉**：
+   *   - CONFIGURE：state 不是 OPEN → 不调驱动 configure，照样返回 OK
+   *     （audio.c:479-507）；
+   *   - START：state 是 DRAINING → 不在 PREPARED/XRUN 分支 → 不调驱动
+   *     start，照样返回 OK（audio.c:633-658）。
+   * 现场（2026-10-10，烧录 1b89964b4 固件）：audio_test 播放
+   * "START ret=0 → WRITE done: 0 of 96000"（write 进来 priv->running
+   * 还是 0，3172 行静默返回 0）；录音守护 1.8 秒一轮
+   * "AUDIO_IN: started → read 立刻 -ENODEV(running=0) → stop → 重开"，
+   * 麦克风喇叭同时全聋，ioctls 却全部"成功"——和本注释描述的闭环完全一致。
+   *
+   * 修法：STOP 是上层唯一会进来的、且此刻 DRAINING 刚被置上的入口，在
+   * hw_stop 成功后补一记 COMPLETE，让状态立刻落回 OPEN，下一个会话的
+   * CONFIGURE/START 就能真进驱动。audio_complete 里除清状态外只会往
+   * mq 发一条消息 —— 本板没人给音频注册 mq，是空操作；且它设计上就
+   * 允许在驱动上下文（含中断）调用，这里在 ioctl 线程里调没有问题。
+   * 失败时不发：上层收到非 OK 会把状态还原（audio.c:698-701），我们
+   * 再发一记 COMPLETE 反而会把还没停掉的会话状态清错。 */
+
+  if (ret == OK && priv->dev.upper != NULL)
+    {
+      priv->dev.upper(priv->dev.priv, AUDIO_CALLBACK_COMPLETE, NULL, OK);
+    }
+
+  return ret;
 }
 #endif
 

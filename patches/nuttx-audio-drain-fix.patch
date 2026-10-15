@@ -1,0 +1,66 @@
+diff --git a/arch/arm/src/arm_m/Make.defs b/arch/arm/src/arm_m/Make.defs
+index a228cd42be4..a4820a80388 100644
+--- a/arch/arm/src/arm_m/Make.defs
++++ b/arch/arm/src/arm_m/Make.defs
+@@ -22,7 +22,7 @@
+ 
+ CMN_ASRCS += arm_exception.S arm_saveusercontext.S
+ 
+-ifeq ($(CONFIG_ARM_M_SYSTICK),y)
++ifeq ($(CONFIG_ARM_SYSTICK),y)
+   CMN_CSRCS += arm_systick.c
+ endif
+ 
+diff --git a/audio/audio.c b/audio/audio.c
+index 35e1344a92e..8e773c52cc6 100644
+--- a/audio/audio.c
++++ b/audio/audio.c
+@@ -469,6 +469,7 @@ static int audio_configure(FAR struct file *filep,
+   FAR struct audio_lowerhalf_s *lower = upper->dev;
+   FAR const struct audio_caps_s *caps = &cap_desc->caps;
+   FAR struct audio_openpriv_s *priv = filep->f_priv;
++  bool preempted = false;
+   int ret = OK;
+ 
+   DEBUGASSERT(lower->ops->configure != NULL);
+@@ -476,7 +477,40 @@ static int audio_configure(FAR struct file *filep,
+   audinfo("configure: status=%d ac_type: %" PRIu8 " \n",
+     upper->status->state, caps->ac_type);
+ 
++  /* 半双工抢占（2026-10-11 真机定案）：本板音频是半双工，上层却是全局单
++   * 状态机 —— 常开麦把状态顶在 RUNNING 之后，其他 app 的 OUTPUT CONFIGURE
++   * 会被下面的门静默吞掉（返回 OK、驱动毫不知情），播放的 PCM 全写在录音
++   * 会话上，DAC/功放从未打开，每块都等 DMA 超时被丢 —— 现场全程无声
++   * （串口只有 "AUDIO: 等播放完成超时，本块丢弃"、从无 "hw_start 真跑了"）。
++   *
++   * 修法：OUTPUT 在 INPUT 会话运行时抢占 —— 直调下层 stop 拆掉录音会话
++   * （sf32lb52_audio_stop 会 hw_stop + 唤醒阻塞的 read + 发 COMPLETE 让
++   * 状态落回 OPEN），hello_app 的录音监听守护随后自动重开麦。反向（INPUT
++   * 抢 OUTPUT）故意不放行：麦不能杀死用户要听到的声音。
++   *
++   * 这正是 robot_ui.c 报警节注释里写的设计意图（「放音时驱动会停掉录音
++   * 通路并唤醒对方阻塞的 read，对方的监听守护会重开」），只是一直没落到
++   * 上层代码 —— 上层这道门让 START 根本到不了驱动，设计意图落空。 */
++
++  if (caps->ac_type == AUDIO_TYPE_OUTPUT &&
++      upper->status->state == AUDIO_STATE_RUNNING &&
++      upper->info.type == AUDIO_TYPE_INPUT)
++    {
++#ifdef CONFIG_AUDIO_MULTI_SESSION
++      lower->ops->stop(lower, cap_desc->session);
++#else
++      lower->ops->stop(lower);
++#endif
++
++      /* 下层 stop 的 COMPLETE 回调一般已把状态带回 OPEN；无论回调时序
++       * 如何，这里显式落到 PREPARED，让下面的门必定转发这次 CONFIGURE。 */
++
++      audio_setstate(upper, AUDIO_STATE_PREPARED);
++      preempted = true;
++    }
++
+   if (upper->status->state == AUDIO_STATE_OPEN ||
++      preempted ||
+       (caps->ac_type != AUDIO_TYPE_INPUT &&
+        caps->ac_type != AUDIO_TYPE_OUTPUT))
+     {

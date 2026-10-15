@@ -186,10 +186,17 @@
 #define MIMO_ERR_DUMP_LEN 200
 
 /* ASR 请求的 JSON 骨架：base64 的 WAV 直接填在中间的空档里（不经过 cJSON，
- * 省掉一整份字符串拷贝 —— hello_app 的编译参数里也没有 cJSON 的 include 路径）。 */
+ * 省掉一整份字符串拷贝 —— hello_app 的编译参数里也没有 cJSON 的 include 路径）。
+ *
+ * "language":"zh"（2026-10-14 加）：不钉语言时网关自带的转写提示不做语种约束，
+ * 老人中文口音/环境噪声下偶尔整句被识别成英文（用户实测反馈）。想塞 text
+ * 提示段改不了 —— PC 实测网关直接 400 拒绝："ASR request must not include
+ * text parts; text prompt is injected by the gateway"，语言只能走 language
+ * 字段。同一发 PC 回环实测：带 language:"zh" HTTP 200、中文转写正常。 */
 
 #define MIMO_ASR_JSON_PREFIX                                             \
-  "{\"model\":\"" MIMO_ASR_MODEL "\",\"messages\":[{\"role\":\"user\"," \
+  "{\"model\":\"" MIMO_ASR_MODEL "\",\"language\":\"zh\","              \
+  "\"messages\":[{\"role\":\"user\","                                    \
   "\"content\":[{\"type\":\"input_audio\",\"input_audio\":{\"data\":\""
 
 #define MIMO_ASR_JSON_SUFFIX "\",\"format\":\"wav\"}}]}]}"
@@ -2810,13 +2817,21 @@ static void chat_build_system_prompt(bool use_weather, bool use_reminder,
   out[0] = '\0';
 
   /* 说话要求：口语化中文、不要 emoji / markdown（屏幕字库没有 emoji，
-   * TTS 也念不出来）。这段跟工具开不开无关，每轮都在。 */
+   * TTS 也念不出来）。这段跟工具开不开无关，每轮都在。
+   * "一律简体中文"是硬性规定单列一段（2026-10-14 用户实测：中文问题偶尔
+   * 得到英文回答）——光说"用口语化的中文说话"约束力不够，模型遇到被 ASR
+   * 识别成英文的输入会顺坡下驴用英文回；写死"识别成什么都要用中文回"。 */
 
   used = prompt_append(out, out_cap, used,
                        "你是老人陪伴机器人里的语音助手，用口语化的中文说话，"
                        "简短直接，一般一两句话就够。不要用 emoji，也不要用"
                        "星号或者 markdown 列表，因为屏幕字库和语音都不支持"
                        "这些符号。");
+
+  used = prompt_append(out, out_cap, used,
+                       "任何时候都必须用简体中文回答，这是硬性规定。"
+                       "即使用户的话被语音识别成了英文、拼音或者错字，"
+                       "也必须用简体中文回复，绝对不要用英文回答。");
 
   /* 当前北京时间：放提示里而不是做成工具 —— "今天几号 / 现在几点 /
    * 今天星期几"照抄就行，不用再打一次网络 */

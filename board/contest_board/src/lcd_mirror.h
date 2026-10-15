@@ -127,6 +127,11 @@ int lcd_mirror_stop(void);
 
 bool lcd_mirror_is_running(void);
 
+/* 真有客户端连着（TCP 握手成功 / 串口打开成功）没有。
+ * lcd_mirror_capture()（LVGL 刷屏路径）只在这个为 true 时才拷影子缓冲：
+ * 没人看镜像时每帧白拷 351 KB 会把滚动拖垮（2026-10-14 卡顿主修）。 */
+bool lcd_mirror_has_client(void);
+
 /* 打印一行状态（NSH 里调，printf 出到串口）。 */
 void lcd_mirror_status(void);
 

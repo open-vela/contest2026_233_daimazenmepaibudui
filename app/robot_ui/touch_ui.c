@@ -4,6 +4,8 @@
  */
 
 #include "touch_ui.h"
+#include "robot_ui.h"        /* ui_page_header_create / ui_clock_label_create：全屏页眉 */
+#include "ui_theme.h"        /* 清新绿色健康主题调色板 */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -94,6 +96,9 @@ static int new_reminder_preset = 0;
 
 /* 关怀确认面板静态变量 */
 static lv_obj_t *checkin_panel = NULL;
+/* 摔倒确认面板的主句柄：手势抑制（右滑必须作答）在文件上半就要看见它，
+ * 所以声明放在这里，不跟下面摔倒那一节的其它量放一起。 */
+static lv_obj_t *fall_panel = NULL;
 static lv_obj_t *checkin_status_lbl = NULL;
 static lv_obj_t *checkin_btn_fine = NULL;
 static lv_obj_t *checkin_btn_help = NULL;
@@ -206,7 +211,7 @@ static void create_menu_panel(menu_type_t type);
 static void create_setting_panel(void);
 static void create_new_reminder_panel(void);
 static void create_back_button(lv_obj_t *parent);
-static void create_menu_item(lv_obj_t *parent, const char *icon_text,
+static void create_menu_item(lv_obj_t *parent, const char *title,
                             const char *subtitle, int index);
 static void create_reminder_add_button(lv_obj_t *parent);
 static void create_reminder_list_items(lv_obj_t *parent);
@@ -259,53 +264,53 @@ static void voice_round_done_async(void *arg);
 /* ==================== 初始化老人友好样式 ==================== */
 static void init_elder_styles(void)
 {
-    /* 老人友好基础样式 */
+    /* 老人友好基础样式（浅色健康主题页面底） */
     lv_style_init(&style_elder);
-    lv_style_set_bg_color(&style_elder, lv_color_hex(0x1A1A2E));
+    lv_style_set_bg_color(&style_elder, THEME_BG_PAGE);
     lv_style_set_bg_opa(&style_elder, LV_OPA_COVER);
-    lv_style_set_text_color(&style_elder, lv_color_hex(0xFFFFFF));
+    lv_style_set_text_color(&style_elder, THEME_TEXT_PRIMARY);
     lv_style_set_text_font(&style_elder, &lv_font_ui_20);
     lv_style_set_border_width(&style_elder, 0);
     lv_style_set_radius(&style_elder, 0);
 
     /* 大按钮样式 - 方便点击 */
     lv_style_init(&style_big_btn);
-    lv_style_set_bg_color(&style_big_btn, lv_color_hex(0x4CAF50));
+    lv_style_set_bg_color(&style_big_btn, THEME_GREEN);
     lv_style_set_bg_opa(&style_big_btn, LV_OPA_COVER);
     lv_style_set_radius(&style_big_btn, 20);
-    lv_style_set_shadow_width(&style_big_btn, 15);
-    lv_style_set_shadow_color(&style_big_btn, lv_color_hex(0x388E3C));
-    lv_style_set_text_color(&style_big_btn, lv_color_hex(0xFFFFFF));
+    lv_style_set_shadow_width(&style_big_btn, 10);
+    lv_style_set_shadow_color(&style_big_btn, THEME_GREEN_DARK);
+    lv_style_set_text_color(&style_big_btn, THEME_TEXT_ON_GREEN);
     lv_style_set_text_font(&style_big_btn, &lv_font_ui_20);
     lv_style_set_pad_all(&style_big_btn, 20);
 
-    /* 菜单项样式 */
+    /* 菜单项样式：白色圆角卡片 + 浅绿描边（健康 APP 风） */
     lv_style_init(&style_menu_item);
-    lv_style_set_bg_color(&style_menu_item, lv_color_hex(0x2D2D44));
+    lv_style_set_bg_color(&style_menu_item, THEME_BG_CARD);
     lv_style_set_bg_opa(&style_menu_item, LV_OPA_COVER);
-    lv_style_set_radius(&style_menu_item, 15);
+    lv_style_set_radius(&style_menu_item, 18);
     lv_style_set_border_width(&style_menu_item, 2);
-    lv_style_set_border_color(&style_menu_item, lv_color_hex(0x4CAF50));
-    lv_style_set_text_color(&style_menu_item, lv_color_hex(0xFFFFFF));
+    lv_style_set_border_color(&style_menu_item, THEME_GREEN_BORDER);
+    lv_style_set_text_color(&style_menu_item, THEME_TEXT_PRIMARY);
     lv_style_set_text_font(&style_menu_item, &lv_font_ui_20);
     lv_style_set_pad_all(&style_menu_item, 25);
 
-    /* 返回按钮样式 */
+    /* 返回按钮样式：浅绿底深绿字 */
     lv_style_init(&style_back_btn);
-    lv_style_set_bg_color(&style_back_btn, lv_color_hex(0x607D8B));
+    lv_style_set_bg_color(&style_back_btn, THEME_GREEN_TINT);
     lv_style_set_bg_opa(&style_back_btn, LV_OPA_COVER);
     lv_style_set_radius(&style_back_btn, 25);
-    lv_style_set_text_color(&style_back_btn, lv_color_hex(0xFFFFFF));
+    lv_style_set_text_color(&style_back_btn, THEME_GREEN_DARK);
     lv_style_set_text_font(&style_back_btn, &lv_font_ui_16);
 
     /* 设置滑块样式 */
     lv_style_init(&style_slider);
-    lv_style_set_bg_color(&style_slider, lv_color_hex(0x37474F));
+    lv_style_set_bg_color(&style_slider, THEME_TRACK);
     lv_style_set_radius(&style_slider, 10);
 
     /* 开关样式 */
     lv_style_init(&style_switch);
-    lv_style_set_bg_color(&style_switch, lv_color_hex(0x4CAF50));
+    lv_style_set_bg_color(&style_switch, THEME_GREEN);
 }
 
 /* ==================== 初始化触摸交互 UI ==================== */
@@ -418,6 +423,18 @@ void touch_ui_init(void)
     printf("touch_ui init done\n");
 }
 
+/* 任何全屏二级页面开着时暂停表情浮动动画，全关了才恢复 ——
+ * 动画每帧都让被盖住的表情区重绘，滚动页面时和滚动重绘抢带宽，
+ * 就是用户反馈的"上下滑动卡顿"。所有面板的开/关路径末尾都要调它。
+ * 只能在 LVGL 线程里调（这些开/关路径本来就在 LVGL 线程）。 */
+static void sync_face_anim(void)
+{
+    bool any_panel = (menu_panel != NULL || setting_panel != NULL ||
+                      new_reminder_panel != NULL || voice_panel != NULL ||
+                      checkin_panel != NULL || fall_panel != NULL);
+    robot_ui_set_face_anim_paused(any_panel);
+}
+
 /* ==================== 显示菜单 ==================== */
 void touch_ui_show_menu(menu_type_t type)
 {
@@ -458,6 +475,7 @@ void touch_ui_show_menu(menu_type_t type)
 
     /* 创建菜单面板 */
     create_menu_panel(type);
+    sync_face_anim();
 }
 
 /* ==================== 隐藏菜单 ==================== */
@@ -467,6 +485,7 @@ void touch_ui_hide_menu(void)
         lv_obj_del(menu_panel);
         menu_panel = NULL;
     }
+    sync_face_anim();
 }
 
 /* ==================== 返回上一级 ==================== */
@@ -490,60 +509,89 @@ void touch_ui_go_back(void)
         }
     }
 
+    sync_face_anim();
+
     /* 播放返回音效 */
     touch_ui_play_sound("back");
 }
 
 /* ==================== 创建菜单面板 ==================== */
+/* 内容滚动区（菜单/设置共用）：面板自身不滚，只有这一块滚。
+ * 好处两条：① 滚动的脏区从整屏 450px 降到内容区 ~300px —— 每帧渲染和
+ * QSPI 推屏都少三分之一，这是"上下滑动卡"在应用侧能拿到的最大削减；
+ * ② 页眉（返回+时间）和页脚（大返回按钮）钉死在原位，不会被滑走。 */
+static lv_obj_t *ui_page_content_create(lv_obj_t *panel)
+{
+    lv_obj_t *content = lv_obj_create(panel);
+    lv_obj_set_width(content, LV_PCT(100));
+    lv_obj_set_flex_grow(content, 1);
+    lv_obj_set_style_bg_opa(content, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(content, 0, 0);
+    lv_obj_set_style_pad_left(content, 20, 0);
+    lv_obj_set_style_pad_right(content, 20, 0);
+    lv_obj_set_style_pad_top(content, 12, 0);
+    lv_obj_set_style_pad_bottom(content, 12, 0);
+    lv_obj_set_style_pad_row(content, 12, 0);
+    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(content, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_scroll_dir(content, LV_DIR_VER);
+    /* 关掉回弹：弹到底多画一截回弹帧，老人滑起来只觉得"黏"
+     * （本树的 LVGL 9 fork 是 elastic_dir 接口，不是上游的 scroll_elastic） */
+    lv_obj_set_elastic_dir(content, LV_DIR_NONE);
+    return content;
+}
+
 static void create_menu_panel(menu_type_t type)
 {
-    /* 菜单容器 */
+    /* 菜单容器：**全屏页面**，自身不可滚 —— 页眉/页脚固定，中间内容滚。 */
     menu_panel = lv_obj_create(current_screen);
-    lv_obj_set_size(menu_panel, LV_PCT(95), LV_PCT(85));
-    lv_obj_align(menu_panel, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_size(menu_panel, LV_PCT(100), LV_PCT(100));
+    lv_obj_align(menu_panel, LV_ALIGN_TOP_MID, 0, 0);
     lv_obj_add_style(menu_panel, &style_elder, 0);
     lv_obj_set_flex_flow(menu_panel, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(menu_panel, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_all(menu_panel, 20, 0);
-    lv_obj_set_style_pad_row(menu_panel, 15, 0);
+    lv_obj_set_style_pad_all(menu_panel, 0, 0);
+    lv_obj_set_style_pad_row(menu_panel, 0, 0);
+    lv_obj_remove_flag(menu_panel, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* 标题 */
-    lv_obj_t *title = lv_label_create(menu_panel);
+    /* 页眉：左返回 + 中标题 + 右实时时钟（固定） */
+    const char *menu_title = "菜单";
     switch (type) {
         case MENU_TYPE_MAIN:
-            lv_label_set_text(title, "[主] 主菜单");
+            menu_title = "主菜单";
             break;
         case MENU_TYPE_REMIND:
-            lv_label_set_text(title, "[提] 提醒");
+            menu_title = "提醒";
             break;
         case MENU_TYPE_SETTING:
-            lv_label_set_text(title, "[设] 设置");
+            menu_title = "设置";
             break;
         case MENU_TYPE_ABOUT:
-            lv_label_set_text(title, "[?] 关于");
+            menu_title = "关于";
             break;
         default:
-            lv_label_set_text(title, "菜单");
             break;
     }
-    lv_obj_set_style_text_font(title, &lv_font_ui_24, 0);
-    lv_obj_set_style_text_color(title, lv_color_hex(0xFFEB3B), 0);
-    lv_obj_set_style_pad_bottom(title, 20, 0);
+    ui_page_header_create(menu_panel, menu_title, back_button_event_handler, NULL);
+
+    /* 内容区：唯一可滚的部分 */
+    lv_obj_t *content = ui_page_content_create(menu_panel);
 
     /* 根据菜单类型创建内容 */
     switch (type) {
         case MENU_TYPE_MAIN:
-            create_menu_item(menu_panel, "[语] 语音聊天", "与机器人对话", 0);
-            create_menu_item(menu_panel, "[提] 查看提醒", "查看今日提醒", 1);
-            create_menu_item(menu_panel, "[设] 设置", "音量、亮度等", 2);
-            create_menu_item(menu_panel, "[急] 紧急呼叫", "联系家人", 3);
-            create_menu_item(menu_panel, "[?] 关于", "版本信息", 4);
+            create_menu_item(content, "语音聊天", "与机器人对话", 0);
+            create_menu_item(content, "查看提醒", "查看今日提醒", 1);
+            create_menu_item(content, "设置", "音量、亮度等", 2);
+            create_menu_item(content, "紧急呼叫", "联系家人", 3);
+            create_menu_item(content, "关于", "版本信息", 4);
             break;
 
         case MENU_TYPE_REMIND:
             /* 新增按钮放**最上面**：老人不用先滚一圈才能找到它 */
-            create_reminder_add_button(menu_panel);
-            create_reminder_list_items(menu_panel);
+            create_reminder_add_button(content);
+            create_reminder_list_items(content);
             break;
 
         case MENU_TYPE_SETTING:
@@ -551,46 +599,64 @@ static void create_menu_panel(menu_type_t type)
             break;
 
         case MENU_TYPE_ABOUT:
-            create_about_info(menu_panel);
+            create_about_info(content);
             break;
 
         default:
             break;
     }
 
-    /* 返回按钮 */
+    /* 页脚大返回按钮（固定，不随内容滚走） */
     create_back_button(menu_panel);
 }
 
 /* ==================== 创建菜单项 ==================== */
-static void create_menu_item(lv_obj_t *parent, const char *icon_text,
+static void create_menu_item(lv_obj_t *parent, const char *title,
                             const char *subtitle, int index)
 {
-    /* 菜单项按钮 - 用 lv_btn 确保触摸事件可响应 */
+    /* 菜单项按钮 - 用 lv_btn 确保触摸事件可响应。
+     * 布局：左列「大标题 + 灰副标题」两行，右侧 ">" 提示可进 ——
+     * 原来的"[语] 语音聊天  与机器人对话"一行塞三个东西太挤（2026-10-14
+     * 用户反馈"很乱"），改成健康 APP 常见的两行列表项。 */
     lv_obj_t *item = lv_btn_create(parent);
-    lv_obj_set_size(item, LV_PCT(100), 80);
+    lv_obj_set_size(item, LV_PCT(100), 88);
     lv_obj_add_style(item, &style_menu_item, 0);
     lv_obj_set_flex_flow(item, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(item, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_flex_align(item, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_left(item, 18, 0);
+    lv_obj_set_style_pad_right(item, 18, 0);
+    lv_obj_set_style_pad_top(item, 10, 0);
+    lv_obj_set_style_pad_bottom(item, 10, 0);
     lv_obj_add_event_cb(item, menu_item_event_handler, LV_EVENT_CLICKED, (void *)(intptr_t)index);
 
-    /* 图标和标题 */
-    lv_obj_t *icon_label = lv_label_create(item);
-    lv_label_set_text(icon_label, icon_text);
-    lv_obj_set_style_text_font(icon_label, &lv_font_ui_24, 0);
+    /* 左列：标题 + 副标题 */
+    lv_obj_t *text_col = lv_obj_create(item);
+    lv_obj_set_size(text_col, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(text_col, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(text_col, 0, 0);
+    lv_obj_set_style_pad_all(text_col, 0, 0);
+    lv_obj_set_flex_flow(text_col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(text_col, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(text_col, 2, 0);
+    lv_obj_remove_flag(text_col, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* 副标题 */
-    lv_obj_t *sub_label = lv_label_create(item);
+    lv_obj_t *title_label = lv_label_create(text_col);
+    lv_label_set_text(title_label, title);
+    lv_obj_set_style_text_font(title_label, &lv_font_ui_24, 0);
+    lv_obj_set_style_text_color(title_label, THEME_TEXT_PRIMARY, 0);
+
+    lv_obj_t *sub_label = lv_label_create(text_col);
     lv_label_set_text(sub_label, subtitle);
-    lv_obj_set_style_text_color(sub_label, lv_color_hex(0x9E9E9E), 0);
-    lv_obj_set_style_text_font(sub_label, &lv_font_ui_24, 0);
-    lv_obj_set_style_pad_left(sub_label, 15, 0);
+    lv_obj_set_style_text_color(sub_label, THEME_TEXT_SECONDARY, 0);
+    lv_obj_set_style_text_font(sub_label, &lv_font_ui_20, 0);
 
     /* 右箭头 */
     lv_obj_t *arrow = lv_label_create(item);
     lv_label_set_text(arrow, ">");
     lv_obj_set_style_text_font(arrow, &lv_font_ui_24, 0);
-    lv_obj_set_style_text_color(arrow, lv_color_hex(0x9E9E9E), 0);
+    lv_obj_set_style_text_color(arrow, THEME_GREEN, 0);
 }
 
 /* ==================== 创建「新增提醒」按钮 ==================== */
@@ -619,7 +685,7 @@ static void create_reminder_list_items(lv_obj_t *parent)
         /* 空提醒 */
         lv_obj_t *empty = lv_label_create(parent);
         lv_label_set_text(empty, "暂无提醒\n\n点上面的「+ 新增提醒」");
-        lv_obj_set_style_text_color(empty, lv_color_hex(0x9E9E9E), 0);
+        lv_obj_set_style_text_color(empty, THEME_TEXT_SECONDARY, 0);
         lv_obj_set_style_text_font(empty, &lv_font_ui_24, 0);
         lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_set_style_pad_top(empty, 30, 0);
@@ -653,7 +719,7 @@ static void create_reminder_item(lv_obj_t *parent, const char *title,
     /* 提醒时间 */
     lv_obj_t *time_label = lv_label_create(item);
     lv_label_set_text(time_label, time_str);
-    lv_obj_set_style_text_color(time_label, lv_color_hex(0xFF9800), 0);
+    lv_obj_set_style_text_color(time_label, THEME_ORANGE, 0);
     lv_obj_set_style_text_font(time_label, &lv_font_ui_24, 0);
 
     /* 提醒标题 */
@@ -665,7 +731,7 @@ static void create_reminder_item(lv_obj_t *parent, const char *title,
     /* 右侧删除按钮 "×" */
     lv_obj_t *del_btn = lv_btn_create(item);
     lv_obj_set_size(del_btn, 50, 50);
-    lv_obj_set_style_bg_color(del_btn, lv_color_hex(0xF44336), 0);
+    lv_obj_set_style_bg_color(del_btn, THEME_RED, 0);
     lv_obj_set_style_radius(del_btn, 25, 0);
     lv_obj_set_style_pad_all(del_btn, 0, 0);
     lv_obj_align(del_btn, LV_ALIGN_RIGHT_MID, 0, 0);
@@ -677,7 +743,7 @@ static void create_reminder_item(lv_obj_t *parent, const char *title,
      * （符号字体不在本工程的三档字库里，会画成空心方块） */
     lv_label_set_text(del_label, "×");
     lv_obj_set_style_text_font(del_label, &lv_font_ui_24, 0);
-    lv_obj_set_style_text_color(del_label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_color(del_label, THEME_TEXT_ON_GREEN, 0);
     lv_obj_center(del_label);
 }
 
@@ -718,13 +784,13 @@ static void create_step_row(lv_obj_t *parent, int field, int value,
             lv_obj_set_width(value_lbl, 130);
             lv_obj_set_style_text_align(value_lbl, LV_TEXT_ALIGN_CENTER, 0);
             lv_obj_set_style_text_font(value_lbl, &lv_font_ui_24, 0);
-            lv_obj_set_style_text_color(value_lbl, lv_color_hex(0xFF9800), 0);
+            lv_obj_set_style_text_color(value_lbl, THEME_ORANGE, 0);
             new_reminder_step_lbls[field] = value_lbl;
         }
 
         btn = lv_btn_create(row);
         lv_obj_set_size(btn, 84, 54);
-        lv_obj_set_style_bg_color(btn, lv_color_hex(0x455A64), 0);
+        lv_obj_set_style_bg_color(btn, THEME_GREEN_TINT, 0);
         lv_obj_set_style_radius(btn, 12, 0);
         /* user_data 编码：高 8 位 = 字段，低 8 位 = ±1（见 step 回调） */
         lv_obj_add_event_cb(btn, new_reminder_step_event_handler,
@@ -758,16 +824,12 @@ static void new_reminder_refresh_preset(void)
             continue;
         }
         lv_obj_set_style_bg_color(new_reminder_preset_btns[i],
-            lv_color_hex(i == new_reminder_preset ? 0x4CAF50 : 0x37474F), 0);
+            i == new_reminder_preset ? THEME_GREEN : THEME_TRACK, 0);
     }
 }
 
 static void create_new_reminder_panel(void)
 {
-    lv_obj_t *header;
-    lv_obj_t *title;
-    lv_obj_t *btn_close;
-    lv_obj_t *lbl_close;
     lv_obj_t *preset_grid;
     lv_obj_t *btn_save;
     lv_obj_t *lbl_save;
@@ -789,47 +851,24 @@ static void create_new_reminder_panel(void)
     reminder_sched_default_time(&new_reminder_hour, &new_reminder_min);
 
     new_reminder_panel = lv_obj_create(current_screen);
-    lv_obj_set_size(new_reminder_panel, LV_PCT(95), LV_PCT(92));
-    lv_obj_align(new_reminder_panel, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_bg_color(new_reminder_panel, lv_color_hex(0x1A1A2E), 0);
+    lv_obj_set_size(new_reminder_panel, LV_PCT(100), LV_PCT(100));
+    lv_obj_align(new_reminder_panel, LV_ALIGN_TOP_MID, 0, 0);
+    /* 内容一屏放得下（~412px / 450），不给滚动：老人误划一下把保存按钮
+     * 划出屏幕是最糟的，而且省掉整个面板的滚动重绘 */
+    lv_obj_remove_flag(new_reminder_panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_color(new_reminder_panel, THEME_BG_PAGE, 0);
     lv_obj_set_style_bg_opa(new_reminder_panel, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(new_reminder_panel, 20, 0);
-    lv_obj_set_style_border_width(new_reminder_panel, 2, 0);
-    lv_obj_set_style_border_color(new_reminder_panel, lv_color_hex(0x4CAF50), 0);
+    lv_obj_set_style_radius(new_reminder_panel, 0, 0);
+    lv_obj_set_style_border_width(new_reminder_panel, 0, 0);
     lv_obj_set_flex_flow(new_reminder_panel, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(new_reminder_panel, LV_FLEX_ALIGN_START,
                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_all(new_reminder_panel, 10, 0);
     lv_obj_set_style_pad_row(new_reminder_panel, 8, 0);
 
-    /* 标题栏：左边"新建提醒"，右上角「×」 */
-    header = lv_obj_create(new_reminder_panel);
-    lv_obj_set_width(header, LV_PCT(100));
-    lv_obj_set_height(header, 44);
-    lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(header, 0, 0);
-    lv_obj_set_style_pad_all(header, 0, 0);
-    lv_obj_remove_flag(header, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_SPACE_BETWEEN,
-                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-
-    title = lv_label_create(header);
-    lv_label_set_text(title, "新建提醒");
-    lv_obj_set_style_text_font(title, &lv_font_ui_24, 0);
-    lv_obj_set_style_text_color(title, lv_color_hex(0xFFEB3B), 0);
-
-    btn_close = lv_btn_create(header);
-    lv_obj_set_size(btn_close, 56, 40);
-    lv_obj_set_style_bg_color(btn_close, lv_color_hex(0x607D8B), 0);
-    lv_obj_set_style_radius(btn_close, 12, 0);
-    lv_obj_add_event_cb(btn_close, new_reminder_close_event_handler,
-                        LV_EVENT_CLICKED, NULL);
-
-    lbl_close = lv_label_create(btn_close);
-    lv_label_set_text(lbl_close, "×");   /* U+00D7，字库里有 */
-    lv_obj_set_style_text_font(lbl_close, &lv_font_ui_24, 0);
-    lv_obj_center(lbl_close);
+    /* 页眉：左返回（复用原来的「×」关闭逻辑）+ 中标题 + 右实时时钟 */
+    ui_page_header_create(new_reminder_panel, "新建提醒",
+                          new_reminder_close_event_handler, NULL);
 
     /* 标题预设：2x2 大按钮（老人点得中）。字库里没有"压"，
      * 所以第四条是"起床"而不是"量血压"。 */
@@ -881,51 +920,54 @@ static void create_new_reminder_panel(void)
 
     printf("[Reminder] 新建提醒面板已打开（默认 %02d:%02d）\n",
            new_reminder_hour, new_reminder_min);
+
+    sync_face_anim();
 }
 
 /* ==================== 创建设置面板 ==================== */
 static void create_setting_panel(void)
 {
-    /* 设置容器 */
+    /* 设置容器：**全屏页面**，自身不可滚（页眉/页脚固定，内容滚）；
+     * 仍是 current_screen 的兄弟节点，z 序盖住 menu_panel，删除逻辑零改动。 */
     setting_panel = lv_obj_create(current_screen);
-    lv_obj_set_size(setting_panel, LV_PCT(95), LV_PCT(85));
-    lv_obj_align(setting_panel, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_size(setting_panel, LV_PCT(100), LV_PCT(100));
+    lv_obj_align(setting_panel, LV_ALIGN_TOP_MID, 0, 0);
     lv_obj_add_style(setting_panel, &style_elder, 0);
     lv_obj_set_flex_flow(setting_panel, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(setting_panel, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_all(setting_panel, 20, 0);
-    lv_obj_set_style_pad_row(setting_panel, 20, 0);
+    lv_obj_set_style_pad_all(setting_panel, 0, 0);
+    lv_obj_set_style_pad_row(setting_panel, 0, 0);
+    lv_obj_remove_flag(setting_panel, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* 标题 */
-    lv_obj_t *title = lv_label_create(setting_panel);
-    lv_label_set_text(title, "[设] 设置");
-    lv_obj_set_style_text_font(title, &lv_font_ui_24, 0);
-    lv_obj_set_style_text_color(title, lv_color_hex(0xFFEB3B), 0);
-    lv_obj_set_style_pad_bottom(title, 20, 0);
+    /* 页眉：左返回 + 中标题 + 右实时时钟（固定） */
+    ui_page_header_create(setting_panel, "设置", back_button_event_handler, NULL);
+
+    /* 内容区：唯一可滚的部分 */
+    lv_obj_t *content = ui_page_content_create(setting_panel);
 
     /* 音量设置 */
-    create_slider_setting(setting_panel, "[音] 音量", user_settings.volume, 0);
+    create_slider_setting(content, "音量", user_settings.volume, 0);
 
     /* 亮度设置 */
-    create_slider_setting(setting_panel, "[亮] 亮度", user_settings.brightness, 1);
+    create_slider_setting(content, "亮度", user_settings.brightness, 1);
 
     /* 自动提醒开关 */
-    create_switch_setting(setting_panel, "[自] 自动提醒", user_settings.auto_remind, 2);
+    create_switch_setting(content, "自动提醒", user_settings.auto_remind, 2);
 
     /* 提醒间隔 */
-    create_interval_setting(setting_panel, "[间] 提醒间隔", user_settings.remind_interval, 3);
+    create_interval_setting(content, "提醒间隔", user_settings.remind_interval, 3);
 
     /* 恢复默认设置按钮 */
-    lv_obj_t *btn_reset = lv_btn_create(setting_panel);
+    lv_obj_t *btn_reset = lv_btn_create(content);
     lv_obj_set_size(btn_reset, LV_PCT(80), 60);
     lv_obj_add_style(btn_reset, &style_back_btn, 0);
     lv_obj_add_event_cb(btn_reset, setting_reset_event_handler, LV_EVENT_CLICKED, NULL);
     lv_obj_t *lbl_reset = lv_label_create(btn_reset);
-    lv_label_set_text(lbl_reset, "[重] 恢复默认");
+    lv_label_set_text(lbl_reset, "恢复默认设置");
     lv_obj_set_style_text_font(lbl_reset, &lv_font_ui_24, 0);
     lv_obj_center(lbl_reset);
 
-    /* 返回按钮 */
+    /* 页脚大返回按钮（固定，不随内容滚走） */
     create_back_button(setting_panel);
 }
 
@@ -941,23 +983,25 @@ static void create_slider_setting(lv_obj_t *parent, const char *title,
     lv_obj_set_flex_flow(container, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_all(container, 0, 0);
 
-    /* 标题行 */
+    /* 标题行：标题在左、数值贴右缘（SPACE_BETWEEN）——
+     * 原来数值紧跟标题，一列设置看起来参差不齐（"很乱"反馈之一） */
     lv_obj_t *title_row = lv_obj_create(container);
     lv_obj_set_size(title_row, LV_PCT(100), 40);
     lv_obj_set_style_bg_opa(title_row, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(title_row, 0, 0);
     lv_obj_set_flex_flow(title_row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(title_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_flex_align(title_row, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
     lv_obj_t *title_label = lv_label_create(title_row);
     lv_label_set_text(title_label, title);
     lv_obj_set_style_text_font(title_label, &lv_font_ui_24, 0);
-    lv_obj_set_style_text_color(title_label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_color(title_label, THEME_TEXT_PRIMARY, 0);
 
     lv_obj_t *value_label = lv_label_create(title_row);
     lv_label_set_text_fmt(value_label, "%d%%", value);
     lv_obj_set_style_text_font(value_label, &lv_font_ui_24, 0);
-    lv_obj_set_style_text_color(value_label, lv_color_hex(0x4CAF50), 0);
+    lv_obj_set_style_text_color(value_label, THEME_GREEN_DARK, 0);
 
     /* 滑块 */
     lv_obj_t *slider = lv_slider_create(container);
@@ -979,19 +1023,21 @@ static void create_switch_setting(lv_obj_t *parent, const char *title,
     lv_obj_set_style_bg_opa(container, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(container, 0, 0);
     lv_obj_set_flex_flow(container, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(container, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    /* 标题在左、开关贴右缘（和音量/亮度行同一套对齐） */
+    lv_obj_set_flex_align(container, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
     /* 标题 */
     lv_obj_t *title_label = lv_label_create(container);
     lv_label_set_text(title_label, title);
     lv_obj_set_style_text_font(title_label, &lv_font_ui_24, 0);
-    lv_obj_set_style_text_color(title_label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_color(title_label, THEME_TEXT_PRIMARY, 0);
 
     /* 开关 */
     lv_obj_t *sw = lv_switch_create(container);
     lv_obj_set_size(sw, 80, 40);
-    lv_obj_set_style_bg_color(sw, lv_color_hex(0x4CAF50), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(sw, lv_color_hex(0x9E9E9E), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(sw, THEME_GREEN, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(sw, THEME_TRACK, LV_PART_INDICATOR);
     if (value) {
         lv_obj_add_state(sw, LV_STATE_CHECKED);
     }
@@ -1015,7 +1061,7 @@ static void create_interval_setting(lv_obj_t *parent, const char *title,
     lv_obj_t *title_label = lv_label_create(container);
     lv_label_set_text(title_label, title);
     lv_obj_set_style_text_font(title_label, &lv_font_ui_24, 0);
-    lv_obj_set_style_text_color(title_label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_color(title_label, THEME_TEXT_PRIMARY, 0);
     lv_obj_set_style_pad_bottom(title_label, 10, 0);
 
     /* 间隔选择按钮组 */
@@ -1032,21 +1078,28 @@ static void create_interval_setting(lv_obj_t *parent, const char *title,
 
     for (int i = 0; i < 4; i++) {
         lv_obj_t *btn = lv_btn_create(btn_group);
-        lv_obj_set_size(btn, 70, 45);
+        /* 70 宽装不下 "30分钟"（ui_24 约 72px，文字顶出按钮外，也是"乱"的
+         * 一处）：加宽到 86、文字降一档到 ui_20，四字刚好放得下 */
+        lv_obj_set_size(btn, 86, 48);
 
         /* 选中的按钮高亮 */
         if (intervals[i] == interval) {
-            lv_obj_set_style_bg_color(btn, lv_color_hex(0x4CAF50), 0);
+            lv_obj_set_style_bg_color(btn, THEME_GREEN, 0);
+            lv_obj_set_style_text_color(btn, THEME_TEXT_ON_GREEN, 0);
         } else {
-            lv_obj_set_style_bg_color(btn, lv_color_hex(0x37474F), 0);
+            lv_obj_set_style_bg_color(btn, THEME_BG_CARD, 0);
+            lv_obj_set_style_border_width(btn, 2, 0);
+            lv_obj_set_style_border_color(btn, THEME_GREEN_BORDER, 0);
         }
-        lv_obj_set_style_radius(btn, 10, 0);
+        lv_obj_set_style_radius(btn, 14, 0);
         lv_obj_add_event_cb(btn, interval_button_event_handler,
                            LV_EVENT_CLICKED, (void *)(intptr_t)intervals[i]);
 
         lv_obj_t *btn_label = lv_label_create(btn);
         lv_label_set_text(btn_label, interval_texts[i]);
-        lv_obj_set_style_text_font(btn_label, &lv_font_ui_24, 0);
+        lv_obj_set_style_text_font(btn_label, &lv_font_ui_20, 0);
+        lv_obj_set_style_text_color(btn_label,
+            intervals[i] == interval ? THEME_TEXT_ON_GREEN : THEME_GREEN_DARK, 0);
         lv_obj_center(btn_label);
     }
 }
@@ -1064,24 +1117,34 @@ static void create_about_info(lv_obj_t *parent)
         "开发板: SF32LB52-DevKit-LCD\n"
         "界面: LVGL\n\n"
         "2026 智爱团队");
-    lv_obj_set_style_text_color(info, lv_color_hex(0xCCCCCC), 0);
+    lv_obj_set_style_text_color(info, THEME_TEXT_SECONDARY, 0);
     lv_obj_set_style_text_font(info, &lv_font_ui_24, 0);
     lv_obj_set_style_text_align(info, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_pad_top(info, 20, 0);
 }
 
-/* ==================== 创建返回按钮 ==================== */
+/* ==================== 创建返回按钮（页脚大按钮） ==================== */
+/* 200×64 大绿按钮（2026-10-14 用户反馈"返回按钮太小不方便摁"：
+ * 120×50 → 200×64，且改成主色绿底白字、作为页脚固定在面板底部）。 */
 static void create_back_button(lv_obj_t *parent)
 {
+    /* 152×56：页脚固定返回条。原来 200×64 是老人反馈"返回太小"后一步加大的，
+     * 2026-10-14 又反馈"太大了挡住其它按钮"——收到 152×56，比内容区按钮
+     * （94×56 那档）大一号但仍不喧宾夺主。 */
     lv_obj_t *btn = lv_btn_create(parent);
-    lv_obj_set_size(btn, 120, 50);
-    lv_obj_align(btn, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_add_style(btn, &style_back_btn, 0);
+    lv_obj_set_size(btn, 152, 56);
+    lv_obj_set_style_bg_color(btn, THEME_GREEN, 0);
+    lv_obj_set_style_radius(btn, 28, 0);
+    lv_obj_set_style_shadow_width(btn, 10, 0);
+    lv_obj_set_style_shadow_color(btn, THEME_GREEN_DARK, 0);
+    lv_obj_set_style_pad_all(btn, 0, 0);
+    lv_obj_set_style_margin_bottom(btn, 8, 0);
     lv_obj_add_event_cb(btn, back_button_event_handler, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *lbl = lv_label_create(btn);
-    lv_label_set_text(lbl, "< 返回");
+    lv_label_set_text(lbl, "返回");
     lv_obj_set_style_text_font(lbl, &lv_font_ui_24, 0);
+    lv_obj_set_style_text_color(lbl, THEME_TEXT_ON_GREEN, 0);
     lv_obj_center(lbl);
 }
 
@@ -1417,8 +1480,8 @@ static void show_confirm_dialog(const char *title, const char *content,
     lv_obj_t *btn_cancel = lv_msgbox_add_footer_button(mbox, "取消");
 
     lv_obj_center(mbox);
-    lv_obj_set_style_bg_color(mbox, lv_color_hex(0x2D2D44), 0);
-    lv_obj_set_style_text_color(mbox, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_bg_color(mbox, THEME_BG_CARD, 0);
+    lv_obj_set_style_text_color(mbox, THEME_TEXT_PRIMARY, 0);
     lv_obj_set_style_text_font(mbox, &lv_font_ui_24, 0);
 
     /* 添加按钮事件 */
@@ -1465,6 +1528,12 @@ static void screen_gesture_event_handler(lv_event_t *e)
              * 会让菜单盖在弹窗上、录音没人收尾。要退请按弹窗里的 ×。 */
             if (voice_panel != NULL) {
                 printf("[Gesture] 语音聊天弹窗开着，忽略右滑\n");
+                return;
+            }
+
+            /* 关怀/摔倒是**安全页**：必须作答，不允许右滑悄悄退出 */
+            if (checkin_panel != NULL || fall_panel != NULL) {
+                printf("[Gesture] 关怀/摔倒页开着，忽略右滑（必须作答）\n");
                 return;
             }
 
@@ -1565,8 +1634,8 @@ void touch_ui_show_setting_detail(const char *title, const char *content)
     lv_msgbox_add_text(mbox, content);
     touch_ui_msgbox_add_close_x(mbox);
     lv_obj_center(mbox);
-    lv_obj_set_style_bg_color(mbox, lv_color_hex(0x2D2D44), 0);
-    lv_obj_set_style_text_color(mbox, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_bg_color(mbox, THEME_BG_CARD, 0);
+    lv_obj_set_style_text_color(mbox, THEME_TEXT_PRIMARY, 0);
     lv_obj_set_style_text_font(mbox, &lv_font_ui_24, 0);
 }
 
@@ -1905,8 +1974,9 @@ static void voice_hist_clear_slot(int slot)
     }
 }
 
-/* 在对话区里造一行。字号/颜色由调用方给：用户那行小一号、浅蓝（0x90CAF9），
- * 智爱那行大一号、白色 —— 老人不用细读，扫一眼颜色就知道哪句是自己说的。
+/* 在对话区里造一行。字号/颜色由调用方给：用户那行小一号、蓝（THEME_ST_LISTENING），
+ * 智爱那行大一号、深绿灰（浅色聊天底上的主文字色）—— 老人不用细读，
+ * 扫一眼颜色就知道哪句是自己说的。
  * pad_top 用间距把相邻两轮分开，不然两轮的四行字会挤成一坨。 */
 static lv_obj_t *voice_hist_new_label(const lv_font_t *font, uint32_t color,
                                       int32_t pad_top)
@@ -1945,7 +2015,7 @@ static void voice_hist_push_user(const char *text)
     }
 
     voice_hist_clear_slot(slot);
-    voice_hist_user[slot] = voice_hist_new_label(&lv_font_ui_16, 0x90CAF9, 8);
+    voice_hist_user[slot] = voice_hist_new_label(&lv_font_ui_16, 0x1E88E5, 8);
     voice_hist_set_line(voice_hist_user[slot], "你说：", text);
 
     voice_hist_next = (slot + 1) % VOICE_HISTORY_ROUNDS;
@@ -1971,7 +2041,7 @@ static void voice_hist_push_ai(const char *text)
         voice_hist_next = (slot + 1) % VOICE_HISTORY_ROUNDS;
     }
 
-    voice_hist_ai[slot] = voice_hist_new_label(&lv_font_ui_20, 0xFFFFFF, 2);
+    voice_hist_ai[slot] = voice_hist_new_label(&lv_font_ui_20, 0x2E3A32, 2);
     voice_hist_set_line(voice_hist_ai[slot], "智爱：", text);
 
     voice_hist_pending = -1;
@@ -2291,11 +2361,11 @@ static const char *voice_state_text(touch_voice_state_t state)
 static lv_color_t voice_state_color(touch_voice_state_t state)
 {
     switch (state) {
-        case TOUCH_VOICE_STATE_LISTENING: return lv_color_hex(0x42A5F5);   /* 蓝 */
-        case TOUCH_VOICE_STATE_THINKING:  return lv_color_hex(0xFFA726);   /* 橙 */
-        case TOUCH_VOICE_STATE_SPEAKING:  return lv_color_hex(0x66BB6A);   /* 绿 */
+        case TOUCH_VOICE_STATE_LISTENING: return THEME_ST_LISTENING;   /* 蓝 */
+        case TOUCH_VOICE_STATE_THINKING:  return THEME_ST_THINKING;    /* 橙 */
+        case TOUCH_VOICE_STATE_SPEAKING:  return THEME_ST_SPEAKING;    /* 绿 */
         case TOUCH_VOICE_STATE_IDLE:
-        default:                          return lv_color_hex(0xBDBDBD);   /* 灰 */
+        default:                          return THEME_ST_IDLE;           /* 灰 */
     }
 }
 
@@ -2326,24 +2396,20 @@ static void voice_state_async(void *arg)
  *      ai_companion，请它立刻收尾这一段录音）。两边的文字都是「提交」。 */
 static void voice_panel_build(bool mirror)
 {
-    lv_obj_t *header;
-    lv_obj_t *title;
-    lv_obj_t *btn_close;
-    lv_obj_t *lbl_close;
-
     /* 重复打开：先把上一轮的控件和定时器收干净，免得对象/lv_timer 泄漏。
      * 注意顺序 —— hide() 会把 voice_mirror_only 清掉，所以它必须在置位之前。 */
     touch_ui_hide_voice_chat();
     voice_mirror_only = mirror;
 
+    /* **全屏页面**（不再是 92% 居中浮层）：页眉的返回按钮复用原「×」的
+     * 关闭逻辑（voice_close_event_handler），并自带实时时钟。 */
     voice_panel = lv_obj_create(current_screen);
-    lv_obj_set_size(voice_panel, LV_PCT(92), LV_PCT(92));
-    lv_obj_align(voice_panel, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_bg_color(voice_panel, lv_color_hex(0x1A1A2E), 0);
+    lv_obj_set_size(voice_panel, LV_PCT(100), LV_PCT(100));
+    lv_obj_align(voice_panel, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_bg_color(voice_panel, THEME_BG_PAGE, 0);
     lv_obj_set_style_bg_opa(voice_panel, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(voice_panel, 20, 0);
-    lv_obj_set_style_border_width(voice_panel, 2, 0);
-    lv_obj_set_style_border_color(voice_panel, lv_color_hex(0x4CAF50), 0);
+    lv_obj_set_style_radius(voice_panel, 0, 0);
+    lv_obj_set_style_border_width(voice_panel, 0, 0);
     lv_obj_remove_flag(voice_panel, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_flex_flow(voice_panel, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(voice_panel, LV_FLEX_ALIGN_START,
@@ -2351,34 +2417,9 @@ static void voice_panel_build(bool mirror)
     lv_obj_set_style_pad_all(voice_panel, 14, 0);
     lv_obj_set_style_pad_row(voice_panel, 10, 0);
 
-    /* 标题栏：左边标题，右上角关闭按钮（标签是真正的 ×） */
-    header = lv_obj_create(voice_panel);
-    lv_obj_set_width(header, LV_PCT(100));
-    lv_obj_set_height(header, 56);
-    lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(header, 0, 0);
-    lv_obj_set_style_pad_all(header, 0, 0);
-    lv_obj_remove_flag(header, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_SPACE_BETWEEN,
-                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-
-    title = lv_label_create(header);
-    lv_label_set_text(title, "语音聊天");
-    lv_obj_set_style_text_font(title, &lv_font_ui_24, 0);
-    lv_obj_set_style_text_color(title, lv_color_hex(0xFFEB3B), 0);
-
-    btn_close = lv_btn_create(header);
-    lv_obj_set_size(btn_close, 60, 52);
-    lv_obj_set_style_bg_color(btn_close, lv_color_hex(0x607D8B), 0);
-    lv_obj_set_style_radius(btn_close, 12, 0);
-    lv_obj_add_event_cb(btn_close, voice_close_event_handler,
-                        LV_EVENT_CLICKED, NULL);
-
-    lbl_close = lv_label_create(btn_close);
-    lv_label_set_text(lbl_close, "×");   /* U+00D7，字库里有，不是 LV_SYMBOL_CLOSE */
-    lv_obj_set_style_text_font(lbl_close, &lv_font_ui_24, 0);
-    lv_obj_center(lbl_close);
+    /* 页眉：左返回（= 原 ×，停录音 + 丢弃这一轮）+ 中标题 + 右实时时钟 */
+    ui_page_header_create(voice_panel, "语音聊天",
+                          voice_close_event_handler, NULL);
 
     /* 录音计时（mm:ss，voice_tick_timer_cb 每秒刷新）。
      * 镜像面板没有录音，这一行不建 —— 建了只会一直停在 00:00，反而让人以为坏了。 */
@@ -2386,7 +2427,7 @@ static void voice_panel_build(bool mirror)
         voice_timer_lbl = lv_label_create(voice_panel);
         lv_label_set_text(voice_timer_lbl, "00:00");
         lv_obj_set_style_text_font(voice_timer_lbl, &lv_font_ui_24, 0);
-        lv_obj_set_style_text_color(voice_timer_lbl, lv_color_hex(0x4CAF50), 0);
+        lv_obj_set_style_text_color(voice_timer_lbl, THEME_GREEN_DARK, 0);
     }
 
     /* 状态行：本面板最醒目的一行（24 号字 + 随状态变色） */
@@ -2400,17 +2441,17 @@ static void voice_panel_build(bool mirror)
     lv_obj_set_style_text_font(voice_status_lbl, &lv_font_ui_24, 0);
     lv_obj_set_style_text_color(voice_status_lbl,
                                 mirror ? voice_state_color(TOUCH_VOICE_STATE_IDLE)
-                                       : lv_color_hex(0xCCCCCC), 0);
+                                       : THEME_TEXT_SECONDARY, 0);
 
     /* 对话区：能换行、能滚动的对话历史（双方都看得见）。
      * 只开纵向滚动 —— 横向滚动会让整行文字被推着跑，反而看不全。 */
     voice_chat_box = lv_obj_create(voice_panel);
     lv_obj_set_width(voice_chat_box, LV_PCT(100));
     lv_obj_set_flex_grow(voice_chat_box, 1);
-    lv_obj_set_style_bg_color(voice_chat_box, lv_color_hex(0x101020), 0);
+    lv_obj_set_style_bg_color(voice_chat_box, THEME_BG_CARD, 0);
     lv_obj_set_style_bg_opa(voice_chat_box, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(voice_chat_box, 1, 0);
-    lv_obj_set_style_border_color(voice_chat_box, lv_color_hex(0x37474F), 0);
+    lv_obj_set_style_border_color(voice_chat_box, THEME_BORDER_SOFT, 0);
     lv_obj_set_style_radius(voice_chat_box, 12, 0);
     lv_obj_set_style_pad_all(voice_chat_box, 10, 0);
     lv_obj_set_style_pad_row(voice_chat_box, 4, 0);
@@ -2429,7 +2470,7 @@ static void voice_panel_build(bool mirror)
         lv_obj_set_width(voice_hist_hint, LV_PCT(100));
         lv_label_set_long_mode(voice_hist_hint, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_font(voice_hist_hint, &lv_font_ui_16, 0);
-        lv_obj_set_style_text_color(voice_hist_hint, lv_color_hex(0x78909C), 0);
+        lv_obj_set_style_text_color(voice_hist_hint, THEME_TEXT_SECONDARY, 0);
     } else {
         /* PTT 弹窗：main.c 送进来的是一整段 "我说：…\n\n智爱：…"
          * （voice_task_show -> touch_ui_set_voice_reply），沿用以前那块
@@ -2439,7 +2480,7 @@ static void voice_panel_build(bool mirror)
         lv_obj_set_width(voice_reply_lbl, LV_PCT(100));
         lv_label_set_long_mode(voice_reply_lbl, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_font(voice_reply_lbl, &lv_font_ui_20, 0);
-        lv_obj_set_style_text_color(voice_reply_lbl, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_text_color(voice_reply_lbl, THEME_TEXT_PRIMARY, 0);
     }
 
     /* 底部大按钮（≥60px，老人好按；绿色 = style_big_btn）。
@@ -2475,11 +2516,12 @@ static void voice_panel_build(bool mirror)
         lv_obj_set_style_text_font(voice_submit_lbl, &lv_font_ui_24, 0);
         lv_obj_center(voice_submit_lbl);
 
-        /* 「重置」：灰蓝 = 次要动作（和右上角那个「×」一个色系），
+        /* 「重置」：中性灰 = 次要动作（和页眉返回按钮一个色系），
          * 宽度够大、好按 —— 卡死时它是一个救命的按钮，不该让人戳不准。 */
         lv_obj_t *reset_btn = lv_btn_create(btn_row);
         lv_obj_set_size(reset_btn, 132, LV_PCT(100));
-        lv_obj_set_style_bg_color(reset_btn, lv_color_hex(0x607D8B), 0);
+        lv_obj_set_style_bg_color(reset_btn, THEME_TRACK, 0);
+        lv_obj_set_style_text_color(reset_btn, THEME_TEXT_PRIMARY, 0);
         lv_obj_set_style_radius(reset_btn, 12, 0);
         lv_obj_add_event_cb(reset_btn, voice_reset_event_handler,
                             LV_EVENT_CLICKED, NULL);
@@ -2501,6 +2543,8 @@ static void voice_panel_build(bool mirror)
         lv_obj_set_style_text_font(voice_submit_lbl, &lv_font_ui_24, 0);
         lv_obj_center(voice_submit_lbl);
     }
+
+    sync_face_anim();
 
     /* 镜像面板到这里就搭完了：不 voice_begin_round()（没有录音，也没有计时），
      * 更不回调 g_voice_chat_cb —— 它会去 audio_record_start()，
@@ -2570,6 +2614,8 @@ void touch_ui_hide_voice_chat(void)
     voice_submit_lbl = NULL;
     voice_btn_state = VOICE_BTN_SUBMIT;
     voice_mirror_only = false;
+
+    sync_face_anim();
 }
 
 bool touch_ui_voice_chat_active(void)
@@ -2580,6 +2626,13 @@ bool touch_ui_voice_chat_active(void)
 uint32_t touch_ui_voice_chat_generation(void)
 {
     return voice_generation;
+}
+
+bool touch_ui_voice_chat_busy(void)
+{
+    /* 面板开着 + 按钮停在「处理中…」= 已提交、还没走到收尾
+     * （round_done 会把按钮放回「再说一次」）。只在 LVGL 线程调。 */
+    return voice_panel != NULL && voice_btn_state == VOICE_BTN_BUSY;
 }
 
 void touch_ui_set_voice_submit_cb(voice_submit_cb_t cb, void *user_data)
@@ -2665,7 +2718,7 @@ static void checkin_btn_fine_handler(lv_event_t *e)
     lv_obj_add_state(checkin_btn_fine, LV_STATE_DISABLED);
     lv_obj_add_state(checkin_btn_help, LV_STATE_DISABLED);
     lv_label_set_text(checkin_status_lbl, "正在通知...");
-    lv_obj_set_style_text_color(checkin_status_lbl, lv_color_hex(0xFFC107), 0);
+    lv_obj_set_style_text_color(checkin_status_lbl, THEME_ST_THINKING, 0);
     touch_ui_play_sound("click");
 
     if (checkin_cb) {
@@ -2685,7 +2738,7 @@ static void checkin_btn_help_handler(lv_event_t *e)
     lv_obj_add_state(checkin_btn_fine, LV_STATE_DISABLED);
     lv_obj_add_state(checkin_btn_help, LV_STATE_DISABLED);
     lv_label_set_text(checkin_status_lbl, "正在通知...");
-    lv_obj_set_style_text_color(checkin_status_lbl, lv_color_hex(0xFFC107), 0);
+    lv_obj_set_style_text_color(checkin_status_lbl, THEME_ST_THINKING, 0);
     touch_ui_play_sound("click");
 
     if (checkin_cb) {
@@ -2703,40 +2756,41 @@ void touch_ui_show_checkin(uint64_t checkin_id, uint32_t timeout_ms,
     checkin_cb = cb;
     checkin_cb_user_data = user_data;
 
+    /* **全屏页面**（不再是 70% 居中浮层）：页眉带时钟，back_cb=NULL ——
+     * 安全页必须作答，不允许从页眉退出（右滑也被手势抑制拦住）。 */
     checkin_panel = lv_obj_create(current_screen);
-    lv_obj_set_size(checkin_panel, LV_PCT(90), LV_PCT(70));
-    lv_obj_align(checkin_panel, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_bg_color(checkin_panel, lv_color_hex(0x1A1A2E), 0);
+    lv_obj_set_size(checkin_panel, LV_PCT(100), LV_PCT(100));
+    lv_obj_align(checkin_panel, LV_ALIGN_TOP_MID, 0, 0);
+    /* 内容一屏放得下（~320px / 450），不给滚动（理由同新建提醒面板） */
+    lv_obj_remove_flag(checkin_panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_color(checkin_panel, THEME_BG_PAGE, 0);
     lv_obj_set_style_bg_opa(checkin_panel, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(checkin_panel, 20, 0);
-    lv_obj_set_style_border_width(checkin_panel, 2, 0);
-    lv_obj_set_style_border_color(checkin_panel, lv_color_hex(0xFF9800), 0);
+    lv_obj_set_style_radius(checkin_panel, 0, 0);
+    lv_obj_set_style_border_width(checkin_panel, 0, 0);
     lv_obj_set_flex_flow(checkin_panel, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(checkin_panel, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_all(checkin_panel, 20, 0);
     lv_obj_set_style_pad_row(checkin_panel, 15, 0);
 
-    lv_obj_t *title = lv_label_create(checkin_panel);
-    lv_label_set_text(title, "关怀提醒");
-    lv_obj_set_style_text_font(title, &lv_font_ui_24, 0);
-    lv_obj_set_style_text_color(title, lv_color_hex(0xFFEB3B), 0);
+    /* 页眉：只有标题 + 时钟（无返回：必须作答） */
+    ui_page_header_create(checkin_panel, "关怀提醒", NULL, NULL);
 
     lv_obj_t *hint = lv_label_create(checkin_panel);
     lv_label_set_text(hint, "您还好吗？请确认状态");
     lv_obj_set_style_text_font(hint, &lv_font_ui_24, 0);
-    lv_obj_set_style_text_color(hint, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_color(hint, THEME_TEXT_PRIMARY, 0);
 
     checkin_status_lbl = lv_label_create(checkin_panel);
     lv_label_set_text(checkin_status_lbl, "等待确认");
     lv_obj_set_style_text_font(checkin_status_lbl, &lv_font_ui_24, 0);
-    lv_obj_set_style_text_color(checkin_status_lbl, lv_color_hex(0x4CAF50), 0);
+    lv_obj_set_style_text_color(checkin_status_lbl, THEME_GREEN_DARK, 0);
 
-    /* "我没事" 按钮 - 绿色 */
+    /* "我没事" 按钮 - 绿色（加大 240×72，老人好按） */
     checkin_btn_fine = lv_btn_create(checkin_panel);
-    lv_obj_set_size(checkin_btn_fine, 200, 60);
-    lv_obj_set_style_bg_color(checkin_btn_fine, lv_color_hex(0x4CAF50), 0);
-    lv_obj_set_style_radius(checkin_btn_fine, 30, 0);
+    lv_obj_set_size(checkin_btn_fine, 240, 72);
+    lv_obj_set_style_bg_color(checkin_btn_fine, THEME_GREEN, 0);
+    lv_obj_set_style_radius(checkin_btn_fine, 32, 0);
     lv_obj_add_event_cb(checkin_btn_fine, checkin_btn_fine_handler,
                         LV_EVENT_CLICKED, NULL);
     lv_obj_t *lbl_fine = lv_label_create(checkin_btn_fine);
@@ -2744,10 +2798,10 @@ void touch_ui_show_checkin(uint64_t checkin_id, uint32_t timeout_ms,
     lv_obj_set_style_text_font(lbl_fine, &lv_font_ui_24, 0);
     lv_obj_center(lbl_fine);
 
-    /* "需要帮助" 按钮 - 红色 */
+    /* "需要帮助" 按钮 - 红色（加大 240×72） */
     checkin_btn_help = lv_btn_create(checkin_panel);
-    lv_obj_set_size(checkin_btn_help, 200, 60);
-    lv_obj_set_style_bg_color(checkin_btn_help, lv_color_hex(0xF44336), 0);
+    lv_obj_set_size(checkin_btn_help, 240, 72);
+    lv_obj_set_style_bg_color(checkin_btn_help, THEME_RED, 0);
     lv_obj_set_style_radius(checkin_btn_help, 30, 0);
     lv_obj_add_event_cb(checkin_btn_help, checkin_btn_help_handler,
                         LV_EVENT_CLICKED, NULL);
@@ -2758,6 +2812,8 @@ void touch_ui_show_checkin(uint64_t checkin_id, uint32_t timeout_ms,
 
     (void)timeout_ms;
     printf("[Checkin] UI shown: id=%lu\n", (unsigned long)checkin_id);
+
+    sync_face_anim();
 }
 
 /* 更新关怀确认状态（lv_async_call 投递到 LVGL 线程） */
@@ -2769,24 +2825,24 @@ static void update_checkin_state_async(void *state_ptr)
     switch (state) {
         case TOUCH_CHECKIN_WAITING:
             lv_label_set_text(checkin_status_lbl, "等待确认");
-            lv_obj_set_style_text_color(checkin_status_lbl, lv_color_hex(0x4CAF50), 0);
+            lv_obj_set_style_text_color(checkin_status_lbl, THEME_GREEN_DARK, 0);
             if (checkin_btn_fine) lv_obj_clear_state(checkin_btn_fine, LV_STATE_DISABLED);
             if (checkin_btn_help) lv_obj_clear_state(checkin_btn_help, LV_STATE_DISABLED);
             checkin_confirmed = false;
             break;
         case TOUCH_CHECKIN_SENDING:
             lv_label_set_text(checkin_status_lbl, "正在通知...");
-            lv_obj_set_style_text_color(checkin_status_lbl, lv_color_hex(0xFFC107), 0);
+            lv_obj_set_style_text_color(checkin_status_lbl, THEME_ST_THINKING, 0);
             break;
         case TOUCH_CHECKIN_SENT:
             /* 这里原来写的是"通知成功 ✓"：U+2713 是 dingbat，不在字库的字符集
              * （GB2312 + ASCII + CJK 标点 + 全角）里，显示出来就是方块，去掉。 */
             lv_label_set_text(checkin_status_lbl, "通知成功");
-            lv_obj_set_style_text_color(checkin_status_lbl, lv_color_hex(0x4CAF50), 0);
+            lv_obj_set_style_text_color(checkin_status_lbl, THEME_GREEN_DARK, 0);
             break;
         case TOUCH_CHECKIN_FAILED:
             lv_label_set_text(checkin_status_lbl, "通知失败，请重试");
-            lv_obj_set_style_text_color(checkin_status_lbl, lv_color_hex(0xF44336), 0);
+            lv_obj_set_style_text_color(checkin_status_lbl, THEME_RED, 0);
             if (checkin_btn_fine) lv_obj_clear_state(checkin_btn_fine, LV_STATE_DISABLED);
             if (checkin_btn_help) lv_obj_clear_state(checkin_btn_help, LV_STATE_DISABLED);
             checkin_confirmed = false;
@@ -2815,6 +2871,8 @@ void touch_ui_hide_checkin(void)
     checkin_confirmed = false;
     checkin_cb = NULL;
     checkin_cb_user_data = NULL;
+
+    sync_face_anim();
 }
 
 /* ==================== 摔倒询问面板（「您摔到了吗？」+ 有/没有） ==================== */
@@ -2823,9 +2881,10 @@ void touch_ui_hide_checkin(void)
  * "疑似摔倒"之后，板子要一边弹这一块、一边语音问同一句话、一边等用户回答
  * （点按钮或说话，先到的那个算数）。
  *
- * 结构是照着上面「关怀确认面板」抄的：**面板就是活动屏上的普通容器**，两个大按钮
+ * 结构是照着上面「关怀确认面板」抄的：**面板是活动屏上的全屏容器**（2026-10-14
+ * 起两块都从居中浮层改成铺满全屏 + 页眉，和其它二级页面一致），两个大按钮
  * 是它的直接孩子，没有单独的全屏 backdrop —— 这个工程踩过"backdrop 吃掉触摸 /
- * 弹窗关不掉"的坑，关怀面板那套写法已经上板验收过（按钮点得动、面板撤得掉），
+ * 弹窗关不掉"的坑，那套写法已经上板验收过（按钮点得动、面板撤得掉），
  * 别改成 msgbox + backdrop。
  *
  * 和关怀面板只有两处不同：
@@ -2838,7 +2897,7 @@ void touch_ui_hide_checkin(void)
  * 被调，约定见 touch_ui.h）。面板没开着时 set_status / hide 都是安全空转。
  */
 
-static lv_obj_t *fall_panel = NULL;
+/* fall_panel 的声明挪到了文件开头（手势抑制要用），这里只剩其余状态量 */
 static lv_obj_t *fall_status_lbl = NULL;
 static lv_obj_t *fall_btn_no = NULL;       /* 「没有」 */
 static lv_obj_t *fall_btn_yes = NULL;      /* 「有」 */
@@ -2859,6 +2918,8 @@ static void fall_panel_destroy(void)
     fall_btn_no = NULL;
     fall_btn_yes = NULL;
     fall_answered = false;
+
+    sync_face_anim();
 }
 
 /* 两个按钮点下去走同一段：只认第一次（第二次点是连点，忽略）。
@@ -2878,10 +2939,10 @@ static void fall_handle_answer(touch_fall_answer_t answer)
     if (fall_status_lbl != NULL) {
         if (answer == TOUCH_FALL_ANSWER_YES) {
             lv_label_set_text(fall_status_lbl, "正在报警，请稍候…");
-            lv_obj_set_style_text_color(fall_status_lbl, lv_color_hex(0xFF5252), 0);
+            lv_obj_set_style_text_color(fall_status_lbl, THEME_RED, 0);
         } else {
             lv_label_set_text(fall_status_lbl, "好的，已取消");
-            lv_obj_set_style_text_color(fall_status_lbl, lv_color_hex(0x4CAF50), 0);
+            lv_obj_set_style_text_color(fall_status_lbl, THEME_GREEN_DARK, 0);
         }
     }
 
@@ -2917,7 +2978,6 @@ static void fall_btn_yes_handler(lv_event_t *e)
 static void fall_panel_build(void)
 {
     lv_obj_t *screen;
-    lv_obj_t *title;
     lv_obj_t *question;
     lv_obj_t *lbl;
     char hint[80];
@@ -2930,14 +2990,17 @@ static void fall_panel_build(void)
         return;
     }
 
+    /* **全屏页面**（不再是 80% 居中浮层）：页眉带时钟，back_cb=NULL ——
+     * 安全页必须作答（右滑也被手势抑制拦住）。
+     * 仍然建在 lv_scr_act() 上：摔倒链可能在红色报警页上被触发，
+     * 全屏浅色页会盖住报警页，答完销毁后报警页自然重现。 */
     fall_panel = lv_obj_create(screen);
-    lv_obj_set_size(fall_panel, LV_PCT(92), LV_PCT(80));
-    lv_obj_align(fall_panel, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_bg_color(fall_panel, lv_color_hex(0x1A1A2E), 0);
+    lv_obj_set_size(fall_panel, LV_PCT(100), LV_PCT(100));
+    lv_obj_align(fall_panel, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_bg_color(fall_panel, THEME_BG_PAGE, 0);
     lv_obj_set_style_bg_opa(fall_panel, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(fall_panel, 20, 0);
-    lv_obj_set_style_border_width(fall_panel, 3, 0);
-    lv_obj_set_style_border_color(fall_panel, lv_color_hex(0xFF9800), 0);
+    lv_obj_set_style_radius(fall_panel, 0, 0);
+    lv_obj_set_style_border_width(fall_panel, 0, 0);
     lv_obj_set_flex_flow(fall_panel, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(fall_panel, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -2946,10 +3009,8 @@ static void fall_panel_build(void)
     /* 面板不滚动：老人不小心划一下就把按钮划出屏幕，那是最糟的 */
     lv_obj_remove_flag(fall_panel, LV_OBJ_FLAG_SCROLLABLE);
 
-    title = lv_label_create(fall_panel);
-    lv_label_set_text(title, "摔倒确认");
-    lv_obj_set_style_text_font(title, &lv_font_ui_24, 0);
-    lv_obj_set_style_text_color(title, lv_color_hex(0xFFEB3B), 0);
+    /* 页眉：只有标题 + 时钟（无返回：必须作答） */
+    ui_page_header_create(fall_panel, "摔倒确认", NULL, NULL);
 
     /* 问的就是这一句：和 TTS 念的是同一个常量（fall_alarm.h） */
     question = lv_label_create(fall_panel);
@@ -2958,7 +3019,7 @@ static void fall_panel_build(void)
     lv_label_set_long_mode(question, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(question, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_font(question, &lv_font_ui_24, 0);
-    lv_obj_set_style_text_color(question, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_color(question, THEME_TEXT_PRIMARY, 0);
 
     fall_status_lbl = lv_label_create(fall_panel);
     snprintf(hint, sizeof(hint), "请回答「有」或「没有」（%u 秒内）",
@@ -2968,13 +3029,13 @@ static void fall_panel_build(void)
     lv_label_set_long_mode(fall_status_lbl, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(fall_status_lbl, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_font(fall_status_lbl, &lv_font_ui_20, 0);
-    lv_obj_set_style_text_color(fall_status_lbl, lv_color_hex(0xCCCCCC), 0);
+    lv_obj_set_style_text_color(fall_status_lbl, THEME_TEXT_SECONDARY, 0);
 
-    /* 「没有」—— 绿色，左边/上面那个（老人最可能的回答，先看到） */
+    /* 「没有」—— 绿色，上面那个（老人最可能的回答，先看到）。加大 280×80。 */
     fall_btn_no = lv_btn_create(fall_panel);
-    lv_obj_set_size(fall_btn_no, LV_PCT(80), 70);
-    lv_obj_set_style_bg_color(fall_btn_no, lv_color_hex(0x4CAF50), 0);
-    lv_obj_set_style_radius(fall_btn_no, 30, 0);
+    lv_obj_set_size(fall_btn_no, 280, 80);
+    lv_obj_set_style_bg_color(fall_btn_no, THEME_GREEN, 0);
+    lv_obj_set_style_radius(fall_btn_no, 32, 0);
     lv_obj_add_event_cb(fall_btn_no, fall_btn_no_handler, LV_EVENT_CLICKED, NULL);
 
     lbl = lv_label_create(fall_btn_no);
@@ -2982,10 +3043,10 @@ static void fall_panel_build(void)
     lv_obj_set_style_text_font(lbl, &lv_font_ui_24, 0);
     lv_obj_center(lbl);
 
-    /* 「有」—— 红色，下面那个 */
+    /* 「有」—— 红色，下面那个。加大 280×80。 */
     fall_btn_yes = lv_btn_create(fall_panel);
-    lv_obj_set_size(fall_btn_yes, LV_PCT(80), 70);
-    lv_obj_set_style_bg_color(fall_btn_yes, lv_color_hex(0xF44336), 0);
+    lv_obj_set_size(fall_btn_yes, 280, 80);
+    lv_obj_set_style_bg_color(fall_btn_yes, THEME_RED, 0);
     lv_obj_set_style_radius(fall_btn_yes, 30, 0);
     lv_obj_add_event_cb(fall_btn_yes, fall_btn_yes_handler, LV_EVENT_CLICKED, NULL);
 
@@ -2996,6 +3057,8 @@ static void fall_panel_build(void)
 
     printf("[Fall] 弹窗已显示：%s（有 / 没有，%u 秒内）\n",
            FALL_ALARM_QUESTION, (unsigned)(FALL_ALARM_ANSWER_TIMEOUT_MS / 1000));
+
+    sync_face_anim();
 }
 
 static void fall_show_async(void *arg)
@@ -3018,7 +3081,7 @@ static void fall_status_async(void *arg)
      * 都是投递过来的，顺序由调用方定，撤在前就不会写）。 */
     if (fall_panel != NULL && fall_status_lbl != NULL) {
         lv_label_set_text(fall_status_lbl, text);
-        lv_obj_set_style_text_color(fall_status_lbl, lv_color_hex(0xFFEB3B), 0);
+        lv_obj_set_style_text_color(fall_status_lbl, THEME_ORANGE, 0);
     }
 
     free(text);

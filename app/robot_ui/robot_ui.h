@@ -101,6 +101,25 @@ void robot_ui_close_alarm(void);
 /* 刷新状态栏时钟（从 main 主循环调用，与 LVGL 定时器双重保障） */
 void robot_ui_update_time(void);
 
+/* 暂停/恢复表情上下浮动动画。全屏二级页面打开时暂停 —— 该动画每帧都让
+ * 被盖住的表情区重绘，和页面滚动的重绘抢带宽，就是用户看到的"上下滑动
+ * 卡顿"。只能在 LVGL 线程里调（touch_ui 的面板开关路径都在 LVGL 线程）。 */
+void robot_ui_set_face_anim_paused(bool paused);
+
+/* 建一个**接入统一定时刷新**的时钟标签（当前时间立即写上，此后由 robot_ui.c
+ * 里那个 10s 定时器统一刷新所有注册过的槽）。全屏子页面的页眉用它，保证
+ * 顶栏时钟被页面盖住时页面自己仍显示时间。只能在 LVGL 线程里调。
+ * 槽位靠 LV_EVENT_DELETE 自动反注册：面板整体 lv_obj_del 时标签随之销毁，
+ * 不留悬垂指针，调用方无需手动注销。 */
+lv_obj_t *ui_clock_label_create(lv_obj_t *parent, lv_color_t color);
+
+/* 建一个 76px 全宽页眉：左返回按钮（back_cb==NULL 则不建，表示本页必须作答
+ * 不能退出，关怀/摔倒用）+ 顶部居中大时钟（28 号，圆角屏右上角会切字，
+ * 居中最安全）+ 时钟下面一行小标题。全屏化后的二级页面统一用它。
+ * 父对象应是 column flex 布局。只能在 LVGL 线程里调。 */
+lv_obj_t *ui_page_header_create(lv_obj_t *parent, const char *title,
+                                lv_event_cb_t back_cb, void *user_data);
+
 /* 切换界面 */
 void robot_ui_switch_view(ui_view_t view);
 

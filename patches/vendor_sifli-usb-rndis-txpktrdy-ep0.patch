@@ -1,0 +1,144 @@
+--- a/chips/sf32lb52/sf32lb_usbdev.c
++++ b/chips/sf32lb52/sf32lb_usbdev.c
+@@ -691,6 +691,38 @@
+       return OK;
+     }
+ 
++  /* 上一包还挂在 FIFO 里等主机取（TXPKTRDY 未清）时，一个字节都不许
++   * 碰 FIFO，原样返回等 TX-complete 中断再来叫醒。
++   *
++   * 本函数有两个调用点：TX-complete 中断（正确时机，FIFO 已被主机取空）
++   * 和 sf32lb52_epsubmit —— 后者每次有新 IN 请求入队都会立刻调下来。
++   * 持续大流量（语音 TTS 下行、ASR 上行时的 TCP ACK 回程）时栈会连着
++   * 发包，第二个请求到达时第一包大概率还没被主机取走；旧代码在这条
++   * 路径上直接写 epwrite，而 epwrite 见 FIFONOTEMPTY 会先 FLUSHFIFO ——
++   * 一 flush 就把在途包冲掉（主机收半截包/错包），更糟的是这颗 MUSB
++   * 类内核在 TXPKTRDY 置位期间被 flush 后 TX 状态机可能彻底卡死：
++   * TX-complete 中断永不再来，队列请求全部滞留，wrreq 池耗尽
++   * （hasfreereqs 恒 false），连 RX 的 rx_req 都分配不出来 ——
++   * 整条数据通道死掉而 EP0 控制还活着，主机侧现象就是 ARP FAILED +
++   * NETDEV WATCHDOG transmit queue timed out（2026-10-14 晚上语音
++   * 一上流量两分钟内必现的那次卡死）。
++   *
++   * 排队的请求不会丢：主机取空 FIFO 后 TX-complete 中断照常来，
++   * 到时队头 TXPKTRDY 已清，正常续写。
++   */
++
++  {
++    volatile USBC_X_Typedef *hw = privep->dev->hw;
++    uint16_t txpkr = (privep->epphy == 0) ? USB_CSR0_TXPKTRDY
++                                          : USB_TXCSR_TXPKTRDY;
++    hw->index = privep->epphy;
++    if (hw->csr0_txcsr & txpkr)
++      {
++        usbtrace(TRACE_WRITE(privep->epphy), privreq->req.xfrd);
++        return OK;
++      }
++  }
++
+   bytesleft = privreq->req.len - privreq->req.xfrd;
+ 
+   usbtrace(TRACE_WRITE(privep->epphy), privreq->req.xfrd);
+@@ -868,6 +900,7 @@
+ 
+ static struct usb_ctrlreq_s g_ep0pending_ctrl;
+ static bool                 g_ep0pending;
++static bool                 g_ep0superseded;
+ 
+ static uint8_t g_ep0outbuf[SF32LB52_EP0MAXPACKET];
+ static size_t  g_ep0outlen;
+@@ -955,6 +988,17 @@
+   if (csr0 & USB_CSR0_P_SETUPEND)
+     {
+       hw->csr0_txcsr = USB_CSR0_P_SVDSETUPEND;
++
++      /* A new SETUP superseded whatever control transfer was in flight.
++       * If a class/vendor OUT request was parked waiting for its data
++       * stage, that data will never arrive -- the bytes now in the FIFO
++       * are the new SETUP packet itself.  Flag it so the pending branch
++       * below abandons the stale request instead of consuming the SETUP
++       * as "data" (which produced 8-byte RNDIS messages, a driver
++       * -EINVAL, an ep0 STALL and host-side "RNDIS init failed, -32").
++       */
++
++      g_ep0superseded = true;
+     }
+ 
+   /* Distinguish 8-byte setup packets from EP0 OUT data stage payload.
+@@ -964,6 +1008,23 @@
+ 
+   count0 = hw->rxcount & 0x7f;
+ 
++  if (g_ep0pending && g_ep0superseded)
++    {
++      /* SETUPEND said a new SETUP replaced the parked request.  Abandon
++       * the parked one and process the bytes below as the new SETUP
++       * packet.  Never hand them to the class driver as the parked
++       * request's data stage -- that is what turned a fresh INIT/QUERY
++       * SETUP into an 8-byte "message" and killed the host's bind with
++       * a -32 STALL.
++       */
++
++      g_ep0pending    = false;
++      g_ep0outlen     = 0;
++      g_ep0outdataend = false;
++    }
++
++  g_ep0superseded = false;
++
+   if (g_ep0pending)
+     {
+       /* This is the OUT data stage of the class/vendor request whose SETUP
+@@ -974,6 +1035,21 @@
+       uint16_t got = 0;
+       bool     shortpkt = (count0 < SF32LB52_EP0MAXPACKET);
+ 
++      if (count0 == 0)
++        {
++          /* No packet is actually waiting (rxcount==0): this call is a
++           * duplicate service of the SETUP interrupt -- INTRTX CONTROL
++           * and INTRRX EP0 both route to here, and the first call has
++           * already cleared RXPKTRDY.  Dispatching the parked request
++           * with an empty data stage made the class driver reject it
++           * (-EINVAL → ep0 STALL → host "RNDIS init failed, -32" on
++           * cold boot).  Keep the request parked; the real data-stage
++           * interrupt will deliver it.
++           */
++
++          return;
++        }
++
+       if (count0 > 0)
+         {
+           if (count0 > sizeof(g_ep0outbuf))
+@@ -1375,6 +1451,16 @@
+           sf32lb52_epreset(priv, i);
+         }
+ 
++      /* Any parked EP0 OUT request died with the reset: its data stage
++       * will never come.  Clear the parking state so the first SETUP of
++       * re-enumeration is not consumed as that request's data.
++       */
++
++      g_ep0pending    = false;
++      g_ep0superseded = false;
++      g_ep0outlen     = 0;
++      g_ep0outdataend = false;
++
+       /* NOTE: do NOT call CLASS_DISCONNECT here.  A USB bus reset is
+        * not a device detach; class drivers (e.g. rndis) take mutexes
+        * in their disconnect path, which is illegal from interrupt
+@@ -1457,6 +1543,13 @@
+               usbtrace(TRACE_INTENTRY(SF32LB52_TRACEINTID_TXFIFOSETEND),
+                        csr0);
+ 
++              /* The new SETUP in the FIFO superseded any parked request;
++               * ep0setup() consumes this flag so it will not treat the
++               * SETUP packet as that request's data stage.
++               */
++
++              g_ep0superseded = true;
++
+               hw->csr0_txcsr = USB_CSR0_P_SVDSETUPEND;
+ 
+               csr0 = hw->csr0_txcsr;

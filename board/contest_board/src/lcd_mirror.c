@@ -325,6 +325,13 @@ static bool     g_touch_latch;     /* "按下"还没被 read_cb 看见（快速�
 /* 下面这些只有镜像任务自己和自己人看：running/stop 是给 NSH 与 LVGL 线程
  * 读的，用 volatile 就够（一个字节的写是原子的，最坏晚一轮生效）。 */
 static volatile bool g_running;
+
+/* 真有客户端连着（TCP 握手成功，或串口打开成功）。刷屏路径的影子拷贝
+ * 只在这个为 true 时做：没人看镜像的时候，滚动一帧脏区就是整屏，
+ * 白白往 PSRAM 拷 351 KB，直接把滑动帧率拖垮一半 —— 2026-10-14 用户
+ * 反馈"上下滑动很卡"，这是最大的一块冤枉开销。
+ * 只有镜像任务写它；lcd_mirror_capture（LVGL 刷屏路径）只读。 */
+static volatile bool g_client_up;
 static volatile bool g_stop;
 static volatile bool g_reconnect;   /* 目标地址变了：把当前连接掐掉重连（只有任务自己动 fd） */
 static volatile int  g_target_port = LCD_MIRROR_DEFAULT_PORT;
@@ -1071,6 +1078,7 @@ static void lm_disconnect(FAR int *fd, FAR struct lm_rx_s *rx,
       *fd = -1;
     }
 
+  g_client_up = false;          /* 断了就别再拷影子（没人看了） */
   rx->len = 0;
   lm_touch_release();
 }
@@ -1185,6 +1193,7 @@ static int lm_task(int argc, FAR char *argv[])
 
           fail_cnt     = 0;
           g_pend_valid = false;
+          g_client_up  = true;   /* 从现在起刷屏才做影子拷贝（见 g_client_up） */
           win_start    = clock_systime_ticks();
           win_bytes    = 0;
           win_frames   = 0;
@@ -1196,9 +1205,12 @@ static int lm_task(int argc, FAR char *argv[])
           nxmutex_unlock(&g_lock);
 
           /* 新客户端/新开的串口：整屏重发一次，别让它从"只有后来那块脏区"
-           * 开始拼。触摸也强制抬起：对面还没发过任何东西。 */
+           * 开始拼。触摸也强制抬起：对面还没发过任何东西。
+           * 另外请 LVGL 整屏重绘一次：断连期间 capture 不再拷影子，
+           * 影子是旧的，靠这次重绘把它填成当前画面。 */
           lm_mark_all_dirty();
           lm_touch_release();
+          lcd_mirror_request_full_redraw();
 
           lm_peer_desc(peer, sizeof(peer));
           syslog(LOG_INFO, "LCDMIRROR: 已连上 %s，开始推屏\n", peer);
@@ -1386,6 +1398,7 @@ static int lm_task(int argc, FAR char *argv[])
   g_pend_valid = false;
   rx.len       = 0;
   lm_touch_release();          /* 退出后绝不留"按着不放" */
+  g_client_up  = false;
   g_running    = false;
 
   syslog(LOG_INFO, "LCDMIRROR: 任务已退出（发过 %u 帧）\n",
@@ -1444,6 +1457,7 @@ int lcd_mirror_start(void)
   g_stop       = false;
   g_reconnect  = false;
   g_pend_valid = false;
+  g_client_up  = false;        /* 任务连上第一个客户端之前不做影子拷贝 */
 
   /* 上一次跑剩下的"按着"不带过来（坐标留着，status 里要显示最后位置） */
   lm_touch_release();
@@ -1499,6 +1513,11 @@ int lcd_mirror_stop(void)
 bool lcd_mirror_is_running(void)
 {
   return g_running;
+}
+
+bool lcd_mirror_has_client(void)
+{
+  return g_client_up;
 }
 
 int lcd_mirror_set_target(const char *ip, uint16_t port)
@@ -1819,8 +1838,9 @@ void lcd_mirror_capture(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
   uint32_t row;
   uint32_t src_row = 0;
 
-  /* 关了镜像就完全绕开：刷屏路径只多读一次这个 bool。 */
-  if (!g_running || g_shadow == NULL)
+  /* 关了镜像、或没有客户端连着，都完全绕开：刷屏路径只多读这两个 bool。
+   * "没客户端就不拷"是滚动卡顿的主修（见 g_client_up 的注释）。 */
+  if (!g_running || !g_client_up || g_shadow == NULL)
     {
       return;
     }

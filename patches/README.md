@@ -8,19 +8,30 @@
 | `vendor_sifli-boot-fixes.patch` | `vendor/sifli` | `chips/sf32lb52/{sifli_uart,sifli_irq,sf32lb_flash}.c` | **要**：不修编不过/起不来 |
 | `vendor_sifli-rtc-alarm-fix.patch` | `vendor/sifli` | `chips/sf32lb52/sf32lb_rtc.c` | **要**：不修 RTC alarm 永不触发 |
 | `vendor_sifli-lcd-brightness.patch` | `vendor/sifli` | `boards/sf32lb52/drivers/lcd/sf32lb_lcd.c` + `.../lcd/co5300.c` | **要**：不修亮度只有 0/100。**2026-09-16 起还带上**：面板重新初始化 `sf32lb_lcd_panel_reinit()`（黑屏救回，`hw_test lcdreinit`）+ 12 步 `[lcdreinit]` 诊断日志 + 关掉"开机第三次复位期间被 SETPOWER 插队"那个竞态 + **面板 QSPI 时钟 48MHz→24MHz**（`co5300.c` 一处，带一键回退），见下 |
+| `vendor_sifli-lcd-content-lost.patch` | `vendor/sifli` | `boards/sf32lb52/drivers/lcd/sf32lb_lcd.c` | **要**：面板就绪前/被重初始化后的静默丢帧改记账（`take_content_lost`），上层整屏判脏重画（需在上一条之后） |
 | `vendor_sifli-usb-rndis.patch` | `vendor/sifli` | `chips/sf32lb52/sf32lb_usbdev.c` | **要**：不修 USB 枚举失败（Code 10） |
+| `vendor_sifli-usb-rndis-txpktrdy-ep0.patch` | `vendor/sifli` | `chips/sf32lb52/sf32lb_usbdev.c` | **要**：不修重流量下 TX FIFO 冲走在途包 → 数据通道整体死亡（ARP FAILED + watchdog、EP0 却活着）；另含 EP0 supersede 竞态修复（需在上一条之后） |
 | `nuttx-usbdev-rndis.patch` | `nuttx` | `drivers/usbdev/rndis.c` | **要**：不修 RX 会永久停摆 |
 | `nuttx-usbdev-rndis-nomem.patch` | `nuttx` | `drivers/usbdev/rndis.c` | **要**：不修 -ENOMEM 会把 USB 栈打死（需在上一条之后） |
+| `nuttx-usbdev-rndis-rdlock.patch` | `nuttx` | `drivers/usbdev/rndis.c` | **要**：不修 SMP 双臂 rdreq 竞态 → RX 永久卡死；另含 INIT 清队列、QUERY 竞态修复（需在上两条之后） |
 | `apps-ai-agent-velaclaw-sdk.patch` | `packages/ai_agent` | `CMakeLists.txt` | **要**：不补 `velaclaw_client_open` 链不上 |
 | `apps-ai-agent-llm-clock-fix.patch` | `packages/ai_agent` | `src/core/agent_loop.c` | **要**：不修 `ask` 永远报超时 |
 | `apps-ai-agent-vela-tls-chunked-end.patch` | `packages/ai_agent` | `src/infra/vela_tls.c` | **要**：不修 chunked 响应卡 120 秒 |
 | `apps-ai-agent-vela-tls-no-block-close.patch` | `packages/ai_agent` | `src/infra/vela_tls.c` | **要**：不修语音永远停在「处理中」（需在上一条之后） |
 | `apps-ai-agent-vela-tls-pool-owner.patch` | `packages/ai_agent` | `src/infra/vela_tls.c` | **要**：不修 TLS 连接池跨 task group 误关 fd（需在前两条之后） |
 | `vendor_sifli-uart-rx-dma-reinit.patch` | `vendor/sifli` | `chips/sf32lb52/sifli_uart.c` | **要**：给板级开一个 `sifli_uart_reinit_rx_dma(idx)` 入口。不补这一条，板级音频恢复里那记"复位整块 DMAC1"会把**串口（控制台）RX 的 DMA 通道**一起抹掉 → **控制台永久收不到命令**（板子还活着、日志照打）。详见文末那一节 |
+| `nuttx-audio-drain-fix.patch` | `nuttx` | `audio/audio.c` + `arch/arm/src/arm_m/Make.defs` | **要**：本板音频半双工、上层却全局单状态机——常开麦把状态顶在 RUNNING 后其他 app 的 OUTPUT CONFIGURE 被静默吞掉 → 全程无声。本补丁放行 OUTPUT 对 INPUT 的抢占；另带 `CONFIG_ARM_M_SYSTICK`→`CONFIG_ARM_SYSTICK` 的 Make.defs 笔误修正（不修 arm_systick.c 编不进） |
 
 补丁文件本身是给「上游树被重新 sync 之后要重打」用的场景留的：这三棵树的改动
-**都已经直接改在工作区里、未提交**，所以补丁都能 `git apply --check --reverse` 通过
-（= 和当前工作区逐字对应）。板级（`boards/`）的改动**不再属于这一套**，见下。
+**都已经直接改在工作区里、未提交**。板级（`boards/`）的改动**不再属于这一套**，见下。
+
+⚠️ **2026-10-15 分层说明**：`nuttx-usbdev-rndis{,-nomem}`、`vendor_sifli-usb-rndis`、
+`vendor_sifli-lcd-brightness` 这四个旧补丁是**当时**工作区的快照。此后工作区又继续
+演进（rdlock 竞态、TXPKTRDY 守门、EP0 supersede、content_lost 记账、audio 半双工抢占），
+所以它们**已不能再单独 `--reverse` 通过**。现在每个仓库的完整恢复序列是
+「旧补丁 → 增量补丁」分层叠加，叠加后与当前工作区 `cmp` **逐字节相同**
+（2026-10-15 逐仓库实测）。各轮节内写的「reverse 通过」是**当时属实的历史记录**，
+当前状态以本段与文末「2026-10-15 增量补丁」一节为准。
 
 ## 板级改动不走补丁了（2026-09-15 清理）
 
@@ -449,9 +460,15 @@ cd <openvela 工作区>/vendor/sifli
 git apply <本仓库>/patches/vendor_sifli-boot-fixes.patch
 git apply <本仓库>/patches/vendor_sifli-rtc-alarm-fix.patch
 git apply <本仓库>/patches/vendor_sifli-lcd-brightness.patch
+git apply <本仓库>/patches/vendor_sifli-lcd-content-lost.patch   # 2026-10-15 增量，需上一条就位
+git apply <本仓库>/patches/vendor_sifli-usb-rndis.patch          # USB（见「USB RNDIS 上网功能」一节）
+git apply <本仓库>/patches/vendor_sifli-usb-rndis-txpktrdy-ep0.patch
+git apply <本仓库>/patches/vendor_sifli-uart-rx-dma-reinit.patch
 ```
 
 打之前先 `git apply --check <补丁>`（或 `--check --reverse` 看是不是已经打过了）。
+⚠️ 2026-10-15 起：`lcd-brightness` / `usb-rndis` 两个旧补丁打完后还要各接一枚增量补丁，
+才是当前工作区的完整状态（见文末一节）。
 
 ## 说明
 
@@ -473,11 +490,17 @@ git apply <本仓库>/patches/vendor_sifli-lcd-brightness.patch
 # 1) nuttx 侧：RNDIS 网卡驱动修复
 cd <openvela 工作区>/nuttx
 git apply <本仓库>/patches/nuttx-usbdev-rndis.patch
+git apply <本仓库>/patches/nuttx-usbdev-rndis-nomem.patch
+git apply <本仓库>/patches/nuttx-usbdev-rndis-rdlock.patch
 
 # 2) vendor_sifli 侧：USB device 控制器驱动修复 + 清理
 cd <openvela 工作区>/vendor/sifli
 git apply <本仓库>/patches/vendor_sifli-usb-rndis.patch
+git apply <本仓库>/patches/vendor_sifli-usb-rndis-txpktrdy-ep0.patch
 ```
+
+（2026-10-15 起每侧都追加了增量补丁 —— 只打 2026-09 那两条旧的已经**不够**了，
+详见文末「2026-10-15 增量补丁」一节。）
 
 ## nuttx-usbdev-rndis.patch（`nuttx/drivers/usbdev/rndis.c`）
 
@@ -743,6 +766,7 @@ Assertion failed at /drivers/usbdev/rndis.c:1820   task: robot_ui
 cd <openvela 工作区>/nuttx
 git apply <本仓库>/patches/nuttx-usbdev-rndis.patch
 git apply <本仓库>/patches/nuttx-usbdev-rndis-nomem.patch
+git apply <本仓库>/patches/nuttx-usbdev-rndis-rdlock.patch   # 2026-10-15 增量，需前两条就位
 ```
 
 ## 验证
@@ -1188,3 +1212,89 @@ int sifli_uart_reinit_rx_dma(int idx)
 记账被我们直接归零）。下轮的验收步骤：干净启动 → 敲命令（应正常）→
 `audio_test audfix`（打一记）→ 再敲命令（应正常）→ 跑十几分钟看是否中途变聋。
 若变聋，改成只清 `last_index`、不碰 NX 记账。
+
+---
+
+# 2026-10-15 增量补丁（四枚：rndis rdlock / usbdev TXPKTRDY+EP0 / lcd content_lost / audio 半双工抢占）
+
+背景：2026-09 导出的旧补丁系列是**当时**工作区的快照。10 月中旬又在三棵上游树里
+继续修了一批问题（见各补丁头注释），旧补丁不再与工作区逐字对应。本节四枚补丁把
+差量补齐——**每枚都是「旧序列叠加后的基线 → 当前工作区」的精确 diff**，四枚依次
+打完后与工作区 `cmp` 逐字节相同（生成当天逐仓库实测，方法见文末）。
+
+## 应用顺序（按仓库）
+
+```bash
+# nuttx —— 三枚按序（后一枚依赖前一枚的基线）
+cd <openvela 工作区>/nuttx
+git apply <本仓库>/patches/nuttx-usbdev-rndis.patch
+git apply <本仓库>/patches/nuttx-usbdev-rndis-nomem.patch
+git apply <本仓库>/patches/nuttx-usbdev-rndis-rdlock.patch
+git apply <本仓库>/patches/nuttx-audio-drain-fix.patch          # 独立文件，任意顺序
+
+# vendor/sifli —— 两枚各接在自己的旧补丁之后
+cd <openvela 工作区>/vendor/sifli
+git apply <本仓库>/patches/vendor_sifli-lcd-brightness.patch
+git apply <本仓库>/patches/vendor_sifli-lcd-content-lost.patch
+git apply <本仓库>/patches/vendor_sifli-usb-rndis.patch
+git apply <本仓库>/patches/vendor_sifli-usb-rndis-txpktrdy-ep0.patch
+```
+
+## 各补丁治什么
+
+### nuttx-usbdev-rndis-rdlock.patch（`nuttx/drivers/usbdev/rndis.c`，基线 = 前两枚 rndis 补丁）
+
+- **SMP 双臂竞态（2026-10-12 真机卡死根因）**：bulk OUT 重臂有两个并发调用点
+  （`rxdispatch` 尾部 / `freewrreq` 完成回调），裸读 `rdreq_submitted` 的
+  检查-然后-动作会双次 `EP_SUBMIT` 同一 rdreq → UDC 队列损坏 → RX 永久死亡。
+  修法 = 新增 `priv->rdlock`（`spin_lock_irqsave`）串行化全部访问点，
+  `EP_SUBMIT`/`EP_CANCEL` 一律放锁外（防 UDC 同步完成回调嵌套死锁）。
+- **-ENOMEM 断言降级为丢包**（挂起的 rxdispatch 尾部统一 unblock + 重臂）。
+- **INIT 清会话残留**：重连时上一会话的挂起状态作废，不再 stall QUERY。
+- **QUERY 永不 stall**：`outlen` 边界检查 + 应答补齐。
+
+### vendor_sifli-usb-rndis-txpktrdy-ep0.patch（`vendor/sifli/chips/sf32lb52/sf32lb_usbdev.c`，基线 = usb-rndis 补丁）
+
+- **TXPKTRDY 守门（2026-10-14 深夜，重流量数据通道死亡根因）**：
+  `sf32lb52_wrrequest` 开头查 TXPKTRDY（EP0 用 `USB_CSR0_TXPKTRDY`=0x0002，
+  其它端点 `USB_TXCSR_TXPKTRDY`=0x0001，寄存器同址 `hw->csr0_txcsr`），
+  上一包还没被主机取走就一个字节不碰 FIFO、原样返回等 TX-complete 中断。
+  不修的话 `epwrite` 的 FLUSHFIFO 会冲走在途包，且这颗 MUSB 类内核在
+  TXPKTRDY 置位期间被 flush 后 TX 状态机可整体卡死 → wrreq 池耗尽 →
+  hasfreereqs 恒 false → **整条数据通道死而 EP0 活**（主机症状：ARP FAILED +
+  NETDEV WATCHDOG transmit queue timed out，控制通道却正常）。
+- **EP0 supersede（冷启动 "RNDIS init failed, -32" 根因）**：SETUPEND 表示
+  新 SETUP 顶掉了在途控制传输；停泊等待数据段的 class/vendor OUT 请求标记
+  作废（`g_ep0superseded`），不再把新 SETUP 的 8 字节当"数据"喂给驱动；
+  另加 `count0 == 0` 重复服务守卫（INTRTX CONTROL 与 INtrRX EP0 双路进
+  同一处理函数，第一次已清 RXPKTRDY，第二次空包会把停泊请求以空数据段
+  派发 → -EINVAL → ep0 STALL → 主机 bind -32）。
+
+### vendor_sifli-lcd-content-lost.patch（`vendor/sifli/boards/sf32lb52/drivers/lcd/sf32lb_lcd.c`，基线 = lcd-brightness 补丁；co5300.c 无差量）
+
+面板就绪前 putrun/putarea 的静默丢弃、以及面板（重）初始化（SWRESET 清 GRAM）
+都记账到 `s_content_lost`/`s_drop_count`；导出 `sf32lb_lcd_take_content_lost()`
+（取走即清零）/ `sf32lb_lcd_drop_count()` 给板级 `robot_ui_bridge_lcd_check`
+轮询——看到 true 就把整屏判脏重画。治"重初始化后画面与 LVGL 记账不一致"。
+
+### nuttx-audio-drain-fix.patch（`nuttx/audio/audio.c` + `arch/arm/src/arm_m/Make.defs`，HEAD 基线，不依赖任何旧补丁）
+
+- **半双工抢占（2026-10-11 真机定案，治全程无声）**：本板音频半双工、上层是全局
+  单状态机——常开麦把状态顶在 RUNNING 后，其他 app 的 OUTPUT CONFIGURE 被
+  OPEN 门静默吞掉（返回 OK、驱动毫不知情），PCM 全写在录音会话上、DAC/功放
+  从未打开，每块都等 DMA 超时被丢。修法：OUTPUT 在 INPUT 会话运行时抢占——
+  直调下层 `stop` 拆掉录音会话并显式落 PREPARED，让这次 CONFIGURE 必定转发；
+  hello_app 的录音监听守护随后自动重开麦。反向（INPUT 抢 OUTPUT）故意不放行。
+- **Make.defs 笔误**：`CONFIG_ARM_M_SYSTICK` → `CONFIG_ARM_SYSTICK`
+  （.config 里真实符号是后者，原条件恒假 → `arm_systick.c` 从未参与编译）。
+
+## 验证方法与结果（2026-10-15）
+
+每枚补丁都做了「重建基线 → apply → 与工作区 `cmp`」闭环：
+
+1. `git show HEAD:<file>` 取 HEAD 版本进临时目录；
+2. 按序 `patch -p1 --fuzz=0` 打该仓库的旧补丁序列（audio 例外，无旧序列）；
+3. `diff -u -L a/<file> -L b/<file>` 基线 vs 工作区 → 生成增量补丁；
+4. 在基线上 `patch -p1 --fuzz=0` 打新补丁，`cmp` 工作区文件。
+
+四枚结果：`RNDIS_OK / USB_OK / LCD_OK / AUDIO_OK`（逐字节相同）。

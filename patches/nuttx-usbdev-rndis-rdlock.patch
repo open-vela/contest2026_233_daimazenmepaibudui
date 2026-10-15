@@ -1,0 +1,331 @@
+--- a/drivers/usbdev/rndis.c
++++ b/drivers/usbdev/rndis.c
+@@ -182,6 +182,16 @@
+   uint32_t rx_dropped_nomem;             /* RX frames dropped for lack of a buffer */
+   uint8_t host_mac_address[6];           /* Host side MAC address */
+   mutex_t lock;                          /* Mutex to protect the driver state */
++  spinlock_t rdlock;                     /* Spinlock guarding rdreq_submitted/
++                                          * rx_blocked.  Taken with IRQs
++                                          * disabled: bulk OUT re-arm has two
++                                          * concurrent call sites (worker
++                                          * rxdispatch tail vs. wrcomplete's
++                                          * freewrreq in IRQ context on another
++                                          * CPU), and the check-then-act on
++                                          * rdreq_submitted must be atomic or
++                                          * the same request gets EP_SUBMITed
++                                          * twice and wedges the UDC queue. */
+ 
+   size_t response_queue_words;           /* Count of words waiting in response_queue. */
+   uint32_t response_queue[RNDIS_RESP_QUEUE_WORDS];
+@@ -638,8 +648,24 @@
+ 
+ static int rndis_submit_rdreq(FAR struct rndis_dev_s *priv)
+ {
++  irqstate_t flags;
+   int ret = OK;
+ 
++  /* 2026-10-12 真机定案（第二次）：本函数有两个并发调用点 ——
++   * rxdispatch 尾部（ETHWORK worker，CPU-B）和 freewrreq（bulk IN 写完成
++   * 回调，IRQ 上下文，CPU-A）。两边原来都是裸读 rdreq_submitted 做
++   * 检查-然后-动作，SMP 上会双双通过检查、把同一个 rdreq EP_SUBMIT 两次
++   * —— 厂商 UDC 的 bulk OUT 队列就此损坏：驱动以为请求还在途、endpoint
++   * 队列其实已空，RX 永久死亡（板子静默、主机 transmit queue watchdog）。
++   * 对话重流量（ASR 上传 + TTS 下载同时打满双向）时必现。
++   *
++   * 修法：标志检查+占位在 rdlock 里做（关中断自旋锁），EP_SUBMIT 放在
++   * 锁外 —— UDC 允许同步完成，嵌套的完成回调会再进 cancel/block 路径取
++   * 同一把锁，锁内调 EP_SUBMIT 会死锁。占位后只有本调用者会提交，
++   * 另一调用点看到 rdreq_submitted=true 直接返回。
++   */
++
++  flags = spin_lock_irqsave(&priv->rdlock);
+   if (!priv->rdreq_submitted && !priv->rx_blocked)
+     {
+       /* Set the flag *before* handing the request to the UDC.  A UDC is
+@@ -657,15 +683,26 @@
+       priv->rdreq->len      = priv->epbulkout->maxpacket;
+       priv->rdreq_submitted = true;
+ 
++      spin_unlock_irqrestore(&priv->rdlock, flags);
++
+       ret = EP_SUBMIT(priv->epbulkout, priv->rdreq);
+       if (ret != OK)
+         {
++          /* EP_SUBMIT 失败时嵌套完成回调可能已经跑过并清过标志，
++           * 再清一次无害；反之若没跑过，这里必须清，否则 RX 断臂。 */
++
++          flags = spin_lock_irqsave(&priv->rdlock);
+           priv->rdreq_submitted = false;
++          spin_unlock_irqrestore(&priv->rdlock, flags);
+ 
+           usbtrace(TRACE_CLSERROR(USBSER_TRACEERR_RDSUBMIT),
+                    (uint16_t)-priv->rdreq->result);
+         }
+     }
++  else
++    {
++      spin_unlock_irqrestore(&priv->rdlock, flags);
++    }
+ 
+   return ret;
+ }
+@@ -683,11 +720,22 @@
+ 
+ static void rndis_cancel_rdreq(FAR struct rndis_dev_s *priv)
+ {
++  irqstate_t flags = spin_lock_irqsave(&priv->rdlock);
++
+   if (priv->rdreq_submitted)
+     {
+-      EP_CANCEL(priv->epbulkout, priv->rdreq);
++      /* Clear the flag under the lock, then cancel outside it: EP_CANCEL
++       * on this vendor UDC may run a nested completion callback, which
++       * takes the same lock.  While rx_blocked is set (the only condition
++       * under which cancel is called) no other site can claim the flag. */
++
+       priv->rdreq_submitted = false;
++      spin_unlock_irqrestore(&priv->rdlock, flags);
++      EP_CANCEL(priv->epbulkout, priv->rdreq);
++      return;
+     }
++
++  spin_unlock_irqrestore(&priv->rdlock, flags);
+ }
+ 
+ /****************************************************************************
+@@ -703,7 +751,9 @@
+ 
+ static void rndis_block_rx(FAR struct rndis_dev_s *priv)
+ {
++  irqstate_t flags = spin_lock_irqsave(&priv->rdlock);
+   priv->rx_blocked = true;
++  spin_unlock_irqrestore(&priv->rdlock, flags);
+   rndis_cancel_rdreq(priv);
+ }
+ 
+@@ -723,7 +773,9 @@
+ 
+ static void rndis_unblock_rx(FAR struct rndis_dev_s *priv)
+ {
++  irqstate_t flags = spin_lock_irqsave(&priv->rdlock);
+   priv->rx_blocked = false;
++  spin_unlock_irqrestore(&priv->rdlock, flags);
+ }
+ 
+ /****************************************************************************
+@@ -1411,15 +1463,40 @@
+         {
+           int ret;
+ 
+-          DEBUGASSERT(work_available(&priv->rxwork));
+-          ret = work_queue(ETHWORK, &priv->rxwork, rndis_rxdispatch,
+-                           priv, 0);
+-          DEBUGASSERT(ret == 0);
+-          UNUSED(ret);
+-
+-          rndis_block_rx(priv);
+-          priv->rndis_host_tx_count++;
+-          return -EBUSY;
++          /* 2026-10-12 真机定案：重流量（TTS/LLM 的 HTTPS 经 RNDIS）时
++           * 前一包的 rxdispatch 还挂在 ETHWORK 上没跑完，又攒齐了一整包
++           * —— 原来这里两条 DEBUGASSERT 直接把整板 panic（老人对话念到
++           * 一半整机重启，host 侧随后报 NETDEV WATCHDOG）。ETHWORK 上
++           * 还压着 TX work 之类，rxdispatch 排队等一等是常态，不是病。
++           *
++           * 降级成丢包：挂起的 rxdispatch 跑完时会在尾部统一 unblock +
++           * 重臂 bulk OUT（那边本来就无条件重臂），RX 必然恢复；这一包
++           * 的字节已经进了 rx_req 的 iob，最坏是并进挂起那帧、校验失败
++           * 被协议栈丢掉，TCP 自己重传 —— 远好过整板 panic。
++           */
++
++          if (!work_available(&priv->rxwork))
++            {
++              ret = -EALREADY;
++            }
++          else
++            {
++              ret = work_queue(ETHWORK, &priv->rxwork, rndis_rxdispatch,
++                               priv, 0);
++            }
++
++          if (ret == 0 || ret == -EALREADY)
++            {
++              rndis_block_rx(priv);
++              priv->rndis_host_tx_count++;
++              return -EBUSY;
++            }
++
++          uerr("ERROR: rxdispatch queue failed (%d), drop datagram\n",
++               ret);
++          NETDEV_RXERRORS(&priv->netdev);
++          priv->current_rx_datagram_size = 0;
++          return OK;
+         }
+     }
+ 
+@@ -1551,13 +1628,38 @@
+ 
+   /* The data stage of SEND_ENCAPSULATED_COMMAND must carry at least the
+    * message header; a NULL/short buffer used to be dereferenced blindly.
++   *
++   * Do NOT -EINVAL a short message: the UDC turns a negative setup
++   * return into a STALL, and one STALL kills the host's entire bind
++   * (-EPIPE, "RNDIS init failed, -32").  The host never legitimately
++   * sends less than the 12-byte header (even HALT); sub-12-byte
++   * arrivals are misrouted SETUP packets from the vendor UDC ep0
++   * parking bug (fixed via g_ep0superseded in sf32lb_usbdev.c).
++   * Handle what we can (HALT only needs msgtype), ignore the rest and
++   * complete the control transfer cleanly so the next INIT/QUERY —
++   * i.e. the bind itself — still has a working pipe.
+    */
+ 
+   if (dataout == NULL || outlen < sizeof(struct rndis_command_header))
+     {
+-      uerr("RNDIS control message without data stage (%u bytes)\n",
+-           (unsigned)outlen);
+-      return -EINVAL;
++      if (dataout != NULL && outlen >= sizeof(uint32_t))
++        {
++          uint32_t msgtype = (uint32_t)dataout[0]       |
++                             (uint32_t)dataout[1] << 8  |
++                             (uint32_t)dataout[2] << 16 |
++                             (uint32_t)dataout[3] << 24;
++
++          if (msgtype == RNDIS_HALT_MSG)
++            {
++              priv->response_queue_words = 0;
++              priv->connected = false;
++              return OK;
++            }
++        }
++
++      uwarn("RNDIS short control message (%u bytes), ignored\n",
++            (unsigned)outlen);
++      return OK;
+     }
+ 
+   cmd_hdr = (FAR struct rndis_command_header *)dataout;
+@@ -1569,6 +1671,17 @@
+           FAR struct rndis_initialize_cmplt *resp;
+           size_t respsize = sizeof(struct rndis_initialize_cmplt);
+ 
++          /* 主机发起 INIT = 开启新会话，上一会话的残留状态作废。不清的话，
++           * 跨多次 USB 重连（板子不复位）后 response_queue 里未被取走的响应
++           * 会一直堆积，堆满后 prepare_response 返回 NULL → 上层 -ENOMEM →
++           * UDC stall → 主机 rndis_host 看到 -32，probe 失败。真机复现：
++           * 2026-10-11 同一开机周期内第三次重新枚举时 QUERY(MAC) 即 stall，
++           * 板子物理复位后立刻恢复。与 HALT/RESET 分支同样处理。
++           */
++
++          priv->response_queue_words = 0;
++          priv->connected = false;
++
+           resp = rndis_prepare_response(priv, respsize, cmd_hdr);
+           if (!resp)
+             {
+@@ -1603,6 +1716,27 @@
+           FAR struct rndis_query_msg *req =
+             (FAR struct rndis_query_msg *)dataout;
+ 
++          /* The cast above reads objid/buflen past the 12-byte header;
++           * a truncated message must not stall the pipe -- answer
++           * NOT_SUPPORTED with a normal completion instead.
++           */
++
++          if (outlen < sizeof(struct rndis_query_msg))
++            {
++              FAR struct rndis_response_header *shortresp;
++              size_t shortsize = sizeof(struct rndis_response_header);
++
++              shortresp = rndis_prepare_response(priv, shortsize, cmd_hdr);
++              if (!shortresp)
++                {
++                  return -ENOMEM;
++                }
++
++              shortresp->status = RNDIS_STATUS_NOT_SUPPORTED;
++              rndis_send_encapsulated_response(priv, shortsize);
++              break;
++            }
++
+           resp = rndis_prepare_response(priv, max_reply_size, cmd_hdr);
+           if (!resp)
+             {
+@@ -1699,6 +1833,23 @@
+           FAR struct rndis_response_header *resp;
+           size_t respsize = sizeof(struct rndis_response_header);
+ 
++          /* Same truncated-message rule as QUERY: reply, never stall. */
++
++          if (outlen < sizeof(struct rndis_set_msg))
++            {
++              FAR struct rndis_response_header *shortresp;
++
++              shortresp = rndis_prepare_response(priv, respsize, cmd_hdr);
++              if (!shortresp)
++                {
++                  return -ENOMEM;
++                }
++
++              shortresp->status = RNDIS_STATUS_NOT_SUPPORTED;
++              rndis_send_encapsulated_response(priv, respsize);
++              break;
++            }
++
+           resp = rndis_prepare_response(priv, respsize, cmd_hdr);
+           req  = (FAR struct rndis_set_msg *)dataout;
+ 
+@@ -1812,7 +1963,11 @@
+ 
+   ret = OK;
+ 
+-  priv->rdreq_submitted = false;
++  {
++    irqstate_t flags = spin_lock_irqsave(&priv->rdlock);
++    priv->rdreq_submitted = false;
++    spin_unlock_irqrestore(&priv->rdlock, flags);
++  }
+ 
+   switch (req->result)
+     {
+@@ -1862,6 +2017,14 @@
+       break;
+     };
+ 
++  /* 重臂 bulk OUT 一律走 submit_rdreq：它在 rdlock 里原子地检查
++   * rdreq_submitted + rx_blocked，被 block 时安全空转（RX 由 rxdispatch
++   * 尾部统一恢复）；EP_CANCEL 在这颗厂商 UDC 上可能触发嵌套完成回调，
++   * 从 default 分支落到这里时同样经由该检查避免越权重臂。
++   * 这里不再手动读 rx_blocked —— 裸读和 submit 内的占位不是原子的，
++   * 两个调用点间的竞态正是 2026-10-12 第二次真机卡死的根因。
++   */
++
+   if (ret == OK)
+     {
+       rndis_submit_rdreq(priv);
+@@ -2957,10 +3120,17 @@
+       if (priv->epbulkout != NULL && priv->rdreq != NULL)
+         {
+           irqstate_t flags = enter_critical_section();
++          irqstate_t rdflags;
+ 
++          /* Flag resets go through rdlock so they exclude the completion
++           * and worker paths, which run on other CPUs. */
++
++          rdflags = spin_lock_irqsave(&priv->rdlock);
+           priv->rdreq->callback = rndis_rdcomplete;
+           priv->rx_blocked      = false;
+           priv->rdreq_submitted = false;
++          spin_unlock_irqrestore(&priv->rdlock, rdflags);
++
+           (void)rndis_submit_rdreq(priv);
+ 
+           leave_critical_section(flags);
+@@ -3107,6 +3277,7 @@
+   *classdev = &drvr->drvr;
+ 
+   nxmutex_init(&priv->lock);
++  spin_lock_init(&priv->rdlock);
+ 
+   /* Get device info */
+ 

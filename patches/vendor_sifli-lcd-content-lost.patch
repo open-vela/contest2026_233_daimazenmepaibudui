@@ -1,0 +1,84 @@
+--- a/boards/sf32lb52/drivers/lcd/sf32lb_lcd.c
++++ b/boards/sf32lb52/drivers/lcd/sf32lb_lcd.c
+@@ -166,6 +166,17 @@
+ static volatile bool s_fb_registering;
+ static volatile bool s_lcd_hw_ready;
+ 
++/* "GRAM 内容跟 LVGL 以为的不一样"这个记账（契约见板级头文件
++ * sf32lb52_devkit_lcd.h 的 take_content_lost）：
++ *   ① 面板就绪前 putrun/putarea 被静默丢弃 —— 计数 + 置位；
++ *   ② 面板被 (重) 初始化过（SWRESET 清 GRAM）—— 置位。
++ * 上层（robot_ui_bridge_lcd_check）每帧轮询 take，取走即清零，看到 true
++ * 就把整屏判脏重画。Cortex-M 上 32 位对齐读写是原子的，丢一两个中断
++ * 之间的计数对诊断无害，不加锁。
++ */
++static volatile uint32_t s_drop_count;
++static volatile bool s_content_lost;
++
+ #if SF32LB_LCD_PANEL_REINIT
+ static int sf32lb_lcd_panel_lock_timeout(uint32_t ms);
+ 
+@@ -441,6 +452,9 @@
+ 
+   if (s_fb_registering || !s_lcd_hw_ready)
+     {
++      /* 静默丢帧：LVGL 以为画上去了。记账，让上层有机会整屏判脏重画。 */
++      s_drop_count++;
++      s_content_lost = true;
+       return OK;
+     }
+ 
+@@ -522,6 +536,9 @@
+ 
+   if (s_fb_registering || !s_lcd_hw_ready)
+     {
++      /* 静默丢帧：LVGL 以为画上去了。记账，让上层有机会整屏判脏重画。 */
++      s_drop_count++;
++      s_content_lost = true;
+       return OK;
+     }
+ 
+@@ -1052,6 +1069,8 @@
+ 	 */
+ 	if (p_drv_ops && p_drv_ops->p_ops && p_drv_ops->p_ops->Init)
+ 	{
++		/* SWRESET 会清 GRAM —— 从这一刻起 GRAM 内容不再等于 LVGL 以为的画面。 */
++		s_content_lost = true;
+ 		p_drv_ops->p_ops->Init(&s_drv_lcd.hlcdc);
+ 	}
+ 
+@@ -1419,6 +1438,7 @@
+    * RCC_MOD_LCDC1 使能 + 硬复位 → SelectIntf → SetFreq（写 SPI_IF_CONF.CLK_DIV）
+    * → SetOutFormat → SetupTE → EnableInf → 释放 RSTB。这就是"显示通路重初始化"
+    * 的 SoC 侧那一步，之后才是面板那一串寄存器。 */
++  s_content_lost = true;   /* SWRESET 清 GRAM：通知上层整屏判脏（take_content_lost） */
+   p_drv_ops->p_ops->Init(hlcdc);
+   LCD_REINIT_STEP("STEP7 面板 Init 完成（含 HAL_LCDC_Init: RCC_MOD_LCDC1 复位→接口/分频/格式/TE）");
+ 
+@@ -1573,3 +1593,26 @@
+ 
+ }
+ 
++/****************************************************************************
++ * Name:  sf32lb_lcd_take_content_lost / sf32lb_lcd_drop_count
++ *
++ * Description:
++ *   板级（robot_ui_bridge_lcd_check）轮询的两个观测入口，契约见板级头文件
++ *   sf32lb52_devkit_lcd.h：
++ *     take  —— 返回"这段时间里 GRAM 是否跟 LVGL 以为的不一样"，取走即清零；
++ *     count —— 面板就绪前被静默丢弃的像素写入总次数（开机日志判据）。
++ ****************************************************************************/
++
++bool sf32lb_lcd_take_content_lost(void)
++{
++  bool lost = s_content_lost;
++
++  s_content_lost = false;
++  return lost;
++}
++
++uint32_t sf32lb_lcd_drop_count(void)
++{
++  return s_drop_count;
++}
++

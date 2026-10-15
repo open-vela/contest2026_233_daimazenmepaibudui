@@ -5,6 +5,7 @@
 
 #include "robot_ui.h"
 #include "touch_ui.h"
+#include "ui_theme.h"         /* 清新绿色健康主题调色板：所有颜色从这里取 */
 #include "network_comm.h"     /* report_alarm()：报警要上报 MQTT + 手机推送 */
 #include <stdio.h>
 #include <string.h>
@@ -64,7 +65,13 @@ static lv_obj_t *scr_alarm = NULL;     // 报警屏幕
  * lbl_net：仍然不在任何地方创建，恒为 NULL（robot_ui_set_net_status() 内部判 NULL
  * 后直接返回）。保留声明是为了不动 main.c 里那些调用点。 */
 static lv_obj_t *lbl_status = NULL;    // 语音状态小标签（建在 AI 回复区里）
-static lv_obj_t *lbl_time = NULL;      // 时间标签
+
+/* 时钟标签注册表：主屏状态栏 + 各全屏子页面页眉的时间都走这里，一个 10s 定时器
+ * 统一刷全部槽。槽位靠 LV_EVENT_DELETE 自动反注册（面板整删时标签随之销毁，
+ * 不留悬垂指针）。主屏状态栏是槽 0，页面页眉是后加的槽，满 6 个后新建的标签
+ * 只写一次时间、不再跟刷（板上同时开着的页面数远到不了这个上限）。 */
+#define UI_CLOCK_MAX 6
+static lv_obj_t *clock_slots[UI_CLOCK_MAX] = {NULL};
 static lv_obj_t *lbl_net = NULL;       // 网络状态标签（已不再创建）
 static lv_obj_t *lbl_face = NULL;      // 表情标签
 static lv_obj_t *lbl_ai_reply = NULL;  // AI回复标签
@@ -72,7 +79,7 @@ static lv_obj_t *lbl_reminder = NULL;  // 提醒标签
 
 /* 按钮 */
 static lv_obj_t *btn_remind = NULL;    // 提醒按钮
-static lv_obj_t *btn_setting = NULL;   // 设置按钮
+static lv_obj_t *btn_menu = NULL;      // 菜单按钮（底部排，2026-10-14 顶替设置位）
 static lv_obj_t *btn_alarm = NULL;     // 报警按钮
 
 /* 报警页的 "!!!" 图标：闪烁只动它一个（原来动的是整屏，见 alarm_blink_timer_cb） */
@@ -83,6 +90,9 @@ static lv_anim_t anim_face = {0};      // 表情动画
 
 /* 报警闪烁：低频定时器，创建后先暂停，报警时 resume（见 robot_ui_show_alarm） */
 static lv_timer_t *alarm_blink_timer = NULL;
+
+/* 表情浮动动画是否在跑（全屏页面打开时暂停，见 robot_ui_set_face_anim_paused） */
+static bool face_anim_running = false;
 
 /* 询问页（「检测到异常声响，要报警吗？」）的那两个量。
  * 定义放在这里、而不是跟下面那一节的其它量放在一起：robot_ui_show_alarm() 要
@@ -127,37 +137,37 @@ static void alarm_blink_timer_cb(lv_timer_t *t);
 /* ==================== 初始化样式 ==================== */
 static void init_styles(void)
 {
-    /* 背景样式 - 深蓝色 */
+    /* 背景样式 - 浅薄荷绿页面底（清新健康风） */
     lv_style_init(&style_bg);
-    lv_style_set_bg_color(&style_bg, lv_color_hex(0x1A1A2E));
+    lv_style_set_bg_color(&style_bg, THEME_BG_PAGE);
     lv_style_set_bg_opa(&style_bg, LV_OPA_COVER);
     lv_style_set_border_width(&style_bg, 0);
     lv_style_set_radius(&style_bg, 0);
 
     /* 按钮样式 - 绿色 */
     lv_style_init(&style_btn);
-    lv_style_set_bg_color(&style_btn, lv_color_hex(0x4CAF50));
+    lv_style_set_bg_color(&style_btn, THEME_GREEN);
     lv_style_set_bg_opa(&style_btn, LV_OPA_COVER);
-    lv_style_set_radius(&style_btn, 15);
-    lv_style_set_shadow_width(&style_btn, 10);
-    lv_style_set_shadow_color(&style_btn, lv_color_hex(0x388E3C));
+    lv_style_set_radius(&style_btn, 18);
+    lv_style_set_shadow_width(&style_btn, 8);
+    lv_style_set_shadow_color(&style_btn, THEME_GREEN_DARK);
 
     /* 报警按钮样式 - 红色 */
     lv_style_init(&style_btn_alarm);
-    lv_style_set_bg_color(&style_btn_alarm, lv_color_hex(0xF44336));
+    lv_style_set_bg_color(&style_btn_alarm, THEME_RED);
     lv_style_set_bg_opa(&style_btn_alarm, LV_OPA_COVER);
-    lv_style_set_radius(&style_btn_alarm, 15);
-    lv_style_set_shadow_width(&style_btn_alarm, 10);
-    lv_style_set_shadow_color(&style_btn_alarm, lv_color_hex(0xD32F2F));
+    lv_style_set_radius(&style_btn_alarm, 18);
+    lv_style_set_shadow_width(&style_btn_alarm, 8);
+    lv_style_set_shadow_color(&style_btn_alarm, THEME_RED_DARK);
 
-    /* 文字样式 - 白色 */
+    /* 文字样式 - 深绿灰（浅底上的主文字色） */
     lv_style_init(&style_text);
-    lv_style_set_text_color(&style_text, lv_color_hex(0xFFFFFF));
+    lv_style_set_text_color(&style_text, THEME_TEXT_PRIMARY);
     lv_style_set_text_font(&style_text, &lv_font_ui_16);
 
-    /* 表情样式 - 大号字体 */
+    /* 表情样式 - 大号字体（浅底用深绿，黄色看不清） */
     lv_style_init(&style_face);
-    lv_style_set_text_color(&style_face, lv_color_hex(0xFFEB3B));
+    lv_style_set_text_color(&style_face, THEME_FACE_HAPPY);
     lv_style_set_text_font(&style_face, &lv_font_ui_24);
 }
 
@@ -195,21 +205,17 @@ static void create_main_screen(void)
  * 正好依赖现在这套简化日历换算，**不建议现在动**；显示层加偏移最省事也最可控。 */
 #define UI_TZ_OFFSET_SEC  (8 * 3600)
 
-/* 从系统时钟（硬件 RTC）读一次，刷新状态栏上的时间标签（本地时间）。 */
-static void ui_clock_refresh(void)
+/* 格式化当前时间到 buf（"--:--" = RTC 没设过，不可信）。 */
+static void ui_clock_format(char *buf, size_t len)
 {
     time_t now = time(NULL);
     struct tm tm_buf;
-
-    if (lbl_time == NULL) {
-        return;
-    }
 
     /* time() <= 0：说明时钟还没被设过（板上没有 RTC 备份电池，
      * 冷启动会读到 1900/2000 这类值）—— 用 "--:--" 明确表示"时间不可信"，
      * 比继续显示一个假的时间好。 */
     if (now <= 0) {
-        lv_label_set_text(lbl_time, "--:--");
+        snprintf(buf, len, "--:--");
         return;
     }
 
@@ -219,12 +225,67 @@ static void ui_clock_refresh(void)
     }
 
     if (localtime_r(&now, &tm_buf) == NULL) {
-        lv_label_set_text(lbl_time, "--:--");
+        snprintf(buf, len, "--:--");
         return;
     }
 
-    lv_label_set_text_fmt(lbl_time, "%02d:%02d",
-                          tm_buf.tm_hour, tm_buf.tm_min);
+    snprintf(buf, len, "%02d:%02d", tm_buf.tm_hour, tm_buf.tm_min);
+}
+
+/* 槽位反注册：标签被删（面板整删）时自动把槽清掉，防悬垂指针。 */
+static void clock_slot_free_cb(lv_event_t *e)
+{
+    lv_obj_t *target = lv_event_get_target(e);
+    for (int i = 0; i < UI_CLOCK_MAX; i++) {
+        if (clock_slots[i] == target) {
+            clock_slots[i] = NULL;
+            return;
+        }
+    }
+}
+
+lv_obj_t *ui_clock_label_create(lv_obj_t *parent, lv_color_t color)
+{
+    char tbuf[8];
+
+    lv_obj_t *lbl = lv_label_create(parent);
+    ui_clock_format(tbuf, sizeof(tbuf));
+    lv_label_set_text(lbl, tbuf);
+    lv_obj_set_style_text_color(lbl, color, 0);
+    /* 时钟统一 28 号（2026-10-14 用户要求"字体调大"）。时间只有 ASCII
+     * 数字和冒号，montserrat_28 覆盖；自建 ui_* 字库最大 24 号。全板
+     * 时钟（主屏栏/各页页眉/报警页/询问页）都走这里，一处生效。 */
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_28, 0);
+    lv_obj_add_event_cb(lbl, clock_slot_free_cb, LV_EVENT_DELETE, NULL);
+
+    for (int i = 0; i < UI_CLOCK_MAX; i++) {
+        if (clock_slots[i] == NULL) {
+            clock_slots[i] = lbl;
+            return lbl;
+        }
+    }
+
+    /* 槽满了：不注册（只显示创建时写上的这一次），打一行日志好排查。 */
+    printf("[UI] 时钟槽已满(%d)，新标签不接入定时刷新\n", UI_CLOCK_MAX);
+    return lbl;
+}
+
+/* 从系统时钟（硬件 RTC）读一次，刷新所有注册过的时钟标签（本地时间）。 */
+static void ui_clock_refresh(void)
+{
+    char tbuf[8];
+
+    ui_clock_format(tbuf, sizeof(tbuf));
+
+    for (int i = 0; i < UI_CLOCK_MAX; i++) {
+        /* 没变就不 set_text：lv_label_set_text 即使文本相同也会标脏等重绘，
+         * 时钟每 10 秒打一次点、大多数分钟内文本没变，白做这些重绘纯属
+         * 和滚动抢带宽（和表情动画是同一类问题）。 */
+        if (clock_slots[i] != NULL &&
+            strcmp(lv_label_get_text(clock_slots[i]), tbuf) != 0) {
+            lv_label_set_text(clock_slots[i], tbuf);
+        }
+    }
 }
 
 static void ui_clock_timer_cb(lv_timer_t *t)
@@ -233,41 +294,96 @@ static void ui_clock_timer_cb(lv_timer_t *t)
     ui_clock_refresh();
 }
 
+/* ==================== 全屏子页面页眉 ==================== */
+/* 76px 全宽：左返回（back_cb==NULL 不建 = 本页必须作答）+ 顶部居中大时钟 +
+ * 时钟下面一行小标题。
+ * 2026-10-14 用户反馈"时间出框了，把时间放在顶部中间"：时钟原来是右上角
+ * 右对齐，屏幕圆角半径大，右上角随时钟字高就可能被啃掉一角 —— 居中放在
+ * 顶部天然躲开两个上圆角，顺便升为页眉的视觉主角（28 号字）。标题退居
+ * 二行（20 号灰字），不再和时钟抢地方。 */
+lv_obj_t *ui_page_header_create(lv_obj_t *parent, const char *title,
+                                lv_event_cb_t back_cb, void *user_data)
+{
+    lv_obj_t *header = lv_obj_create(parent);
+    lv_obj_set_size(header, LV_PCT(100), 76);
+    lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+    /* 左右 40：这块屏的物理圆角比预估大（主屏菜单按钮 28 内缩都被切过），
+     * 返回按钮也往里收 40px 才不会被圆角啃掉一角。 */
+    lv_obj_set_style_pad_left(header, 40, 0);
+    lv_obj_set_style_pad_right(header, 40, 0);
+    lv_obj_remove_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+    /* 不用 flex：三块各自对齐 */
+    lv_obj_set_style_pad_all(header, 0, 0);
+
+    if (back_cb != NULL) {
+        /* 48×48：46 太小难摁 → 56 又嫌大挡着页眉其它元素（用户两头都提过），
+         * 折中 48，圆角 24。圆角安全性：按钮左缘 x=40，即使屏幕圆角到 r75，
+         * 顶角侵入 ≈39px 也仍在按钮内缘之内。 */
+        lv_obj_t *btn = lv_btn_create(header);
+        lv_obj_set_size(btn, 48, 48);
+        lv_obj_align(btn, LV_ALIGN_LEFT_MID, 0, 0);
+        lv_obj_set_style_bg_color(btn, THEME_GREEN_TINT, 0);
+        lv_obj_set_style_radius(btn, 24, 0);
+        lv_obj_set_style_shadow_width(btn, 0, 0);
+        lv_obj_add_event_cb(btn, back_cb, LV_EVENT_CLICKED, user_data);
+        lv_obj_t *lbl = lv_label_create(btn);
+        lv_label_set_text(lbl, "<");
+        lv_obj_set_style_text_color(lbl, THEME_GREEN_DARK, 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_ui_24, 0);
+        lv_obj_center(lbl);
+    }
+
+    /* 时钟：顶部居中、28 号（字体在 ui_clock_label_create 里统一给） */
+    lv_obj_t *lbl_time = ui_clock_label_create(header, THEME_TEXT_PRIMARY);
+    lv_obj_align(lbl_time, LV_ALIGN_TOP_MID, 0, 4);
+
+    /* 标题：时钟下面一行，20 号灰字 */
+    lv_obj_t *lbl_title = lv_label_create(header);
+    lv_label_set_text(lbl_title, (title != NULL) ? title : "");
+    lv_obj_set_style_text_color(lbl_title, THEME_TEXT_SECONDARY, 0);
+    lv_obj_set_style_text_font(lbl_title, &lv_font_ui_20, 0);
+    lv_obj_align(lbl_title, LV_ALIGN_TOP_MID, 0, 46);
+
+    return header;
+}
+
 /* ==================== 创建状态栏 ==================== */
-/* 状态栏上的「菜单」按钮：主菜单的保底入口。
+/* 「菜单」按钮：主菜单的保底入口（2026-10-14 起在底部按钮排，不再挂顶栏）。
  * 主菜单只在开机时显示一次，关掉之后要么右滑（手势，见 touch_ui.c），
- * 要么点这里。两者都调 touch_ui_show_menu(MENU_TYPE_MAIN)。 */
+ * 要么点这里。两者都调 touch_ui_show_menu(MENU_TYPE_MAIN)。
+ * 按键音和底部同排的提醒/报警保持一致。 */
 static void menu_button_event_handler(lv_event_t *e)
 {
     if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+        touch_ui_play_sound("click");
         touch_ui_show_menu(MENU_TYPE_MAIN);
     }
 }
 
 static void create_status_bar(lv_obj_t *parent)
 {
-    /* 状态栏容器。**现在只放两样：时钟 + 「菜单」按钮。**
+    /* 状态栏容器。**现在顶上只有时钟一样。**
      *
-     * 2026-09-14 用户要求删掉原来那三样：「[在线]」状态、「WiFi 100%」、「NET --」——
-     * 对老人没有任何用处（电量/信号本来就是写死的假值，网络状态只会让人困惑），
-     * 挤在 40px 高的栏里还占地方。删掉之后：
-     *   - 时间保留（它是真的，联网自动对时之后是准的）；
-     *   - 「菜单」按钮**做大**（130×40，占满整栏高度）—— 它是手势失灵时进主菜单
-     *     唯一的保底入口，老人手指粗，越大越好按。
+     * 演变史：最早有「[在线]/WiFi/NET」三样假状态（2026-09-14 删）→ 后来是
+     * 时钟 + 「菜单」按钮 → 2026-10-14 用户拍板"顶部只有时间"：菜单按钮
+     * 挪到底部按钮排里顶替设置（设置仍可从主菜单进），顶栏回归纯净。
      *
      * 注意：`robot_ui_set_status()` / `robot_ui_set_net_status()` 两个 setter
      * 都**保留**了（内部都有 NULL 检查），main.c 里那十几处调用点一行都不用改：
      *   - set_net_status()：对应标签仍然不创建，恒为 NULL，没有任何显示效果；
-     *   - set_status()：2026-09-16 起**有显示效果了** —— 它写的不再是状态栏，
-     *     而是主界面「AI 回复区」里那一行语音状态小字（见 create_ai_reply_area()
-     *     和 robot_ui_set_status()）。状态栏这一块仍然只有时钟 + 菜单按钮。 */
+     *   - set_status()：写的是主界面「AI 回复区」里那一行语音状态小字
+     *     （见 create_ai_reply_area() 和 robot_ui_set_status()），与顶栏无关。 */
     lv_obj_t *bar = lv_obj_create(parent);
     /* 高度 40 → **64**：菜单按钮要做到 52 高才够好点（40 的栏里塞不下），
      * 顺便让整块状态栏不那么挤。 */
     lv_obj_set_size(bar, LV_PCT(100), 64);
     lv_obj_align(bar, LV_ALIGN_TOP_MID, 0, 0);
-    lv_obj_set_style_bg_color(bar, lv_color_hex(0x2D2D44), 0);
-    lv_obj_set_style_border_width(bar, 0, 0);
+    lv_obj_set_style_bg_color(bar, THEME_STATUSBAR_BG, 0);
+    /* 白底状态栏：只留 1px 底部描边把栏和页面底分开 */
+    lv_obj_set_style_border_width(bar, 1, 0);
+    lv_obj_set_style_border_color(bar, THEME_STATUSBAR_LINE, 0);
+    lv_obj_set_style_border_side(bar, LV_BORDER_SIDE_BOTTOM, 0);
     lv_obj_set_style_radius(bar, 0, 0);
     lv_obj_set_style_pad_all(bar, 0, 0);
     lv_obj_remove_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
@@ -291,27 +407,15 @@ static void create_status_bar(lv_obj_t *parent)
      * 注意：本构建没开 CONFIG_LIBC_LOCALTIME，`localtime` 实际就是 `gmtime`，
      * 所以**显示的是 UTC**，比北京时间少 8 小时。要显示本地时间得自己加偏移
      * （这里刻意不加，保持"屏幕上显示的就是 RTC 里的值"，免得排查时对不上）。 */
-    lbl_time = lv_label_create(bar);
-    lv_obj_set_style_text_color(lbl_time, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_text_font(lbl_time, &lv_font_ui_24, 0);
+    /* 时间标签（居中）：走 ui_clock_label_create 注册进统一定时刷新槽
+     * （创建时已立即写上当前时间，浅色栏用深绿灰字）。 */
+    lv_obj_t *lbl_time = ui_clock_label_create(bar, THEME_TEXT_PRIMARY);
     lv_obj_align(lbl_time, LV_ALIGN_CENTER, 0, 0);           /* 时间居中 */
-    ui_clock_refresh();                                      /* 先立刻显示一次 */
     clock_timer = lv_timer_create(ui_clock_timer_cb, 10000, NULL);  /* 每 10 秒刷一次 */
 
-    /* 「菜单」按钮：主菜单的保底入口（手势不灵时也能进）。
-     * 120×52 = 比原来的 LV_SIZE_CONTENT×36 大得多（宽度几乎翻倍、高度 +44%），
-     * 而且**从右上圆角里挪出来**（右移 -28px）—— 之前贴在屏幕角上，
-     * 圆角把可点区域切掉一块，所以"不好点"。 */
-    lv_obj_t *btn_menu = lv_btn_create(bar);
-    lv_obj_set_size(btn_menu, 120, 52);
-    lv_obj_align(btn_menu, LV_ALIGN_RIGHT_MID, -28, 0);
-    lv_obj_add_style(btn_menu, &style_btn, 0);
-    lv_obj_add_event_cb(btn_menu, menu_button_event_handler,
-                        LV_EVENT_CLICKED, NULL);
-    lv_obj_t *lbl_menu = lv_label_create(btn_menu);
-    lv_label_set_text(lbl_menu, "菜单");
-    lv_obj_set_style_text_font(lbl_menu, &lv_font_ui_24, 0);
-    lv_obj_center(lbl_menu);
+    /* 原来这里右上角还有一颗「菜单」按钮（右对齐内缩 40 躲圆角）。
+     * 2026-10-14 用户拍板"顶部只有时间"：它挪到底部按钮排里顶替「设置」
+     * 的位置（见 create_bottom_buttons），顶栏只剩时钟，右上圆角区彻底空出来。 */
 }
 
 /* ==================== 更新网络状态 ==================== */
@@ -328,8 +432,8 @@ void robot_ui_set_net_status(const char *text)
     lv_label_set_text(lbl_net, text);
     lv_obj_set_style_text_color(lbl_net,
                                 strncmp(text, "NET OK", 6) == 0
-                                    ? lv_color_hex(0x4CAF50)
-                                    : lv_color_hex(0xFFC107),
+                                    ? THEME_GREEN_DARK
+                                    : THEME_ST_THINKING,
                                 0);
 }
 
@@ -353,8 +457,8 @@ static void create_face_area(lv_obj_t *parent)
 
     /* 状态文字 */
     lbl_reminder = lv_label_create(container);
-    lv_label_set_text(lbl_reminder, "Hello! I am ZhiAi.");
-    lv_obj_set_style_text_color(lbl_reminder, lv_color_hex(0xCCCCCC), 0);
+    lv_label_set_text(lbl_reminder, "你好，我是智爱");
+    lv_obj_set_style_text_color(lbl_reminder, THEME_TEXT_SECONDARY, 0);
     lv_obj_set_style_text_font(lbl_reminder, &lv_font_ui_24, 0);
     lv_obj_set_style_pad_top(lbl_reminder, 10, 0);
 
@@ -367,6 +471,37 @@ static void create_face_area(lv_obj_t *parent)
     lv_anim_set_repeat_count(&anim_face, LV_ANIM_REPEAT_INFINITE);
     lv_anim_set_exec_cb(&anim_face, (lv_anim_exec_xcb_t)lv_obj_set_y);
     lv_anim_start(&anim_face);
+    face_anim_running = true;
+}
+
+/* 全屏二级页面打开/关闭时暂停/恢复表情浮动动画。
+ *
+ * 为什么必须暂停：这个动画每帧（16~33ms）都把表情标签那块区域标脏等重绘。
+ * 页面全屏盖住主屏之后，那块重绘完全是白做的，而滚动页面时 LVGL 要把
+ * 滚动的大块重绘和这块"冤枉"重绘拼在一起送显 —— 面板接口本来就慢，
+ * 叠加出来就是用户看到的"上下滑动卡顿"。
+ * 只能在 LVGL 线程里调（touch_ui 的面板开关路径都在 LVGL 线程）。 */
+void robot_ui_set_face_anim_paused(bool paused)
+{
+    if (lbl_face == NULL) {
+        return;
+    }
+
+    if (paused && face_anim_running) {
+        lv_anim_del(lbl_face, (lv_anim_exec_xcb_t)lv_obj_set_y);
+        lv_obj_set_y(lbl_face, 0);   /* 停在中间，别停在半空 */
+        face_anim_running = false;
+    } else if (!paused && !face_anim_running) {
+        lv_anim_init(&anim_face);
+        lv_anim_set_var(&anim_face, lbl_face);
+        lv_anim_set_values(&anim_face, -10, 10);
+        lv_anim_set_time(&anim_face, 1000);
+        lv_anim_set_playback_time(&anim_face, 1000);
+        lv_anim_set_repeat_count(&anim_face, LV_ANIM_REPEAT_INFINITE);
+        lv_anim_set_exec_cb(&anim_face, (lv_anim_exec_xcb_t)lv_obj_set_y);
+        lv_anim_start(&anim_face);
+        face_anim_running = true;
+    }
 }
 
 /* ==================== 创建 AI 回复区域 ==================== */
@@ -379,10 +514,10 @@ static void create_face_area(lv_obj_t *parent)
  *
  * 写成宏是因为它有两处用：下面建标签时的初始颜色，和 robot_ui_set_status()
  * 里每一档的写入（两处必须一致，散着写迟早会漂）。 */
-#define UI_STATUS_COLOR_IDLE      lv_color_hex(0xBDBDBD)   /* 灰：空闲，不抢眼 */
-#define UI_STATUS_COLOR_LISTENING lv_color_hex(0x42A5F5)   /* 蓝：在听 */
-#define UI_STATUS_COLOR_THINKING  lv_color_hex(0xFFA726)   /* 橙：在想 */
-#define UI_STATUS_COLOR_SPEAKING  lv_color_hex(0x66BB6A)   /* 绿：在说 */
+#define UI_STATUS_COLOR_IDLE      THEME_ST_IDLE        /* 灰：空闲，不抢眼 */
+#define UI_STATUS_COLOR_LISTENING THEME_ST_LISTENING   /* 蓝：在听 */
+#define UI_STATUS_COLOR_THINKING  THEME_ST_THINKING    /* 橙：在想 */
+#define UI_STATUS_COLOR_SPEAKING  THEME_ST_SPEAKING    /* 绿：在说 */
 
 static void create_ai_reply_area(lv_obj_t *parent)
 {
@@ -396,24 +531,24 @@ static void create_ai_reply_area(lv_obj_t *parent)
     lv_obj_t *container = lv_obj_create(parent);
     lv_obj_set_size(container, LV_PCT(90), 150);
     lv_obj_align(container, LV_ALIGN_CENTER, 0, 20);
-    lv_obj_set_style_bg_color(container, lv_color_hex(0x2D2D44), 0);
+    lv_obj_set_style_bg_color(container, THEME_BG_CARD, 0);
     lv_obj_set_style_radius(container, 20, 0);
     lv_obj_set_style_border_width(container, 2, 0);
-    lv_obj_set_style_border_color(container, lv_color_hex(0x4CAF50), 0);
+    lv_obj_set_style_border_color(container, THEME_GREEN_BORDER, 0);
     lv_obj_set_flex_flow(container, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(container, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_all(container, 15, 0);
 
-    /* AI 说话图标 */
+    /* 发送者名（原来是 "[AI]" 字样，方括号看着乱，换成聊天软件式的署名） */
     lv_obj_t *lbl_icon = lv_label_create(container);
-    lv_label_set_text(lbl_icon, "[AI]");
-    lv_obj_set_style_text_color(lbl_icon, lv_color_hex(0x4CAF50), 0);
-    lv_obj_set_style_text_font(lbl_icon, &lv_font_ui_24, 0);
+    lv_label_set_text(lbl_icon, "智爱");
+    lv_obj_set_style_text_color(lbl_icon, THEME_GREEN_DARK, 0);
+    lv_obj_set_style_text_font(lbl_icon, &lv_font_ui_20, 0);
 
     /* AI 回复内容 */
     lbl_ai_reply = lv_label_create(container);
-    lv_label_set_text(lbl_ai_reply, "Hello!\nHow can I help you?");
-    lv_obj_set_style_text_color(lbl_ai_reply, lv_color_hex(0xFFFFFF), 0);
+    lv_label_set_text(lbl_ai_reply, "你好！\n有什么可以帮你的吗？");
+    lv_obj_set_style_text_color(lbl_ai_reply, THEME_TEXT_PRIMARY, 0);
     lv_obj_set_style_text_font(lbl_ai_reply, &lv_font_ui_24, 0);
     lv_label_set_long_mode(lbl_ai_reply, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(lbl_ai_reply, LV_PCT(100));
@@ -449,19 +584,20 @@ static void create_bottom_buttons(lv_obj_t *parent)
      * 会压在**左下/右下圆角**上 —— 视觉被切一块，触摸也可能点不到。
      * 所以左右各内缩 28px，三个按钮整体往里收（用户反馈"不好点"）。 */
     lv_obj_t *container = lv_obj_create(parent);
-    lv_obj_set_size(container, LV_PCT(100), 80);
+    lv_obj_set_size(container, LV_PCT(100), 88);
     lv_obj_align(container, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_opa(container, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(container, 0, 0);
     lv_obj_set_style_pad_left(container, 28, 0);
     lv_obj_set_style_pad_right(container, 28, 0);
-    lv_obj_set_style_pad_bottom(container, 6, 0);
+    /* 底部内缩 12（原 6）：给屏幕下圆角让出余量，三颗按钮整体不再贴边 */
+    lv_obj_set_style_pad_bottom(container, 12, 0);
     lv_obj_set_flex_flow(container, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(container, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
     /* 提醒按钮 */
     btn_remind = lv_btn_create(container);
-    lv_obj_set_size(btn_remind, 90, 50);
+    lv_obj_set_size(btn_remind, 94, 56);
     lv_obj_add_style(btn_remind, &style_btn, 0);
     lv_obj_add_event_cb(btn_remind, btn_event_handler, LV_EVENT_CLICKED, (void *)UI_VIEW_REMIND);
     lv_obj_t *lbl_btn1 = lv_label_create(btn_remind);
@@ -471,20 +607,26 @@ static void create_bottom_buttons(lv_obj_t *parent)
     lv_obj_set_style_text_font(lbl_btn1, &lv_font_ui_24, 0);
     lv_obj_center(lbl_btn1);
 
-    /* 设置按钮 */
-    btn_setting = lv_btn_create(container);
-    lv_obj_set_size(btn_setting, 90, 50);
-    lv_obj_add_style(btn_setting, &style_btn, 0);
-    lv_obj_add_event_cb(btn_setting, btn_event_handler, LV_EVENT_CLICKED, (void *)UI_VIEW_SETTING);
-    lv_obj_t *lbl_btn2 = lv_label_create(btn_setting);
-    lv_label_set_text(lbl_btn2, "Setting");
+    /* 菜单按钮：2026-10-14 用户拍板，这颗位置原来是「设置」，换成「菜单」
+     * （顶栏那颗同名按钮同时删除，顶部只留时间）。设置页仍可从主菜单进，
+     * 功能一个不丢；菜单反而升格成常驻底排，老人不用手势也能随时进主菜单。 */
+    btn_menu = lv_btn_create(container);
+    lv_obj_set_size(btn_menu, 94, 56);
+    lv_obj_add_style(btn_menu, &style_btn, 0);
+    lv_obj_add_event_cb(btn_menu, menu_button_event_handler, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *lbl_btn2 = lv_label_create(btn_menu);
+    lv_label_set_text(lbl_btn2, "菜单");
     lv_obj_set_style_text_font(lbl_btn2, &lv_font_ui_24, 0);
     lv_obj_center(lbl_btn2);
 
-    /* 报警按钮 */
+    /* 报警按钮：全屏最大的控件（110×64，比旁边两个明显大一圈）——
+     * 用户要求"报警按钮要清晰"，老人紧急时一眼找到、一按就中。
+     * 左侧再让开 14px：SPACE_EVENLY 下三颗按钮间距本来就均等，报警
+     * 更大更红，和"设置"贴太近容易误触 —— 加一道明显的空隙。 */
     btn_alarm = lv_btn_create(container);
-    lv_obj_set_size(btn_alarm, 90, 50);
+    lv_obj_set_size(btn_alarm, 110, 64);
     lv_obj_add_style(btn_alarm, &style_btn_alarm, 0);
+    lv_obj_set_style_margin_left(btn_alarm, 14, 0);
     lv_obj_add_event_cb(btn_alarm, btn_event_handler, LV_EVENT_CLICKED, (void *)UI_VIEW_ALARM);
     lv_obj_t *lbl_btn3 = lv_label_create(btn_alarm);
     lv_label_set_text(lbl_btn3, "报警");
@@ -546,43 +688,47 @@ static void alarm_blink_timer_cb(lv_timer_t *t)
 
 static void create_alarm_screen(void)
 {
-    /* 创建报警屏幕 */
+    /* 创建报警屏幕（保持全红：报警页要一眼看出是"出事了"） */
     scr_alarm = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(scr_alarm, lv_color_hex(0xF44336), 0);
+    lv_obj_set_style_bg_color(scr_alarm, THEME_RED, 0);
     lv_obj_set_style_bg_opa(scr_alarm, LV_OPA_COVER, 0);
+
+    /* 报警页也是全屏页：顶部自带时钟（白字），不靠主屏状态栏 */
+    lv_obj_t *lbl_time_alarm = ui_clock_label_create(scr_alarm, THEME_TEXT_ON_GREEN);
+    lv_obj_align(lbl_time_alarm, LV_ALIGN_TOP_MID, 0, 12);
 
     /* 报警图标（闪烁只动它，不透明度的切换见 alarm_blink_timer_cb） */
     lbl_alarm_icon = lv_label_create(scr_alarm);
     lv_label_set_text(lbl_alarm_icon, "!!!");
     lv_obj_set_style_text_font(lbl_alarm_icon, &lv_font_ui_24, 0);
-    lv_obj_set_style_text_color(lbl_alarm_icon, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_color(lbl_alarm_icon, THEME_TEXT_ON_GREEN, 0);
     lv_obj_align(lbl_alarm_icon, LV_ALIGN_CENTER, 0, -60);
 
     /* 报警文字 */
     lv_obj_t *text = lv_label_create(scr_alarm);
     lv_label_set_text(text, "紧急");
-    lv_obj_set_style_text_color(text, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_color(text, THEME_TEXT_ON_GREEN, 0);
     lv_obj_set_style_text_font(text, &lv_font_ui_24, 0);
     lv_obj_align(text, LV_ALIGN_CENTER, 0, 0);
 
     /* 报警详情 */
     lv_obj_t *detail = lv_label_create(scr_alarm);
     lv_label_set_text(detail, "检测到异常\n已通知家人");
-    lv_obj_set_style_text_color(detail, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_color(detail, THEME_TEXT_ON_GREEN, 0);
     lv_obj_set_style_text_font(detail, &lv_font_ui_24, 0);
     lv_obj_align(detail, LV_ALIGN_CENTER, 0, 40);
 
-    /* 返回按钮 */
+    /* 返回按钮：加大到 180×64（用户要求报警相关按钮清晰好点） */
     lv_obj_t *btn_back = lv_btn_create(scr_alarm);
-    lv_obj_set_size(btn_back, 120, 50);
+    lv_obj_set_size(btn_back, 180, 64);
     lv_obj_align(btn_back, LV_ALIGN_CENTER, 0, 100);
-    lv_obj_set_style_bg_color(btn_back, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_radius(btn_back, 25, 0);
+    lv_obj_set_style_bg_color(btn_back, THEME_BG_CARD, 0);
+    lv_obj_set_style_radius(btn_back, 32, 0);
     lv_obj_add_event_cb(btn_back, btn_event_handler, LV_EVENT_CLICKED, (void *)UI_VIEW_MAIN);
 
     lv_obj_t *lbl_back = lv_label_create(btn_back);
     lv_label_set_text(lbl_back, "返回");
-    lv_obj_set_style_text_color(lbl_back, lv_color_hex(0xF44336), 0);
+    lv_obj_set_style_text_color(lbl_back, THEME_RED, 0);
     lv_obj_set_style_text_font(lbl_back, &lv_font_ui_24, 0);
     lv_obj_center(lbl_back);
 
@@ -619,19 +765,19 @@ void robot_ui_set_face(robot_face_t face)
         /* 根据表情改变颜色 */
         switch (face) {
             case ROBOT_FACE_HAPPY:
-                lv_obj_set_style_text_color(lbl_face, lv_color_hex(0xFFEB3B), 0); // 黄色
+                lv_obj_set_style_text_color(lbl_face, THEME_FACE_HAPPY, 0); // 深绿
                 break;
             case ROBOT_FACE_THINKING:
-                lv_obj_set_style_text_color(lbl_face, lv_color_hex(0x2196F3), 0); // 蓝色
+                lv_obj_set_style_text_color(lbl_face, THEME_FACE_THINKING, 0); // 蓝
                 break;
             case ROBOT_FACE_SLEEPY:
-                lv_obj_set_style_text_color(lbl_face, lv_color_hex(0x9E9E9E), 0); // 灰色
+                lv_obj_set_style_text_color(lbl_face, THEME_FACE_SLEEPY, 0); // 灰
                 break;
             case ROBOT_FACE_ALARM:
-                lv_obj_set_style_text_color(lbl_face, lv_color_hex(0xF44336), 0); // 红色
+                lv_obj_set_style_text_color(lbl_face, THEME_FACE_ALARM, 0); // 红
                 break;
             default:
-                lv_obj_set_style_text_color(lbl_face, lv_color_hex(0xFFEB3B), 0);
+                lv_obj_set_style_text_color(lbl_face, THEME_FACE_HAPPY, 0);
                 break;
         }
     }
@@ -691,11 +837,11 @@ void robot_ui_set_status(robot_status_t status)
                 break;
             case ROBOT_STATUS_REMINDING:
                 lv_label_set_text(lbl_status, "提醒中");
-                lv_obj_set_style_text_color(lbl_status, lv_color_hex(0x9C27B0), 0);
+                lv_obj_set_style_text_color(lbl_status, THEME_ST_REMINDING, 0);
                 break;
             case ROBOT_STATUS_ALARM:
                 lv_label_set_text(lbl_status, "报警");
-                lv_obj_set_style_text_color(lbl_status, lv_color_hex(0xF44336), 0);
+                lv_obj_set_style_text_color(lbl_status, THEME_RED, 0);
                 break;
             default:
                 break;
@@ -714,8 +860,8 @@ void robot_ui_show_reminder(const char *title, const char *content)
     lv_msgbox_add_text(mbox, content);
     touch_ui_msgbox_add_close_x(mbox);
     lv_obj_center(mbox);
-    lv_obj_set_style_bg_color(mbox, lv_color_hex(0x2D2D44), 0);
-    lv_obj_set_style_text_color(mbox, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_bg_color(mbox, THEME_BG_CARD, 0);
+    lv_obj_set_style_text_color(mbox, THEME_TEXT_PRIMARY, 0);
 
     /* 字体必须显式指定：msgbox 默认吃 LVGL 主题字体，而本工程的默认字体是
      * 16px 的 simsun（约 1436 个字形），界面用到的一些汉字（"散""嘱"…）
@@ -767,10 +913,10 @@ void robot_ui_show_error(const char *title, const char *content)
     err_panel = lv_obj_create(scr);
     lv_obj_set_size(err_panel, LV_PCT(92), LV_PCT(78));
     lv_obj_center(err_panel);
-    lv_obj_set_style_bg_color(err_panel, lv_color_hex(0x3A1F1F), 0);
+    lv_obj_set_style_bg_color(err_panel, THEME_RED_BG, 0);
     lv_obj_set_style_bg_opa(err_panel, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(err_panel, 3, 0);
-    lv_obj_set_style_border_color(err_panel, lv_color_hex(0xE53935), 0);
+    lv_obj_set_style_border_color(err_panel, THEME_RED_BORDER, 0);
     lv_obj_set_style_radius(err_panel, 20, 0);
     lv_obj_set_flex_flow(err_panel, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(err_panel, LV_FLEX_ALIGN_SPACE_EVENLY,
@@ -780,24 +926,25 @@ void robot_ui_show_error(const char *title, const char *content)
     lv_obj_t *t = lv_label_create(err_panel);
     lv_label_set_text(t, (title != NULL && title[0] != '\0') ? title : "出错了");
     lv_obj_set_style_text_font(t, &lv_font_ui_24, 0);
-    lv_obj_set_style_text_color(t, lv_color_hex(0xFFCDD2), 0);
+    lv_obj_set_style_text_color(t, THEME_RED_DARK, 0);
 
     lv_obj_t *c = lv_label_create(err_panel);
     lv_label_set_text(c, (content != NULL) ? content : "");
     lv_obj_set_style_text_font(c, &lv_font_ui_20, 0);
-    lv_obj_set_style_text_color(c, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_color(c, THEME_TEXT_PRIMARY, 0);
     lv_obj_set_width(c, LV_PCT(95));
     lv_label_set_long_mode(c, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(c, LV_TEXT_ALIGN_CENTER, 0);
 
     lv_obj_t *btn = lv_btn_create(err_panel);
     lv_obj_set_size(btn, LV_PCT(70), 70);
-    lv_obj_set_style_bg_color(btn, lv_color_hex(0xE53935), 0);
+    lv_obj_set_style_bg_color(btn, THEME_RED, 0);
     lv_obj_set_style_radius(btn, 16, 0);
     lv_obj_add_event_cb(btn, err_close_event_handler, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *bl = lv_label_create(btn);
     lv_label_set_text(bl, "知道了");
+    lv_obj_set_style_text_color(bl, THEME_TEXT_ON_GREEN, 0);
     lv_obj_set_style_text_font(bl, &lv_font_ui_24, 0);
     lv_obj_center(bl);
 
@@ -1304,7 +1451,7 @@ void robot_ui_show_ask_alarm(const char *reason)
 
     ask_panel = lv_obj_create(lv_layer_top());
     lv_obj_set_size(ask_panel, LV_PCT(100), LV_PCT(100));
-    lv_obj_set_style_bg_color(ask_panel, lv_color_hex(0xF44336), 0);
+    lv_obj_set_style_bg_color(ask_panel, THEME_RED, 0);
     lv_obj_set_style_bg_opa(ask_panel, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(ask_panel, 0, 0);
     lv_obj_set_style_radius(ask_panel, 0, 0);
@@ -1315,18 +1462,25 @@ void robot_ui_show_ask_alarm(const char *reason)
                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_row(ask_panel, 14, 0);
 
+    /* 询问页盖满全屏：顶部自带时钟（白字），不靠主屏状态栏。
+     * FLOATING 让它脱离 column flex 流，不挤压下面的内容
+     * （本版本 LVGL 没有 LV_POSITION_ABSOLUTE，FLOATING 是等效手段）。 */
+    lv_obj_t *lbl_time_ask = ui_clock_label_create(ask_panel, THEME_TEXT_ON_GREEN);
+    lv_obj_add_flag(lbl_time_ask, LV_OBJ_FLAG_FLOATING);
+    lv_obj_align(lbl_time_ask, LV_ALIGN_TOP_MID, 0, 12);
+
     /* 大字标题 */
     title = lv_label_create(ask_panel);
     lv_label_set_text(title, "检测到异常声响");
     lv_obj_set_style_text_font(title, &lv_font_ui_24, 0);
-    lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_color(title, THEME_TEXT_ON_GREEN, 0);
     lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
 
     /* 小字原因（清洗过的那份） */
     detail = lv_label_create(ask_panel);
     lv_label_set_text(detail, ask_panel_reason);
     lv_obj_set_style_text_font(detail, &lv_font_ui_20, 0);
-    lv_obj_set_style_text_color(detail, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_color(detail, THEME_TEXT_ON_GREEN, 0);
     lv_obj_set_style_text_align(detail, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_width(detail, LV_PCT(90));
     lv_label_set_long_mode(detail, LV_LABEL_LONG_WRAP);
@@ -1338,7 +1492,7 @@ void robot_ui_show_ask_alarm(const char *reason)
     hint_lbl = lv_label_create(ask_panel);
     lv_label_set_text(hint_lbl, hint);
     lv_obj_set_style_text_font(hint_lbl, &lv_font_ui_16, 0);
-    lv_obj_set_style_text_color(hint_lbl, lv_color_hex(0xFFEBEE), 0);
+    lv_obj_set_style_text_color(hint_lbl, THEME_RED_BG, 0);
     lv_obj_set_style_text_align(hint_lbl, LV_TEXT_ALIGN_CENTER, 0);
 
     /* 两个大按钮：左右并排，横着一排 150×64（老人好点；圆角屏左右各内缩 28，
@@ -1358,29 +1512,29 @@ void robot_ui_show_ask_alarm(const char *reason)
     /* 「是的，报警」：白底红字（唯一会真的报警的那一个，做得最醒目） */
     btn_yes = lv_btn_create(row);
     lv_obj_set_size(btn_yes, 150, 64);
-    lv_obj_set_style_bg_color(btn_yes, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_bg_color(btn_yes, THEME_BG_CARD, 0);
     lv_obj_set_style_bg_opa(btn_yes, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(btn_yes, 32, 0);
     lv_obj_add_event_cb(btn_yes, ask_btn_handler, LV_EVENT_CLICKED, (void *)(intptr_t)1);
     lbl = lv_label_create(btn_yes);
     lv_label_set_text(lbl, "是的，报警");
     lv_obj_set_style_text_font(lbl, &lv_font_ui_24, 0);
-    lv_obj_set_style_text_color(lbl, lv_color_hex(0xF44336), 0);
+    lv_obj_set_style_text_color(lbl, THEME_RED, 0);
     lv_obj_center(lbl);
 
     /* 「不用了」：半透明白底白字（视觉上比上面那个"轻"，避免误点） */
     btn_no = lv_btn_create(row);
     lv_obj_set_size(btn_no, 150, 64);
-    lv_obj_set_style_bg_color(btn_no, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_bg_color(btn_no, THEME_BG_CARD, 0);
     lv_obj_set_style_bg_opa(btn_no, LV_OPA_30, 0);
     lv_obj_set_style_border_width(btn_no, 2, 0);
-    lv_obj_set_style_border_color(btn_no, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_border_color(btn_no, THEME_BG_CARD, 0);
     lv_obj_set_style_radius(btn_no, 32, 0);
     lv_obj_add_event_cb(btn_no, ask_btn_handler, LV_EVENT_CLICKED, (void *)(intptr_t)0);
     lbl = lv_label_create(btn_no);
     lv_label_set_text(lbl, "不用了");
     lv_obj_set_style_text_font(lbl, &lv_font_ui_24, 0);
-    lv_obj_set_style_text_color(lbl, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_color(lbl, THEME_TEXT_ON_GREEN, 0);
     lv_obj_center(lbl);
 
     printf("[Ask] 询问页已弹出：原因=%s（%u 秒无人应答按「不用了」处理；"

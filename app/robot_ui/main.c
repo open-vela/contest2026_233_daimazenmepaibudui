@@ -1691,6 +1691,34 @@ out:
     return NULL;
 }
 
+/* 一轮的超时上限（毫秒）：ASR+对话+TTS 正常几十秒；TLS 单次读超时 120s，
+ * 网络半死时一轮能拖到三分钟以上 —— 150s 还没收尾就按卡死处理（见回调）。 */
+#define VOICE_ROUND_TIMEOUT_MS 150000
+
+/* 超时看门狗（LVGL 线程的一次性定时器，voice_submit_handler 里创建）：
+ * 到点时这一轮还停在「处理中」= 网络慢或链路死了，界面必须给说法，
+ * 不能让用户对着"正在想…"干等（TLS 那边最多还会再熬到自己的 120s 超时，
+ * 但用户不欠那两分钟）。工作线程不杀：迟到的回复照样显示、照样播。 */
+static void voice_watchdog_cb(lv_timer_t *t)
+{
+    uint32_t gen = (uint32_t)(uintptr_t)lv_timer_get_user_data(t);
+
+    lv_timer_delete(t);                      /* 一次性：响过就自删 */
+
+    if (gen != touch_ui_voice_chat_generation()) {
+        return;                              /* 用户关窗/又开了一轮：不误伤 */
+    }
+    if (!touch_ui_voice_chat_busy()) {
+        return;                              /* 这一轮已经正常收尾了 */
+    }
+
+    printf("[VoiceChat] 本轮超 %d 秒未收尾，界面判超时（工作线程仍在等网络）\n",
+           VOICE_ROUND_TIMEOUT_MS / 1000);
+    touch_ui_set_voice_status("等太久了，网络可能不稳\n点「再说一次」重新问");
+    touch_ui_voice_chat_round_done();        /* 按钮放回可点 */
+    ui_post(ROBOT_STATUS_IDLE, ROBOT_FACE_HAPPY, NULL);
+}
+
 /* 「提交」：结束录音，把这一轮 PCM 交给工作线程（在 LVGL 线程里被调用） */
 static void voice_submit_handler(void *user_data)
 {
@@ -1789,6 +1817,18 @@ static void voice_submit_handler(void *user_data)
     pthread_attr_destroy(&attr);
 
     touch_ui_set_voice_status("正在识别…");
+
+    /* 超时看门狗（一次性定时器）：正常一轮 ASR+对话+TTS 几十秒够了，但
+     * TLS 单次读超时就有 120s —— 网络半死时用户会对着「正在想…」干等
+     * 两三分钟，感觉就是"问了没反应"（2026-10-14 用户原话"必须解决"）。
+     * 150s 还没收尾就界面主动判超时：状态行说人话、按钮放回「再说一次」。
+     * 工作线程不杀（HTTPS 调用杀不掉）：它迟到的结果照样能显示播放 ——
+     * 用户等来答案总比干等强。关窗/又开一轮都会推进世代号，看门狗对不上号
+     * 就什么都不做，不会误伤新一轮。 */
+    lv_timer_create(voice_watchdog_cb, VOICE_ROUND_TIMEOUT_MS,
+                    (void *)(uintptr_t)touch_ui_voice_chat_generation());
+    /* 一次性：回调开头自己 lv_timer_delete，不设 repeat_count 免得和
+     * LVGL 的自动回收打架 */
 }
 
 /* 「×」：用户放弃这一轮。停录音、丢缓冲；在途的工作线程靠世代号自动作废。 */

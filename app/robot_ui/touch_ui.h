@@ -106,6 +106,11 @@ bool touch_ui_voice_chat_active(void);
  * 对不上说明用户已经关窗或又开了一轮，这一轮的结果必须整份丢掉。 */
 uint32_t touch_ui_voice_chat_generation(void);
 
+/* 本轮是否还在"处理中"（已提交、未收尾）。给 main.c 的超时看门狗用：
+ * 到点了还 true 就是这一轮卡住了（网络慢/链路死），界面主动报超时并把
+ * 按钮放回「再说一次」。只在 LVGL 线程调（读的量只在 LVGL 线程写）。 */
+bool touch_ui_voice_chat_busy(void);
+
 void touch_ui_set_voice_submit_cb(voice_submit_cb_t cb, void *user_data);
 void touch_ui_set_voice_cancel_cb(voice_cancel_cb_t cb, void *user_data);
 
