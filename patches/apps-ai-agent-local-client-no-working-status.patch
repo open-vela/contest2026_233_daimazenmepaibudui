@@ -1,0 +1,43 @@
+--- a/src/core/agent_loop.c
++++ b/src/core/agent_loop.c
+@@ -912,9 +912,31 @@
+ #define WORKING_PHRASE_COUNT \
+     ((int)(sizeof(s_working_phrases) / sizeof(s_working_phrases[0])))
+ 
++/* local_client 渠道名。必须与 src/sdk/velaclaw_client_local.c 的
++ * CLIENT_CHANNEL 逐字一致（那边是文件私有的 #define，没有对外头文件，
++ * 所以这里只能重写一份字面串）。改一处必须改另一处。 */
++#define AGENT_CHAN_LOCAL_CLIENT "local_client"
++
+ /* Send a "working" status message on the first iteration.
+  * Skip for feishu (has its own typing indicator) and voice
+- * (TTS synthesis of a status phrase wastes time and memory). */
++ * (TTS synthesis of a status phrase wastes time and memory).
++ *
++ * ★ local_client 也必须跳过（2026-10-16）。
++ *
++ * velaclaw_client_local.c 的 velaclaw_ask() 是**一次性异步回调**语义：
++ * 它注册 c->async_cb，而 tap_callback 一收到本渠道的 outbound 消息就调用
++ * 该回调并把 async_cb 置 NULL（见该文件 tap_callback 的 async 分支）。
++ * 也就是说 **本渠道的第一条 outbound 消息就把这次 ask 的回调消耗掉了**。
++ *
++ * 而本条状态话是在 ReAct 循环开头无条件发出的，它比真正的模型回复先到
++ * → 回调被“正在思考中...”触发并清空 → 真回复到达时 async_cb 已是 NULL，
++ * 只能落进 sync 分支的 c->reply_text 并 sem_post(c->reply_sem)。而上层
++ * （app/hello_app/ai_llm.c 的 llm_do_ai_agent_request）等的是自己的
++ * backend_sem、注册的是 async 回调，**没有任何人去读 reply_text、也没有人
++ * 等 reply_sem** → 真回复就此丢失，上层表现为“一直停在思考中、收不到回复”。
++ *
++ * 语音链路正是走 local_client（ai_llm.c 里 velaclaw_client_open("elder_companion")），
++ * 所以这不是理论问题，是每次对话都会发生。 */
+ static void send_working_status(const agent_msg_t* msg, int iteration)
+ {
+     if (iteration != 0) {
+@@ -922,6 +944,7 @@
+     }
+     if (strcmp(msg->channel, AGENT_CHAN_FEISHU) == 0
+         || strcmp(msg->channel, AGENT_CHAN_VOICE) == 0
++        || strcmp(msg->channel, AGENT_CHAN_LOCAL_CLIENT) == 0
+ #ifdef CONFIG_FEATURE_SYSTEM_VELACLAW
+         || strcmp(msg->channel, AGENT_CHAN_QUICKAPP) == 0
+ #endif

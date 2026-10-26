@@ -26,7 +26,12 @@
  * Pre-processor Definitions
  ****************************************************************************/
 
-/* 面板原生分辨率（CO5300，RGB565，QSPI）。协议 v2 就按这个写死。 */
+/* 面板分辨率（CO5300，RGB565，QSPI）。协议 v2 就按这个写死。
+ *
+ * ⚠️ 2026-10-24 试过横屏（450×390）：co5300.c 写 MADCTL 换轴在真机上是乱码，
+ * 已整体回退到竖屏 390×450（详见 co5300.c 里那段记录）。
+ * PC 端 tools/lcd_mirror/lcd_mirror.py 的 DEFAULT_W/H 必须和这里一致
+ * （它按 x+w<=W、y+h<=H 校验帧，不一致会整片丢帧）。 */
 #define LCD_MIRROR_PANEL_W        390
 #define LCD_MIRROR_PANEL_H        450
 #define LCD_MIRROR_ROW_BYTES      (LCD_MIRROR_PANEL_W * 2)          /* 780 */
@@ -87,7 +92,7 @@
  *       w*h 个像素，所有 run 之和必须正好等于 w*h。
  * 压不小（RLE 不小于原样）时板端直接退回原样发，flags 的 bit0 就是 0。
  *
- * **一帧最多 LCD_MIRROR_MAX_ROWS_PER_FRAME 行**（w 恒为 390）：这个上限由板端
+ * **一帧最多 LCD_MIRROR_MAX_ROWS_PER_FRAME 行**（w 恒为 LCD_MIRROR_PANEL_W）：这个上限由板端
  * 那块 RLE scratch 缓冲的大小决定（见 lcd_mirror.c 的 lm_take_run / lm_build_frame）。
  * 脏区行数比它多时会被**拆成多帧**发，不是丢行 —— 客户端按 (x,y,w,h) 贴图，
  * 拆帧对画面没影响，只是多几个 20 字节的头。 */
@@ -205,7 +210,7 @@ bool lcd_mirror_take_redraw_request(void);
  *   "现在按着没有、在哪"，所以这里给的是**最新状态**，可以反复读：
  *     - 返回 false：镜像没在跑，或者从来没收到过合法的触摸消息。
  *       此时 *x / *y / *pressed **一个字都不改**，调用方自己给默认值。
- *     - 返回 true ：*x / *y 是面板坐标（已经钳在 0..389 / 0..449），
+ *     - 返回 true ：*x / *y 是面板坐标（已经钳在面板内 0..W-1 / 0..H-1），
  *       *pressed 是当前是"按下"还是"抬起"。
  *   断开/停止之后会强制变成"抬起"，但坐标还留着最后那一次（诊断用）；
  *   所以"返回 true 且 pressed=false"是正常状态，不是错误。

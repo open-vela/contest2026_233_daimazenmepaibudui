@@ -10,13 +10,17 @@
  *
  * 语音（voice_tts_speak 这条）对**调用方缓冲**的要求：一次能念多少字由
  * mimo_voice.c 的 MIMO_TTS_TEXT_MAX（300 字）和调用方的 PCM 缓冲一起决定，
- * 两块都要按"300 字 ≈ 60 秒 ≈ 2 MB"（16 kHz 单声道 s16le，32 KB/秒）准备：
- *   - robot_ui 的 VOICE_TTS_BUF_BYTES 建议 (16000 * 2 * 70) = 2240000 字节；
- *   - ai_audio 的 AUDIO_PLAY_BUFFER_MS 建议 70000（audio_play_start 会把
- *     PCM 整段拷进自己的播放缓冲，装不下直接返回 -ENOSPC，所以它也得这么大）。
- * 两块合起来约 4.3 MB，加上合成时那块 896 KB 的响应缓冲，一轮 TTS 的峰值
- * 约 5.2 MB（用户堆约 8 MB）。缓冲给得比这小也不会越界：mimo_tts_synthesize()
- * 按剩余空间自动少念几个字，并在日志里报"念到第几个字"。
+ * 调用方缓冲按"300 字 ≈ 60 秒 ≈ 2 MB"（16 kHz 单声道 s16le，32 KB/秒）准备
+ * （hello_app 的 g_tts_buf / robot_ui 的 s_tts_buf，都是开机预分配 + 阶梯降级）。
+ *
+ * ⚠ 2026-10-19 更新：播放层**不再需要**同尺寸的第二份缓冲 —— TTS 出声走
+ * audio_play_start_ref()（零拷贝，直读调用方缓冲），ai_audio 的
+ * AUDIO_PLAY_BUFFER_MS 已从 70000 砍回 16000（play_buf 只服务短提示音）。
+ * 一轮 TTS 的常驻峰值就是调用方那 2 MB + 合成时 896 KB 响应缓冲 ≈ 3 MB；
+ * 旧口径"两块合起来 4.3 MB"曾把开机水位挤爆（hello_app 崩溃重启死亡螺旋，
+ * 取证见 ai_audio.h 的 AUDIO_PLAY_BUFFER_MS 注释）。缓冲给得比 2 MB 小也
+ * 不会越界：mimo_tts_synthesize() 按剩余空间自动少念几个字，并在日志里报
+ * "念到第几个字"。
  *
  ****************************************************************************/
 
@@ -181,5 +185,66 @@ void mimo_set_reminder_hook(mimo_reminder_hook_t fn);
 
 int mimo_wav_load_16k(const char *path, unsigned char **pcm_out,
                       size_t *pcm_len);
+
+/* ===== 切块上限：调用方按"首块 / 后续块"分别传进 mimo_tts_speak_head() =====
+ *
+ * 两个值定义在这里（不是 mimo_voice.c）是因为它们是**调用方要选的旋钮**：
+ * 首块要小（早出声），后续块要大（块间空档少）。2026-10-25 之前后续块上限
+ * 写死在 mimo_voice.c 里、走的是首块那个小值，改宏是空操作 —— 详见
+ * mimo_voice.c 里"切块上限的设计史"那一大段真机实测。
+ *
+ * 两个值都是**上限**：tts_split_len() 优先切在句子边界，实际块一般更小。
+ * min_chars = max/2，所以首块最短 10 字、后续块最短 32 字，不会切出碎块。 */
+
+/* 后续块上限：大一点，块与块之间的空档少、断句落在句号上而不是逗号上。
+ * 嫌停顿多就调大；代价是被打断时浪费的音频更多。 */
+#define MIMO_TTS_CHUNK_CHARS 64
+
+/* 首块上限：比后续块小，只为让第一声早点出来（"回复快"优先级高于"顺滑"）。 */
+#define MIMO_TTS_HEAD_CHUNK_CHARS 20
+
+/****************************************************************************
+ * Name: mimo_tts_speak_head
+ *
+ * Description:
+ *   只合成回复的**一块**（按句子边界切，字数上限由 max_chars 给），给
+ *   "边播边合成"的流水线用（2026-10-19 用户反馈"回复太慢"：原来要等整条
+ *   回复合成完才出声，两三秒的等待被感知成七八秒）。
+ *
+ *   ⚠ 名字叫 speak_head，但流水线**每一块都调它**（首块 + 后续块）。所以
+ *   必须区分传值：
+ *     - 第 1 块：max_chars = MIMO_TTS_HEAD_CHUNK_CHARS（小，早出声）
+ *     - 后续块：max_chars = MIMO_TTS_CHUNK_CHARS（大，少空档）
+ *
+ *   典型用法（见 ai_companion_main.c 的 llm_complete_callback）：
+ *     1. mimo_tts_speak_head(全文, buf, cap, HEAD, &len, &consumed);
+ *     2. audio_play_start_ref(buf, len) 立刻开始出声；
+ *     3. 播放的同时，生产者循环对 text+consumed 继续调本函数（max_chars 传
+ *        CHUNK），把后续块写进**另外两个缓冲槽**（三槽轮转，队列深度 2）；
+ *     4. 每块播放完成回调里取下一块接着播，队列空了才算整轮收尾。
+ *
+ *   ⚠ 顺滑的天花板：云端合成比实时慢约 20%（实测 235 ms/字 合成 vs 196
+ *   ms/字 播放），所以块间必有静音，调块大小只能把它从"每 4 秒断一次"
+ *   变成"每 12 秒断一次"，压不到 0。剩下每块 ~800 ms 的 TLS 握手要靠连接
+ *   复用才能省，而复用被 vela_tls.c 的排空判定挡死，需要单独授权才能动。
+ *
+ * Input Parameters:
+ *   text          - 待合成文本（UTF-8，从句首开始）；
+ *   pcm_out       - 输出缓冲（调用方的 TTS 常驻缓冲某一槽）；
+ *   pcm_cap       - 缓冲大小；
+ *   max_chars     - 本块最多几个字（传 MIMO_TTS_HEAD_CHUNK_CHARS 或
+ *                   MIMO_TTS_CHUNK_CHARS）；
+ *   pcm_len       - 输出：本块 PCM 字节数；
+ *   consumed_bytes - 输出：本块消耗的 text 字节数（调用方据此推进游标）。
+ *
+ * Returned Value:
+ *   OK on success; a negated errno (-EINVAL 参数 / -ENOENT 未配置 /
+ *   -ENOSPC 槽一个字都装不下 / -EIO 网络失败)。
+ *
+ ****************************************************************************/
+
+int mimo_tts_speak_head(const char *text, unsigned char *pcm_out,
+                        size_t pcm_cap, size_t max_chars, size_t *pcm_len,
+                        size_t *consumed_bytes);
 
 #endif /* __APP_HELLO_APP_MIMO_VOICE_H */

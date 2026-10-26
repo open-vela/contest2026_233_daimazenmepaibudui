@@ -48,8 +48,11 @@
 #include <stdbool.h>
 
 /* 显示文本的缓冲上限（字节，含结尾 '\0'）。
- * 与界面那一侧一致：robot_ui 的对话区显示缓冲就是 256。 */
-#define ROBOT_UI_BRIDGE_TEXT_MAX   256
+ * 2026-10-19 从 256 提到 1024：256 只装得下约 85 个汉字，大模型一条正常的
+ * 长回复（TTS 上限 300 字 ≈ 900 字节 UTF-8）在桥这里就被砍成三分之一，
+ * 用户实测"长答案屏幕上只显示一部分"的第一道截断就是它。1024 ≈ 340 字，
+ * 装得下整条回复还留清洗余量；touch_ui 那边的 VOICE_TEXT_MAX 已同步提到 1024。 */
+#define ROBOT_UI_BRIDGE_TEXT_MAX   1024
 
 /* 语音状态档位。
  * 这里**刻意不复用** touch_ui.h 的 touch_voice_state_t：那个头文件要 <lvgl.h>，

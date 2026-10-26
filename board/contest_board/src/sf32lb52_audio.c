@@ -133,6 +133,13 @@ extern int sifli_uart_reinit_rx_dma(int idx);
  * 拆一条刚开始的会话。 */
 #define SF32LB52_AUDIO_SWITCH_GRACE_MS  3000
 
+/* 播放僵尸判定：会话是播放方向、但**最近这么久没有任何 write()**，就认为
+ * 播放线程已经死了/卡死了（播放线程是连续写块的，正常间隙远小于此）。
+ * 依据见 sf32lb52_audio_rx_fix_apply 里 L5 守卫的说明：流水线 TTS 的最长
+ * 等待约 20 秒（llm_speak_chunk_complete 的 2000×10ms 上限），30 秒在它
+ * 之外，不会误伤任何活播放。 */
+#define SF32LB52_AUDIO_PLAY_ZOMBIE_MS   30000
+
 /* 停 RX DMA 通道时**不动 AUDPRC 的 ADC 数据通路**（CFG.ADC_PATH_EN，CFG 的
  * bit7）—— 只做 HAL_DMA_Abort()，**不**走 HAL_AUDPRC_DMAStop()。
  *
@@ -389,14 +396,32 @@ struct sf32lb52_audio_s
    *             换来的是绝不误停活会话。
    * holder_since：这次会话在 hw_start 里提交成功的时刻，判"会话刚开始"用
    *             （SF32LB52_AUDIO_SWITCH_GRACE_MS，见 sf32lb52_audio_start）。
+   * last_io    ：最近一次真的有人 read()/write() 的时刻。holder_alive 只回答
+   *             "线程/任务组的 TCB 还查得到吗" —— pid 会被重启的 app 复用
+   *             （看护把 hello_app 拉起来常常拿回同一个 pid），TCB 证据在
+   *             "僵尸会话 + app 被重启"的组合下会说谎；时间证据不会。
+   * last_write ：**只有 write()** 才更新的时刻。L5 的僵尸播放判定用它，不用
+   *             last_io —— 2026-10-21 真机教训：一条被打上 playback=1 标签的
+   *             **录音**会话（毒链见 ai_audio.c audio_configure_output 头上）
+   *             只做失败的 read()，而失败的 read() 同样会刷新 last_io，于是
+   *             "最近 30 秒有 IO"这条证据被卡死的读循环**自己喂活**，L5 永远
+   *             判成"健康的播放"永久跳过（skip-playback 连报 705 次，RX 冻死）。
+   *             真播放是连续 write() 的，卡死的录音循环一次 write() 都没有 ——
+   *             拿 write 独占的时间戳，两种会话才分得开。
+   * last_read  ：只有 read() 才更新的时刻。和 last_write 一起做"谁在主导"
+   *             判定：播放会话 last_write >= last_read，读循环卡死的会话
+   *             last_read >> last_write。
    *
-   * 四个都只在 running 为真时有意义：前三个在 hw_start 里记、hw_stop/hw_shutdown
-   * 清 running 时一起清。-1 = 没记过。 */
+   * 七个都只在 running 为真时有意义：在 hw_start 里记、hw_stop/hw_shutdown
+   * 清 running 时一起清。-1 / 0 = 没记过。 */
 
   pid_t                   holder_tid;
   pid_t                   holder_pid;
   pid_t                   user_tid;
   clock_t                 holder_since;
+  clock_t                 last_io;
+  clock_t                 last_write;
+  clock_t                 last_read;
 
   /* 真实通路状态位 —— 这是"硬件到底开着哪几条模拟级"的唯一真相，
    * **不是**方向标签。
@@ -1573,14 +1598,16 @@ static uint32_t sf32lb52_audio_rx_fix_apply(FAR struct sf32lb52_audio_s *priv,
          * 句柄收干净 → 再抹模块 → 再重建"，否则 HAL 的账本会和硬件对不上
          * （池里还说某条通道归谁、硬件已经被复位抹空）。
          *
-         * ⚠️ **只在 playback == 0（没有在播放）时才做**：
+         * ⚠️ **只在"播放确实还活着"时才跳过**（2026-10-20 改）：
          *   DMAC1 上挂着 codec 播放的 DMA —— hw_start 给 codec.hdma[DAC_CH0/1] 挂的
          *   就是 DMA1_Channel2/3，而这一记是**模块级**复位（RSTR1 的 DMAC1 位，
          *   bf0_hal_rcc.c:516/2032），整块 DMAC1 的通道配置、请求映射、标志位全回
          *   上电默认 —— 正在出声的播报会当场断掉。
-         *   录音会话的 playback 恒为 0（方向只在 hw_start 里提交，一个会话只有
-         *   一个方向），所以这一级在该用的场合总能跑；万一在播放态被轮到，只记下
-         *   原因（报告行里 note=skip-playback），下一轮轮转还会再轮到它。
+         *   原来的判据是裸看 playback 标签，但那个标签在 app 崩溃（fd 没走到
+         *   close）时会永久留真，把这一级堵死 25+ 分钟、麦克风变聋到重启
+         *   （见下面守卫代码上的三条证据说明）。现在改为"标签 + 通路位 +
+         *   持有者/宽限期 + 最近写入时间"四证合一；确实有活播放被轮到时，
+         *   只记下原因（报告行里 note=skip-playback），下一轮轮转还会再来。
          *
          * ⚠️ 这一记是**整块控制器**级的：被它一并抹掉的通道配置不限于 codec ——
          *   别的 DMAC1 用户（若此刻正有传输）也会被复位打断、且下一次启动可能因为
@@ -1611,7 +1638,42 @@ static uint32_t sf32lb52_audio_rx_fix_apply(FAR struct sf32lb52_audio_s *priv,
          *    或 armed 不是 0x2（BUSY），就说明通道没被真正重建。
          * 4) 武装丢弃缓冲：这一级有没有把请求握手叫活，靠 irq/half 涨没涨回答。 */
 
-        if (priv->playback)
+        /* playback 标签只是"最近一次 hw_start 提交的方向"。hw_stop/hw_shutdown
+         * 现在会清它，但 app 崩溃、fd 没走到 close 时那两个都跑不到 —— 僵尸
+         * 播放会话会把这个标签永久留真。2026-10-20 实测：hello_app 崩过一次
+         * 之后 playback=1 卡了 25+ 分钟，唯一的 DMAC1 复位被这一行永久跳过
+         * （每轮报告 note=skip-playback），RX 中断从此冻结、麦克风变聋，
+         * 只有重启板子能救。
+         *
+         * 所以这里不看标签本身，看"播放还活着"的证据，四条凑不齐就按僵尸
+         * 处理、照常做 DMAC1 复位（复位顺带把僵尸的 codec DMA 一起收掉 ——
+         * 它本来也没人在供数据）：
+         *   ① 播放通路位（dac/pa）至少一个还开着 —— 和标签一起才算真在播；
+         *   ② 持有者还活着（sf32lb52_audio_holder_alive），或会话还新到没过
+         *      宽限期（SF32LB52_AUDIO_SWITCH_GRACE_MS，短命线程窗口）；
+         *   ③ 最近 SF32LB52_AUDIO_PLAY_ZOMBIE_MS 内真的有人 **write()** 过。
+         *      ⚠️ 这条 2026-10-21 从 last_io 改成 last_write：last_io 连失败的
+         *      read() 都算，一条被打上 playback=1 标签的**录音**会话（毒链见
+         *      ai_audio.c audio_configure_output 头上那段）只做超时的 read()，
+         *      被判成"最近一直有 IO 的健康播放"永久跳过 L5 —— 这正是 10-21
+         *      那次 skip-playback 连报 705 次、RX 冻死的机制。
+         *   ④ write 主导：last_write >= last_read。真播放只写不读；中毒的
+         *      录音会话被 read() 刷出来的 last_read 一压就露馅。加上这条之后，
+         *      "读循环自己喂活第③条"的路被彻底堵死。
+         * 流水线 TTS 的最长等待约 20 秒（llm_speak_chunk_complete 的
+         * 2000×10ms 上限），30 秒阈值在它之外，不会误伤活播放。
+         * 另外 L5 本来就只从 read 侧的恢复路径进来 —— 纯播放会话压根走不到这，
+         * 所以③④放宽不了任何"真在播"的场景，只放过"标签是播、身体是录"的假播放。 */
+
+        if (priv->playback &&
+            (priv->dac_path_on || priv->pa_on) &&
+            (sf32lb52_audio_holder_alive(priv) ||
+             (uint32_t)TICK2MSEC(clock_systime_ticks() - priv->holder_since) <
+               SF32LB52_AUDIO_SWITCH_GRACE_MS) &&
+            priv->last_write != (clock_t)0 &&
+            (uint32_t)TICK2MSEC(clock_systime_ticks() - priv->last_write) <
+               SF32LB52_AUDIO_PLAY_ZOMBIE_MS &&
+            priv->last_write >= priv->last_read)
           {
             priv->rx_fix_note = "skip-playback";
             armed = 0u;
@@ -2095,6 +2157,16 @@ static int sf32lb52_audio_hw_start(FAR struct sf32lb52_audio_s *priv,
 
   priv->holder_since = clock_systime_ticks();
 
+  /* 会话起点也算"有人在用"：播放僵尸判定（SF32LB52_AUDIO_PLAY_ZOMBIE_MS）
+   * 从这里开始计时 —— 否则一条刚起来、还没进第一次 write() 的播放会被
+   * 误判成僵尸。last_write 同样从这里起表（L5 现在只认 write 独占的时间戳，
+   * 见 struct 里 last_write 那段）；last_read 从 0 起，第一次 read() 之后
+   * "谁在主导"的证据才成立。 */
+
+  priv->last_io     = clock_systime_ticks();
+  priv->last_write  = priv->last_io;
+  priv->last_read   = (clock_t)0;
+
   /* 新会话开始：上一次会话遗留的 read()（如果有）到此作废 —— 它的会话代号
    * 已经对不上，醒来就会自己退出，不会把新会话的数据接走。 */
 
@@ -2161,6 +2233,17 @@ static int sf32lb52_audio_hw_stop(FAR struct sf32lb52_audio_s *priv)
 
       priv->rx_aborted = priv->rx_busy;
       priv->session_gen++;
+
+      /* 早退也要把方向标签一并清掉：会话已经没有硬件状态了，留着的
+       * playback 只会让下一条判定（L5 守卫、方向冲突）拿上一条会话
+       * 的方向说事。pending_playback 同理：它是"下一次 START 想要的方向"
+       * 这个**意图**，会话都收干净了意图就必须作废 —— 否则一次没走到
+       * START 的 CONFIGURE(OUTPUT)（设音量、报警抢麦失败等）会把这个意图
+       * 永久留真，下一条**录音**会话就带着 playback=1 启动（毒链见
+       * ai_audio.c 的 audio_configure_output 头上那段）。 */
+
+      priv->playback = false;
+      priv->pending_playback = false;
       nxsem_post(&priv->rx_sem);
       return OK;
     }
@@ -2370,11 +2453,19 @@ static int sf32lb52_audio_hw_stop(FAR struct sf32lb52_audio_s *priv)
   priv->running = false;
 
   /* running 一清，这套持有者 id 就没有意义了。不清的话，下一个会话看到的是
-   * 上一条会话的线程 id，判"持有者还在不在"就会拿错人。 */
+   * 上一条会话的线程 id，判"持有者还在不在"就会拿错人。
+   * playback 同理：它是"这次会话的方向"，会话结束了标签就该死 —— 留真的
+   * 话，L5 的播放守卫会把一次本该跑的 DMAC1 复位永久跳过（僵尸播放卡死
+   * 麦克风，见 sf32lb52_audio_rx_fix_apply 的 L5 段）。 */
 
   priv->holder_tid = (pid_t)-1;
   priv->holder_pid = (pid_t)-1;
   priv->user_tid   = (pid_t)-1;
+  priv->last_io    = (clock_t)0;
+  priv->last_write = (clock_t)0;
+  priv->last_read  = (clock_t)0;
+  priv->playback   = false;
+  priv->pending_playback = false;
 
   audinfo("audio stopped\n");
   return OK;
@@ -2513,11 +2604,17 @@ static int sf32lb52_audio_hw_shutdown(FAR struct sf32lb52_audio_s *priv)
 
   /* 和 hw_stop() 一样要清持有者 id：close() 之后 running 变假，留着上一条会话的
    * 线程 id 只会把下一次判定带偏（本函数所在的上下文不能加别的活，清几个
-   * pid_t 只是普通赋值）。 */
+   * pid_t 只是普通赋值）。playback 同理 —— 会话随 close 结束，方向标签跟着死，
+   * 否则 L5 的播放守卫会被一条已经关掉的会话永久堵住。 */
 
   priv->holder_tid = (pid_t)-1;
   priv->holder_pid = (pid_t)-1;
   priv->user_tid   = (pid_t)-1;
+  priv->last_io    = (clock_t)0;
+  priv->last_write = (clock_t)0;
+  priv->last_read  = (clock_t)0;
+  priv->playback   = false;
+  priv->pending_playback = false;
   return OK;
 }
 
@@ -3215,9 +3312,12 @@ static ssize_t sf32lb52_audio_write(FAR struct audio_lowerhalf_s *dev,
 
   /* 记下"这次会话最近一次真的有人在写"（判残留时的一条证据，见
    * sf32lb52_audio_holder_alive）。放在 running 早退之后：设备没在跑就不算
-   * 有人用它。 */
+   * 有人用它。last_write（**只有这一处**更新）供 L5 的僵尸播放判定用
+   * （SF32LB52_AUDIO_PLAY_ZOMBIE_MS + write 主导判据，见 struct 里那段）。 */
 
-  priv->user_tid = nxsched_gettid();
+  priv->user_tid  = nxsched_gettid();
+  priv->last_io   = clock_systime_ticks();
+  priv->last_write = priv->last_io;
 
   /* 起这次等待前的两句清理：
    *
@@ -3702,7 +3802,12 @@ static ssize_t sf32lb52_audio_read(FAR struct audio_lowerhalf_s *dev,
       return 0;
     }
 
-  priv->user_tid = nxsched_gettid();
+  /* last_read 只在这一处更新（**失败的 read 也记** —— 卡死的读循环正是靠
+   * 这条在 L5 守卫里压过 last_write、戳穿"标签是播、身体是录"的假播放）。 */
+
+  priv->user_tid  = nxsched_gettid();
+  priv->last_io   = clock_systime_ticks();
+  priv->last_read = priv->last_io;
 
   /* 清掉上一次 stop 可能留下的计数：不清的话本次 read 一进等待就立刻返回，
    * 把一块没采满的缓冲当数据交上去。清在 rx_busy 置真之前 —— ISR 的 post

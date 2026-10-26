@@ -10,8 +10,11 @@
 
 #include <nuttx/config.h>
 #include <nuttx/clock.h>     /* clock_systime_ticks / TICK2MSEC：开机起算的运行时长 */
+#include <nuttx/net/tcp.h>   /* tcp_conn_probe()：连接池只读快照，见下方 [TCP] 行 */
+#include <netinet/in.h>      /* ntohs()：[TCP] 行把对端端口转主机序打印 */
 #include <stdio.h>
 #include <stdlib.h>
+#include <malloc.h>                 /* mallinfo：开机堆水位一行日志用 */
 #include <unistd.h>
 #include <signal.h>
 #include <pthread.h>
@@ -72,6 +75,11 @@
  * 和 PC 侧脚本 _flash/gen_tts_cache.py 必须逐字节一致。 */
 #include "tts_cache.h"
 
+/* 说完之后立刻响一声的"我听见了"（S2.1）：真实答复砍不进 1 秒，但把
+ * "说完到有点动静"压到 1 秒上下，体感差别很大。robot_ui 用的是同一份
+ * prompt_ack.c（跨 app 符号最终链接时解析）。 */
+#include "prompt_ack.h"
+
 /****************************************************************************
  * Pre-processor Definitions
  ****************************************************************************/
@@ -123,8 +131,9 @@
  * MQTT 那一路：ai_network_publish_command() 的参数缓冲是 AI_CMD_PARAM_MAX(512)，
  * ASR 的 text_buf 也是 512，理论上塞得下；但 JSON 转义会把 " 和 \ 涨成 2 字节，
  * 撑爆后 ai_network_json_escape() 会把参数**整段丢空**（界面收到一条空消息）。
- * 直调那一路：界面自己的显示缓冲也只有 256（robot_ui_bridge.h 的
- * ROBOT_UI_BRIDGE_TEXT_MAX），两边在这里取同一个上限，省得两路显示不一样。 */
+ * 直调那一路：界面的显示缓冲 2026-10-19 已提到 1024（robot_ui_bridge.h），
+ * 但用户原话是短句（15 秒语音 ≈ 60 字 ≈ 180 字节），256 仍然装得下，
+ * 这里不动 —— 上限跟着 MQTT 转义余量走，不跟着界面缓冲走。 */
 #define USER_SAID_MAX            256
 
 /* ---- 异常声追问流程的参数 (W1) ---- */
@@ -132,8 +141,14 @@
 /* 同一阵响声的防抖时间：这段时间内再来一次检测直接丢掉 */
 #define ASK_DEBOUNCE_MS          10000
 
-/* 每轮追问最多听多久（毫秒） */
-#define ASK_LISTEN_TIMEOUT_MS    6000
+/* 每轮追问最多听多久（毫秒）。
+ *
+ * 这个值**必须大于** `AUDIO_VAD_SILENCE_TIMEOUT_MS`（ai_audio.h）加一次 ASR
+ * HTTPS 的耗时，否则追问的回答窗口会赶在识别结果回来之前关掉，回答永远
+ * "超时"。历史上它跟着静音超时改过好几回（6 秒/10 秒），别再写死对照数字 ——
+ * 改 `AUDIO_VAD_SILENCE_TIMEOUT_MS` 时回头对一眼这里就够。 */
+
+#define ASK_LISTEN_TIMEOUT_MS    10000
 
 /* 迟迟收不到"播放完成"回调时的兜底（毫秒）。
  * audio_play_start() 的播放被 stop 打断时回调不会触发，不兜底就一直卡在 SPEAKING。 */
@@ -401,7 +416,12 @@ static uint32_t    g_net_retry_count;
 
 /* 语音段累积缓冲区 (用于 ASR) */
 
-#define SPEECH_BUF_MAX_FRAMES  (16000 * 10)  /* 最长10秒 @16kHz */
+/* 最长 15 秒（2026-10-18 从 10 秒上调）：老人说话慢、一句话带停顿，10 秒
+ * 经常掐掉尾巴，ASR 拿到半句话基本识别不出什么 —— "总是听不懂"的成分之一。
+ * 代价 = 缓冲 480 KB（+160 KB）、ASR 请求体的 base64 峰值 ~640 KB，堆可承受
+ * （大块预分配见 tts_buf_ensure 那一段的说明）。 */
+
+#define SPEECH_BUF_MAX_FRAMES  (16000 * 15)  /* 最长15秒 @16kHz */
 
 /* 一段语音至少要有多长才值得送去识别：1600 帧 = 100ms @16kHz。
  * 两个地方共用它，口径必须一致：
@@ -411,9 +431,102 @@ static uint32_t    g_net_retry_count;
 
 #define SPEECH_MIN_FRAMES_FOR_ASR  1600
 
+/* 300 ms 预滚缓冲：VAD 判"开始说话"要先攒 300ms 的能量帧（min_speech_ms），
+ * 这一段音频在 2026-10-18 之前会被 speech_capture_begin 的清零直接丢掉 ——
+ * 老人起音慢，句子的第一个字经常就死在这一段里，ASR 收到的句子缺头，
+ * 识别结果自然驴唇不对马嘴（"总是听不懂"的另一个成分）。
+ *
+ * audio_data_callback 每帧把最近 300ms 挪进这里；speech_capture_begin
+ * 收段时先把它垫进累积缓冲，句子不再缺头。KWS 命中路径同样受益：命中报在
+ * 尾静音 300ms 之后，预滚里只会是唤醒词结束后的静音/命令词开头，不会把
+ * 唤醒词本身垫回去（那条"清零防唤醒词混入"的纪律仍然成立）。 */
+
+#define SPEECH_PREROLL_SAMPLES  (16000 * 3 / 10)  /* 300ms @16kHz = 4800 采样 */
+
 static int16_t *g_speech_buf = NULL;
 static size_t   g_speech_frames = 0;
 static bool     g_speech_capturing = false;
+
+/* 「没听清」这句话要出声的请托（S4.3）。
+ *
+ * 为什么不就地播：有两处判"没听清"的代码跑在**录音线程**上（VAD 回调，
+ * 见 speech_capture_complete 的降噪门那一支），而起播要过
+ * audio_prepare_output() 停录音 —— 从录音线程里停录音是自己停自己，
+ * 正是历史上把录音线程拖死的那类尾巴。所以录音线程只置标志，main_loop_task
+ * 每 100 ms 看一眼去说（它不是录音线程也不是播放线程，说得起）。
+ *
+ * 别的线程（dialogue_worker 里的 ASR 失败/结果为空）自己就安全，直接调
+ * prompt_ack_play_kind()，不用绕这一道。 */
+static volatile bool g_say_miss_pending = false;
+
+/* 预滚 + 麦克风健康观测（都只在录音线程写，别的线程最多在收尾点读一次快照）。
+ *
+ * peak/energy_sum 是为了回答"麦克风到底有没有收到声音"：收尾时打一行
+ * 峰值 + RMS，串口一眼能分出三种情况 ——
+ *   峰值 < ~300：麦克风这轮基本没收到声音（距离太远/增益太低/硬件问题），
+ *                ASR 结果再差也不赖云端；
+ *   峰值正常、RMS 很低：收到的多是底噪，人声占比低；
+ *   两者都正常但识别还错：才是 ASR/内容本身的问题。 */
+
+static int16_t g_speech_preroll[SPEECH_PREROLL_SAMPLES];
+static uint32_t g_speech_peak;        /* 本段峰值（绝对值） */
+static int64_t  g_speech_energy_sum;  /* 本段幅度平方和（算 RMS 用） */
+
+/* TTS 整段 PCM 缓冲（回复文字 → 16k/单声道/s16le 全段）。
+ *
+ * 2026-10-17 晚的真机教训："回复只念 2 个字就停"。当时这个缓冲是**懒分配**
+ * 的 —— 第一次回复那一刻才 malloc(2 MB)，而那时堆已经被 LVGL / TLS /
+ * 镜像 / 网络切碎，2 MB 的连续块要不到 → 静默落到 32 KB 兜底 ≈ 1 秒音频
+ * ≈ 2 个字。修复 = 开机初始化时就预分配（那时堆还是整块的），并带阶梯
+ * 降级：2 MB → 1.5 MB → 1 MB → 512 KB → 32 KB。实际拿到哪一档**开机即
+ * 打日志**（[TTS] 缓冲 N 字节已分配），串口一眼可判；万一全失败，第一次
+ * 回复时 tts_buf_ensure() 还会再试一遍（惰性兜底保留）。
+ *
+ * ⚠ 2026-10-19 补充：预分配刚加上时曾把开机水位挤爆 —— 那时 TTS 播放还要
+ * memcpy 一份进 play_buf，play_buf 被迫 2.24 MB × 两份 ctx（hello_app /
+ * robot_ui），叠上这里的 2 MB 后开机空闲只剩 606 KB，主循环任务都建不起来
+ * （崩溃重启死亡螺旋，取证见 ai_audio.h 的 AUDIO_PLAY_BUFFER_MS 注释）。
+ * 解法不是砍这里的 2 MB，而是 TTS 播放改零拷贝（audio_play_start_ref），
+ * play_buf 缩回 512 KB —— 这块 2 MB 因此得以保留，300 字长回复完整念完
+ * 的能力不受损。 */
+
+static unsigned char *g_tts_buf;
+static size_t          g_tts_buf_size;
+
+static int tts_buf_ensure(void)
+{
+  static const size_t ladder[] =
+  {
+    2 * 1024 * 1024,                /* 300 字上限 ≈ 64 秒，配套见下 */
+    1536 * 1024,                    /* ≈ 48 秒 ≈ 220 字 */
+    1024 * 1024,                    /* ≈ 32 秒 ≈ 150 字 */
+    512 * 1024,                     /* ≈ 16 秒 ≈ 75 字 */
+    32 * 1024                       /* 兜底 ≈ 1 秒（只够一两个字，聊胜于无） */
+  };
+  size_t i;
+
+  if (g_tts_buf != NULL)
+    {
+      return OK;
+    }
+
+  for (i = 0; i < sizeof(ladder) / sizeof(ladder[0]); i++)
+    {
+      g_tts_buf = malloc(ladder[i]);
+      if (g_tts_buf != NULL)
+        {
+          g_tts_buf_size = ladder[i];
+          printf("[TTS] 缓冲 %zu 字节已分配（第 %zu 档）\n",
+                 g_tts_buf_size, i + 1);
+          return OK;
+        }
+
+      printf("[TTS] 缓冲 %zu 字节分配失败，试下一档\n", ladder[i]);
+    }
+
+  g_tts_buf_size = 0;
+  return -ENOMEM;
+}
 
 /* 上一次成功发给界面的语音状态串（空串 = 还没发过），去重就靠它 */
 static char g_voice_state_sent[16];
@@ -537,9 +650,14 @@ static uint32_t main_now_ms(void)
 static const char *voice_state_probe(sm_context_t *ctx)
 {
   /* 扬声器在响 = 我在说话。这条要排最前面：TTS 出声时状态机还停在
-   * AI_TALKING，不先判播放，界面就会一直显示"正在想…"。 */
+   * AI_TALKING，不先判播放，界面就会一直显示"正在想…"。
+   *
+   * ★ record_hold（整轮播报让路锁，2026-10-24）也算"正在说"：流水线 TTS 的
+   * 首句→尾段空档里扬声器是不响的（playing=false），但整轮还没说完。以前
+   * 这段空档界面会掉回"空闲"，用户看到的就是"AI 话说到一半断掉了"。 */
 
-  if (audio_is_playing(&g_audio_ctx) || g_ask_phase == ASK_PHASE_SPEAKING)
+  if (audio_is_playing(&g_audio_ctx) || g_ask_phase == ASK_PHASE_SPEAKING ||
+      g_audio_ctx.record_hold)
     {
       return VOICE_STATE_SPEAKING;
     }
@@ -692,11 +810,274 @@ static void voice_state_tick(sm_context_t *ctx)
 
 static void speech_capture_begin(sm_context_t *ctx)
 {
+  /* ★ 整轮播报期间不认（2026-10-24）：这段时间麦本来就该是关的
+   * （record_hold，见 ai_audio.h）。真走到这里只可能是残留的一帧或者别处
+   * 抢跑 —— 不认，否则就是把状态机从"正在说"切到"正在听"，用户听到的
+   * 正是"AI 说话被打断"。 */
+
+  if (g_audio_ctx.record_hold)
+    {
+      printf("[VAD] 整轮播报中丢弃语音开始（不让旁边的声音把 AI 从说切到听）\n");
+      return;
+    }
+
   g_speech_frames = 0;              /* 从这一块开始重新累积 */
+
+  /* 预滚垫头：把最近 300ms 先放进累积缓冲，VAD 门槛期丢掉的句头补回来
+   * （为什么需要见 SPEECH_PREROLL_SAMPLES 的注释）。调用者可能是主循环
+   * （KWS/门控）而预滚由录音线程写，理论上可能读到一帧半的撕裂值 ——
+ * 最坏是句头带一小段杂音，比缺头强，不值得为它加锁。 */
+
+  if (g_speech_buf != NULL)
+    {
+      memcpy(g_speech_buf, g_speech_preroll,
+             SPEECH_PREROLL_SAMPLES * sizeof(int16_t));
+      g_speech_frames = SPEECH_PREROLL_SAMPLES;
+    }
+
+  g_speech_peak = 0;                /* 本段观测清零重记 */
+  g_speech_energy_sum = 0;
   g_speech_capturing = true;
   g_voice_spoke = false;            /* 新一轮说话开始：这轮还没出过声 */
   sm_handle_event(ctx, SM_EVENT_WAKEUP);
 }
+
+/* ===== 基线取证（S0）：把一轮对话串成时间线 =====
+ *
+ * 用户报的是「说完半天不出声」。这一段链路是
+ *   说完 → ASR（阻塞 HTTPS）→ LLM（velaclaw IPC → 云端）→ TTS 首块合成 → 起播
+ * 环节多、每一环都可能慢，只靠体感分不出慢在哪。下面三个时刻 + 既有的
+ * 「[TTS] 块间空档」就是四个对照数：
+ *   ① 说完 → ASR 文本到手          （g_t0 → g_t1）
+ *   ② ASR 文本 → LLM 回复到手      （g_t1 → g_t2）
+ *   ③ 回复到手 → 首字出声          （g_t2 → 首句起播）
+ *   ④ 块间空档                     （llm_speak_chunk_complete 里那行）
+ *
+ * **只打点，不改任何行为** —— 后面每个阶段改造完都拿这四个数当对照组；
+ * 改了某项、对应数没动，就是「现实与预期不符」，得停下来看，别接着往下改。
+ * 跨线程写这几个量没关系：一轮里它们按 ①→②→③ 的顺序依次写，读的时刻一定在
+ * 写的之后；新一轮覆盖旧值正是想要的（看的就是最新一轮）。 */
+
+static uint32_t g_t0_speech_ms;   /* ① 起点：VAD 判停 / 「提交」那一刻 */
+static uint32_t g_t1_asr_ms;      /* ② ASR 文本到手 */
+static uint32_t g_t2_llm_ms;      /* ③ LLM 回复到手 */
+
+/* ===== 轮次代数 + 让路锁有主化（S1.1）=====
+ *
+ * 用户报的「后面又不能对话了」，最可能的形状是：一轮死在「置让路锁之后、
+ * 清锁之前」，三条清锁路径一条都不触发 —— 于是麦永久锁死，而监听守护又在
+ * `record_hold` 立着时整体早退，连它自己都发现不了。**看门狗被它要看护的
+ * 东西关掉了**，这就是死锁能一直挂着的原因。
+ *
+ * 两个手段：
+ *   ① **轮次代数 `g_round`**：每开一轮 +1。任何「这一轮作废」的动作都只做
+ *      「++g_round + 清队列」，在途回调（ASR 返回、LLM 回调、TTS 块、播放
+ *      完成）发布前核对代数，对不上就当迟到的旧数据扔掉 —— 不必到处写
+ *      「这个 buffer 还能不能用」的判断，整类 stale-data 死锁直接消失。
+ *   ② **让路锁有主**：置锁时记下「是哪一轮置的」和「最晚什么时候必须放」，
+ *      主循环发现锁立着且超期就强制收。守护在让路期间**照旧豁免其它判据，
+ *      但必须查这一条**。
+ *
+ * 写法沿用本文件的纪律：volatile + 先写数据后翻标志，不加锁。 */
+
+static volatile uint32_t g_round;             /* 每开一轮 +1：语音提交 / 主动打断都算 */
+static volatile uint32_t g_hold_owner_round;  /* 让路锁是哪一轮置的（0 = 没人持锁） */
+static uint32_t          g_hold_deadline_ms;  /* 持锁最晚到这一刻（main_now_ms 口径） */
+
+/* 让路锁最多持有多久：整轮兜底上限（AI_TALKING 90 秒，见 ai_state_machine.c）
+ * 再给 10 秒余量。超过就是「锁立着却没人来收」，强制清。 */
+#define HOLD_MAX_MS   (90000 + 10000)
+
+/* 分相记账：这一轮现在卡在哪一段。各段有自己的上限 —— 整轮 95 秒兜底是最后
+ * 一道网，但真要自愈得先知道卡在哪，否则日志只说"超时了"没法定位。
+ *
+ * 三个上限取值（都是**观测之后再调**的初值，不是测量结论）：
+ *   ASR 20s —— 整段 WAV 上传一次 HTTPS + 网关排队，慢网下就是这个量级；
+ *   LLM 35s —— velaclaw IPC + 云端整条回复（无 SSE），长回复 5~10s，
+ *              35s 是"明显已经死了"的界线，不是"慢一点就掐"；
+ *   TTS **不看墙钟总长**，只判"停滞"（见下）。
+ *
+ * ★ 2026-10-25 改：TTS 原来由整轮 95s 兜着，那个写法会把**正常念得久的长
+ * 回复**掐死在半路。算一笔账就懂：TTS 上限 300 字（MIMO_TTS_TEXT_MAX），
+ * 按实测"每字约 66 ms 音频 + 每块约 6 s 合成"，300 字约 13 块 ≈ 75 s 光是
+ * 播放，再叠上前置链路 ~25 s —— 稳超 95 s。而 S2.6 把块从 64 字切到 24 字
+ * 之后块数翻了近三倍，每块还要单独付一次 TLS 握手，整体只会更长。
+ * 也就是说这个上限正在威胁"回复快"和"把话说完"，属于稳定性倒退，必须改。
+ *
+ * 正确判据是**停滞**不是**时长**：正在一块一块往下念的轮次，念多久都该让它
+ * 念完（老人要的就是听完）；只有"整整 25 秒一块都没往前走"才是真卡死
+ * （2026-10-25 现场那次就是这种：播放线程卡在设备里 75 秒一动不动）。
+ * TTS 另留一个 4 分钟硬上限兜极端，正常永远到不了。 */
+
+typedef enum
+{
+  ROUND_PHASE_IDLE = 0,   /* 没有一轮在跑 */
+  ROUND_PHASE_ASR,        /* 说完 → ASR 文本到手 */
+  ROUND_PHASE_LLM,        /* ASR 文本 → LLM 回复到手 */
+  ROUND_PHASE_TTS         /* 回复到手 → 整轮念完 */
+} round_phase_t;
+
+static volatile int g_round_phase = ROUND_PHASE_IDLE;
+static uint32_t     g_round_started_ms;   /* 这一轮起算时刻 */
+static uint32_t     g_round_phase_ms;     /* 当前相位起算时刻 */
+static uint32_t     g_round_progress_ms;  /* 最近一次真有进展的时刻（TTS 判停滞用） */
+
+#define ROUND_ASR_MAX_MS    20000
+#define ROUND_LLM_MAX_MS    35000
+#define ROUND_TOTAL_MAX_MS  95000
+#define ROUND_TTS_STALL_MAX_MS  25000   /* TTS 连续 25s 没进展 = 卡死 */
+#define ROUND_TTS_MAX_MS       240000   /* TTS 硬上限 4 分钟，只兜极端 */
+
+/* 记一笔"有进展了"。谁该调：进新相位、一块开始播、一块播完。
+ * 只在 TTS 相位被看门狗读，但 ASR/LLM 一起记也不亏（换相位时顺手归零起点）。 */
+static void round_progress(void)
+{
+  g_round_progress_ms = main_now_ms();
+}
+
+static void round_phase_set(round_phase_t phase)
+{
+  g_round_phase    = phase;
+  g_round_phase_ms = (phase == ROUND_PHASE_IDLE) ? 0 : main_now_ms();
+
+  if (phase != ROUND_PHASE_IDLE)
+    {
+      round_progress();   /* 换段本身就是一次进展 */
+    }
+}
+
+static const char *round_phase_name(round_phase_t phase)
+{
+  switch (phase)
+    {
+      case ROUND_PHASE_ASR: return "ASR";
+      case ROUND_PHASE_LLM: return "LLM";
+      case ROUND_PHASE_TTS: return "TTS";
+      default:              return "空闲";
+    }
+}
+
+/* 让路锁的唯一入口/出口。原来三处直接写 ctx->record_hold = true / 调
+ * audio_record_hold_end()，谁在持、该什么时候放全靠注释交代 —— 注释交代不了
+ * 「那一轮死了没人来收」。收成一对函数，持有者和截止时间在这儿登记，
+ * 超期由 main_loop_task 强制收（见 round_watchdog_tick）。 */
+
+static void round_hold_take(uint32_t round)
+{
+  /* 播报要占麦，而此刻还有一段正在累积的语音没收尾 —— 麦一关它就再也收不到
+   * VAD 的「说完了」（还麦时 audio_record_start 会把 vad_speech_active 清零
+   * 且**不回调**），这一段就静静消失了，串口上连痕迹都没有。
+   *
+   * 2026-10-25 实测到过一次：ASR 进行中（33.12s）用户开口说了话，那句话既没
+   * 被识别、也没留下任何日志，84 秒后才被新的一次「语音开始」顶掉。
+   *
+   * 这里**只留痕、不送去识别**：record_hold 的立意是「播报中别让旁边的声音把
+   * AI 从说切到听」（2026-10-24），反手把在途的一段送出去，等于给打断开了后门。
+   * 真要支持"识别中/播报中还能插话"，是快照槽 ×2 + 明确的打断策略那件事，
+   * 不在这里偷偷做。 */
+
+  if (g_speech_capturing)
+    {
+      printf("[VAD] 播报要占麦，掐掉一段没收尾的语音（累积 %zu 帧 ≈ %u ms）"
+             "—— 这段不会再被送去识别\n",
+             g_speech_frames, (unsigned)(g_speech_frames / 16));
+      g_speech_capturing = false;
+    }
+
+  g_hold_owner_round = round;
+  g_hold_deadline_ms = main_now_ms() + HOLD_MAX_MS;
+  g_audio_ctx.record_hold = true;
+}
+
+static void round_hold_give(const char *why)
+{
+  if (!g_audio_ctx.record_hold)
+    {
+      g_hold_owner_round = 0;
+      g_hold_deadline_ms = 0;
+      return;
+    }
+
+  g_hold_owner_round = 0;
+  g_hold_deadline_ms = 0;
+  audio_record_hold_end(&g_audio_ctx);
+  printf("[音频] 交还麦克风（%s）\n", why ? why : "未标注");
+}
+
+/* 收掉一轮的在途产物（TTS 队列 + 播放 + 让路锁）。
+ * **不动 g_round** —— 调用方自己决定是"作废这一轮"还是"这一轮正常收尾"。
+ * 定义在流式 TTS 那一段之后（要用 g_tts_*），这里先声明。 */
+
+static void round_teardown(const char *why);
+
+/* 作废一轮（超时 / 出错 / 被打断）：代数 +1 让一切在途回调失效，再收摊。 */
+
+static void round_abort(const char *why);
+
+/* ===== 识别请求槽（S1.2：ASR 撤离录音线程）=====
+ *
+ * 为什么要撤：`speech_capture_complete()` 是**在录音线程上**被 VAD 判停调进来的，
+ * 而它原来一路走到 `sm_handle_event(VOICE_COMPLETE)` → `sm_ai_talking_enter` →
+ * `process_ai_dialogue()` → `voice_asr_recognize()`，整段 ASR（阻塞 HTTPS，实测
+ * 1~8 秒）就跑在录音线程上。这期间 `audio_in_read()` 一次都不调，真机日志就是
+ * 那两条：
+ *   - `[rxstuck] 录音标志说在录、但已 10083 ms 没读到数据（wait=-1）…`——
+ *     `wait=-1` 正是"根本没在 read 里"，线程卡在 ASR；
+ *   - `[AUDIO] stop: 录音线程 1000ms 内没退出，放弃 join…` —— 半双工切放音时
+ *     收不掉这条线程，只能 detach。
+ * 也就是说「说完到出声」的那 10 秒里麦克风是**聋的**，用户这时候说话必然丢。
+ *
+ * 做法照抄本文件既有纪律「只登记请求、真动作在自己线程里做」
+ * （`ai_companion_req.h`：`ai_companion_voice_submit()` 只置一个标志，真收尾在
+ * 录音线程的 `audio_data_callback` 里做）：
+ *   - 录音线程只做「快照 + 登记槽 + 置事件」，立刻回去继续读麦克风；
+ *   - `dialogue_worker` 线程跑 ASR → 轻意图 → llm_send_text。
+ *
+ * ⚠ **快照是必须的，不能让 worker 直接读 g_speech_buf**：
+ *   worker 在识别第 N 段时，录音线程已经在往 `g_speech_buf` 累积第 N+1 段
+ *   （说话开始就清零重写）。直接读就是读写竞态。所以收尾那一刻把用过的帧
+ *   memcpy 进 `g_dlg_buf`，此后这块只归 worker 读。
+ *
+ * ⚠ **槽只有一个，被占着就丢这一段**（打日志）。`g_dlg_busy` 从「登记」一直
+ * 置到「这一轮识别收工」，覆盖的是整个 ASR（1~8 秒），不只是交接那一瞬。
+ * 这不是能力回退：今天录音线程卡在 ASR 里时，这段时间的音频本来就被驱动丢掉
+ * 了，识别结果同样是"没有"。丢在收尾点比丢在驱动里好歹多一行日志，看得见。
+ * 想真支持"识别中还能打断"要两个快照槽（再 +480 KB），那是个独立的小改动，
+ * 等这一版的收益坐实再加。
+ *
+ * ⚠ **兜底**：`g_dlg_buf` 分配失败、或 worker 线程没起来 → `dialogue_request()`
+ * 直接同步调 `process_ai_dialogue()`，行为逐字回到改造前，不引入新路径。 */
+
+static int16_t          *g_dlg_buf = NULL;     /* 识别快照缓冲（worker 独占读） */
+static int16_t          *g_dlg_ptr = NULL;     /* 这一轮识别读哪块（兜底=累积缓冲） */
+static size_t            g_dlg_frames = 0;     /* 这一轮的帧数快照 */
+static volatile uint32_t g_dlg_round = 0;      /* 快照属于哪一轮（发布前核对用） */
+static volatile bool     g_dlg_busy = false;   /* worker 正占着快照（整个识别期） */
+
+/* 快照槽代际号：每次占用自增，收工时只许**自己这一代**把 busy 还回去。
+ * 理由和录音线程那套 record_gen 一模一样（见 ai_audio.c）：轮次收摊会强制
+ * 收回槽、新一段马上占上新的一代，迟到归来的旧一代若也去清 busy，就把
+ * 新一代的占用一并抹了 —— 新一段白登记，又回到"这一段丢弃"。
+ * 就算竞态窗口里真抹错了，下一段的 round_teardown 还会再收一次，代价是
+ * 丢一句而不是永久失聪。 */
+static volatile uint32_t g_dlg_gen = 0;
+
+/* 这一轮的请求投递过了没有。投递**不能挂在状态机上**：sm_handle_event 只在
+ * 状态真的切换时才走 enter 回调，而 AI_TALKING 收 VOICE_COMPLETE 走 default
+ * 返回同状态、什么都不做 —— 挂在那条路上的 sem_post 会被静默吞掉，槽从此
+ * 还不回去（真机症状「回了一句就再也不说话」，2026-10-25 定位）。现在
+ * speech_capture_complete 无条件投递，靠这个按轮次去重，让 enter 回调那
+ * 一次是空操作 —— 否则同步兜底那条路会把同一段识别跑两遍。 */
+static volatile uint32_t g_dlg_delivered_round = 0;
+
+static sem_t             g_dlg_sem;
+static pthread_t         g_dlg_thread;
+static bool              g_dlg_thread_valid = false;
+static bool              g_dlg_ready = false;  /* sem 已 init */
+static volatile bool     g_dlg_worker_alive = false;  /* 线程此刻还在圈里 */
+
+static void dialogue_request(sm_context_t *ctx);
+static void process_ai_dialogue(sm_context_t *ctx);   /* 定义在识别线程之后 */
 
 /**
  * @brief  这一段语音说完了：走 ASR（VAD 静音超时 和 「提交」共用这一段）
@@ -711,8 +1092,180 @@ static void speech_capture_begin(sm_context_t *ctx)
 
 static void speech_capture_complete(sm_context_t *ctx)
 {
-  printf("[VAD] 语音结束 (累积 %zu 帧)\n", g_speech_frames);
+  /* ★ 整轮播报期间的残留收尾一律丢掉（2026-10-24，和 speech_capture_begin
+   * 那道闸配对）。这段时间麦本来就该是关的（record_hold）；真走到这里只可能
+   * 是让路前漏进来的尾巴。只把 capturing 清掉就走 —— 不清它会永远挂在 true，
+   * 界面就一直显示"正在听"（voice_state_probe 认这个标志）。 */
+
+  if (g_audio_ctx.record_hold)
+    {
+      printf("[VAD] 整轮播报中丢弃残留语音收尾（不打断播报）\n");
+      g_speech_capturing = false;
+      return;
+    }
+
+  /* 峰值/RMS 是麦克风健康的直接证据（判读标准见 g_speech_peak 定义处）：
+   * 收尾这一眼就能回答"是麦克风没收到声，还是识别错了"。RMS 用整数近似
+   * （能量和开方），够分辨量级，不值得引浮点。 */
+
+  uint32_t rms = 0;
+
+  if (g_speech_frames > 0)
+    {
+      int64_t mean = g_speech_energy_sum / (int64_t)g_speech_frames;
+
+      if (mean > 0)
+        {
+          int64_t r = mean;
+          int64_t x = (r + 1) / 2;
+
+          while (x * x > r)        /* 整数开方（牛顿迭代），够用 */
+            {
+              x = (x + r / x) / 2;
+            }
+
+          rms = (uint32_t)x;
+        }
+    }
+
+  printf("[VAD] 语音结束 (累积 %zu 帧 ≈ %u ms, 峰值 %u, RMS %u)%s\n",
+         g_speech_frames, (unsigned)(g_speech_frames / 16),
+         (unsigned)g_speech_peak, (unsigned)rms,
+         g_speech_peak < 300 ? "  ← 峰值过低：这一段几乎没收到声音，"
+                               "查麦克风距离/增益/硬件" : "");
+
+  /* 基线取证 ① 起点：「说完」就是这一刻（自动断句和「提交」共用）。 */
+  g_t0_speech_ms = main_now_ms();
+  printf("[基线] ① 说完\n");
+
+  /* ★ 新一轮在此刻起算（S1.1）：语音提交 / 「提交」按钮 / 主动打断共用这一处。
+   * 先收掉上一轮的在途产物（TTS 队列 + 播放 + 让路锁），再 ++g_round 作废它
+   * 的所有在途回调 —— 上一轮的 ASR 结果、LLM 回调、TTS 块、播放完成回调在
+   * 发布前都要核对代数，对不上就当迟到的旧数据扔掉。
+   *
+   * 这就是「打断」的正解：用户在 AI 念到一半时开口，新的一轮干净地接管，
+   * 不必去猜「那个块还能不能播」。 */
+  round_teardown("新一轮起算，收掉上一轮残留");
+  g_round++;
+  printf("[轮次] 开第 %lu 轮\n", (unsigned long)g_round);
+
   g_speech_capturing = false;
+
+  /* 2026-10-19 降噪门：峰值 < 300 的段落几乎全是环境噪声（真说话实测
+   * 峰值 ≥ 778，纯噪声只有 ~88）。以前不管多安静都照送云端 —— ASR 把
+   * 噪声认成 "um." 之类的垃圾再喂给大模型，回复（或网络失败时的兜底句）
+   * 一条条刷上屏幕，用户看到的就是"没说话也自己冒话"。峰值是麦克风
+   * 健康的直接证据（判读标准见 g_speech_peak 定义处），这里顺手当门用：
+   * 没收到声就别花钱打云端，直接用本地话术请用户靠近再说。
+   * 「提交」按钮共用本函数，同样的门同样适用（安静环境下按提交＝白送
+   * 一轮云端，不如当场提示）。 */
+
+  if (g_speech_peak < 300)
+    {
+      printf("[VAD] 峰值 %u < 300，判定为没听到有效人声，不送云端识别\n",
+             (unsigned)g_speech_peak);
+
+      /* 上屏 + 出声（S4.3）。文案用 prompt_ack.h 的 PROMPT_MISS_TEXT，
+       * **必须和以后要合成进 ROMFS 的那句逐字一样** —— tts_cache 是按文案
+       * 算哈希查表的，屏上念的和将来要说的是同一句才对得上。 */
+      robot_ui_bridge_voice_reply(PROMPT_MISS_TEXT);
+
+      /* 本函数跑在录音线程上，出声只能托给 main_loop_task（见
+       * g_say_miss_pending 的说明）。 */
+      g_say_miss_pending = true;
+
+      robot_ui_bridge_voice_state(ROBOT_UI_BRIDGE_VOICE_IDLE);
+
+      /* ★ 只在 LISTENING 态才发 TIMEOUT（2026-10-24）。
+       * 原来这里无条件 sm_handle_event(SM_EVENT_TIMEOUT)，注释写的是
+       * "LISTENING → IDLE"，但状态机转换表里 **AI_TALKING + TIMEOUT 也是 → IDLE**
+       * （ai_state_machine.c）。也就是说播报途中漏进来的一段残留语音收尾，
+       * 会把正在说的这一轮连状态一起打回 IDLE —— 听感是"话说到一半没声了、
+       * 之后也不理人"，正是用户报的"断掉 / 后面又不能对话了"。
+       * 本函数的语义是"这一段没听到有效人声，回到待机"，播报中压根不该收尾。 */
+
+      if (sm_get_state(ctx) == SM_STATE_LISTENING)
+        {
+          sm_handle_event(ctx, SM_EVENT_TIMEOUT);
+        }
+      else
+        {
+          printf("[VAD] 峰值过低发生在非 LISTENING 态，丢弃 TIMEOUT"
+                 "（否则 AI_TALKING + TIMEOUT → IDLE，整轮回复被打死）\n");
+        }
+
+      /* 这一轮压根没上云，别让轮次看门狗盯着它（相位=空闲就不判）。 */
+      round_phase_set(ROUND_PHASE_IDLE);
+      return;
+    }
+
+  /* ★ 这一刻才算「这一轮真的起跑了」：接下来 ASR → LLM → TTS 都在途上，
+   * 轮次看门狗从这里开始计相位时限（见 round_watchdog_tick）。 */
+  g_round_started_ms = main_now_ms();
+  round_phase_set(ROUND_PHASE_ASR);
+
+  /* ==== 快照 + 登记识别请求（S1.2）====
+   * 这之后本函数**立刻返回**，录音线程马上回去读麦克风；ASR 在 dialogue_worker
+   * 里跑。细节见 g_dlg_* 那一段的说明。 */
+
+  if (g_dlg_buf != NULL && g_speech_buf != NULL &&
+      g_dlg_ready && g_dlg_thread_valid)
+    {
+      if (g_dlg_busy)
+        {
+          /* 上一段还在识别（ASR 是阻塞 HTTPS，1~8 秒），快照槽被占着。
+           * 这一段丢掉 —— 改造前的等价物是"录音线程卡在 ASR 里、这段音频被
+           * 驱动丢掉"，结果一样，只是现在看得见。 */
+
+          printf("[识别] 上一段还在识别中（占着快照槽），这一段丢弃"
+                 "（累积 %zu 帧）—— 想支持识别中打断要第二个快照槽\n",
+                 g_speech_frames);
+          round_phase_set(ROUND_PHASE_IDLE);   /* 没上云，看门狗别盯着 */
+          return;
+        }
+
+      /* 先拷数据、后立 busy、再唤醒 worker —— worker 那边是"等到信号就直接
+       * 读 g_dlg_buf"，顺序反了它可能读到半截 memcpy。 */
+
+      memcpy(g_dlg_buf, g_speech_buf,
+             g_speech_frames * sizeof(int16_t));
+      g_dlg_ptr    = g_dlg_buf;
+      g_dlg_frames = g_speech_frames;
+      g_dlg_round  = g_round;
+      g_dlg_gen++;
+      g_dlg_busy   = true;
+
+      printf("[识别] 快照就绪（%zu 帧，第 %lu 轮，代 %lu），交给识别线程，"
+             "录音线程继续听\n",
+             g_dlg_frames, (unsigned long)g_dlg_round,
+             (unsigned long)g_dlg_gen);
+
+      /* ★ 投递**不挂在状态机上**（2026-10-25）。
+       * 原来只有下面那句 sm_handle_event，靠"切进 AI_TALKING → enter 回调 →
+       * dialogue_request() → sem_post"把请求送出去。但 sm_handle_event 只在
+       * 状态**真的切换**时才走 enter（ai_state_machine.c 末尾那个 if），而
+       * AI_TALKING 收到 VOICE_COMPLETE 走的是 default：返回同状态、什么都不
+       * 做。于是「上一轮还在识别/播报时用户又说一句」这种最常见时序里，
+       * **槽已经占上了、sem_post 却永远没人发** —— 槽从此还不回去，之后
+       * 每一句都在「上一段还在识别中」里被丢弃，真机就是"回了一句就再也不
+       * 说话"。现在这里无条件投递，状态机只管界面状态。 */
+      dialogue_request(ctx);
+      sm_handle_event(ctx, SM_EVENT_VOICE_COMPLETE);
+      return;
+    }
+
+  /* 兜底：快照缓冲没要到 / worker 没起来 —— 走改造前的同步路，一字不改。 */
+  printf("[识别] 识别线程不可用，同步走（ASR 会占住录音线程）\n");
+  g_dlg_ptr    = g_speech_buf;
+  g_dlg_frames = g_speech_frames;
+  g_dlg_round  = g_round;
+  g_dlg_gen++;
+  g_dlg_busy   = true;
+
+  /* 同样无条件投递（理由见上面那条）。这条没有 worker，dialogue_request
+   * 会直接同步跑 process_ai_dialogue()；enter 回调那一次被按轮次去重挡掉，
+   * 所以同一段不会识别两遍。 */
+  dialogue_request(ctx);
   sm_handle_event(ctx, SM_EVENT_VOICE_COMPLETE);
 }
 
@@ -778,7 +1331,25 @@ static void audio_data_callback(const int16_t *data, size_t frames,
 {
   sm_context_t *ctx = (sm_context_t *)user_data;
 
-  /* 累积语音数据到缓冲区，供 ASR 使用 */
+  /* 维护 300ms 预滚缓冲（无条件，与是否在收段无关）：
+   * 无论这一帧是否赶上累积，最近 300ms 都留在 g_speech_preroll 里，
+   * speech_capture_begin 垫头用。为什么需要见 SPEECH_PREROLL_SAMPLES。 */
+
+  if (frames >= SPEECH_PREROLL_SAMPLES)
+    {
+      memcpy(g_speech_preroll, data + (frames - SPEECH_PREROLL_SAMPLES),
+             SPEECH_PREROLL_SAMPLES * sizeof(int16_t));
+    }
+  else if (frames > 0)
+    {
+      memmove(g_speech_preroll, g_speech_preroll + frames,
+              (SPEECH_PREROLL_SAMPLES - frames) * sizeof(int16_t));
+      memcpy(g_speech_preroll + (SPEECH_PREROLL_SAMPLES - frames), data,
+             frames * sizeof(int16_t));
+    }
+
+  /* 累积语音数据到缓冲区，供 ASR 使用；顺手记峰值/能量（麦克风健康观测，
+   * 量的意义见 speech_capture_complete 里那一行日志） */
 
   if (g_speech_capturing && g_speech_buf != NULL)
     {
@@ -786,9 +1357,43 @@ static void audio_data_callback(const int16_t *data, size_t frames,
       size_t copy = frames < space ? frames : space;
       if (copy > 0)
         {
+          size_t i;
+
+          for (i = 0; i < copy; i++)
+            {
+              int32_t v = data[i];
+
+              if (v < 0)
+                {
+                  v = -v;
+                }
+
+              if ((uint32_t)v > g_speech_peak)
+                {
+                  g_speech_peak = (uint32_t)v;
+                }
+
+              g_speech_energy_sum += (int64_t)v * v;
+            }
+
           memcpy(&g_speech_buf[g_speech_frames], data,
                  copy * sizeof(int16_t));
           g_speech_frames += copy;
+
+          /* 说话还在推进 → 给状态机续期，别在句子中间 TIMEOUT。
+           * （根因见 sm_kick_timer() 的说明：超时原本从"进入 LISTENING"
+           * 那一刻起算、状态不切换就不重置，长一点的句子必然被打断。）
+           * 每 ~500ms 一次即可：超时是 20 秒量级，0.5 秒粒度不影响判定，
+           * 又省掉录音线程上每帧一次的时钟读取。 */
+          {
+            static uint32_t s_kick_frames = 0;
+
+            if (++s_kick_frames >= 25)
+              {
+                s_kick_frames = 0;
+                sm_kick_timer(ctx);
+              }
+          }
         }
     }
 
@@ -974,7 +1579,12 @@ static void gate_voice_cb(const sound_gate_features_t *f, void *arg)
 static bool gate_busy_pred(void *arg)
 {
   (void)arg;
-  return audio_is_playing(&g_audio_ctx);
+
+  /* ★ record_hold（整轮播报让路锁，2026-10-24）一并算"忙"：流水线 TTS 的
+   * 首句→尾段空档里扬声器是不响的（playing=false），但整轮播报还没结束，
+   * 门控那条线不该拿这一段去判"异响"。 */
+
+  return audio_is_playing(&g_audio_ctx) || g_audio_ctx.record_hold;
 }
 
 /**
@@ -1305,21 +1915,25 @@ int ai_companion_voice_submit(void)
 /* "忙"的兜底上限（毫秒）：录音已经断了这么久、而那几个"忙"标志还挂着，
  * 就不再认"忙"，强行把麦克风抢回来（见 listen_supervise_tick 里那一段）。
  *
- * 取 45 秒，两个方向都要交代：
+ * 2026-10-19 从 45 秒抬到 80 秒：TTS 改零拷贝（audio_play_start_ref）后
+ * 单次出声的上限不再是播放缓冲，而是 TTS 整段缓冲 —— g_tts_buf 2 MB ≈
+ * 64 秒（300 字上限的回复）。45 秒会在一轮正常长回复念到 ~140 字时把麦
+ * 抢回来，半双工连带把播放掐断 —— "读不完整"会换个方式重演。80 秒 =
+ * 64 秒 + 16 秒余量。
+ *
+ * 两个方向的交代：
  *   - 不能比"正常的忙"短：正常流程里唯一会让录音停下来的事是 TTS 出声
- *     （半双工让路，见 ai_audio.c 的 audio_prepare_output），而单次出声的上限
- *     就是播放缓冲 AUDIO_PLAY_BUFFER_MS = 30 秒；45 秒 = 30 秒 + 15 秒余量，
- *     正常出声绝不会被它掐掉。状态机 AI_TALKING 自己的超时也是 30 秒，
- *     45 秒是它的 1.5 倍，够一次正常回复先跑完。
+ *     （半双工让路，见 ai_audio.c 的 audio_prepare_output）；它计的是
+ *     "**失去麦克风**的时长"（audio_record_is_active() 一命中就清零，
+ *     ASR/大模型推理期间录音线程还活着、不累加），所以正常一轮里它只在
+ *     播放期间增长，播完自动恢复、清零 —— 80 秒正常出声绝不会被它掐掉。
+ *     状态机 AI_TALKING 自己的兜底是 90 秒（见 ai_state_machine.c）。
  *   - 又不能太长：真正会挂住的是**标志本身卡死**（播放线程写不动、追问相位
  *     没收尾、大模型回复永远不来），它们没有任何上限，全靠这个数兜底。
- *     45 秒是"老人还能忍"和"别误伤正常流程"之间的取舍：喊了半天没反应之后，
- *     45 秒内一定能把耳朵抢回来。
- * 注意它计的是"**失去麦克风**的时长"，不是"推理时长"：上面那句
- * audio_record_is_active() 一命中就清零，正常推理期间根本不会累加 ——
- * 这也正是它敢取这么温和的值的原因。 */
+ *     80 秒是"老人还能忍"和"别误伤正常流程"之间的取舍：喊了半天没反应之后，
+ *     80 秒内一定能把耳朵抢回来。 */
 
-#define LISTEN_SUPERVISE_FORCE_MS  45000
+#define LISTEN_SUPERVISE_FORCE_MS  80000
 
 /* 【2026-09-19 新加】"会话活着、但录音线程已经卡在设备调用里"的判据（毫秒）。
  *
@@ -1382,6 +1996,24 @@ int ai_companion_voice_submit(void)
 
 #define LISTEN_SUPERVISE_WANT_MUTE_MS  5000
 
+/* 【2026-10-16 新增】第四条判据："僵尸会话"——录音标志说在录，驱动却根本
+ * 没有会话（armed=0 busy=0）。真机形状（2026-09-16 凌晨开机后第一轮）：
+ * ract=1 / wait=-1（线程不在 read 里）/ idle 涨到 50 秒以上 / 驱动计数全程
+ * 冻结，三条旧判据（died / stalled / want_mute）一条都盖不住：
+ *   - stalled 要求线程卡在 read 里（wait ≥ 8 秒），僵尸会话的线程不在 read；
+ *   - want_mute 要求录音标志为假，僵尸会话的标志是真；
+ *   - died 要靠录音线程自己报异常，僵尸会话的线程还在正常循环。
+ * 用户视角就是"开机后第一轮说话必然没反应"，只能断电重来。
+ *
+ * 为什么 armed/busy 是可信判据：audio_record_start() 是先 audio_in_start()
+ * （把驱动会话武装起来）**再**置 recording=true，所以"标志为真而驱动没会话"
+ * 在正常路径上不存在瞬态；半双工让路（TTS 抢麦）走的是 audio_record_stop()
+ * （标志先清），也不产生这个形状；ASR/TLS 在录音线程里跑的那几十秒，驱动
+ * 会话照常挂着（armed=1 busy=1），不会被这条误伤。取 5 秒与 want_mute 同
+ * 一个量纲：正常一帧 20ms，5 秒是它的 250 倍，瞬态早就过去了。 */
+
+#define LISTEN_SUPERVISE_ZOMBIE_MS     5000
+
 /* 失败日志节流：前 5 次每次都打（开头几次最需要看见），之后每 10 次一条 */
 
 #define LISTEN_SUPERVISE_LOG_FIRST      5
@@ -1396,6 +2028,10 @@ static uint32_t g_listen_mute_since;       /* 从哪一刻起"要常听却没在
 static bool     g_listen_mute_logged;      /* 这一次断开已经报过一行了（别 100ms 刷一行） */
 static uint32_t g_listen_last_try_ms;      /* 上一次真去重开录音的那一拍（失败也算；
                                             * 它是防抖与防刷屏的锚点，见下面那段） */
+static uint32_t g_listen_zombie_since;     /* "标志说在录、驱动却没会话"持续了多久，
+                                            * 0 = 没这情况（判据见
+                                            * LISTEN_SUPERVISE_ZOMBIE_MS 头顶那段） */
+static bool     g_listen_zombie_logged;    /* 这一次僵尸已报过一行（别 100ms 刷一行） */
 
 /**
  * @brief  监听守护：录音不活跃就按退避把它重新拉起来
@@ -1442,6 +2078,7 @@ static void listen_supervise_tick(sm_context_t *ctx)
   bool     stale;
   bool     urgent;
   bool     stalled;
+  bool     zombie = false;
   bool     want_mute;
   int      rx_wait;
   int ret;
@@ -1457,6 +2094,54 @@ static void listen_supervise_tick(sm_context_t *ctx)
       g_listen_dead_since = 0;
       g_listen_mute_since = 0;
       g_listen_mute_logged = false;
+      g_listen_zombie_since = 0;
+      g_listen_zombie_logged = false;
+      return;
+    }
+
+  /* ★【2026-10-24】整轮播报期间一律不碰设备。
+   *
+   * 用户反馈："AI 在说话的时候有时候会断掉，一会自己会继续说，怀疑如果 AI
+   * 在说话时旁边又有声音，AI 会停止说话然后监听，这个问题要解决。"
+   *
+   * 实锤是流水线 TTS 的首句→尾段空档（尾段还在"每 64 字一次 HTTPS"地合成）：
+   * 那段里半双工契约会把常开监听恢复起来，麦一开，VAD 就把状态机从"正在说"
+   * 切到"正在听"。record_hold 由播报轮在首句起播前置真、整轮收尾
+   * （play_complete_callback → audio_record_hold_end）才清。
+   *
+   * 这里必须挡：上面那条"扬声器在响就别抢"只看 audio_is_playing()，而空档里
+   * playing 已经是 false 了；再往下 want_mute（5 秒）就会把锁冲掉、直接开麦。
+   * 计时器一并清零 —— 让路期间的"听不见"不算断，锁一解除从头计。
+   *
+   * ★★ 但**不能整体早退**（2026-10-25 修）：原来这里 return 一行直接走人，
+   * 结果是"看门狗被它要看护的东西关掉了" —— 一轮若死在置锁之后、交还之前
+   * （三条清锁路径 audio_record_start / audio_play_stop / audio_record_hold_end
+   * 一条都没触发），麦永久锁死，而守护因为锁立着连查都不查，只能重启。
+   * 现在让路期间**只豁免其它判据，保留「查持锁截止」这一条**：锁立着且超过
+   * HOLD_MAX_MS 就当持有者已经死了，强制交还并大声留一行。
+   *
+   * 另外两条兜底不变：audio_record_start() / audio_play_stop() 都会主动清它
+   * （有人明确要动设备，锁就该让路），加上整轮收尾那条。 */
+
+  if (g_audio_ctx.record_hold)
+    {
+      g_listen_dead_since = 0;
+      g_listen_mute_since = 0;
+      g_listen_mute_logged = false;
+      g_listen_zombie_since = 0;
+      g_listen_zombie_logged = false;
+
+      /* 【唯一保留的判据】持锁超期 = 持有者没能把它交回来。 */
+      if (g_hold_deadline_ms != 0 &&
+          (int32_t)(main_now_ms() - g_hold_deadline_ms) >= 0)
+        {
+          printf("[音频] ★★ 让路锁超期（轮 %lu，超 %ld ms）强制交还麦克风"
+                 "—— 持锁那一轮死了没来收，这是「后面又不能对话」的形状\n",
+                 (unsigned long)g_hold_owner_round,
+                 (long)(main_now_ms() - g_hold_deadline_ms));
+          round_hold_give("守护：持锁超期强制交还");
+        }
+
       return;
     }
 
@@ -1475,7 +2160,36 @@ static void listen_supervise_tick(sm_context_t *ctx)
   stalled = audio_record_is_active(&g_audio_ctx) &&
             rx_wait >= (int)LISTEN_SUPERVISE_RX_STALL_MS;
 
-  if (!stalled && audio_record_is_active(&g_audio_ctx))
+  /* 【2026-10-16 新加】"僵尸会话"检测（判据和为什么不误伤见
+   * LISTEN_SUPERVISE_ZOMBIE_MS 头顶那一段）。 */
+
+  if (audio_record_is_active(&g_audio_ctx))
+    {
+      struct sf32lb52_audio_rx_stats_s rxst;
+
+      if (sf32lb52_audio_rx_stats(&rxst) == OK && !rxst.armed && !rxst.busy)
+        {
+          if (g_listen_zombie_since == 0)
+            {
+              g_listen_zombie_since = (main_now_ms() != 0) ? main_now_ms() : 1;
+            }
+
+          zombie = ((int32_t)(main_now_ms() - g_listen_zombie_since) >=
+                    (int32_t)LISTEN_SUPERVISE_ZOMBIE_MS);
+        }
+      else
+        {
+          g_listen_zombie_since = 0;
+          g_listen_zombie_logged = false;
+        }
+    }
+  else
+    {
+      g_listen_zombie_since = 0;
+      g_listen_zombie_logged = false;
+    }
+
+  if (!stalled && !zombie && audio_record_is_active(&g_audio_ctx))
     {
       /* 录音还活着（设备已 START 且线程没退出）：把重试状态复位 */
 
@@ -1519,10 +2233,11 @@ static void listen_supervise_tick(sm_context_t *ctx)
            (int32_t)LISTEN_SUPERVISE_FORCE_MS);
 
   /* 扬声器在响：这次先不抢设备。半双工上把麦抢回来就会掐掉正在放的那一段，
-   * 而播放本身有上限（≤ AUDIO_PLAY_BUFFER_MS = 30 秒），播完播放线程还会按原
-   * 配置把录音恢复起来 —— 也就是说这一条通常自愈。
+   * 而播放本身有上限（TTS 全段零拷贝，≤ g_tts_buf 2 MB ≈ 64 秒，见
+   * audio_play_start_ref），播完播放线程还会按原配置把录音恢复起来 ——
+   * 也就是说这一条通常自愈。
    * 只有"长期不活跃"的兜底（stale）才越过它：那种情况下"还在放"本身就说明
-   * 播放标志也卡住了（正常出声到不了 45 秒），不抢就永远聋着。 */
+   * 播放标志也卡住了（正常出声到不了 80 秒），不抢就永远聋着。 */
 
   if (audio_is_playing(&g_audio_ctx) && !stale)
     {
@@ -1557,6 +2272,22 @@ static void listen_supervise_tick(sm_context_t *ctx)
       printf("[监听守护] 录音线程卡在设备读里 %d ms（驱动一次等满只有 5 秒上界，"
              "说明那次等待的超时丢了）：判定这一次会话已死，停掉再重开\n",
              rx_wait);
+      died = true;
+    }
+
+  /* 【2026-10-16 新加】僵尸会话同样给 died 资格（紧急重开），下面重开之前
+   * 也会先 stop —— 与 stalled 那条完全同路，理由写在各自头顶。 */
+
+  if (zombie)
+    {
+      if (!g_listen_zombie_logged)
+        {
+          g_listen_zombie_logged = true;
+          printf("[监听守护] 录音标志说在录、驱动却没会话（armed=0 busy=0，"
+                 "已持续 %u ms）：判定僵尸会话，停掉再重开\n",
+                 (unsigned)(now - g_listen_zombie_since));
+        }
+
       died = true;
     }
 
@@ -1675,7 +2406,8 @@ static void listen_supervise_tick(sm_context_t *ctx)
    * 为真），但我们这一拍就是要把它收掉的，所以不拿它当"设备被别人占着"看。 */
 
   if (!g_listen_wanted ||
-      (audio_record_is_active(&g_audio_ctx) && !stalled && !want_mute))
+      (audio_record_is_active(&g_audio_ctx) && !stalled && !zombie &&
+       !want_mute))
     {
       return;
     }
@@ -1698,9 +2430,24 @@ static void listen_supervise_tick(sm_context_t *ctx)
    * 后面所有守卫都会把自己挡回去（也让下次守护重开前要等更久）。
    * 对"本来就不在录"的会话（want_mute 那条）这一次调用近似空操作，代价可忽略。 */
 
-  if (stalled || want_mute)
+  if (stalled || zombie || want_mute)
     {
-      printf("[监听守护] 先停掉那一次没退干净的录音会话（wait=%d ms）\n", rx_wait);
+      /* 这一行必须自带**是哪条判据命中 + 它们各自的读数**：下面那两个 once-only
+       * 日志（"录音标志说在录、驱动却没会话" / "要常听立着却没在录"）一旦报过
+       * 就再也不打，重开环里就只剩这一行 —— 没有原因、没有读数，从串口看
+       * 就是"一切正常地每 2 秒重启一次"，查不出是谁在收会话（2026-10-25 现场）。 */
+
+      printf("[监听守护] 先停掉那一次没退干净的录音会话"
+             "（命中：%s%s%s | wait=%d ms idle=%d ms | "
+             "僵尸计时 %u ms / 没在录计时 %u ms）\n",
+             stalled   ? "卡在读里 "   : "",
+             zombie    ? "僵尸会话 "   : "",
+             want_mute ? "要常听却没在录 " : "",
+             rx_wait, audio_record_idle_ms(&g_audio_ctx),
+             (unsigned)(g_listen_zombie_since != 0 ?
+                        (now - g_listen_zombie_since) : 0),
+             (unsigned)(g_listen_mute_since != 0 ?
+                        (now - g_listen_mute_since) : 0));
 
       audio_record_stop(&g_audio_ctx);
       audio_vad_disable(&g_audio_ctx);
@@ -1727,6 +2474,30 @@ static void listen_supervise_tick(sm_context_t *ctx)
     {
       kws_reset();
     }
+
+  /* ★【2026-10-25】重开前把"这一次会话有多久了"的三个计时器**连同 once-only
+   * 日志标记一起清零**。漏掉这一句的后果是真机上那个 2.0 秒一圈、永不自愈的
+   * 重开环（实测 25 秒内 12 次）：
+   *
+   *   g_listen_zombie_since / g_listen_mute_since 只在上面那条"录音很健康"
+   *   的早退里清（!stalled && !zombie && is_active）。而本函数重开成功后，
+   *   下一拍（100ms）就又跑一遍 listen_supervise_tick —— 计时器还挂着**上一次**
+   *   会话的起点，"已持续 5 秒"在新会话起来 200ms 内就成立，于是刚 START 好的
+   *   会话立刻又被判定已死、又被收掉。两个 once-only 标记（zombie_logged /
+   *   mute_logged）同样卡着不放，环里一条原因日志都不打，从外面只看到
+   *   "语音监听已恢复（之前连续失败 0 次）"无限重复 —— 看着像守护在好好干活，
+   *   实际是麦克风一秒都没真在听。
+   *
+   *   修好之后，新会话由**它自己的**读数说话：真有数据就一路走早退、环自然断；
+   *   真没数据则要等满 LISTEN_SUPERVISE_ZOMBIE_MS / WANT_MUTE_MS（5 秒）才
+   *   判死，且判死那一条会重新打一行带读数的命中日志 —— 一眼看出是设备没起
+   *   （armed=0 busy=0）还是没在录，而不是笼统的"又重开了一次"。 */
+
+  g_listen_dead_since    = 0;
+  g_listen_mute_since    = 0;
+  g_listen_mute_logged   = false;
+  g_listen_zombie_since  = 0;
+  g_listen_zombie_logged = false;
 
   ret = start_audio_listening(ctx);
 
@@ -2311,6 +3082,7 @@ static int ask_speak(const char *text)
 
   if (tts_cache_load(text, &cached, &cached_len) == 0)
     {
+      prompt_ack_stop(&g_audio_ctx);   /* 真话要出声，先收掉"我听见了" */
       ret = audio_play_start(&g_audio_ctx, (const int16_t *)cached,
                                     cached_len / sizeof(int16_t),
                                     ask_play_done_cb, NULL);
@@ -2363,6 +3135,7 @@ static int ask_speak(const char *text)
    * （ai_audio.c 的 audio_prepare_output / audio_resume_record），
    * 恢复之后麦克风才重新有人喂检测器 —— 顺带也挡住了"喇叭的声音被判成异常"。 */
 
+  prompt_ack_stop(&g_audio_ctx);   /* 真话要出声，先收掉"我听见了" */
   ret = audio_play_start(&g_audio_ctx, (const int16_t *)tts_buf,
                                 tts_len / sizeof(int16_t), ask_play_done_cb, NULL);
   if (ret < 0)
@@ -2679,9 +3452,14 @@ static void ask_flow_tick(sm_context_t *ctx)
       return;
     }
 
-  /* 最优先：屏幕上那条确认路（或者 MQTT 下行）已经报警了，报警声正在响 ——
-   * 这条语音追问立刻收摊，别再问第二轮（登记处见 ai_companion_req.c；
-   * robot_ui_show_alarm() 是唯一登记点，所以任何报警来源都覆盖）。
+  /* 最优先：屏幕上那条确认路已经出了结论 —— 这条语音追问立刻收摊，别再问第二轮
+   * （登记处见 ai_companion_req.c）。登记点有两个：
+   *   ① robot_ui_show_alarm()：报警真的走起来了（用户点「是的，报警」/ 手机确认）；
+   *   ② ask_finish(confirmed == 0 且来源不是"超时")：用户**主动**点了「不用了」。
+   *      2026-10-22 补的这一条 —— 少了它，用户明确说不用了之后语音那条还在问
+   *      第二轮、最后往家人手机上推 unconfirmed_FALL，等于替用户做了相反的决定。
+   *   （"20 秒没人应答"那一路**不**登记：没人回答不是回答，问满两轮仍没人应
+   *     就推给家人的安全网要留着。）
    * 收摊只做状态收尾：设备归 robot_ui 的报警那条链，界面归 robot_ui
    * （它自己会把询问页撤下）。 */
   if (ai_companion_ask_abort_take() && g_ask_phase != ASK_PHASE_IDLE)
@@ -2868,6 +3646,10 @@ static void *care_announce_task(void *arg)
     }
 
   /* ---- ④ 出声（本进程自己的 g_audio_ctx，半双工由 audio_play_start 内部处理） ---- */
+
+  /* "我听见了"那声不算"扬声器被别人占着" —— 它只有 0.43 秒、又不是正事，
+   * 让路给关怀播报。真有别的播报在响时下面那道闸照旧，这次不抢。 */
+  prompt_ack_stop(&g_audio_ctx);
 
   if (audio_is_playing(&g_audio_ctx))
     {
@@ -3090,9 +3872,472 @@ static void play_complete_callback(void *user_data)
   /* 这轮已经出过声了：语音状态回传据此不在收尾的那一小段里报"正在想" */
   g_voice_spoke = true;
 
+  /* ★ 整轮播报收尾：解掉让路锁，并把首句→尾段空档里欠着的那次还麦补上
+   * （2026-10-24 修"AI 说话被旁边的声音打断"）。单段播放（追问 / 灯控 /
+   * 关怀）从来没置过锁，这一段对它们是 no-op，走的仍是 ai_audio.c 里
+   * 播完自动还麦那条老路。
+   *
+   * ★ 顺序：必须在 sm_handle_event 之前 —— 那个事件会让状态机进"听"，
+   * 而"听"要麦；麦得先还回来。 */
+
+  round_hold_give("整轮播报收尾");
+  round_phase_set(ROUND_PHASE_IDLE);   /* 这一轮到此结束，看门狗别再盯着 */
+
   /* 播放完成后触发AI响应完成事件 */
 
   sm_handle_event(ctx, SM_EVENT_AI_RESPONSE);
+}
+
+/* ── 流式 TTS（2026-10-24 二次改造，用户点名"边出字边说话"）──────────
+ *
+ * 上一版（2026-10-19）是"首句 + 剩余"两段式：首句先出声，剩余在首句播放
+ * 期间整段合成完。它治好了"整条合成完才出声"，但**屏幕还是一次性把全文
+ * 刷完** —— 用户看到的是"字全出来了，声音还在慢悠悠往出走"，也就是用户
+ * 说的"边读边输没有解决"。
+ *
+ * 这一版把播报拆成**逐句 N 块**，文字和声音一起往前走：
+ *   1. 合成第 1 块 → 屏上先出这一句 → 起播
+ *   2. 第 1 块在播的同时，合成第 2 块（乒乓两个 PCM 槽，不抢同一块内存）
+ *   3. 第 1 块播完 → 屏上出到第 2 句 → 播第 2 块，同时合成第 3 块
+ *   4. 如此往复到正文念完
+ * 屏幕上永远是"念到哪儿、显示到哪儿"。
+ *
+ * 生产者 = llm_complete_callback（LLM 请求线程）：逐块合成、逐块发布，
+ *          发布完一块就等队列腾出格再合成下一块（队列深度 2，见 g_tts_q）。
+ * 消费者 = llm_speak_chunk_complete（音频播放线程）：等队列、取块、起播。
+ * 同步沿用 volatile + 头尾游标（单核 32 位对齐读写原子，同 g_voice_spoke）。
+ * seq 迟到判定、record_hold 让路锁、8 秒提前还麦、90 秒放弃上限全部保留。
+ *
+ * 顺带**内存变省**：不再需要"一整段" PCM 缓冲，按块分槽就够
+ * （最坏一块 24 字 × 约 11 KB/字 ≈ 264 KB；2 MB 三等分 ≈ 682 KB/槽，
+ * 余量 2.5 倍以上）。以前"300 字全段 2 MB"是按整段来的，现在按块。
+ * ⚠ 降级档要留神：分配阶梯掉到 512 KB 时单槽只剩 170 KB，装不下一个最大块
+ * —— 届时会打一行警告（见 tts_buf_ensure 之后那段），别当成小事。
+ *
+ * ⚠ 仍然不是 token 级流式：大模型整条回复到手才开始逐句合成（链路是
+ * hello_app → velaclaw 一次性回调 → ai_agent ReAct → 云端，全程无 SSE）。
+ * 要把"问完到出声"压到 1 秒，还得给 llm_chat_tools 加 "stream":true +
+ * 分片经 message_bus 回传，那是另一件事，别和这次改动混在一起。 */
+
+/* 队列深度 2（S3.2，2026-10-25）：生产者最多可以领先消费者两块。
+ *
+ * 为什么要从 1 加到 2（实测推出来的，不是拍脑袋）：
+ *   一块的合成耗时 ≈ 800 ms（TLS 握手，每块都要付一次 —— 见 mimo_voice.c
+ *   里 MIMO_TLS_REUSE_IN_ROUND 那段的说明：复用被 vela_tls.c 内部挡住了，
+ *   所以这个 800 ms 现在躲不掉）+ 服务器合成；一块的播放时长 ≈ 75 ms/字节。
+ *   两者一抵，队列深度 1 时「块间空档」的下限就是那 800 ms 握手 ——
+ *   实测非零空档中位 650 ms、最大 1570 ms，正是它。
+ *   深度 2 给生产者多一块播放时长（3~5 秒）的领先量，远大于 800 ms，
+ *   空档就基本吃掉了。**这条路不动 TLS、不引入 120 秒假死面**。
+ *
+ * 为什么是 3 个缓冲槽：最坏「2 块在排队 + 1 块在播」= 3 块占着缓冲，
+ * 生产者只能写那块空的。原来双槽乒乓（2 槽）天生只够深度 1。
+ *
+ * ★ 同步纪律（和原来一样，只是多了头尾两个游标）：
+ *   g_tts_q_tail **只有生产者写**，g_tts_q_head **只有消费者写**，
+ *   两边只读对方那个。**不搞共享计数器** —— 那是 read-modify-write，
+ *   两个线程各自 ++/-- 会撕。判空 = head==tail，判满 = 下一格就是 head。
+ *   所以数组要留一格（深度 2 → 数组 3 格）。
+ *   发布顺序：先写条目内容，最后挪 tail（读方看到 tail 变了，内容一定已就位）。
+ */
+
+#define TTS_Q_DEPTH 2
+
+typedef struct
+{
+  volatile size_t   len;    /* 那一块 PCM 字节数 */
+  volatile size_t   end;    /* 播完这一块时正文应该显示到哪个字节 */
+  volatile int      slot;   /* 那一块在几号缓冲槽 */
+  volatile uint32_t seq;    /* ★ 这一块是哪一轮的（S1.1 消费者侧校验） */
+} tts_qent_t;
+
+/* 每槽容量 = g_tts_buf_size / 3。最坏一块 64 字 × 约 7 KB/字 ≈ 448 KB
+ * （MIMO_TTS_CHUNK_CHARS × MIMO_TTS_PCM_PER_CHAR），2 MB 三等分 ≈ 682 KB/槽，
+ * 余量 1.5 倍。槽不够大时**不会写越界、也不会截断** —— mimo_tts_speak_head
+ * 按槽容量自动少念几个字（fit_chars），只是块变小、空档变多。 */
+static unsigned char *g_tts_pcm[TTS_Q_DEPTH + 1];
+static size_t         g_tts_pcm_cap;
+
+/* 环形队列：数组比深度多一格，靠 head/tail 判空满，不用共享计数器。 */
+static tts_qent_t     g_tts_q[TTS_Q_DEPTH + 1];
+static volatile uint8_t g_tts_q_head;      /* 只有消费者写：取完就 +1 */
+static volatile uint8_t g_tts_q_tail;      /* 只有生产者写：发布后才 +1 */
+
+static volatile bool   g_tts_prod_done;    /* 生产者跑完了（没有下一块了） */
+static uint32_t        g_tts_seq;          /* 轮次代号：每来一轮回复 +1 */
+
+/* 队列空 / 满（只读游标，两个线程都可调用） */
+static bool tts_q_empty(void)
+{
+  return g_tts_q_head == g_tts_q_tail;
+}
+
+static bool tts_q_full(void)
+{
+  return (uint8_t)((g_tts_q_tail + 1) % (TTS_Q_DEPTH + 1)) == g_tts_q_head;
+}
+
+/* 队列里压着几块（只读游标，诊断用） */
+static int tts_q_count(void)
+{
+  return (int)((g_tts_q_tail - g_tts_q_head + TTS_Q_DEPTH + 1) %
+               (TTS_Q_DEPTH + 1));
+}
+
+/* 清空队列（换轮时调）。⚠ 只在**生产者线程**里调（llm_complete_callback
+ * 开头、round_teardown 里），并且靠 g_round/seq 判定挡住在途的迟到块 ——
+ * 单纯清游标和原来清 g_tts_next_ready 是同一个竞态面，不更差。 */
+static void tts_q_reset(void)
+{
+  g_tts_q_head = 0;
+  g_tts_q_tail = 0;
+}
+
+/* 本轮回复正文副本。response 是 llm_send_to_api 的**栈上** buffer，回调一返回
+ * 就没了，而逐块合成要跨好几次播放回调读它，必须自己留一份。 */
+
+static char   g_tts_text[LLM_MAX_OUTPUT_LENGTH + 1];
+static char   g_tts_shown[LLM_MAX_OUTPUT_LENGTH + 1]; /* 屏上正在显示的前缀 */
+static size_t g_tts_text_pos;               /* 生产者已经合成到哪个字节 */
+
+/* ── 轮次收摊 / 排空判据 / 轮次看门狗（S1.1）─────────────────────────────
+ *
+ * 这三样是小智那套「世代代数 + 排空后再开听 + 主任务单线程推进」在本机
+ * volatile/无锁风格下的等价物。理由见文件里 g_round 那一段的注释。
+ */
+
+/* 上一轮排空了吗：没有在播、队列里没压着块、生产者也跑完了。
+ * 一轮都还没跑过（g_tts_seq == 0）按排空算 —— 那是开机第一次，
+ * 没有"上一轮"要等。 */
+
+static bool tts_drained(void)
+{
+  if (g_tts_seq == 0)
+    {
+      return true;
+    }
+
+  return !audio_is_playing(&g_audio_ctx) && tts_q_empty() && g_tts_prod_done;
+}
+
+/* 收掉一轮的在途产物（TTS 队列 + 播放 + 让路锁）。**不动 g_round** ——
+ * 调用方自己决定是「作废这一轮」还是「这一轮正常起算新的」。
+ *
+ * 顺序：先翻代数，再收摊。万一这一瞬间有回调正在发布，它自己会发现代数
+ * 对不上而弃权，不需要这里去跟它抢。 */
+
+static void round_teardown(const char *why)
+{
+  g_tts_seq++;                 /* 作废在途的合成/播放回调 */
+  g_tts_prod_done  = true;
+  tts_q_reset();               /* 队列里压着的块一并作废 */
+
+  /* 条目里的轮次号也清掉：万一 reset 之后还有迟到块落进来，消费者那边
+   * 「块属轮 != 当前轮」会把它扔掉，不会串到下一轮。 */
+  for (int i = 0; i < TTS_Q_DEPTH + 1; i++)
+    {
+      g_tts_q[i].seq = 0;
+    }
+
+  /* ★ 识别快照槽一并强制收回（2026-10-25）。
+   * 这一轮都被收摊了，它占着的识别快照就必须还回来 —— 否则「投递被吞 /
+   * ASR 那个阻塞 HTTPS 挂住不返回」会把槽**永久租走**，之后每一句都在
+   * 「上一段还在识别中」里被丢弃，真机就是"回了一句就再也不说话"。
+   *
+   * 代际号一起翻：在途的那一代收工时看见自己不是当前代，就不会把新一段
+   * 的占用抹掉（见 dlg_done）。
+   *
+   * 代价说清楚：新一段会去 memcpy 同一块 g_dlg_buf，旧一代若正读在半路就
+   * 读到掺了半截的数据 —— **只坏它自己那一次 ASR 结果**，而那个结果本来就
+   * 会被 `g_dlg_round != g_round` 扔掉（本轮号早被 ++g_round 顶掉了：本函数
+   * 的调用方 round_abort 是先 ++g_round 再进来，speech_capture_complete 是
+   * 进来之后马上 ++g_round，两条路都作废了旧轮）。缓冲长度是同一个上界，
+   * 不会越界，不会崩。
+   *
+   * 落点是白送的：speech_capture_complete 每轮开头就调本函数（"新一轮起
+   * 算，收掉上一轮残留"），所以下一句自动就把槽夺回来，不需要额外看门狗。
+   * 正常收尾时槽早就还回去了（worker 在 ASR/LLM 送出去那一刻就收工，TTS
+   * 还没开始），这里的 if 不成立，是空操作。 */
+  if (g_dlg_busy)
+    {
+      printf("[识别] 轮次收摊，强制收回识别快照槽（代 %lu → %lu），"
+             "下一段才能进来\n",
+             (unsigned long)g_dlg_gen, (unsigned long)(g_dlg_gen + 1));
+      g_dlg_gen++;
+      g_dlg_busy = false;
+    }
+
+  /* ★ 顺序要紧：**先交还麦，再停播放**（2026-10-25）。
+   * audio_play_stop() 会顺手把 record_hold 清成 false（ai_audio.c 里那条
+   * "锁不会永久挂住"的第三条兜底），但它**不**补上那次还麦 —— 被它打断的
+   * 播放按设计不恢复录音（"上层主动要停"）。反过来做就会：锁被 play_stop
+   * 清掉 → round_hold_give 看到"没人在持锁"直接返回 → 欠着的那次还麦
+   * 永远没人补，常开监听哑掉。
+   * 先交还的话，audio_record_hold_end() 内部的 audio_record_start() 自己
+   * 会去停播放（半双工），两条一起办妥；下面那句 stop 只剩兜底。 */
+
+  round_hold_give(why);
+
+  if (audio_is_playing(&g_audio_ctx))
+    {
+      audio_play_stop(&g_audio_ctx);
+    }
+
+  round_phase_set(ROUND_PHASE_IDLE);
+}
+
+/* 作废一轮（超时 / 出错 / 被打断）：代数 +1 让一切在途回调失效，再收摊。
+ * **不碰状态机** —— 该不该发 AI_ERROR 由调用方按当时的相位决定。 */
+
+static void round_abort(const char *why)
+{
+  uint32_t r = ++g_round;
+
+  printf("[轮次] ★ 轮 %lu 作废：%s\n",
+         (unsigned long)r, why ? why : "未标注");
+  round_teardown(why);
+}
+
+/* 轮次看门狗：main_loop_task 每 100ms 一拍。**这是应用层状态自愈，不是硬件
+ * 看门狗** —— 只在"这一轮明显已经死了"时把状态从卡死里捞回来，绝不复位。
+ *
+ * 为什么必须有它：整条链路里有四个"没有上界的等待"（ASR HTTPS 阻塞在录音
+ * 线程、velaclaw IPC、云端整条回复、逐块 TTS 合成），任何一个挂住，状态就
+ * 停在 AI_TALKING 里出不来。以前唯一的出口是 AI_TALKING 那 90 秒兜底，而那
+ * 只改状态、不收摊 —— 麦还锁着、队列还压着，下一轮照样起不来。
+ *
+ * 命中动作：round_abort()（代数 +1 + 清队列 + 停播放 + 交还麦）→ 状态机发
+ * AI_ERROR 回 IDLE（LISTENING 态收它会保持原状态，见 ai_state_machine.c）。 */
+
+static void round_watchdog_tick(sm_context_t *ctx)
+{
+  uint32_t now;
+  uint32_t limit;
+
+  /* 【第一道，与相位无关】让路锁超期 = 持有者没能把它交回来。
+   * 必须放在相位早退**之前**：轮已经收尾（相位=空闲）而锁忘了放的形状，
+   * 相位判据是看不见的，那正是"麦永久锁死"的典型。listen_supervise_tick
+   * 里是主判据，这里是第二道（两处都调 round_hold_give，幂等）。 */
+
+  if (g_audio_ctx.record_hold && g_hold_deadline_ms != 0 &&
+      (int32_t)(main_now_ms() - g_hold_deadline_ms) >= 0)
+    {
+      printf("[轮次] ★★ 让路锁超期（轮 %lu）强制交还麦克风\n",
+             (unsigned long)g_hold_owner_round);
+      round_hold_give("轮次看门狗：持锁超期");
+    }
+
+  if (g_round_phase == ROUND_PHASE_IDLE)
+    {
+      return;
+    }
+
+  now = main_now_ms();
+
+  /* TTS 段不看墙钟总长，只判"停滞"（理由见上面 ROUND_PHASE 那段注释）：
+   * 念得久不是病，念不动才是。 */
+
+  if (g_round_phase == ROUND_PHASE_TTS)
+    {
+      uint32_t stalled = now - g_round_progress_ms;
+
+      if ((int32_t)stalled >= (int32_t)ROUND_TTS_STALL_MAX_MS)
+        {
+          printf("[轮次] ★★ 轮 %lu TTS 停滞 %lu ms（≥ %d）没有任何一块往前走，"
+                 "作废（这条才是真卡死，不是念得久）\n",
+                 (unsigned long)g_round, (unsigned long)stalled,
+                 ROUND_TTS_STALL_MAX_MS);
+          round_abort("TTS 停滞");
+          sm_handle_event(ctx, SM_EVENT_AI_ERROR);
+          return;
+        }
+
+      if ((int32_t)(now - g_round_started_ms) >= (int32_t)ROUND_TTS_MAX_MS)
+        {
+          printf("[轮次] ★★ 轮 %lu 到 TTS 硬上限（%lu ms ≥ %d，停滞仅 %lu ms），"
+                 "作废\n",
+                 (unsigned long)g_round,
+                 (unsigned long)(now - g_round_started_ms),
+                 ROUND_TTS_MAX_MS, (unsigned long)stalled);
+          round_abort("TTS 硬上限");
+          sm_handle_event(ctx, SM_EVENT_AI_ERROR);
+        }
+
+      return;
+    }
+
+  /* 整轮上限只管 ASR / LLM 两段（这两段有明确的终点，拖过界就是死了） */
+
+  if ((int32_t)(now - g_round_started_ms) >= (int32_t)ROUND_TOTAL_MAX_MS)
+    {
+      printf("[轮次] ★★ 轮 %lu 整轮超时（%lu ms ≥ %d），相位=%s，作废\n",
+             (unsigned long)g_round,
+             (unsigned long)(now - g_round_started_ms),
+             ROUND_TOTAL_MAX_MS,
+             round_phase_name(g_round_phase));
+      round_abort("整轮超时");
+      sm_handle_event(ctx, SM_EVENT_AI_ERROR);
+      return;
+    }
+
+  switch (g_round_phase)
+    {
+      case ROUND_PHASE_ASR: limit = ROUND_ASR_MAX_MS; break;
+      case ROUND_PHASE_LLM: limit = ROUND_LLM_MAX_MS; break;
+      default:              return;
+    }
+
+  if ((int32_t)(now - g_round_phase_ms) < (int32_t)limit)
+    {
+      return;
+    }
+
+  printf("[轮次] ★ 轮 %lu 卡在 %s 相位 %lu ms（上限 %lu），作废\n",
+         (unsigned long)g_round,
+         round_phase_name(g_round_phase),
+         (unsigned long)(now - g_round_phase_ms),
+         (unsigned long)limit);
+  round_abort("相位超时");
+  sm_handle_event(ctx, SM_EVENT_AI_ERROR);
+}
+
+static void llm_speak_chunk_complete(void *user_data)
+{
+  sm_context_t *ctx = (sm_context_t *)user_data;
+  int spins = 0;
+  size_t len;
+  size_t end;
+  int slot;
+  int showlen;
+
+  round_progress();   /* 一块播完了 = 在往下走（TTS 停滞判据的主证据） */
+
+  /* 迟到的旧块丢掉之后**接着等下一块**（goto 下面这个标签），而不是把这一轮
+   * 顺手收尾 —— 否则一个残留块会把正在正常跑的一轮打死（那正是我们要消掉的
+   * 那类"说完没反应"）。正常一次只走一趟就 return。 */
+
+retry_next_chunk:
+  spins = 0;
+
+  /* 这一块播完了，下一块可能还在合成（下一句短、再下一句长的极端情况）：
+   * 在播放线程里小睡等队列 —— 播放线程两段之间本来就是空闲态，
+   * 睡在这里不压任何设备。生产者合成失败也会发布一个 len=0 的块，不会等满。
+   *
+   * ★ 上限 90 秒（2026-10-23 从 20 秒抬上来的，理由逐字保留）：20 秒是
+   * **悬崖**，一条 300 字的回复分 5 块、网络稍慢就超；一到点就把正文
+   * 无声丢掉，而且合成还在跑、跑完会把上一轮的块发布出来，被下一轮当成
+   * 自己的播掉（见 llm_complete_callback 里 g_tts_seq 的说明）。 */
+  while (tts_q_empty() && !g_tts_prod_done && spins < 9000)
+    {
+      usleep(10000);
+      spins++;
+
+      /* ★ 让路锁的上界（2026-10-24）：空档超过 8 秒就当生产者跟不上了，把麦
+       * 提前还回去 —— AI 已经明显停住不说了，这时候用户开口是想**插话**，
+       * 不该被当成"旁边的噪音"挡在门外。留着锁不放就是拿一个 bug 换另一个。
+       *
+       * 队列深度 2 之后正常空档应该恒为 0（生产者领先 1~2 块）；真到了这里
+       * 就大声留一行日志，串口一眼看得见是合成跟不上播放。 */
+
+      if (spins == 800 && g_audio_ctx.record_hold)
+        {
+          printf("[TTS] ★ 块间空档超过 8 秒，提前交还麦克风（允许插话；"
+                 "后面的块等到后照常接着播）—— 查合成耗时/网络\n");
+          round_hold_give("块间空档超 8 秒，提前还麦");
+        }
+    }
+
+  /* 取证（2026-10-24）：这段空档就是用户听到的"断掉、过一会自己接着说"。
+   * 设计上它应该是 0。量出来才知道空档实际有多长。
+   * ★ 顺带把**取的时候队列里还压着几块**打出来：这是 S3.2 队列深度 2 到底
+   * 有没有生效的直接证据（深度 2 生效时这里常是 1，表示生产者还领先着）。
+   * 上次 TLS 复用就是"以为生效了其实没有"，这次不靠猜。 */
+
+  printf("[TTS] 块间空档 %lu ms（队列 %d）%s\n",
+         (unsigned long)spins * 10,
+         tts_q_count(),
+         tts_q_empty() ? "（没等到下一块）" : "");
+
+  if (tts_q_empty())
+    {
+      if (!g_tts_prod_done)
+        {
+          printf("[TTS] ★ 等了 90 秒下一块还没合成完，本轮放弃后文"
+                 "—— 这是异常，查网络/合成耗时\n");
+        }
+
+      /* 正文念完了，或没等到：整轮就地收尾 */
+      play_complete_callback(ctx);
+      return;
+    }
+
+  /* 取队头这一条。先抄内容再动游标 —— 游标一挪生产者就可能往这一格里写
+   * 下一块，所以内容必须先拿走。 */
+  {
+    tts_qent_t *e = &g_tts_q[g_tts_q_head];
+
+    len  = e->len;
+    end  = e->end;
+    slot = e->slot;
+
+    /* ★ 消费者侧校验（S1.1 补）：这一块是哪一轮的？生产者发布时记了号，
+     * 对不上当前代数就说明是上一轮残留的迟到数据 —— 收摊时已经翻过代数了，
+     * 它却还是把块塞进了队列。**以前这里不查**，迟到的块会被当成这一轮播
+     * 出来（听感是"回答串台 / 答非所问"），是跨轮竞态的口子。 */
+
+    if (e->seq != g_round)
+      {
+        printf("[TTS] 丢弃迟到的块（块属轮 %lu，当前轮 %lu）\n",
+               (unsigned long)e->seq, (unsigned long)g_round);
+        g_tts_q_head = (uint8_t)((g_tts_q_head + 1) % (TTS_Q_DEPTH + 1));
+
+        if (g_tts_prod_done)
+          {
+            /* 这一轮的生产者也没了：队列里再没有好块，就地收尾。 */
+            play_complete_callback(ctx);
+            return;
+          }
+
+        /* 这一轮还活着：接着等它自己的好块，别顺手把这一轮打死。 */
+        goto retry_next_chunk;
+      }
+  }
+
+  /* 归还槽位：从这一刻起生产者可以往这一格里写**下**一块了。
+   * 必须在起播之前挪 head —— 生产者只写刚空出来的那一槽，
+   * 正在播的这一槽它不碰，所以提前放行是安全的。 */
+  g_tts_q_head = (uint8_t)((g_tts_q_head + 1) % (TTS_Q_DEPTH + 1));
+
+  if (len == 0)
+    {
+      /* 生产者报了空块（合成失败）：后面没戏了，收尾 */
+      play_complete_callback(ctx);
+      return;
+    }
+
+  /* 文字随声推进：这一块开播的这一刻，屏幕上才出到这一句。
+   * 这就是用户要的"边出字边说话"—— 念到哪儿、显示到哪儿。 */
+
+  showlen = (int)((end <= sizeof(g_tts_shown) - 1) ? end : sizeof(g_tts_shown) - 1);
+  memcpy(g_tts_shown, g_tts_text, showlen);
+  g_tts_shown[showlen] = '\0';
+  robot_ui_bridge_voice_reply(g_tts_shown);
+
+  prompt_ack_stop(&g_audio_ctx);   /* 真话要出声，先收掉"我听见了" */
+
+  if (audio_play_start_ref(&g_audio_ctx,
+                           (const int16_t *)g_tts_pcm[slot],
+                           len / sizeof(int16_t),
+                           llm_speak_chunk_complete, ctx) == 0)
+    {
+      round_progress();   /* 起播了 = 在往下走，别让停滞判据误伤 */
+      printf("[TTS] 下一块开始播放（%zu 字节，槽 %d）\n", len, slot);
+      return;
+    }
+
+  /* 起播失败：整轮就地收尾 */
+  printf("[TTS] ★ 下一块起播失败，本轮收尾\n");
+  play_complete_callback(ctx);
 }
 
 /**
@@ -3107,19 +4352,51 @@ static void llm_complete_callback(const char *response, int error,
   if (error != 0)
     {
       printf("[LLM] AI请求失败: %d\n", error);
+      round_phase_set(ROUND_PHASE_IDLE);
       sm_handle_event(ctx, SM_EVENT_AI_ERROR);
       return;
     }
 
+  /* ★ 起播前先确认上一轮真的排空了（S1.1 规则 2）。正常路径上
+   * speech_capture_complete 已经 round_teardown 过，这里应当是 true；真为
+   * false 就说明还有旧东西压着（单段播报 / 迟到的合成 / 上一轮的生产者），
+   * 先收干净再开这一轮，否则新旧两套抢同一台半双工设备。 */
+
+  if (!tts_drained())
+    {
+      printf("[TTS] 起播前发现上一轮没排空（在播 %d / 队列 %d / 生产者完 %d），"
+             "先收摊再开这一轮\n",
+             (int)audio_is_playing(&g_audio_ctx),
+             tts_q_count(),
+             (int)g_tts_prod_done);
+      round_teardown("起播前清残留");
+    }
+
+  /* 本轮代数：本回调的每一个发布点、消费者侧的每一次取块都要核对它。
+   * 这里抄一份，之后 g_round 再变（新轮起算 / 被打断）就说明本轮已作废。 */
+
+  uint32_t my_round = g_round;
+
   printf("[LLM] AI回复: %s\n", response);
 
-  /* 回传界面：AI 的每次回复正文都要上屏。
+  /* 基线取证 ③：识别文本到回复到手（velaclaw IPC + 云端整条回复）。 */
+  g_t2_llm_ms = main_now_ms();
+  printf("[基线] ③ LLM 回复到手（距说完 %lu ms，识别后 %lu ms）\n",
+         (unsigned long)(g_t2_llm_ms - g_t0_speech_ms),
+         (unsigned long)(g_t2_llm_ms - g_t1_asr_ms));
+
+  /* 进入 TTS 相位：接下来是逐块合成 + 逐块播，由整轮 95s 上限兜着。 */
+  round_phase_set(ROUND_PHASE_TTS);
+
+  /* 回传界面：**不再一次性把全文刷到屏上** —— 那正是用户说的"边读边输没有
+   * 解决"的直接原因（字全出来了、声音还在慢悠悠往出走）。改成"念到哪儿、
+   * 显示到哪儿"：第一句开播的那一刻屏上先出这一句，之后每开播一块再往后
+   * 出一段（见 llm_speak_chunk_complete 里的 robot_ui_bridge_voice_reply）。
+   *
    * 主路是同进程直调（robot_ui_bridge_voice_reply：清洗 + 主屏对话区 + 镜像
    * 面板对话区，内部全是 lv_async_call，本函数在录音线程里跑也安全）；
-   * 旁路是原来的 MQTT ai_reply/set_face，给手机/PC 端 —— 那种"本机界面反馈
-   * 必须绕公网跑一个来回"的写法，网络一抖用户看到的就是完全没反应。 */
-
-  robot_ui_bridge_voice_reply(response);
+   * 旁路是原来的 MQTT ai_reply/set_face，给手机/PC 端 —— 那条路整条发
+   * （手机端不做逐句），保持原样。 */
 
   if (g_net_started)
     {
@@ -3127,61 +4404,227 @@ static void llm_complete_callback(const char *response, int error,
       ai_network_send_face(&g_net_ctx, AI_CMD_FACE_HAPPY);
     }
 
-  /* TTS: 文字转语音 */
+  /* TTS: 文字转语音 —— 逐句流式（见本文件"流式 TTS"那段说明） */
 
-  /* TTS 缓冲 256 KB ≈ 16 kHz/单声道/16 bit 的 8 秒；原来 32 KB 只有 1 秒，
-   * 超出部分会被 volc_tts.c 静默截断（PCM buffer full）。
-   * 必须走堆：静态 256 KB 会把内核 SRAM 顶到 96%（构建报告可查），运行时就没余量了；
-   * 堆里有第二块 PSRAM（8 MB），大块分配会落到那边。 */
-  static unsigned char *tts_buf = NULL;
-  static size_t tts_buf_size = 0;
-  size_t tts_len = 0;
+  /* 缓冲走开机预分配的 g_tts_buf（阶梯降级的来龙去脉见文件头部
+   * tts_buf_ensure 的注释；2026-10-17 "只念 2 个字"就是懒分配踩的坑）。
+   * 这里仍留一次 ensure()：开机预分配万一全失败，第一次回复时堆可能已经
+   * 释放出空间，再试一次比直接放弃强。 */
+  size_t chunk_len = 0;
+  size_t consumed = 0;
   int ret;
 
-  if (tts_buf == NULL)
+  if (tts_buf_ensure() != OK)
     {
-      tts_buf_size = 256 * 1024;
-      tts_buf = malloc(tts_buf_size);
-      if (tts_buf == NULL)
+      printf("[TTS] 缓冲分配失败，跳过合成\n");
+      /* 出不了声，至少把字摆上屏，别让人以为面板坏了 */
+      robot_ui_bridge_voice_reply(response);
+      round_phase_set(ROUND_PHASE_IDLE);
+      sm_handle_event(ctx, SM_EVENT_AI_RESPONSE);
+      return;
+    }
+
+  /* 正文副本 + 三槽轮转。response 是 llm_send_to_api 的栈上 buffer，本回调
+   * 一返回就没了，而逐块合成要跨好几次播放回调读它。 */
+
+  strncpy(g_tts_text, response, sizeof(g_tts_text) - 1);
+  g_tts_text[sizeof(g_tts_text) - 1] = '\0';
+  g_tts_text_pos = 0;
+  g_tts_shown[0] = '\0';
+
+  /* 三槽：队列深度 2 最坏「2 块排队 + 1 块在播」，得各占一槽。
+   * 见 g_tts_q 那一段的说明。 */
+  g_tts_pcm[0]  = g_tts_buf;
+  g_tts_pcm[1]  = g_tts_buf + g_tts_buf_size / 3;
+  g_tts_pcm[2]  = g_tts_buf + (g_tts_buf_size / 3) * 2;
+  g_tts_pcm_cap = g_tts_buf_size / 3;
+
+  /* 单槽装不下一个最大块（64 字 ≈ 448 KB）就报出来。⚠ 不是"念半句就断"：
+   * mimo_tts_speak_head 按槽容量自动少念几个字，音频是完整的，只是块变小、
+   * 块间空档变多、顺滑变差。正常开机拿到 2 MB 那档（682 KB/槽）够不到这里，
+   * 到了这里说明分配阶梯掉档了，得当异常看。 */
+  if (g_tts_pcm_cap < 460 * 1024)
+    {
+      printf("[TTS] ★ 单槽只有 %zu 字节（< 460 KB），装不下一个最大块（64 字"
+             " ≈ 448 KB）—— 不会截断，但块会被迫切小、空档变多；"
+             "查缓冲分配阶梯掉到第几档\n",
+             g_tts_pcm_cap);
+    }
+
+  tts_q_reset();
+  for (int i = 0; i < TTS_Q_DEPTH + 1; i++)
+    {
+      g_tts_q[i].len  = 0;
+      g_tts_q[i].end  = 0;
+      g_tts_q[i].slot = 0;
+      g_tts_q[i].seq  = 0;
+    }
+
+  g_tts_prod_done  = false;
+
+  /* 本轮代号。逐块合成是**整条流水线里最慢的一段**（每块一次 HTTPS）：
+   * 万一上一轮的生产者拖到这里才跑完，它会把上一轮的块写进队列，下一轮
+   * 的播放回调就会把上一轮的正文当成这一轮播出来 —— 听感是"回答串台/答非
+   * 所问"。每轮 +1，发布前对一下号，对不上就是迟到的旧数据，直接扔。
+   *
+   * ★ 消费者侧的配对校验见 llm_speak_chunk_complete 里取块时的 e->seq ——
+   * 那边才是原来漏掉的那半边。 */
+  uint32_t seq = ++g_tts_seq;
+
+  uint32_t t_speak = main_now_ms();
+
+  /* 第 1 块：直接合成 + 直接起播，不走队列 —— 第一个字出声的路径越短越好。
+   * 块上限用小的那个（20 字），只为早出声；后续块才用大的（64 字）。 */
+
+  ret = mimo_tts_speak_head(g_tts_text, g_tts_pcm[0], g_tts_pcm_cap,
+                            MIMO_TTS_HEAD_CHUNK_CHARS, &chunk_len, &consumed);
+  if (ret < 0 || chunk_len == 0 || consumed == 0)
+    {
+      printf("[TTS] 首句合成失败: %d\n", ret);
+      robot_ui_bridge_voice_reply(response);   /* 出不了声也要让字上屏 */
+      round_phase_set(ROUND_PHASE_IDLE);
+      sm_handle_event(ctx, SM_EVENT_AI_RESPONSE);
+      return;
+    }
+
+  /* 取证（2026-10-24）：用户报"输出完毕后很久才会读出来"。这一段是回复到手
+   * 之后、第一个字出声之前**唯一**的阻塞（一次 HTTPS TTS 合成 ≤64 字），
+   * 量出来才知道慢在合成还是慢在网络/别处。 */
+
+  printf("[TTS] 首句合成耗时 %lu ms（回复到手到起声之间的阻塞）\n",
+         (unsigned long)(main_now_ms() - t_speak));
+
+  g_tts_text_pos = consumed;
+
+  /* 第一句开播的这一刻，屏上才出这一句 */
+  memcpy(g_tts_shown, g_tts_text, consumed);
+  g_tts_shown[consumed] = '\0';
+  robot_ui_bridge_voice_reply(g_tts_shown);
+
+  /* 首句立刻起播（起播内部会先停录音，见 ai_audio.c 的 audio_prepare_output）。
+   *
+   * ★ 整轮播报的让路锁在这里置真（2026-10-24，修用户报的"AI 说话时旁边一有
+   * 声音就断掉、转去听、过一会自己接着说"）：每块之间都有"合成跟不上播放"的
+   * 空档，这段空档里半双工契约会把常开监听恢复起来，麦一开，VAD 就把状态机
+   * 从"正在说"切到"正在听"。置锁后 ai_audio.c 连"播完还麦"都不做，整轮收尾
+   * （play_complete_callback）才交还麦克风（中途超 8 秒会提前还，见上）。
+   *
+   * ★ 2026-10-25：改走 round_hold_take()，把「是哪一轮持的、最晚什么时候放」
+   * 一起登记下来 —— 原来只翻一个 bool，那一轮要是死在半路上就没人知道该
+   * 谁来收（见 g_hold_owner_round 那一段）。 */
+
+  round_hold_take(my_round);
+
+  /* ★ 真答复首块要出声了，先把"我听见了"收掉。
+   * 这条不是可选的：audio_play_start() / audio_play_start_ref() 对"已经在播"
+   * 一律返回 -EBUSY，**不会顶掉在播的那一段**（ai_audio.c 的注释）。提示音
+   * 只有 0.43 秒，正常早播完了，但万一还在响（网络快、或提示音走的是预缓存
+   * 那条长语音），不停掉就会走下面的"首句播放失败"分支 —— 整轮回复就地收尾，
+   * 用户听到的是叮一声就没下文了，正是"又不能对话"那一类。
+   * prompt_ack_stop() 在没响的时候是空操作，不额外花钱。 */
+
+  prompt_ack_stop(&g_audio_ctx);
+
+  ret = audio_play_start_ref(&g_audio_ctx,
+                             (const int16_t *)g_tts_pcm[0],
+                             chunk_len / sizeof(int16_t),
+                             llm_speak_chunk_complete, ctx);
+  if (ret < 0)
+    {
+      printf("[TTS] 首句播放失败: %d\n", ret);
+      round_hold_give("首句起播失败，锁不能留着");
+      round_phase_set(ROUND_PHASE_IDLE);
+      sm_handle_event(ctx, SM_EVENT_AI_RESPONSE);
+      return;
+    }
+
+  round_progress();   /* 起播了 = 在往下走，别让停滞判据误伤 */
+  printf("[TTS] 首句开始播放（%zu 字节），正文 %zu 字节，逐句往下走\n",
+         chunk_len, strlen(g_tts_text));
+
+  /* 基线取证 ③→④：回复到手到首字出声，就是用户等的那一段。上面那行
+   * 「首句合成耗时」量的是其中的合成阻塞，两行对着看就知道慢在合成还是
+   * 别处（起播前还有切块/缓冲搬运）。 */
+  printf("[基线] ④ 首字出声（距说完 %lu ms，回复到手后 %lu ms）\n",
+         (unsigned long)(main_now_ms() - g_t0_speech_ms),
+         (unsigned long)(main_now_ms() - g_t2_llm_ms));
+
+  /* 生产者：逐块合成、逐块发布。本回调线程（agent 派发线程）在这里阻塞是
+   * 预期的 —— 但它一次只合成一块（≤64 字），而且第一句正在出声。 */
+
+  int fill = 1;   /* 下一块写进哪个槽（0 号正被第 1 块占着）。
+                   * 三槽轮转 1→2→0→1…，和消费者「取走即腾出那一槽」对得上：
+                   * 队列里最多 2 块 + 在播 1 块 = 3 槽，生产者要写的那一槽
+                   * 一定不在播、也不在队列里。 */
+
+  while (g_tts_text[g_tts_text_pos] != '\0')
+    {
+      int waits = 0;
+
+      /* 队列深度 2：队列满了才等（消费者取走就腾出一格）。满 = 最多领先两块，
+       * 再多就要盖掉消费者正要读的那块了。 */
+      while (tts_q_full() && seq == g_tts_seq && my_round == g_round &&
+             waits < 9000)
         {
-          tts_buf_size = 32 * 1024;
-          tts_buf = malloc(tts_buf_size);
+          usleep(10000);
+          waits++;
         }
 
-      if (tts_buf == NULL)
+      if (seq != g_tts_seq || my_round != g_round)
         {
-          printf("[TTS] 缓冲分配失败，跳过合成\n");
-          sm_handle_event(ctx, SM_EVENT_AI_RESPONSE);
+          printf("[TTS] 本轮已作废（seq %lu/%lu 轮 %lu/%lu），停止生产\n",
+                 (unsigned long)seq, (unsigned long)g_tts_seq,
+                 (unsigned long)my_round, (unsigned long)g_round);
           return;
         }
 
-      printf("[TTS] 缓冲 %zu 字节已分配\n", tts_buf_size);
+      if (waits >= 9000)
+        {
+          printf("[TTS] ★ 等消费者取走上一块等了 90 秒，停止生产\n");
+          break;
+        }
+
+      /* 后续块用**大**上限（64 字）：块少 = HTTPS 往返少 = 块间空档少，
+       * 而且断句落在句号上而不是逗号上（tts_split_len 的 min_chars = max/2）。
+       * ★ 2026-10-25 修：这里原来没传上限，被 mimo_tts_speak_head 内部写死的
+       * 首块小值（20 字）卡住，改 MIMO_TTS_CHUNK_CHARS 是空操作。 */
+      ret = mimo_tts_speak_head(g_tts_text + g_tts_text_pos,
+                                g_tts_pcm[fill], g_tts_pcm_cap,
+                                MIMO_TTS_CHUNK_CHARS, &chunk_len, &consumed);
+      if (ret < 0 || chunk_len == 0 || consumed == 0)
+        {
+          printf("[TTS] 第 %zu 字节起的块合成失败: %d，正文到此为止\n",
+                 g_tts_text_pos, ret);
+          break;
+        }
+
+      g_tts_text_pos += consumed;
+
+      /* 发布：先写条目内容，最后才挪 tail —— 消费者看到 tail 变了，
+       * len/end/slot 一定已经就位（同原来「ready 最后写」的纪律）。 */
+      {
+        tts_qent_t *e = &g_tts_q[g_tts_q_tail];
+
+        e->slot = fill;
+        e->len  = chunk_len;
+        e->end  = g_tts_text_pos;
+        e->seq  = my_round;    /* 记下这块是谁的，消费者据此校验 */
+
+        g_tts_q_tail = (uint8_t)((g_tts_q_tail + 1) % (TTS_Q_DEPTH + 1));
+      }
+
+      fill = (fill + 1) % (TTS_Q_DEPTH + 1);
     }
 
-  ret = voice_tts_speak(response, tts_buf, tts_buf_size, &tts_len);
-  if (ret < 0 || tts_len == 0)
+  if (seq != g_tts_seq || my_round != g_round)
     {
-      printf("[TTS] 语音合成失败: %d\n", ret);
-      sm_handle_event(ctx, SM_EVENT_AI_RESPONSE);
       return;
     }
 
-  printf("[TTS] 合成完成, %zu 字节\n", tts_len);
+  /* 告诉消费者：没有下一块了（正文念完了，或中途合成失败）。
+   * 它把队列里剩的那块播完就整轮收尾。 */
 
-  /* 播放合成的语音（起播内部会先停录音，见 ai_audio.c 的 audio_prepare_output） */
-
-  size_t frames = tts_len / sizeof(int16_t);
-  ret = audio_play_start(&g_audio_ctx,
-                                (const int16_t *)tts_buf, frames,
-                                play_complete_callback, ctx);
-  if (ret < 0)
-    {
-      printf("[TTS] 播放失败: %d\n", ret);
-      sm_handle_event(ctx, SM_EVENT_AI_RESPONSE);
-      return;
-    }
-
-  printf("[TTS] 开始播放语音\n");
+  g_tts_prod_done = true;
 }
 
 /****************************************************************************
@@ -3481,6 +4924,7 @@ static int light_speak(sm_context_t *ctx, const char *text)
 
   if (tts_cache_load(text, &cached, &cached_len) == 0)
     {
+      prompt_ack_stop(&g_audio_ctx);   /* 真话要出声，先收掉"我听见了" */
       ret = audio_play_start(&g_audio_ctx, (const int16_t *)cached,
                                     cached_len / sizeof(int16_t),
                                     play_complete_callback, ctx);
@@ -3533,6 +4977,7 @@ static int light_speak(sm_context_t *ctx, const char *text)
    * 播放完成回调直接用现成的 play_complete_callback()：它置"这轮出过声"
    * 并发 AI_RESPONSE，让状态机从 AI_TALKING 收尾回 LISTENING。 */
 
+  prompt_ack_stop(&g_audio_ctx);   /* 真话要出声，先收掉"我听见了" */
   ret = audio_play_start(&g_audio_ctx, (const int16_t *)tts_buf,
                                 tts_len / sizeof(int16_t),
                                 play_complete_callback, ctx);
@@ -3852,6 +5297,120 @@ static void publish_user_said(const char *text)
 }
 
 /**
+ * @brief  识别线程（S1.2）：跑 ASR → 轻意图 → llm_send_text
+ *
+ * 线程常驻、`sem` 等活，不随轮次建/销 —— 建线程那一下本身就要几十毫秒，
+ * 放在「说完到出声」的关键路径上就是白送的延迟；而且反复建销正是历史上
+ * 「录音线程 1000ms 内没退出」那类尾巴的温床。做法照抄 state_beacon_task
+ * （固定栈 + detach + 起不来只留一行日志）。
+ */
+
+#define DIALOGUE_WORKER_STACK  32768
+
+static void *dialogue_worker(void *arg)
+{
+  sm_context_t *ctx = (sm_context_t *)arg;
+
+  g_dlg_worker_alive = true;
+  printf("[识别] 识别线程进入服务\n");
+
+  while (g_running)
+    {
+      if (sem_wait(&g_dlg_sem) != 0)
+        {
+          if (errno == EINTR)
+            {
+              continue;
+            }
+
+          printf("[识别] 等待请求失败(%d)，识别线程退出\n", errno);
+          break;
+        }
+
+      if (!g_running)
+        {
+          break;
+        }
+
+      if (!g_dlg_busy)
+        {
+          continue;   /* 有人喊了一声但没登记请求（不该发生），不空跑 */
+        }
+
+      /* ★ S2.1 本地即时反馈音：进识别之前先响一声"我听见了"。
+       *
+       * 为什么放在这儿、而不是在 speech_capture_complete() 里：那个函数跑在
+       * **录音线程**上（VAD 回调），而起播要过 audio_prepare_output() 停录音 ——
+       * 从录音线程里停录音是自己停自己，历史上就是这类尾巴把录音线程拖死的。
+       * 识别线程是干净的非设备线程，唤醒开销是微秒级，从"说完"到这一声
+       * 仍然是亚百毫秒。
+       *
+       * 为什么必须放在这儿、而不是等 ASR 出了文本再响：ASR 是整段上传的阻塞
+       * HTTPS，实测 1 秒起。放后面就白瞎了这一层的意义。
+       *
+       * 失败不用管：-EBUSY 说明真答复已经先出声了（正常竞态），其它负值
+       * 只是没听到这一声，不影响本轮对话继续往下走。 */
+
+      prompt_ack_play(&g_audio_ctx);
+
+      process_ai_dialogue(ctx);
+    }
+
+  /* 圈外标记必须在**退出那一刻**打。g_running 在接管路径上会先 0 后 1
+   * （见 ai_companion 那段接管说明），如果线程恰好在这个窗口里从 sem_wait
+   * 醒来，它就真的退了 —— 而 g_dlg_thread_valid 还是 true，之后每一句的
+   * sem_post 都落进没人听的信号量里，对话从此静默。有了这一句，
+   * dialogue_request 能发现"线程不在了"，直接同步跑，退化而不是失聪。 */
+  g_dlg_worker_alive = false;
+  printf("[识别] 识别线程退出（之后每一轮走同步兜底）\n");
+  return NULL;
+}
+
+/**
+ * @brief  状态机进 AI_TALKING 时的入口：只负责唤醒识别线程
+ *
+ * 注册给 `sm_set_user_data()`，签名必须是 `void (*)(sm_context_t *)`
+ * （`sm_ai_talking_enter` 按这个形状转型调用）。真活全在 dialogue_worker 上。
+ *
+ * 兜底：识别线程没起来 / 没在跑 / 快照缓冲没要到 → 直接同步跑
+ * `process_ai_dialogue()`，行为逐字回到 S1.2 之前，不引入"半个新半个旧"的
+ * 中间态。**宁可退回到"ASR 占住录音线程"，也不能把这一轮丢掉** —— 丢掉就是
+ * 用户说了话没反应，正是这一版要消灭的东西。 */
+
+static void dialogue_request(sm_context_t *ctx)
+{
+  /* 同一轮只投递一次：speech_capture_complete 现在无条件投递，而状态真的
+   * 切进 AI_TALKING 时 enter 回调还会再来一次。两次都发出去的话，同步兜底
+   * 那条路会把同一段识别跑两遍（两遍 ASR、两遍回话）。 */
+  if (g_dlg_delivered_round == g_round)
+    {
+      return;
+    }
+
+  g_dlg_delivered_round = g_round;
+
+  if (!g_dlg_thread_valid || !g_dlg_ready || !g_dlg_worker_alive)
+    {
+      static uint32_t s_fallback_logged;
+
+      if (s_fallback_logged < 8)   /* 节流：别在坏掉之后把串口刷爆 */
+        {
+          s_fallback_logged++;
+          printf("[识别] 识别线程不可用（ready=%d valid=%d alive=%d），"
+                 "这一轮同步跑（ASR 会占住录音线程）\n",
+                 g_dlg_ready ? 1 : 0,
+                 g_dlg_thread_valid ? 1 : 0,
+                 g_dlg_worker_alive ? 1 : 0);
+        }
+
+      process_ai_dialogue(ctx);
+      return;
+    }
+
+  sem_post(&g_dlg_sem);
+}
+
+/**
  * @brief  处理AI对话的本体（在AI_TALKING状态调用，见 sm_ai_talking_enter）
  */
 
@@ -3862,6 +5421,11 @@ static void process_ai_dialogue(sm_context_t *ctx)
   size_t frames;
   int ret;
 
+  /* 抄成本地代际号，收工时只认这一代（见 g_dlg_gen 的说明）。
+   * 放在**最开头**抄：这一段识别可能跑上几十秒，期间轮次收摊已经把槽
+   * 收回去给下一段了，晚抄就抄到了别人的代。 */
+  uint32_t my_gen = g_dlg_gen;
+
   /* 异常声追问流程（W1）：这一轮的识别结果不送大模型，只用来判定
    * "要不要真报警"。判定和收尾都在 ask_flow_tick() 里做（那个线程独占相位），
    * 这里只把文本送过去。 */
@@ -3871,9 +5435,14 @@ static void process_ai_dialogue(sm_context_t *ctx)
    * 重开会话之前、以及放音收尾恢复录音之前）都在别的线程里把 g_speech_frames
    * 清零，读到一半被清就会出现"判断时有数据、送 ASR 时长度变 0"这种自相矛盾的
    * 一轮。快照只影响这一次识别（用的是旧值），不会越界：缓冲是常驻的，
-   * 帧数只会变小。 */
+   * 帧数只会变小。
+   *
+   * S1.2 之后读的是**收尾那一刻拷好的快照**（g_dlg_ptr / g_dlg_frames），
+   * 不再是 g_speech_buf / g_speech_frames：那时录音线程已经回去累积下一段了，
+   * 直接读就是读写竞态。兜底路径（识别线程不可用）里 g_dlg_ptr 就是
+   * g_speech_buf，行为不变。 */
 
-  frames = g_speech_frames;
+  frames = g_dlg_frames;
 
   printf("[AI] 开始AI对话处理 (累积 %zu 帧音频)\n", frames);
 
@@ -3881,7 +5450,7 @@ static void process_ai_dialogue(sm_context_t *ctx)
    * 门槛（100ms）和 ai_companion_voice_submit() 那边共用同一个宏：两边口径必须
    * 一致 —— 那边达标才会登记「提交」请求，这里不达标就白白跳过一次识别。 */
 
-  if (g_speech_buf == NULL || frames < SPEECH_MIN_FRAMES_FOR_ASR)
+  if (g_dlg_ptr == NULL || frames < SPEECH_MIN_FRAMES_FOR_ASR)
     {
       printf("[AI] 语音数据不足，跳过\n");
 
@@ -3894,15 +5463,30 @@ static void process_ai_dialogue(sm_context_t *ctx)
           sm_handle_event(ctx, SM_EVENT_AI_ERROR);
         }
 
-      return;
+      goto dlg_done;
     }
 
-  /* ASR: 语音转文字 */
+  /* ASR: 语音转文字
+   *
+   * S1.2 之后这一句跑在 dialogue_worker 上，不再是录音线程 —— 录音全程没停，
+   * 用户在识别期间说话照样录得进（只是这一版还丢在快照槽那道闸上，见
+   * speech_capture_complete 的说明）。 */
 
   printf("[AI] 正在进行语音识别...\n");
-  ret = voice_asr_recognize((const unsigned char *)g_speech_buf,
+  ret = voice_asr_recognize((const unsigned char *)g_dlg_ptr,
                             frames * sizeof(int16_t),
                             text_buf, sizeof(text_buf));
+
+  /* 识别这一段是唯一可能耗时几秒的同步调用。期间这一轮可能已经作废
+   * （用户又说了一句开了新一轮 / 轮次看门狗判 ASR 相位超时）—— 迟到的旧结果
+   * 一律扔掉，不许再往界面、云端、播放器上贴（S1.1 的代数纪律）。 */
+  if (g_dlg_round != g_round)
+    {
+      printf("[AI] 识别结果迟到（快照是第 %lu 轮，现在是第 %lu 轮），作废\n",
+             (unsigned long)g_dlg_round, (unsigned long)g_round);
+      goto dlg_done;
+    }
+
   if (ret < 0)
     {
       printf("[AI] 语音识别失败: %d\n", ret);
@@ -3916,7 +5500,7 @@ static void process_ai_dialogue(sm_context_t *ctx)
           sm_handle_event(ctx, SM_EVENT_AI_ERROR);
         }
 
-      return;
+      goto dlg_done;
     }
 
   if (!user_said_has_content(text_buf))
@@ -3936,10 +5520,15 @@ static void process_ai_dialogue(sm_context_t *ctx)
           sm_handle_event(ctx, SM_EVENT_AI_ERROR);
         }
 
-      return;
+      goto dlg_done;
     }
 
   printf("[AI] 识别结果: %s\n", text_buf);
+
+  /* 基线取证 ②：说完到识别文本到手（这一段整条是阻塞的 ASR HTTPS）。 */
+  g_t1_asr_ms = main_now_ms();
+  printf("[基线] ② ASR 文本到手（距说完 %lu ms）\n",
+         (unsigned long)(g_t1_asr_ms - g_t0_speech_ms));
 
   /* 用户原话回传界面：全文件唯一的发送点。放在这里（所有分支之前）是因为
    * 下面三条出路 —— 追问判定 / 灯控 / 大模型 —— 都被这一次覆盖：
@@ -3954,7 +5543,8 @@ static void process_ai_dialogue(sm_context_t *ctx)
   if (ask_mode)
     {
       ask_flow_mark_answer(text_buf);
-      return;
+      round_phase_set(ROUND_PHASE_IDLE);   /* 不上云，轮次看门狗别再盯着 */
+      goto dlg_done;
     }
 
   /* 本机灯控意图：命中就直接做完（device_cmd + 回话 + 播报），
@@ -3964,12 +5554,27 @@ static void process_ai_dialogue(sm_context_t *ctx)
   if (light_intent == LIGHT_INTENT_ON || light_intent == LIGHT_INTENT_OFF)
     {
       handle_light_intent(ctx, light_intent);
-      return;
+      round_phase_set(ROUND_PHASE_IDLE);   /* 本机回话是单段播报，不走这条流水线 */
+      goto dlg_done;
     }
 
   printf("[意图] 灯控未命中，交给大模型\n");
 
   /* LLM: 发送文字到大模型 */
+
+  /* 进入 LLM 相位：ASR 那段到此为止，接下来等 velaclaw IPC + 云端整条回复。
+   *
+   * 动手前再核一次代数：从识别到手到这里隔着 publish_user_said（MQTT）和
+   * 意图分类，用户可能已经又说了一句开了新一轮 —— 这时候再发一条 LLM，
+   * 就是**两条回复同时往 TTS 队列里灌**，正是「边说边跳字/两个声音」那种乱。 */
+  if (g_dlg_round != g_round)
+    {
+      printf("[AI] 这一轮在送大模型前已作废（快照 %lu 轮 / 现在 %lu 轮），不发\n",
+             (unsigned long)g_dlg_round, (unsigned long)g_round);
+      goto dlg_done;
+    }
+
+  round_phase_set(ROUND_PHASE_LLM);
 
   if (g_net_started)
     {
@@ -3977,12 +5582,59 @@ static void process_ai_dialogue(sm_context_t *ctx)
       ai_network_send_face(&g_net_ctx, AI_CMD_FACE_THINKING);
     }
 
-  ret = llm_send_text(&g_llm_ctx, text_buf,
-                      NULL, llm_complete_callback, ctx);
+  /* -EBUSY 重试：llm_send_text 在上一轮还没收工时会直接拒。
+   * 上一轮的收工时间点是 llm_complete_callback 把**尾段合成**跑完
+   * （见 g_tts_seq 那段），也就是说"机器还在说话/还在合成"的这段时间里
+   * 新问题一律会被 -EBUSY 打回。正常情况下播放回调会等到合成完才收轮，
+   * 这里不会撞上；但「提交」提前收尾、监听守护强制收尾这两条路会 ——
+   * 那时用户明明已经说了话，一句"发送LLM请求失败: -16"就把他的话吞了，
+   * 表现就是"完全不能对话"。所以先给它两三次机会，别一撞就丢。 */
+  for (int attempt = 0; attempt < 3; attempt++)
+    {
+      /* 每次动手前核一次：-EBUSY 的那 300ms 里用户可能已经又开口了。 */
+      if (g_dlg_round != g_round)
+        {
+          printf("[AI] 重试期间这一轮已作废（%lu → %lu），不再发 LLM\n",
+                 (unsigned long)g_dlg_round, (unsigned long)g_round);
+          goto dlg_done;
+        }
+
+      ret = llm_send_text(&g_llm_ctx, text_buf,
+                          NULL, llm_complete_callback, ctx);
+      if (ret != -EBUSY)
+        {
+          break;
+        }
+
+      printf("[AI] LLM 正忙(-EBUSY)，%d/3 次重试\n", attempt + 1);
+      usleep(300000);
+    }
+
   if (ret < 0)
     {
       printf("[AI] 发送LLM请求失败: %d\n", ret);
+      round_phase_set(ROUND_PHASE_IDLE);   /* 这一轮没发出去，看门狗别再盯着 */
       sm_handle_event(ctx, SM_EVENT_AI_ERROR);
+    }
+
+dlg_done:
+
+  /* 这一段识别收工，快照槽还回去 —— 下一段语音才登记得进来。
+   * 放在**所有**出路的必经点上（含中途作废）。漏一条的后果是真机上再也
+   * 认不出话：槽一直 busy，speech_capture_complete 每一段都丢弃，日志里
+   * 只有"上一段还在识别中"无限重复 —— 那正是这一版要避免的形状。
+   *
+   * ★ 只许**自己这一代**还（2026-10-25）：轮次收摊会强制收回槽给下一段，
+   * 迟到归来的这一代若也去清 busy，就把新一代的占用一并抹了。 */
+  if (my_gen == g_dlg_gen)
+    {
+      g_dlg_busy = false;
+    }
+  else
+    {
+      printf("[识别] 我这一代收工时槽已易主（我这代 %lu，当前 %lu），"
+             "不碰它\n",
+             (unsigned long)my_gen, (unsigned long)g_dlg_gen);
     }
 }
 
@@ -4163,6 +5815,31 @@ static void *main_loop_task(void *arg)
 
       listen_supervise_tick(ctx);
 
+      /* 5.1 轮次看门狗（S1.1）：一轮卡在 ASR / LLM 哪个相位超了上限就作废收摊，
+      *     别让状态停在 AI_TALKING 里出不来。**应用层状态自愈，不复位硬件。**
+      *     让路锁超期那一条同时在这里兜一遍（listen_supervise_tick 里是主判据，
+      *     这里是第二道）。 */
+
+      round_watchdog_tick(ctx);
+
+      /* 5.1b 播放停滞看门狗（2026-10-25 加）：播放线程卡在设备调用里出不来时
+       *     强制收摊放行。**必须放在音频层、与轮次无关** —— 追问/报警提示音、
+       *     灯控音这些单段播报压根不在"轮"里，上面那条在 ROUND_PHASE_IDLE 就
+       *     早退，对它们是瞎的。2026-10-25 真机那次就是这么漏的：一次播报卡死
+       *     80 秒，期间 playing 一直为真，「提交」全被判"正忙"、新一轮起不来，
+       *     用户看到的就是"AI 不回答"。 */
+
+      audio_play_watchdog_tick(&g_audio_ctx);
+
+      /* 5.1c 「没听清」出声的代跑（S4.3）：录音线程只置 g_say_miss_pending，
+       *     这里替它说。放在看门狗之后、不占关键路径；没要说是两次判断就返回。 */
+
+      if (g_say_miss_pending)
+        {
+          g_say_miss_pending = false;
+          prompt_ack_play_kind(&g_audio_ctx, PROMPT_ACK_KIND_MISS);
+        }
+
       /* 5.2 录音卡死的串口观测（**只打印**，不做任何恢复动作）：
        *     上面那条守护看不见"录音线程卡在 read 里、标志却全健康"的形状
        *     （那种情况录音"活着"），所以另开一条纯观测的路，卡住时每 10 秒
@@ -4207,6 +5884,123 @@ static void print_system_status(sm_context_t *ctx)
   printf("  状态机状态: %s\n",
          ctx->initialized ? "已初始化" : "未初始化");
   printf("========================================\n\n");
+}
+
+/* ── 状态信标（2026-10-24 加）───────────────────────────────────────────
+ *
+ * 每 10 秒往串口打一行"现在各处是什么状态"。
+ *
+ * 为什么需要它：2026-10-24 真机上出现过**跑几轮对话之后整机静默** —— 连
+ * robot_ui 那条每秒一条的 `[ui] 慢统计` 都不打了，串口十几秒一个字节都没有。
+ * 现场只留下"卡住了"这个结论，卡在哪一无所知（那一轮的对话日志也没抓到）。
+ *
+ * 现有的 g_beat_ms 心跳**区分不了**"这一拍很长"和"这一拍卡死了" —— 主循环是
+ * 同步跑一整轮对话的（ASR + 大模型最多 3 轮工具调用 + TTS 合成，见上面
+ * g_beat_ms 那段注释），一轮几十秒没心跳完全正常。
+ *
+ * 信标绕开这个盲区的办法是：**自己一条独立线程，不碰任何锁、不碰设备、
+ * 只读几个 volatile / 标量字段**。于是
+ *   - 信标还在打 ⇒ 系统没死，是某条线程被钉住了 —— 这一行里
+ *     play/rec/hold/sm 的组合直接指出钉在哪一段；
+ *   - 信标也不打了 ⇒ 是整机级锁死（中断关了 / 内核层），跟应用逻辑无关。
+ * 两种结果都是判据，不再需要猜。
+ *
+ * 代价：每 10 秒一行串口日志。用户已明确"没用的东西不要拖累软件"，所以
+ * 只读不写、不参与任何决策、不看门狗复位，纯仪表（和 g_beat_ms 同一个口径）。 */
+
+#define STATE_BEACON_PERIOD_MS  10000
+#define STATE_BEACON_STACK      4096
+
+static void *state_beacon_task(void *arg)
+{
+  (void)arg;
+
+  while (g_running)
+    {
+      usleep(STATE_BEACON_PERIOD_MS * 1000);
+
+      if (!g_running)
+        {
+          break;
+        }
+
+      /* 只读、无锁、无阻塞：所有被读的量要么是 volatile 标量，要么是
+       * 32 位对齐的整型（单核上读写原子），慢半拍没有任何影响。 */
+
+      printf("[信标] up=%lus beat_age=%dms sm=%s play=%d rec=%d hold=%d "
+             "ask=%d q=%d listen=%d\n",
+             (unsigned long)(TICK2MSEC(clock_systime_ticks()) / 1000),
+             ai_companion_beat_age_ms(),
+             sm_get_state_name(g_sm_ctx.current_state),
+             (int)g_audio_ctx.playing,
+             (int)g_audio_ctx.recording,
+             (int)g_audio_ctx.record_hold,
+             (int)g_ask_phase,
+             tts_q_count(),      /* q= 队列里压着几块（0..2，深度 2） */
+             (int)g_listen_wanted);
+
+#ifdef CONFIG_NET_TCP
+      /* 连接池只读快照（tcp_conn_probe，见 nuttx/include/nuttx/net/tcp.h）。
+       *
+       * 2026-10-24 真机：跑几轮对话后 socket() 必然 ENOMEM（
+       * [vela_tls] net_connect ... ret=0x42 errno=12），根因是 tcp_conn 的
+       * mempool 打满。当时"谁占着不放"只能猜，这一行就是把它变成判据的：
+       *   - TW 独大        => 收尾没跑完（TIME_WAIT 住了 CONFIG_NET_TCP_WAIT_TIMEOUT 秒）
+       *   - EST/SNT 独大   => 真泄漏（fd 没 close），peer 表的端口指出是哪条链路
+       * **只在数字变了才打**：正常运行零噪音，一泄漏就自己冒出来。 */
+      {
+        static struct tcp_conn_probe_s s_tcp_last;
+        struct tcp_conn_probe_s p;
+
+        tcp_conn_probe(&p);
+
+        if (p.used != s_tcp_last.used || p.nactive != s_tcp_last.nactive)
+          {
+            char st[96];
+            char pr[96];
+            int  i;
+            int  n;
+
+            s_tcp_last = p;
+
+            n = snprintf(st, sizeof(st),
+                         "D%d AR%d SNT%d EST%d F1:%d F2:%d CW:%d CL:%d TW:%d LA:%d",
+                         p.nstate[TCP_CLOSED], p.nstate[TCP_ALLOCATED],
+                         p.nstate[TCP_SYN_SENT], p.nstate[TCP_ESTABLISHED],
+                         p.nstate[TCP_FIN_WAIT_1], p.nstate[TCP_FIN_WAIT_2],
+                         p.nstate[TCP_CLOSE_WAIT], p.nstate[TCP_CLOSING],
+                         p.nstate[TCP_TIME_WAIT], p.nstate[TCP_LAST_ACK]);
+            if (n < 0 || n >= (int)sizeof(st))
+              {
+                st[sizeof(st) - 1] = '\0';
+              }
+
+            /* 对端端口：443=HTTPS、1883=MQTT、5600=LCDMIRROR、28789=WS……
+             * 一行就能看出"是谁在刷连接"。 */
+
+            pr[0] = '\0';
+            n = 0;
+            for (i = 0; i < p.npeer && n < (int)sizeof(pr) - 1; i++)
+              {
+                int w = snprintf(pr + n, sizeof(pr) - n, "%s%u:%d",
+                                 (n > 0) ? " " : "",
+                                 (unsigned)ntohs(p.peer[i].rport),
+                                 p.peer[i].count);
+                if (w < 0 || w >= (int)sizeof(pr) - n)
+                  {
+                    break;
+                  }
+                n += w;
+              }
+
+            printf("[TCP] pool=%d/%d act=%d st[%s] peers[%s]\n",
+                   p.used, p.cap, p.nactive, st, (pr[0] != '\0') ? pr : "-");
+          }
+      }
+#endif /* CONFIG_NET_TCP */
+    }
+
+  return NULL;
 }
 
 /****************************************************************************
@@ -4490,6 +6284,28 @@ int main(int argc, char *argv[])
       return ret;
     }
 
+  /* 2.5 预分配 TTS 整段缓冲 + 记一行堆水位。
+   *
+   * 必须趁堆还是整块的时候做（此刻刚开机，播放缓冲 512 KB 也刚成功，
+   * 说明连续大块要得到）；懒到第一次回复再分配就会重演 2026-10-17
+   * 晚"只念 2 个字"那个坑（来龙去脉见 tts_buf_ensure）。失败不致命：
+   * 第一次回复时 ensure() 还会再试。 */
+
+  ret = tts_buf_ensure();
+  if (ret != OK)
+    {
+      printf("[警告] TTS 缓冲预分配失败（第一次回复时重试；若届时仍失败，"
+             "回复会非常短）\n");
+    }
+
+  {
+    struct mallinfo mi = mallinfo();
+
+    printf("[堆] 开机水位: 总 %u / 在用 %u / 空闲 %u / 最大单块 %u 字节\n",
+           (unsigned)mi.arena, (unsigned)mi.uordblks,
+           (unsigned)mi.fordblks, (unsigned)mi.mxordblk);
+  }
+
   /* 3. 初始化LLM模块 */
 
   printf("[初始化] 正在初始化AI对话模块...\n");
@@ -4600,9 +6416,85 @@ int main(int argc, char *argv[])
              KWS_DATA_DIR);
     }
 
+  /* ==== 起识别线程 + 识别快照缓冲（S1.2）====
+   *
+   * 必须在 start_audio_listening() 之前做完：录音一起来就可能收尾一段语音，
+   * 那时 g_dlg_ready / g_dlg_thread_valid 得已经就位，否则每一段都会掉进
+   * 同步兜底（ASR 占住录音线程），这一版等于没做。
+   *
+   * 三样东西各自独立降级，任何一样失败都退回 S1.2 之前的行为、不引入新路径：
+   *   sem_init 失败 → g_dlg_ready=false
+   *   快照缓冲 malloc 失败 → speech_capture_complete 看 g_dlg_buf==NULL 走同步
+   *   pthread_create 失败 → g_dlg_thread_valid=false → dialogue_request 走同步
+   *
+   * 接管路径上**不重建**：g_dlg_thread_valid 是 static，上一代已经起过就沿用
+   * （同一个进程、同一套全局量，多起一个才是错的）。 */
+
+  if (!g_dlg_ready)
+    {
+      if (sem_init(&g_dlg_sem, 0, 0) != 0)
+        {
+          printf("[警告] 识别信号量初始化失败(%d)：识别退回同步，"
+                 "ASR 会占住录音线程\n", errno);
+        }
+      else
+        {
+          g_dlg_ready = true;
+        }
+    }
+
+  if (g_dlg_buf == NULL && g_dlg_ready)
+    {
+      g_dlg_buf = malloc(SPEECH_BUF_MAX_FRAMES * sizeof(int16_t));
+
+      if (g_dlg_buf == NULL)
+        {
+          printf("[警告] 识别快照缓冲分配失败（%u 字节）：识别退回同步，"
+                 "ASR 会占住录音线程\n",
+                 (unsigned)(SPEECH_BUF_MAX_FRAMES * sizeof(int16_t)));
+        }
+    }
+
+  if (g_dlg_ready && g_dlg_buf != NULL && !g_dlg_thread_valid)
+    {
+      pthread_attr_t dattr;
+
+      pthread_attr_init(&dattr);
+      pthread_attr_setstacksize(&dattr, DIALOGUE_WORKER_STACK);
+
+      ret = pthread_create(&g_dlg_thread, &dattr, dialogue_worker, &g_sm_ctx);
+      pthread_attr_destroy(&dattr);
+
+      if (ret != 0)
+        {
+          printf("[警告] 识别线程起不来: %d —— 识别退回同步，"
+                 "ASR 会占住录音线程\n", ret);
+        }
+      else
+        {
+          g_dlg_thread_valid = true;
+          pthread_detach(g_dlg_thread);
+          printf("[识别] 识别线程已起：ASR 不再占录音线程\n");
+        }
+    }
+  else if (g_dlg_thread_valid)
+    {
+      printf("[识别] 识别线程已在跑（接管路径，沿用）\n");
+    }
+
+  /* 这块快照缓冲的代价要看得见：和上面那行开机水位对照着看，
+   * 就是「ASR 撤离录音线程」多花了多少堆。 */
+  {
+    struct mallinfo mi2 = mallinfo();
+
+    printf("[堆] 识别快照后: 总 %u / 在用 %u / 空闲 %u / 最大单块 %u 字节\n",
+           (unsigned)mi2.arena, (unsigned)mi2.uordblks,
+           (unsigned)mi2.fordblks, (unsigned)mi2.mxordblk);
+  }
+
   /* 设置 AI 对话回调给状态机 (通过 user_data) */
 
-  sm_set_user_data(&g_sm_ctx, (void *)process_ai_dialogue);
+  sm_set_user_data(&g_sm_ctx, (void *)dialogue_request);
 
   /* 4. 初始化声音检测模块 */
 
@@ -4739,6 +6631,29 @@ int main(int argc, char *argv[])
     }
 
   printf("[运行] 系统已启动, 按 Ctrl+C 退出\n\n");
+
+  /* 起状态信标（纯仪表，见 state_beacon_task 的说明）。**起不来不算故障**：
+   * 少一条诊断不影响功能，主循环照常跑，所以失败只留一行日志就往下走。 */
+
+  {
+    pthread_t beacon_thread;
+    pthread_attr_t battr;
+
+    pthread_attr_init(&battr);
+    pthread_attr_setstacksize(&battr, STATE_BEACON_STACK);
+
+    ret = pthread_create(&beacon_thread, &battr, state_beacon_task, NULL);
+    pthread_attr_destroy(&battr);
+
+    if (ret != 0)
+      {
+        printf("[警告] 状态信标起不来: %d（只是少条诊断，不影响功能）\n", ret);
+      }
+    else
+      {
+        pthread_detach(beacon_thread);
+      }
+  }
 
   if (startup_text != NULL)
     {

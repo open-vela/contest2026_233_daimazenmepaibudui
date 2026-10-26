@@ -112,7 +112,8 @@ static void *audio_play_thread(void *arg);
 static uint32_t audio_now_ms(void);
 static uint32_t audio_now_ms_nonzero(void);
 static int audio_since_ms(uint32_t since);
-static bool audio_record_thread_is_current(const audio_context_t *ctx);
+static bool audio_record_thread_is_current(const audio_context_t *ctx,
+                                           uint32_t my_gen);
 static uint32_t audio_calc_frame_energy(const int16_t *data, size_t frames);
 static size_t audio_play_chunk_bytes(const audio_context_t *ctx);
 static void audio_apply_chunk_fade(audio_context_t *ctx, size_t frames);
@@ -124,7 +125,8 @@ static int audio_hw_set_volume(const audio_context_t *ctx, uint8_t volume);
 static void audio_prepare_output(audio_context_t *ctx);
 static void audio_resume_record(audio_context_t *ctx);
 static void audio_reap_play_thread(audio_context_t *ctx, const char *who);
-static int audio_play_begin(audio_context_t *ctx, size_t frames,
+static int audio_play_begin(audio_context_t *ctx, const int16_t *src,
+                            size_t frames,
                             audio_play_complete_cb_t callback,
                             void *user_data);
 
@@ -200,25 +202,32 @@ static int audio_since_ms(uint32_t since)
 /**
  * @brief  本线程还是不是"当前这一代录音会话"的线程
  *
- * audio_record_start() 起新一代时会覆盖 ctx->record_thread。上一次的线程仍然
- * 可能在"上层已经起了新一代"之后才醒过来/才收尾：
- *   - 回收是在**录音线程自己里**被调的那种玩法（见 audio_reap_record_thread
- *     里 pthread_equal 那一支：不能 join 自己，TCB 留给下次回收）；
- *   - 以及"线程自己判定被抢走、自己退出"的那条路（stolen）。
- * 这种"上一代的线程"再去收尾就是踩别人：
- *   - audio_in_stop() / audio_in_abandon() 动到的都是**全局那一份**录音会话
- *     （前者发设备级 STOP、后者关掉那个 fd，设备/ fd 都只有一份）；
- *   - recording / record_exited / record_died 会被写成新一代的状态，
- *     于是"线程在跑、标志说没在录"，监听守护据此反复重开，永远好不了。
- * 判据就是"当前会话记着的那个线程还是不是我"；正常情况下它一定是 true
- * （线程本来就是 audio_record_start() 起的那个）。
- * NuttX 的 pthread_create() 是先写好这个输出参数、再激活新线程的，所以新线程
- * 第一行就能看到自己的 tid，不用担心"起得太快还没写进去"。
+ * 2026-10-25 改成比**代际号**，不再比 pthread_t。原来的写法是
+ * `pthread_equal(ctx->record_thread, pthread_self())`，判据落在一个会被下一次
+ * pthread_create() 覆盖的共享字段上；真机上它出现过对**刚创建出来的线程**
+ * 判假，于是新一代一进函数就走"上一代录音线程退出…不动任何标志"那条早退，
+ * record_exited 永远没人置，audio_record_is_active() 永远报"活着"，
+ * 监听守护每 5 秒重开一次、永不升级 —— 一次抖动被放大成永久性"不能对话"
+ * （现场证据与读数记在 ai_audio.h 的 record_gen / record_claimed 头上）。
+ *
+ * 代际号为什么可靠：它由 audio_record_start() 在 pthread_create() **之前**
+ * 自增，线程把自己那一代的号从**自己的参数**里抄进局部变量 —— 参数是这一个
+ * 线程私有的，之后谁再起新一代都改不到它。比出来的是"我这一代还在不在当班"，
+ * 语义正好是这里要的：
+ *
+ *   - 上一代的线程（回收时放弃 join 被 detach 的那条、或自己判被抢走正在收尾
+ *     的那条）在"上层已经起了新一代"之后才醒过来：代际号对不上 → 什么都不碰，
+ *     直接退出。该踩的别人才不会被踩：
+ *       · audio_in_stop() / audio_in_abandon() 动到的都是**全局那一份**录音会话
+ *         （前者发设备级 STOP、后者关掉那个 fd，设备/fd 都只有一份）；
+ *       · recording / record_exited / record_died 会被写成新一代的状态。
+ *   - 当前这一代：号对得上，正常干活、正常收尾。
  */
 
-static bool audio_record_thread_is_current(const audio_context_t *ctx)
+static bool audio_record_thread_is_current(const audio_context_t *ctx,
+                                           uint32_t my_gen)
 {
-  return pthread_equal(ctx->record_thread, pthread_self()) != 0;
+  return my_gen == ctx->record_gen;
 }
 
 /**
@@ -373,10 +382,19 @@ static int audio_apply_volume(int fd, uint8_t volume)
  * @brief  把一个刚 open 的 fd 配成"16k/单声道 输出"方向
  * @return 0成功, 负值失败
  *
- * 单独抽出来是因为它不光建播放会话要用，**设音量也必须先走一遍**：
- * 驱动是按"当前方向"决定 AUDIO_FU_VOLUME 改的是 DAC 音量还是麦克风增益的
- * （见 sf32lb52_audio_configure），上一次会话如果是录音（priv->playback 还是
- * false），不标一次 OUTPUT 音量就下到 ADC 增益上去了。
+ * 只给**建播放会话**用（open_play_device）。
+ *
+ * ⚠️ 设音量**不要**走这条路（audio_hw_set_volume 现在只发 FEATURE）：
+ * 这记 CONFIGURE(OUTPUT) 是 2026-10-21 那次「开机就聋、越修越坏」的毒源。
+ * 两条毒：① 上层半双工抢占会把它当"要播放"，把正在跑的录音会话直接 stop 掉；
+ * ② 驱动记下 pending_playback=true，而录音重启的 CONFIGURE(INPUT) 又被上层
+ * 状态机（state=PREPARED≠OPEN）静默吞掉，于是录音会话带着 playback=1 的标签
+ * 启动（串口铁证 "hw_start 真跑了：playback=1"），L5 恢复守卫看着"健康的播放"
+ * 永久跳过、RX 从此冻结。
+ *
+ * 音量落哪条通路由驱动自己判（sf32lb52_audio_configure 的 rec_dir 身份判据：
+ * 只有**正在读这条录音通路的那条线程**来设才算录音增益，其余一律记播放音量），
+ * 不需要上层标方向 —— 标方向的代价就是上面那两条毒。
  */
 
 static int audio_configure_output(int fd, const audio_context_t *ctx)
@@ -408,13 +426,22 @@ static int audio_configure_output(int fd, const audio_context_t *ctx)
  * 不碰播放线程的 fd：NuttX 的 fd 属于 task group，只能在本任务里 open/close。
  * 设备没在跑时 close() 会走驱动的 shutdown 路径，那条路径已修成
  * "未 running 就直接返回"的最小化版本（见 docs/audio_driver_usage.md 第 8 节）。
+ *
+ * **只发 AUDIO_TYPE_FEATURE / AUDIO_FU_VOLUME，绝不先 CONFIGURE(OUTPUT)。**
+ * FEATURE 在上层是无条件放行的（audio.c 的转发门只拦 INPUT/OUTPUT），也不会
+ * 触发抢占、不会写 pending_playback；落 DAC 还是 ADC 由驱动按身份判据自己定
+ * （见 audio_configure_output 头上那段）。原来那句 CONFIGURE(OUTPUT) 是
+ * 「音量滑块一动、麦克风就聋」的整条毒链起点，2026-10-21 删掉。
  */
 
 static int audio_hw_set_volume(const audio_context_t *ctx, uint8_t volume)
 {
-  int fd = open(AUDIO_PLAY_DEVICE, O_WRONLY);
+  int fd;
   int ret;
 
+  (void)ctx; /* 方向改由驱动的身份判据决定，这里不再需要采样率/channels */
+
+  fd = open(AUDIO_PLAY_DEVICE, O_WRONLY);
   if (fd < 0)
     {
       int errcode = errno;
@@ -423,14 +450,7 @@ static int audio_hw_set_volume(const audio_context_t *ctx, uint8_t volume)
       return -errcode;
     }
 
-  /* 先标方向（否则音量可能被下到麦克风增益上），再下发 */
-
-  ret = audio_configure_output(fd, ctx);
-  if (ret == OK)
-    {
-      ret = audio_apply_volume(fd, volume);
-    }
-
+  ret = audio_apply_volume(fd, volume);
   close(fd);
   return ret;
 }
@@ -534,7 +554,10 @@ static void audio_prepare_output(audio_context_t *ctx)
 {
   if (!ctx->recording)
     {
-      ctx->record_resume_on_play_end = false;
+      /* 已经没在录：没什么可停的。★ record_resume_on_play_end **不清** ——
+       * 它可能正是上一段让路欠下的那次恢复（流水线 TTS 的首句→尾段空档被
+       * record_hold 住时就是这个形状，见 audio_resume_record）。清掉就等于
+       * 把常开监听永久丢掉，再也没人开麦。 */
       return;
     }
 
@@ -560,6 +583,17 @@ static void audio_resume_record(audio_context_t *ctx)
       return;
     }
 
+  /* ★ 整轮播报还没收尾（流水线 TTS 的首句→尾段空档）：这一段让路要留着。
+   * record_resume_on_play_end 保持 true = "还欠一次还麦"，等轮子收尾由上层
+   * audio_record_hold_end() 补上。这里**不清**这一位是关键 —— 清了就再也没
+   * 人开麦，常开监听直接哑掉。 */
+
+  if (ctx->record_hold)
+    {
+      AUDIO_DEBUG("整轮播报未结束，暂不还麦");
+      return;
+    }
+
   ctx->record_resume_on_play_end = false;
   cfg = ctx->record_cfg;               /* 用副本：audio_record_start 会写回 record_cfg */
 
@@ -570,12 +604,46 @@ static void audio_resume_record(audio_context_t *ctx)
 }
 
 /**
+ * @brief  解除"整轮播报"的让路锁，并把欠着的那次还麦补上
+ *
+ * 用法与设计动机见 ai_audio.h 的声明处。幂等：没在 hold 时就是 no-op。
+ */
+
+void audio_record_hold_end(audio_context_t *ctx)
+{
+  if (ctx == NULL || !ctx->record_hold)
+    {
+      return;
+    }
+
+  ctx->record_hold = false;
+  audio_resume_record(ctx);
+}
+
+/**
+ * @brief  录音线程的启动参数（堆上一份，线程起跑即刻抄进局部变量后释放）
+ *
+ * 为什么不直接把 audio_context_t* 当参数传：线程还要知道自己是**第几代**。
+ * 代际号必须是这个线程私有的，不能是"醒来之后再去读共享字段"——共享字段会被
+ * 下一次 audio_record_start() 改掉，那正是 2026-10-25 那次"新一代被判成上一代"
+ * 的形状（详见 audio_record_thread_is_current 头上）。
+ */
+
+typedef struct
+{
+  audio_context_t *ctx;
+  uint32_t         gen;
+} record_thread_arg_t;
+
+/**
  * @brief  录音线程
  */
 
 static void *audio_record_thread(void *arg)
 {
-  audio_context_t *ctx = (audio_context_t *)arg;
+  record_thread_arg_t *ta  = (record_thread_arg_t *)arg;
+  audio_context_t     *ctx = ta->ctx;
+  uint32_t             my_gen = ta->gen;   /* 抄成私有，之后不再看 ta */
   size_t frame_bytes = ctx->config.channels * sizeof(int16_t);
   size_t frames_per_read;
   size_t want;
@@ -591,7 +659,25 @@ static void *audio_record_thread(void *arg)
   bool stolen = false;         /* 被别人抢走：read 返回 0/EOF（对家发了设备级 STOP） */
   bool starved = false;        /* 自己断粮：连续读超时到上限，或其它真错误 */
 
-  AUDIO_DEBUG("录音线程启动");
+  free(ta);                    /* 参数用完就还，之后所有退出路径都不用再管它 */
+
+  /* 起跑认领：只有**确实是当前这一代**才置 record_claimed。
+   * 这一步放在进读循环之前，是为了让"这一代到底有没有真跑起来"有个不依赖
+   * 线程收尾的实证 —— 没认领就退的那一代，audio_record_is_active() 报假，
+   * 监听守护立刻按"要常听却没在录"重开，自愈；而不是像 2026-10-25 现场那样
+   * 把假健康一直挂着、每 5 秒空转一圈。 */
+
+  if (!audio_record_thread_is_current(ctx, my_gen))
+    {
+      printf("[录音] ★起跑即被换代（我这代 %lu，当前 %lu）：不碰设备、"
+             "不动任何标志，直接退出\n",
+             (unsigned long)my_gen, (unsigned long)ctx->record_gen);
+      return NULL;
+    }
+
+  ctx->record_claimed = true;
+
+  printf("[录音] 录音线程起跑并认领（代=%lu）\n", (unsigned long)my_gen);
 
   /* 每次读一帧（config.frame_ms 毫秒）的数据。
    * record_buf 在 audio_init 里就是按一帧分配的，这里再夹一次上限防越界。 */
@@ -635,7 +721,7 @@ static void *audio_record_thread(void *arg)
        * 它和新一代用的是同一块 record_buf，处理一遍等于把同一段音频喂两次
        * VAD/KWS/ASR。本次唯一的正确动作就是退出去。 */
 
-      if (!audio_record_thread_is_current(ctx))
+      if (!audio_record_thread_is_current(ctx, my_gen))
         {
           stale = true;
           break;
@@ -697,8 +783,47 @@ static void *audio_record_thread(void *arg)
             {
               uint32_t energy = audio_calc_frame_energy(
                 ctx->record_buf, samples_read);
+              uint32_t thr;
 
-              if (energy > ctx->vad_energy_threshold)
+              /* ===== 自适应噪声门（2026-10-25）=====
+               *
+               * 先学底噪、再算门槛、最后才判有声/无声。为什么必须有这一段
+               * （以及 2026-10-24 把阈值写死成 300 是怎么把静音判停变成死代码的）
+               * 全记在 ai_audio.h 的「VAD 参数」那一段 —— 那里是唯一真相，
+               * 这里只写怎么算，不再复述。
+               *
+               * 两条纪律：
+               *   ① 只有**明确不是人声**的帧才进统计（energy <= LEARN_BLOCK）。
+               *      人声/突发噪声混进来会把门槛抬到人声量级，之后小声说话
+               *      全被自己挡掉 —— 自适应门最常见的自杀方式。
+               *   ② 只在「还没判成说话」时更新。判成说话之后再学，学到的
+               *      就是这一句人声本身。
+               *
+               * 用 int64 中转是因为 energy 与底噪都是 uint32，直接相减会在
+               * energy < 底噪时下溢成天文数字。 */
+
+              if (energy <= VAD_NOISE_LEARN_BLOCK && !ctx->vad_speech_active)
+                {
+                  int64_t f = (int64_t)ctx->vad_noise_floor_e;
+
+                  f += ((int64_t)energy - f) / 32;
+                  if (f < 0)
+                    {
+                      f = 0;
+                    }
+
+                  ctx->vad_noise_floor_e = (uint32_t)f;
+                }
+
+              thr = ctx->vad_noise_floor_e * VAD_NOISE_FLOOR_MULT;
+              if (thr < AUDIO_VAD_ENERGY_THRESHOLD)
+                {
+                  thr = AUDIO_VAD_ENERGY_THRESHOLD;
+                }
+
+              ctx->vad_energy_threshold = thr;
+
+              if (energy > thr)
                 {
                   /* 检测到语音 */
 
@@ -712,8 +837,17 @@ static void *audio_record_thread(void *arg)
                   if (!ctx->vad_speech_active &&
                       ctx->vad_speech_frames >= min_speech_frames)
                     {
-                      AUDIO_DEBUG("VAD: 检测到语音开始 (能量=%lu)",
-                                  (unsigned long)energy);
+                      /* 这一行**故意走 printf 而不是 AUDIO_DEBUG**：本构建没开
+                       * AUDIO_DEBUG（见本文件 457 行附近），而门槛/底噪这两个数
+                       * 是「自适应门调得对不对」的唯一判据 —— 换个屋子要是不灵，
+                       * 串口上得能一眼看出是门槛飘了还是人声真小。每段语音一行，
+                       * 密度合适。 */
+
+                      printf("[VAD] 判到说话（帧能量 %lu > 门槛 %lu，"
+                             "底噪 %lu）\n",
+                             (unsigned long)energy, (unsigned long)thr,
+                             (unsigned long)ctx->vad_noise_floor_e);
+
                       ctx->vad_speech_active = true;
 
                       if (ctx->vad_callback)
@@ -736,7 +870,15 @@ static void *audio_record_thread(void *arg)
                   if (ctx->vad_speech_active &&
                       ctx->vad_silence_frames >= silence_frames)
                     {
-                      AUDIO_DEBUG("VAD: 语音结束 (静音超时)");
+                      /* 同上走 printf：这是「自动断句到底有没有触发」的唯一凭据。
+                       * 2026-10-25 之前这句是 AUDIO_DEBUG，所以那条死代码在串口上
+                       * 连痕迹都没留 —— 一直以为是"等 8 秒太慢"，其实是从来没判过。 */
+
+                      printf("[VAD] 判到说完（静音 %u 帧 ≥ %u，即 %u ms）\n",
+                             (unsigned)ctx->vad_silence_frames,
+                             (unsigned)silence_frames,
+                             (unsigned)ctx->record_cfg.silence_timeout_ms);
+
                       ctx->vad_speech_active = false;
 
                       if (ctx->vad_callback)
@@ -924,10 +1066,22 @@ static void *audio_record_thread(void *arg)
    *     没在录、还报 record_exited"，监听守护据此反复重开，永远好不了。
    * 所以这时候什么都不碰，直接退出。 */
 
-  if (stale || !audio_record_thread_is_current(ctx))
+  if (stale || !audio_record_thread_is_current(ctx, my_gen))
     {
+      /* 这一行带**代际号**：2026-10-25 现场只有一句"上一代录音线程退出"，
+       * 分不清打它的是真正上一代的残影、还是刚起跑就被判负的新一代 ——
+       * 而这两件事的处置完全不同（前者是正常收场，后者是根因）。带上号，
+       * 下次一眼分清。 */
+
       printf("[录音] 上一代录音线程退出（当前会话已由新一代接管）："
-             "不碰设备，也不动任何标志\n");
+             "不碰设备，也不动任何标志（我这代 %lu，当前 %lu%s）\n",
+             (unsigned long)my_gen, (unsigned long)ctx->record_gen,
+             ctx->record_claimed ? "" : "，且我从未认领");
+
+      /* 没认领就退的那一代：把"没真跑起来"如实留成假账本里那个洞被堵上的样子。
+       * record_claimed 由 audio_record_start() 起手清成 false，所以这里不用改它
+       * —— 它本来就是 false。真正要防的是**认领过**却中途被判换代：那时账本
+       * 归新一代，同样不能碰。 */
       return NULL;
     }
 
@@ -1038,12 +1192,19 @@ static void *audio_record_thread(void *arg)
 static void *audio_play_thread(void *arg)
 {
   audio_context_t *ctx = (audio_context_t *)arg;
+  uint32_t my_gen = ctx->play_gen;  /* 本线程属于哪一代，见 play_gen 说明 */
   size_t frame_bytes = ctx->config.channels * sizeof(int16_t);
   size_t total_bytes = ctx->play_frames * frame_bytes;
   size_t chunk_bytes = audio_play_chunk_bytes(ctx);
   size_t done = 0;
   int fail = 0;                  /* 0=没失败；负值=没出声的原因，最后写进 ctx */
   int fd;
+
+  /* 数据源只认 play_src（拷贝路径＝play_buf，零拷贝路径＝调用方缓冲，
+   * 两条路都在起播前设好）。play_src 万一没设（防御），退回 play_buf。 */
+
+  const char *src = (const char *)(ctx->play_src != NULL
+                                   ? ctx->play_src : ctx->play_buf);
 
   if (chunk_bytes == 0)
     {
@@ -1052,6 +1213,7 @@ static void *audio_play_thread(void *arg)
 
   AUDIO_DEBUG("播放线程启动 (%zu 帧)", ctx->play_frames);
 
+  ctx->play_stage = PLAY_STAGE_OPEN;   /* 诊断标记，见 play_stage 说明 */
   fd = audio_open_play_device(ctx);
   if (fd < 0)
     {
@@ -1067,7 +1229,12 @@ static void *audio_play_thread(void *arg)
     }
   else
     {
-      while (!ctx->play_stop && ctx->playing && done < total_bytes)
+      ctx->play_stage = PLAY_STAGE_WRITE;  /* 设备开好了，进写数据阶段 */
+
+      /* 代数不等 = 已经被下一代作废（audio_reap_play_thread 解闩放行过）：
+       * 立刻停手，别再往设备里灌数据、也别走后面的完成回调。 */
+      while (!ctx->play_stop && ctx->playing && done < total_bytes &&
+             ctx->play_gen == my_gen)
         {
           size_t chunk = total_bytes - done;
           ssize_t written;
@@ -1077,7 +1244,7 @@ static void *audio_play_thread(void *arg)
               chunk = chunk_bytes;
             }
 
-          written = write(fd, (const char *)ctx->play_buf + done, chunk);
+          written = write(fd, src + done, chunk);
 
           /* write() 同步：返回 <= 0 说明设备被别的会话占了或出错
            * （板级 alarm 同一招：关掉 fd，剩下的静默走完）。 */
@@ -1092,6 +1259,11 @@ static void *audio_play_thread(void *arg)
             }
 
           done += (size_t)written;
+
+          /* 推进打卡：每写完一块盖一章，audio_play_watchdog_tick() 靠它判
+           * "这条线程还活着"。卡在 write() 里就盖不了章，看门狗自然会响。 */
+
+          ctx->play_progress_ms = audio_now_ms_nonzero();
         }
 
       /* "写满但没走完"：被上层 stop 打断不算失败（那是调用方要停），
@@ -1109,6 +1281,7 @@ static void *audio_play_thread(void *arg)
   /* 先停设备再退出：AUDIOIOC_STOP 会同时停掉录音通路（半双工），
    * 所以它必须是播放的最后一步。fd 也是在本线程里关的。 */
 
+  ctx->play_stage = PLAY_STAGE_CLOSE;  /* 诊断标记：进收尾（STOP/close） */
   audio_close_play_device(fd);
 
   /* 结果落定：必须在 audio_resume_record() / play_cb **之前** ——
@@ -1151,7 +1324,9 @@ static void *audio_play_thread(void *arg)
    * 语义不变：失败也回调 —— 上层（hello_app 的 TTS 状态机）靠它收尾，
    * 吞掉它会让人一直卡在"正在说话"。想区分成败请读 play_last_result。 */
 
-  if (!ctx->play_stop && ctx->play_cb)
+  /* 作废代（已被下一代顶掉）不许回调：那会把状态机再推一遍，
+   * 表现是"没人说话它自己响一下 / 状态乱跳"。 */
+  if (!ctx->play_stop && ctx->play_gen == my_gen && ctx->play_cb)
     {
       ctx->play_cb(ctx->play_user_data);
     }
@@ -1159,16 +1334,37 @@ static void *audio_play_thread(void *arg)
   /* 最后一步：告诉 audio_reap_play_thread() "我已经跑完了"。
    * 必须在所有收尾动作（关播放设备 / 恢复录音 / 完成回调）**之后**置位 ——
    * 回收的人看到它就是直接 join 走 TCB，早置一位等于把线程剩下的动作甩给一个
-   * 随时可能被释放的上下文。和录音线程末尾那个 record_exited 是同一套语义。 */
+   * 随时可能被释放的上下文。和录音线程末尾那个 record_exited 是同一套语义。
+   *
+   * ★ 只在自己仍是"当前那条播放线程"时才置位（2026-10-24 修）。
+   *
+   * 流水线 TTS 的首句→尾段是**在播放线程里重开一段播放**的（play_cb 里起尾段，
+   * 走 audio_play_begin 的"自己调自己"分支）：那时 ctx->play_thread 已经被
+   * 换成了**新线程 T2** 的 id，而本线程 T1 是它的上一代。
+   *
+   * 旧写法无条件写 play_exited = true，等于 T1 一退出就把 T2 标成"已退出"，
+   * 可 T2 还在放尾段。此后任何 audio_play_stop() / 下一轮 audio_play_begin()
+   * 去 reap，看到 play_exited 为真就**跳过有界等待直接 pthread_join**，join 的
+   * 却是正在播的 T2 —— 轻则调用者被钉住整个尾段时长，重则和"设备动作权锁"
+   * 互锁，表现就是跑了几轮之后整机静默（连 [ui] 慢统计 都不打了）。
+   *
+   * 判据用 pthread_equal 而不是加代数计数：pthread_create 覆盖 ctx->play_thread
+   * 就是天然的换代信号，T2 自己退出时 equal 成立、照常置位，语义不变。 */
 
-  ctx->play_exited = true;
+  if (pthread_equal(pthread_self(), ctx->play_thread))
+    {
+      ctx->play_exited = true;
+    }
+
+  ctx->play_stage = PLAY_STAGE_DONE;   /* 诊断标记：走完了 */
 
   AUDIO_DEBUG("播放线程退出");
   return NULL;
 }
 
 /**
- * @brief  启动播放线程（数据已经在 ctx->play_buf 里了）
+ * @brief  启动播放线程（数据源由调用方备好：拷贝路径在 play_buf，零拷贝路径
+ *         在调用方自己的缓冲；本函数只把它挂到 ctx->play_src 上）
  * @return 0成功, 负值失败
  *
  * 设备由播放线程自己 open/START/write/STOP/close，这里只负责：
@@ -1180,7 +1376,8 @@ static void *audio_play_thread(void *arg)
  *   - 线程起不来时写 -ret：这也是一次"没出声"的播放尝试，得如实记下来。
  */
 
-static int audio_play_begin(audio_context_t *ctx, size_t frames,
+static int audio_play_begin(audio_context_t *ctx, const int16_t *src,
+                            size_t frames,
                             audio_play_complete_cb_t callback,
                             void *user_data)
 {
@@ -1225,9 +1422,14 @@ static int audio_play_begin(audio_context_t *ctx, size_t frames,
 
   ctx->play_cb = callback;
   ctx->play_user_data = user_data;
+  ctx->play_src = src;                  /* 播放线程只从这里读（拷贝/零拷贝两条路
+                                         * 都在进本函数前把数据准备好了） */
   ctx->play_frames = frames;
+  ctx->play_gen++;                      /* ★ 换代：上一代从此作废（见 play_gen） */
+  ctx->play_stage = PLAY_STAGE_NONE;    /* 新一代从头走，见 play_stage */
   ctx->play_stop = false;
   ctx->playing = true;
+  ctx->play_progress_ms = audio_now_ms_nonzero();  /* 起播先盖一章（停滞看门狗） */
   ctx->play_exited = false;               /* 新一代播放线程的收尾标记 */
   ctx->play_last_result = -EINPROGRESS;   /* 这次的结果还没落定 */
 
@@ -1307,9 +1509,15 @@ int audio_init(audio_context_t *ctx, const audio_config_t *config)
   ctx->record_fd = -1;
   ctx->play_fd = -1;
 
-  /* 初始化VAD参数 */
+  /* 初始化VAD参数
+   *
+   * 底噪估计的**种子**是 AUDIO_VAD_ENERGY_THRESHOLD（300）—— 不是 0。
+   * 起手门槛因此是 max(300, 300×4) = 1200，实测房间底噪能量 729 < 1200，
+   * 开机第一帧就被判成「无声」，不会误触发，同时底噪往真实值收敛。
+   * 写 0 的话起手门槛就是 300，正好是 2026-10-25 之前那个死代码的形状。 */
 
   ctx->vad_energy_threshold = AUDIO_VAD_ENERGY_THRESHOLD;
+  ctx->vad_noise_floor_e    = AUDIO_VAD_ENERGY_THRESHOLD;
 
   /* 分配缓冲区 */
 
@@ -1415,12 +1623,19 @@ void audio_deinit(audio_context_t *ctx)
 int audio_record_start(audio_context_t *ctx,
                        const audio_record_config_t *config)
 {
+  record_thread_arg_t *ta;
   int ret;
 
   if (ctx == NULL || !ctx->initialized)
     {
       return -EINVAL;
     }
+
+  /* 有人明确要开麦（开机常开监听 / 监听守护 / 手动接管）：让路锁到此为止。
+   * 这是"锁不会永久挂住"的第二条兜底 —— 万一上层漏了解锁，谁要开麦谁就把它
+   * 冲掉，代价只是多还一次麦，比常开监听永久哑掉强得多。 */
+
+  ctx->record_hold = false;
 
   if (ctx->recording)
     {
@@ -1495,6 +1710,16 @@ int audio_record_start(audio_context_t *ctx,
       ctx->vad_speech_active = false;
       ctx->vad_silence_frames = 0;
       ctx->vad_speech_frames = 0;
+
+      /* **不清 vad_noise_floor_e**：本函数在每一轮播报结束后都会被调一次
+       * （半双工还麦 → 重新开录），清了就等于每次答完话都要重新热身 2 秒，
+       * 老人刚问完下一句正赶在这 2 秒里说，门槛还没稳就可能被误判。
+       * 已经学到的底噪直接接着用。只在它还是 0（ctx 被 memset 过）时补种子。 */
+
+      if (ctx->vad_noise_floor_e == 0)
+        {
+          ctx->vad_noise_floor_e = AUDIO_VAD_ENERGY_THRESHOLD;
+        }
     }
 
   /* 启动录音线程：设备已经 START 好，线程里只管 audio_in_read() */
@@ -1503,6 +1728,16 @@ int audio_record_start(audio_context_t *ctx,
   ctx->recording = true;
   ctx->record_exited = false;         /* 新一代录音线程的收尾标记 */
   ctx->record_died = false;           /* 上一代的"异常中断"标记到此作废 */
+
+  /* ★ 代际号 + 认领握手（2026-10-25）。顺序很关键：
+   *   ① 代际号必须在 pthread_create **之前**自增 —— 线程起跑后读到的必须是
+   *      "我已经是最新的那一代"，否则它一上来就判负；
+   *   ② record_claimed 先清成 false，等线程自己起跑认领 —— 这样"创建成功了
+   *      但线程从没真跑起来"不会被记成"会话活着"，守护下一拍就能看见并重开。
+   * 详见 ai_audio.h 那两个字段头上的现场读数。 */
+
+  ctx->record_gen++;
+  ctx->record_claimed = false;
 
   /* 数据流活跃度也重新起算：上一代攒下的时间戳/计数/错误码到这里作废。
    * 时间戳先种成"现在"（设备已经 START 好了，线程马上就开读）——
@@ -1516,11 +1751,27 @@ int audio_record_start(audio_context_t *ctx,
   ctx->record_empty_reads = 0;
   ctx->record_last_result = -EINPROGRESS;
 
+  /* 线程参数走临时堆：代际号必须是这一个线程私有的（见 record_thread_arg_t）。
+   * 这里 8~12 字节、起跑即还，不值得进 SRAM 静态区。 */
+
+  ta = (record_thread_arg_t *)malloc(sizeof(*ta));
+  if (ta == NULL)
+    {
+      ctx->recording = false;
+      ctx->record_last_data_ms = 0;
+      audio_in_stop();
+      return -ENOMEM;
+    }
+
+  ta->ctx = ctx;
+  ta->gen = ctx->record_gen;
+
   ret = pthread_create(&ctx->record_thread, NULL,
-                       audio_record_thread, ctx);
+                       audio_record_thread, ta);
   if (ret != 0)
     {
       AUDIO_DEBUG("创建录音线程失败: %d", ret);
+      free(ta);
       ctx->recording = false;
       ctx->record_last_data_ms = 0;   /* 没起成，"从没启动过录音"才是实话 */
       audio_in_stop();                /* 把刚 START 的设备还回去 */
@@ -1645,6 +1896,34 @@ static void audio_reap_record_thread(audio_context_t *ctx, const char *who)
 
 #define AUDIO_PLAY_REAP_MS   1000
 
+/* 播放停滞多久算"这条线程卡死了"。判据是**推进**（每写完一块盖一次章），
+ * 不是总时长 —— 合法的长回复能连着念 60 秒以上，按总时长一刀切会把好好的
+ * 长播报掐断。
+ *
+ * 余量怎么算的：块是 AUDIO_PLAY_CHUNK_MS = 250ms，驱动单次 write 的上界是
+ * "一块 + 500ms"（board/contest_board/src/sf32lb52_audio.c 的
+ * sf32lb52_audio_tx_wait_slice，由 wr_wait_wdog 私有心跳收口），也就是单块
+ * 最多 750ms。5 秒 = 6~7 块的余量，正常路径绝对够，卡死路径又不至于让人
+ * 等太久。
+ *
+ * 2026-10-25 真机基线：那一次卡死整整 80 秒才被监听守护兜住，期间「提交」
+ * 全被判"正忙"、新一轮起不来 —— 这个值就是要把那 80 秒压成 5 秒。 */
+
+#define AUDIO_PLAY_STALL_MAX_MS  5000
+
+/* play_stage 的人话（只给日志用）。见 ai_audio.h 里 play_stage 的说明。 */
+static const char *audio_play_stage_name(uint8_t stage)
+{
+  switch (stage)
+    {
+      case PLAY_STAGE_OPEN:  return "open/CONFIGURE/START";
+      case PLAY_STAGE_WRITE: return "write";
+      case PLAY_STAGE_CLOSE: return "STOP/close";
+      case PLAY_STAGE_DONE:  return "已收尾";
+      default:               return "还没开工";
+    }
+}
+
 static void audio_reap_play_thread(audio_context_t *ctx, const char *who)
 {
   int i;
@@ -1670,15 +1949,90 @@ static void audio_reap_play_thread(audio_context_t *ctx, const char *who)
 
   if (!ctx->play_exited)
     {
+      static uint32_t s_reap_giveups;   /* 本开机累计放弃回收的次数 */
+
+      s_reap_giveups++;
+
+      /* ★ 2026-10-25 真机教训：这里原来打完日志就 return，play_thread_valid
+       * 留 true。那是**单向闩锁** —— 只要有一条播放线程卡在设备调用里
+       * （open / write / ioctl(STOP) / close，这几处都没有等待上界），
+       * 此后每一次 audio_play_begin() 都走「上一次还没收尾」分支返回 -EBUSY，
+       * 整机**永久哑巴**：能听、能识别、文字上屏，就是不出声，只有断电能好。
+       * 14:46 现场连续两轮 100% 复现（[TTS] 首句播放失败: -16）。
+       *
+       * 代码原意是"宁可永久哑巴，也不要两条线程抢一个设备 / 写同一块缓冲"。
+       * 但永久哑巴正中"别又不能对话"这条第一优先级，必须反过来取舍：
+       *
+       *   ① 换代 ctx->play_gen++（在 audio_play_begin 里做）让被甩下的那条线程
+       *      自己作废 —— 它哪天从设备调用里醒过来，会在下一个块间隙看到代数
+       *      不等、立刻停手退出，也不会再调 play_cb 推状态机。抢设备的风险
+       *      因此被压到"它醒来的那一瞬间"，而不是永远。
+       *   ② 照旧置 play_stop，双保险。
+       *   ③ **解闩**：play_thread_valid 放回 false，让下一次起播有机会重新
+       *      open 设备。它若还占着 fd，audio_open_play_device() 会失败并走
+       *      正常收尾（play_exited 照常置位、TCB 照常回收），下一轮就恢复了
+       *      —— 自己会好，不用断电。这一步把"永久哑巴"降级成"可能掉一轮"。
+       *
+       * TCB 仍然不 join（它还活着，join 会把调用方钉死），交给内核回收。 */
+
       syslog(LOG_ERR,
-             "[AUDIO] %s: 播放线程 %dms 内没退出，放弃 join"
-             "（多半卡在音频设备调用里；TCB 留给下一次回收）\n",
-             who, AUDIO_PLAY_REAP_MS);
-      return;                           /* play_thread_valid 保持 true */
+             "[AUDIO] %s: 播放线程 %dms 内没退出，放弃 join 并**解闩放行**"
+             "（累计 %u 次；卡在【%s】（阶段 %u，代 %lu）。"
+             "下一次起播若还被它占着设备会报 START 被拒，那一轮掉、下一轮恢复）\n",
+             who, AUDIO_PLAY_REAP_MS, (unsigned)s_reap_giveups,
+             audio_play_stage_name(ctx->play_stage),
+             (unsigned)ctx->play_stage, (unsigned long)ctx->play_gen);
+
+      ctx->play_stop = true;
+      ctx->play_thread_valid = false;
+      return;
     }
 
   pthread_join(ctx->play_thread, NULL);
   ctx->play_thread_valid = false;
+}
+
+/**
+ * @brief  播放停滞看门狗（上层每 100ms 调一次，**与轮次无关**）
+ *
+ * 2026-10-25 真机定案的那 80 秒：一次播报卡在 write 里，playing 一直为真，
+ * 「提交」全被判"正忙"、新一轮起不来。自愈的「解闩放行」是对的，但它只在
+ * **别人调 audio_play_stop()** 时才触发 —— 而那 80 秒里没人调：轮次看门狗
+ * 在 ROUND_PHASE_IDLE 就早退，追问/报警提示音压根不在"轮"里。于是只能等
+ * 监听守护 80 秒后兜底，用户看到的就是"AI 不回答"。
+ *
+ * 所以这条判据必须放在音频层，只看"这块有没有往前走"，不看是谁在放、
+ * 放的是哪一轮。
+ */
+
+void audio_play_watchdog_tick(audio_context_t *ctx)
+{
+  int idle;
+
+  if (ctx == NULL || !ctx->playing)
+    {
+      return;
+    }
+
+  idle = audio_since_ms(ctx->play_progress_ms);
+  if (idle < 0 || idle < (int)AUDIO_PLAY_STALL_MAX_MS)
+    {
+      return;
+    }
+
+  /* 判定为卡死。把现场一次说清：卡在哪一步、哪一代、多久没动 ——
+   * 这几项正是上次只拿到"卡在【write】"之后还要再挖一遍的东西。 */
+
+  printf("[音频] ★★ 播放卡死：%d ms 没有任何一块往前走（阶段=%s/%u，代=%lu）"
+         "—— 强制收摊放行，本段作废、下一轮自愈\n",
+         idle, audio_play_stage_name(ctx->play_stage),
+         (unsigned)ctx->play_stage, (unsigned long)ctx->play_gen);
+
+  /* audio_play_stop() 内部就是那条已经验过的收摊路：置 play_stop →
+   * audio_reap_play_thread（等不到就换代 + 解闩放行）→ playing=false。
+   * 它会连带把让路锁放掉、把欠着的还麦补上，所以只调它就够。 */
+
+  audio_play_stop(ctx);
 }
 
 /**
@@ -1763,6 +2117,18 @@ bool audio_is_recording(audio_context_t *ctx)
 bool audio_record_is_active(const audio_context_t *ctx)
 {
   if (ctx == NULL || !ctx->recording || !ctx->record_thread_valid)
+    {
+      return false;
+    }
+
+  /* ★ record_claimed 是 2026-10-25 加的那一道：上面三个 + 下面两个都是
+   * "**软件**认为在录"的证据，没有一个能证明"这一代的线程真的跑起来过"。
+   * 现场那种形状（线程起跑就被判负、走了"不动任何标志"的早退）正是靠这五个
+   * 全为健康骗过了守护 —— 于是每 5 秒空转一圈重开、永不升级，一次抖动变成
+   * 永久性"不能对话"。认领是线程自己在进读循环之前盖的章，盖不了就说明这一代
+   * 压根没干活，必须如实报假，让守护走"要常听却没在录"那条重开路自愈。 */
+
+  if (!ctx->record_claimed)
     {
       return false;
     }
@@ -1881,7 +2247,54 @@ int audio_play_start(audio_context_t *ctx,
   memcpy(ctx->play_buf, data, frames * frame_bytes);
   audio_apply_chunk_fade(ctx, frames);
 
-  return audio_play_begin(ctx, frames, callback, user_data);
+  return audio_play_begin(ctx, ctx->play_buf, frames, callback, user_data);
+}
+
+/**
+ * @brief  开始播放音频数据（零拷贝：直读调用方缓冲）
+ *
+ * 和 audio_play_start 的唯一区别是数据怎么进播放线程：
+ *   - 这里不 memcpy、不淡入淡出（淡入淡出会改数据，而调用方的缓冲不许碰）、
+ *     不受 AUDIO_PLAY_BUFFER_MS 容量限制 —— 数据压根不进 play_buf；
+ *   - 换来的义务写在头文件的原型注释里：调用方必须保证 data 从本函数返回 0
+ *     起一直有效，直到完成回调被调用（或 audio_play_stop() 返回）。
+ *
+ * 为什么加它（2026-10-19 真机取证）：TTS 全段最长 2 MB ≈ 64 秒，原来必须
+ * memcpy 进 play_buf 才能播，play_buf 因此被迫常驻 2.24 MB × 两份
+ * （hello_app / robot_ui 各一个 ctx），开机水位被挤到 606 KB、主循环任务
+ * 都建不起来，hello_app 进崩溃重启死亡螺旋。零拷贝之后 play_buf 缩回
+ * 512 KB（只服务短提示音），TTS 容量与播放缓冲彻底解耦。
+ *
+ * 生命周期契约为什么在这条链上天然成立：g_tts_buf / s_tts_buf 都是常驻
+ * 缓冲、从不 free；下一次 voice_tts_speak 合成必然排在这一轮播放完成之后
+ * （状态机一轮对话串行），所以"覆写"也不会发生在播放期间。
+ */
+
+int audio_play_start_ref(audio_context_t *ctx,
+                         const int16_t *data, size_t frames,
+                         audio_play_complete_cb_t callback,
+                         void *user_data)
+{
+  if (ctx == NULL || !ctx->initialized || data == NULL || frames == 0)
+    {
+      return -EINVAL;
+    }
+
+  if (ctx->playing)
+    {
+      AUDIO_DEBUG("已在播放中");
+      return -EBUSY;
+    }
+
+  /* 半双工切割和拷贝路径完全一致（audio_prepare_output：停录音，播完自动恢复） */
+
+  audio_prepare_output(ctx);
+
+  AUDIO_DEBUG("开始播放（零拷贝）(%zu 帧)", frames);
+
+  /* 不 memcpy、不淡入淡出、不查 play_buf 容量：播放线程直读 data */
+
+  return audio_play_begin(ctx, data, frames, callback, user_data);
 }
 
 /**
@@ -1974,7 +2387,7 @@ int audio_play_file(audio_context_t *ctx,
 
   AUDIO_DEBUG("播放文件: %s (%zu 帧)", filepath, frames);
 
-  return audio_play_begin(ctx, frames, callback, user_data);
+  return audio_play_begin(ctx, ctx->play_buf, frames, callback, user_data);
 }
 
 /**
@@ -1987,6 +2400,11 @@ void audio_play_stop(audio_context_t *ctx)
     {
       return;
     }
+
+  /* 上层明确掐掉这一轮播报：让路锁一并解除，别把麦一直扣在手里
+   * （"锁不会永久挂住"的第三条兜底，见 ai_audio.h 的 record_hold）。 */
+
+  ctx->record_hold = false;
 
   AUDIO_DEBUG("停止播放");
 

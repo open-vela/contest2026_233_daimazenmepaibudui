@@ -145,8 +145,9 @@
  * 解码、重采样后**追加**写进调用方的 PCM 缓冲（各块顺序拼起来 = 整段音频）。
  * 响应缓冲只要装得下**一块**：
  *
- *   MIMO_TTS_RESP_CAP = 896 KB，一块最多 64 字 × 约 11 KB/字 ≈ 704 KB，
- *   留 27% 余量（每个字的实际音频长度跟语速有关，留够免得响应被 cap 截掉）。
+ *   MIMO_TTS_RESP_CAP = 896 KB，一块最多 24 字 × 约 11 KB/字 ≈ 264 KB，
+ *   余量很足（896 KB 是按当年 64 字/块定的，块切小后就没再缩 —— 留着当
+ *   免疫：每个字的实际音频长度跟语速有关，留够免得响应被 cap 截掉）。
  *
  * 块尽量切在一句话的末尾（tts_split_len 优先在句末标点处切），所以拼接处的
  * 停顿听起来是自然的。代价是整段要分几次 HTTPS（每次一次握手 + 一次合成），
@@ -170,9 +171,53 @@
  * 这个上限保证常规回复（几十到两三百字）能整段合出来。 */
 #define MIMO_TTS_TEXT_MAX 300
 
-/* 一块送多少个字（也是响应缓冲的尺寸依据）。只是**上限**：切块优先切在
- * 一句话的末尾（见 tts_split_len），所以实际块一般比这个小。 */
-#define MIMO_TTS_CHUNK_CHARS 64
+/* ===== 一块送多少个字 —— 切块上限的设计史 =====
+ *
+ * 两个上限宏 MIMO_TTS_CHUNK_CHARS（后续块）/ MIMO_TTS_HEAD_CHUNK_CHARS（首块）
+ * **定义在 mimo_voice.h**，因为 2026-10-25 查明它们必须由调用方按"首块 / 后续块"
+ * 分别传进 mimo_tts_speak_head() 的 max_chars 参数。
+ *
+ * ★★ 2026-10-25 修的坑：MIMO_TTS_CHUNK_CHARS 原来写死在本文件，注释还写着
+ * "后续块在 mimo_tts_synthesize 的循环里用"。**那句话是错的** —— 流水线每一块
+ * （含后续块）都调 mimo_tts_speak_head()，一块都没走过 mimo_tts_synthesize()。
+ * 结果是改那个宏纯属空操作：真机块大小一动不动，还是卡在 20 字。日志为证
+ * （/tmp/c64.log，宏改成 64 之后）：最大块 60 字节 = 20 个汉字，正好撞死在
+ * MIMO_TTS_HEAD_CHUNK_CHARS 上。注释说的和代码做的不是一回事，以代码为准。
+ *
+ * 这些是**上限**：切块优先切在一句话的末尾（见 tts_split_len），所以实际块
+ * 一般比这个小。
+ *
+ * ★ 2026-10-25 两次改，第二次推翻了第一次，依据是真机实测：
+ *
+ * 【第一次 64 → 24】看的是「首块大小 → 首句合成耗时」，那组数是对的：
+ *     70 字节 →  6047 ms      152 字节 → 13656 ms
+ *    100 字节 →  9428 ms      174 字节 → 13820 ms
+ *    134 字节 → 11787 ms      188 字节 → 15282 ms
+ *   （约 78 ms/字节 + ~800 ms TLS 握手）。首块切小确实让出声变快，这一步没白做
+ *   —— 它由 MIMO_TTS_HEAD_CHUNK_CHARS 单独保住，本宏不再背这个锅。
+ *
+ * 【第二次 24 → 64】当初的警告「首块小必须配套把后续块也切小」是**错的**，
+ *   错在只看了合成耗时、没算上真实的静音。2026-10-25 晚实测（同一份日志里
+ *   拿音频设备 hw_stop→hw_start 量，不是拿"块间空档"那行量）：
+ *
+ *       块 1→2  日志报 1360 ms，真实静音 3410 ms
+ *       块 2→3  日志报  770 ms，真实静音 2200 ms
+ *       块 3→4  日志报  710 ms，真实静音 2200 ms
+ *
+ *   日志那行只量"队列等了多久"，没算上每块一次的设备关/开（约 600 ms）
+ *   与排队。**耳朵听到的是真实静音那一列** —— 说话和静音差不多各占一半。
+ *
+ *   按「合成 = 800 ms 固定 + 235 ms/字，音频 = 196 ms/字」反推静音占比：
+ *       12 字 → 54%    24 字 → 37%    64 字 → 26%    128 字 → 23%
+ *   64 之后收益递减，而且回合被打断时浪费的音频更多，所以停在 64。
+ *
+ *   ★ 硬约束先说清，别指望调这个调到 0：云端合成比实时慢约 20%（235 vs
+ *   196 ms/字），光靠加块只能把静音压到 ~20%。剩下那 800 ms/块的 TLS 握手
+ *   （实测 600 ms）要靠连接复用才能省，而复用现在被 vela_tls.c 的排空判定
+ *   挡死（阻塞 socket 上读超时被判死连接），改动不在本文件、需要单独授权。
+ *
+ * 想再快出声就调小 MIMO_TTS_HEAD_CHUNK_CHARS；嫌停顿多就调大
+ * MIMO_TTS_CHUNK_CHARS。两个宏的值在 mimo_voice.h。 */
 
 /* 估算一个字念出来占多少字节 PCM（16k 单声道 16bit）：实测 13 字 = 107564
  * 字节的 24 kHz WAV，转成 16 kHz 约 71700 字节 ≈ 5.5 KB/字（那一段语速偏快，
@@ -754,6 +799,74 @@ static int mimo_load_config(void)
   return OK;
 }
 
+/* ── TLS 连接复用策略（2026-10-25） ────────────────────────────
+ *
+ * mimo_post() 以前**每次**都先 vela_tls_pool_cleanup() 强制全新 TLS 握手，
+ * 那是为了躲 vela_tls.c 池子复用路径的一个 bug（排空残包时把错误态当"排空
+ * 干净了"继续用，死连接要等满读超时才失败，界面停在"正在识别"）。
+ *
+ * 那个根因**后来在 vela_tls.c 里修掉了**：现在排空结果只有 WANT_READ /
+ * WANT_WRITE 算"连接还活着"，其余一律 pool_reconnect 重建，注释里还写明
+ * "mimo_post()/weather_http_get() 里那句 vela_tls_pool_cleanup() 是给这个
+ * bug 打的补丁 —— 根因修在这里，补丁以后可以逐步撤掉"。现在就是撤补丁。
+ *
+ * 为什么要撤：实测每块 TTS 都要付一次握手税（约 800 ms），而块间空档中位
+ * 870 ms 里绝大部分就是它（合成 78 ms/字 ≈ 播放 75 ms/字，两者基本抵消）。
+ * 轮内复用后空档应降到 200 ms 量级。而且每块一次握手 = 每块一次可能失败的
+ * DNS/TCP/TLS，块数越多越容易中途掉一次；复用反而是**更少的故障点**。
+ *
+ * 保守在哪（三条，都为了"稳定优先于流畅"）：
+ *   ① 空闲超过 MIMO_TLS_FRESH_AFTER_MS 就当"新一轮"，起手先清池。
+ *      一轮内相邻两次 POST 间隔只有 3~5 秒（播放一小块的时间），远小于这个
+ *      阈值 → 轮内复用；两轮之间隔着"说话 + ASR + LLM"，十几秒到几十秒
+ *      → 每轮首块前仍是全新连接，捡不到上一轮的陈货。
+ *      这正好等于计划里写的"只在每轮首块前清一次"，只是判据放在本函数内，
+ *      不用跨文件去数 g_tts_seq，也不会漏掉某个入口。
+ *   ② 上一次 POST 失败或墙钟超过 MIMO_POST_SLOW_MS，置 s_tls_dirty，
+ *      下一次起手必定清池。真踩上一次坏连接，最多慢一块，不会一路慢下去。
+ *      （失败时 vela_tls 自己已经 pool_release(keep=false) 拆掉连接了，
+ *      这条只是"网络可疑就别再复用"的额外保守。）
+ *   ③ 每次清池都打一行带原因的日志，异常（失败/过慢）另打一行。一轮大概
+ *      一两行，不吵，但烧录后能直接看出"到底有没有在复用"。
+ *
+ * 残余风险（说实话）：半开连接（对端悄悄没了、没发 FIN/RST）是池子复用的
+ * 真空洞 —— 排空 10ms 超时读到 WANT_READ 会当成活着，写进去之后在
+ * tls_read_response() 上等满 AGENT_LLM_SOCKET_TIMEOUT_SEC（**120 秒**）才
+ * 失败。①就是冲着它去的：半开和"闲置多久"强相关，闲置短的连接基本不会半开。
+ * 万一还是踩上，界面上有 ROUND_TTS_STALL_MAX_MS（25 秒无进展即作废整轮）
+ * 兜底 —— 轮会掉、但设备会自愈，最坏是那条调用线程再挂到 120 秒读超时。
+ *
+ * 硬回退判据（**30 轮里出现一次「合成卡住 >20 秒」就照做**）：
+ *   把 MIMO_TLS_REUSE_IN_ROUND 改成 0，一行回到旧的"每块清池"。
+ *
+ * weather_http_get() 里的清池**不动**：那是另一台机器（open-meteo）、
+ * 平时用不上池子，保持每次全新连接。
+ */
+
+#ifndef MIMO_TLS_REUSE_IN_ROUND
+#define MIMO_TLS_REUSE_IN_ROUND 1
+#endif
+
+/* 距上次 POST 超过这个毫秒数就当"新一轮"，起手先清池。
+ * 取 12 秒：要明显大于一轮内相邻两次 POST 的间隔（3~5 秒，最长约 8 秒），
+ * 又明显小于两轮之间的间隔（说话 + ASR + LLM，十几秒起）。 */
+#define MIMO_TLS_FRESH_AFTER_MS 12000
+
+/* 单次 POST 墙钟超过这个毫秒数 = 异常（不是"念得久"，是网络/服务端不对劲）。
+ * 计划里定的 15 秒：正常合成一块（24 字上限 ≈ 50 字节）约 4~5 秒。 */
+#define MIMO_POST_SLOW_MS 15000
+
+static uint32_t s_post_last_ms;   /* 上一次 mimo_post 起手的时刻 */
+static bool     s_tls_dirty;      /* 置位后下次 mimo_post 必须清池 */
+
+static uint32_t mimo_now_ms(void)
+{
+  struct timespec ts;
+
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint32_t)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+}
+
 /****************************************************************************
  * Name: mimo_post
  *
@@ -771,6 +884,11 @@ static int mimo_load_config(void)
 static int mimo_post(const char *body, char *resp, size_t resp_cap)
 {
   char auth[192];
+  uint32_t now;
+  uint32_t t0;
+  uint32_t dt;
+  int ret;
+  bool fresh;
 
   /* 只在本函数里用，绝不打印 */
 
@@ -781,17 +899,85 @@ static int mimo_post(const char *body, char *resp, size_t resp_cap)
     { NULL, NULL }
   };
 
-  /* 请求前清掉 ai_agent TLS 连接池里的旧连接，强制走"全新连接"。
-   *
-   * 为什么：池子的复用路径（vela_tls.c 里 pool 那段）在排空旧连接残包时用的是 10ms 超时，
-   * 读到 WANT_READ 时它**不重连**，而是把死连接当好的继续用 —— 写进去之后在
-   * tls_read_response() 上等满 120 秒才失败、再重连重发。表现就是界面长时间停在
-   * "正在识别"（不是崩溃，是慢得离谱）。丢一次连接、重做一次 TLS 握手（几百毫秒）
-   * 比这个划算。 */
-  vela_tls_pool_cleanup();
+  now = mimo_now_ms();
 
-  return vela_https_post_json(s_host, s_port, s_path, hdrs, body,
-                              resp, resp_cap);
+  /* 该不该清池：开关关着 / 上次出过事 / 空闲太久 → 清；否则轮内复用。
+   * 见上面 MIMO_TLS_REUSE_IN_ROUND 那整段说明。 */
+  if (!MIMO_TLS_REUSE_IN_ROUND)
+    {
+      fresh = true;
+    }
+  else if (s_tls_dirty)
+    {
+      fresh = true;
+    }
+  else if (s_post_last_ms == 0 ||
+           (uint32_t)(now - s_post_last_ms) >= MIMO_TLS_FRESH_AFTER_MS)
+    {
+      fresh = true;
+    }
+  else
+    {
+      fresh = false;
+    }
+
+  if (fresh)
+    {
+      const char *why;
+
+      if (!MIMO_TLS_REUSE_IN_ROUND)
+        {
+          why = "复用已关（旧行为）";
+        }
+      else if (s_tls_dirty)
+        {
+          why = "上次 POST 出过事";
+        }
+      else if (s_post_last_ms == 0)
+        {
+          why = "本轮第一次";
+        }
+      else
+        {
+          why = "闲置太久";
+        }
+
+      /* 这行是给烧录后验收用的：一轮里应该只看到一次"清池"，
+       * 后面十几块都不再打，说明确实没再重复握手。 */
+      printf("[TLS] 清池强制全新连接（%s，距上次 %lu ms）\n",
+             why,
+             (unsigned long)(s_post_last_ms == 0
+                             ? 0 : (uint32_t)(now - s_post_last_ms)));
+
+      vela_tls_pool_cleanup();
+      s_tls_dirty = false;
+    }
+
+  t0 = mimo_now_ms();
+  s_post_last_ms = t0;
+
+  ret = vela_https_post_json(s_host, s_port, s_path, hdrs, body,
+                             resp, resp_cap);
+
+  dt = (uint32_t)(mimo_now_ms() - t0);
+
+  /* 失败或过慢 → 下次别再复用，并打一行异常日志（观测行，不改别的行为）。
+   * 用 printf 而不是 syslog：这条就是要在串口上一眼看见。 */
+  if (ret < 0)
+    {
+      s_tls_dirty = true;
+      printf("[TLS] ★ POST 失败 ret=%d，耗时 %lu ms —— 下次强制全新连接\n",
+             ret, (unsigned long)dt);
+    }
+  else if ((int32_t)dt >= (int32_t)MIMO_POST_SLOW_MS)
+    {
+      s_tls_dirty = true;
+      printf("[TLS] ★ POST 耗时 %lu ms（≥ %d）—— 异常慢，下次强制全新连接"
+             "（这就是「合成卡住」的样子，30 轮里出现一次就该回退）\n",
+             (unsigned long)dt, MIMO_POST_SLOW_MS);
+    }
+
+  return ret;
 }
 
 /****************************************************************************
@@ -1673,7 +1859,8 @@ static int mimo_asr_recognize(const unsigned char *pcm_data, size_t pcm_len,
 
   status = mimo_post(body, resp, MIMO_ASR_RESP_CAP);
 
-  /* body 是 16k*2*10 秒 PCM 的 base64（几百 KB），请求一回来就还给堆 ——
+  /* body 是 16k*2*最长 15 秒 PCM 的 base64（~640 KB，见
+   * ai_companion_main.c 的 SPEECH_BUF_MAX_FRAMES），请求一回来就还给堆 ——
    * 后面解析响应、进 chat/TTS 都不再需要它。 */
   mimo_free_logged("asr.body", body, pfx_len + b64_need + sfx_len + 1);
 
@@ -2053,6 +2240,97 @@ static int mimo_tts_synthesize(const char *text, unsigned char *pcm_out,
 
   syslog(LOG_INFO, "[%s] TTS: 输出 16k PCM %zu 字节（约 %zu ms，%zu 块）\n",
          TAG, *pcm_len, *pcm_len * 1000 / (MIMO_PCM_RATE * 2), chunk_no);
+  return OK;
+}
+
+/****************************************************************************
+ * Name: mimo_tts_speak_head
+ *
+ * Description:
+ *   只合成**一块**（用法和设计动机见 mimo_voice.h 的声明处）。
+ *   切句逻辑与 mimo_tts_synthesize 的块循环完全一致（tts_split_len 按
+ *   句子边界收），所以"逐块拼起来"念的效果和整段一次合成完全一样。
+ *
+ *   ⚠ 名字叫 speak_head，但流水线**每一块都调它**（首块 + 后续块，见
+ *   ai_companion_main.c 生产者循环 4476 与 robot_ui/main.c 1895）。所以上限
+ *   必须由调用方传进来：首块传 MIMO_TTS_HEAD_CHUNK_CHARS（小，只为让第一声
+ *   早点出来），后续块传 MIMO_TTS_CHUNK_CHARS（大，块间空档少）。
+ *   2026-10-25 之前上限是写死的，于是后续块一直被卡在首块那个小值上。
+ *
+ ****************************************************************************/
+
+int mimo_tts_speak_head(const char *text, unsigned char *pcm_out,
+                        size_t pcm_cap, size_t max_chars, size_t *pcm_len,
+                        size_t *consumed_bytes)
+{
+  size_t fit_chars;
+  size_t chunk_len;
+  size_t got = 0;
+  size_t full = 0;
+  int ret;
+
+  if (text == NULL || pcm_out == NULL || pcm_len == NULL ||
+      consumed_bytes == NULL || pcm_cap == 0 || max_chars == 0)
+    {
+      return -EINVAL;
+    }
+
+  *pcm_len = 0;
+  *consumed_bytes = 0;
+
+  if (mimo_load_config() != OK)
+    {
+      syslog(LOG_ERR, "[%s] TTS 首句: 配置里缺 llm_host / api_key，MiMo 不可用\n",
+             TAG);
+      return -ENOENT;
+    }
+
+  if (text[0] == '\0')
+    {
+      return -EINVAL;
+    }
+
+  fit_chars = pcm_cap / MIMO_TTS_PCM_PER_CHAR;
+  if (fit_chars == 0)
+    {
+      return -ENOSPC;
+    }
+
+  /* 上限由调用方传（见函数头的 ⚠）：首块传 MIMO_TTS_HEAD_CHUNK_CHARS，
+   * 后续块传 MIMO_TTS_CHUNK_CHARS。
+   *
+   * ★ 2026-10-25 修：这里原来写死 MIMO_TTS_HEAD_CHUNK_CHARS，而流水线每一块
+   * 都调本函数 —— 于是"后续块用 MIMO_TTS_CHUNK_CHARS"那句注释从来没生效过，
+   * 真机每块都卡在 20 字（日志里最大块 60 字节 = 20 个汉字）。改宏是空操作，
+   * 只有把上限做成参数才真正生效。
+   *
+   * fit_chars 还会被上面那步「缓冲还放得下几个字」压得更小 —— 两个上限取
+   * 小的那个。所以槽不够大时是**优雅降级**（块变小），不是写越界、也不会
+   * 截断成半截音频。 */
+  if (fit_chars > max_chars)
+    {
+      fit_chars = max_chars;
+    }
+
+  chunk_len = tts_split_len(text, strlen(text), fit_chars);
+  if (chunk_len == 0)
+    {
+      return -EINVAL;
+    }
+
+  ret = tts_synth_chunk(text, chunk_len, pcm_out, pcm_cap, &got, &full);
+  if (ret != OK)
+    {
+      syslog(LOG_WARNING, "[%s] TTS 首句合成失败: %d\n", TAG, ret);
+      return ret;
+    }
+
+  *pcm_len = got;
+  *consumed_bytes = chunk_len;
+
+  syslog(LOG_INFO,
+         "[%s] TTS: 块 %zu 字节 -> %zu 字节 PCM（约 %zu ms）\n",
+         TAG, chunk_len, got, got * 1000 / (MIMO_PCM_RATE * 2));
   return OK;
 }
 
@@ -2827,6 +3105,16 @@ static void chat_build_system_prompt(bool use_weather, bool use_reminder,
                        "简短直接，一般一两句话就够。不要用 emoji，也不要用"
                        "星号或者 markdown 列表，因为屏幕字库和语音都不支持"
                        "这些符号。");
+
+  /* 2026-10-19 加的硬上限：语音一次最多念 MIMO_TTS_TEXT_MAX=300 字
+   * （2 MB PCM 缓冲 ÷ 16 kHz 的物理限制），模型不守"简短"约定时长回复
+   * 会被拦腰截断 —— 用户实测"长答案只念一部分"。留 20 字余量写 280，
+   * 让"屏幕显示多少 = 念到多少"成立。 */
+
+  used = prompt_append(out, out_cap, used,
+                       "回答最多 280 个字。内容多的时候挑最重要的先说完整，"
+                       "宁可少说几条，也不要每条都说一半 —— 说一半的话"
+                       "语音念不完，用户既听不到也看不到。");
 
   used = prompt_append(out, out_cap, used,
                        "任何时候都必须用简体中文回答，这是硬性规定。"

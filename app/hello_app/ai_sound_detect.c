@@ -325,9 +325,22 @@ static int sound_detect_run_model(sound_detect_context_t *ctx,
         }
     }
 
-  /* 检查是否超过阈值 */
+  /* 检查是否超过阈值
+   *
+   * 阈值**按类**取（2026-10-22）：原来这里一律比 ctx->config.threshold，
+   * 每个类自己那条 classes[i].threshold 从头到尾没被查过 —— 是死配置。
+   * 结果是"跌倒"这种一命中就报警 + 抢麦克风 + 打扰老人的紧急动作，和
+   * "敲门"共用 0.7 的门槛：现场一声硬物响就以 0.73 的置信度报了跌倒
+   * （2026-10-22 真机日志 `[门控] 本地小模型命中: 疑似跌倒撞击…置信度 0.73`），
+   * 接着红屏 + 响铃 + 追问把正在进行的对话整条吃掉。
+   *
+   * 现在按类取：跌倒走 0.85 的高门槛（判错的代价是整机被打断 + 吓到老人），
+   * 敲击/喊叫保持 0.7（求救信号宁可多问一句也不能漏）。 */
+  float gate = (ctx->classes[max_idx].threshold > 0.0f)
+               ? ctx->classes[max_idx].threshold
+               : ctx->config.threshold;
 
-  if (max_score >= ctx->config.threshold && max_idx != SOUND_TYPE_NONE)
+  if (max_score >= gate && max_idx != SOUND_TYPE_NONE)
     {
       SOUND_DEBUG("模型检测: type=%s, score=%.2f",
                   g_type_names[max_idx], max_score);
@@ -910,7 +923,11 @@ int sound_detect_once(sound_detect_context_t *ctx,
         }
     }
 
-  if (max_score >= ctx->config.threshold && max_idx != SOUND_TYPE_NONE)
+  /* 阈值同样按类取（和上面 sound_detect_run 里那处同一条规矩，见那边的说明） */
+  if (max_score >= ((ctx->classes[max_idx].threshold > 0.0f)
+                    ? ctx->classes[max_idx].threshold
+                    : ctx->config.threshold) &&
+      max_idx != SOUND_TYPE_NONE)
     {
       *type = max_idx;
       *confidence = max_score;
@@ -1152,7 +1169,7 @@ void sound_detect_init_default_classes(sound_detect_context_t *ctx)
   ctx->classes[SOUND_TYPE_FALL].type = SOUND_TYPE_FALL;
   strncpy(ctx->classes[SOUND_TYPE_FALL].name, "跌倒撞击",
           sizeof(ctx->classes[SOUND_TYPE_FALL].name) - 1);
-  ctx->classes[SOUND_TYPE_FALL].threshold = SOUND_DETECT_THRESHOLD_DEFAULT;
+  ctx->classes[SOUND_TYPE_FALL].threshold = SOUND_DETECT_THRESHOLD_HIGH;
   ctx->classes[SOUND_TYPE_FALL].enabled = true;
 
   /* 敲击求救 */
@@ -1219,6 +1236,19 @@ static pthread_t       g_gate_thread;
 static bool            g_gate_thread_valid;
 static volatile bool   g_gate_stop;
 static volatile bool   g_gate_enabled;
+
+/* 在途 tap 计数：sound_detect_pcm_tap（录音线程）从"检查通过"到"解锁返回"
+ * 之间的那一小段。sound_detect_bypass_stop 先关 g_gate_enabled、再把这个计数
+ * 等一小段，让收尾干净些。
+ *
+ * ⚠ 但**安全性现在不靠这个计数**（2026-10-25 起）：stop 已经不再销毁锁、
+ * 也不再释放环形缓冲了，所以 tap 就算比 stop 慢一拍也掀不起风浪。历史上
+ * 用这个计数去守"销毁锁前等在途归零"，结果 2026-10-20 和 2026-10-25 各崩
+ * 一次（sem_post.c:63 持有者断言 → hello_app 崩 → 整条音频链卡死），根因是
+ * 等在途只有 200 ms 上限 + set_enabled(true) 能中途把闸重新打开。现在改成
+ * "永远不销毁"，这类窗口从根上不存在了，本计数退化为诊断用。
+ * 单核 Cortex-M 上普通 int 自增自减即可，不需要原子操作。 */
+static volatile int    g_gate_taps_inflight;
 static volatile float  g_gate_sensitivity = 1.0f;
 static sound_detect_busy_cb_t  g_gate_busy_cb;
 static void                   *g_gate_busy_arg;
@@ -1521,16 +1551,32 @@ int sound_detect_pcm_tap(const int16_t *pcm, size_t n)
       return 0;    /* 门控没开：静默丢掉，不影响主链路 */
     }
 
+  /* 先登记在途，再**重新**检查一遍三件套。顺序不能反：stop 的协议是
+   * "关 enabled → 等在途归零 → 销毁锁/释放环"，重查这一步保证
+   * "检查通过"和"在途计数可见"对 stop 而言是原子的 —— stop 要么在
+   * 增量之前看到计数为 0（此后本函数重查 enabled 一定失败、直接退出），
+   * 要么在增量之后看到计数为 1（等本函数走完才继续）。 */
+
+  g_gate_taps_inflight++;
+
+  if (!g_gate_enabled || g_gate_ring == NULL || !g_gate_lock_valid)
+    {
+      g_gate_taps_inflight--;
+      return 0;
+    }
+
   /* 只**试**锁：录音线程在这里等门控线程 = 丢麦克风数据，绝不允许。
    * 抢不到就当下这一小块不要了（下一帧 20ms 后还有）。 */
 
   if (pthread_mutex_trylock(&g_gate_lock) != 0)
     {
+      g_gate_taps_inflight--;
       return 0;
     }
 
   gate_ring_push(pcm, n);
   pthread_mutex_unlock(&g_gate_lock);
+  g_gate_taps_inflight--;
   return 0;
 }
 
@@ -1718,27 +1764,61 @@ int sound_detect_bypass_start(void)
 
 void sound_detect_bypass_stop(void)
 {
+  int i;
+
   if (!g_gate_thread_valid)
     {
       return;
     }
 
+  /* 顺序：先关闸（新 tap 从此在第一道检查就被拦下），再等在途的 tap
+   * 归零，然后 join 门控线程。
+   *
+   * ★★★ 2026-10-25：这里**不再销毁锁、也不再释放环形缓冲**。
+   *
+   * 原来的写法是"等在途归零 → pthread_mutex_destroy + free(环)"，并且等在途
+   * 只等 200 ms，超时就照旧销毁。注释自己写着这样会重现 2026-10-20 那次崩溃：
+   * tap 卡在"检查通过之后、unlock 之前"时销毁锁，那次 unlock 就打在已销毁的
+   * 互斥量上，触发 sem_post.c:63 的持有者断言、hello_app 当场崩。**2026-10-25
+   * 真机又崩了一次，就是这个逃生口**（日志：
+   *   Assertion failed at /sched/semaphore/sem_post.c:63 task: hello_app
+   *   backtrace: nxsem_post_slow ← pthread_mutex_give ← sound_detect_pcm_tap
+   *   ← audio_record_thread
+   * ）。另一个洞是 sound_detect_gate_set_enabled(true) 能在 teardown 途中把
+   * g_gate_enabled 重新打开，绕过"不许新 tap"这道门。
+   *
+   * 与其把时序窗口一个个堵上，不如让这类竞争**根本不可能有后果**：
+   *   - g_gate_lock 是**静态全局**，不是堆上的 —— 销毁它没有任何收益，
+   *     只换来"use-after-destroy"这一整类崩溃。留着，下次 start 直接复用。
+   *   - 环形缓冲是**固定大小一次性分配**，也不必释放。留着，下次 start 复用。
+   *   于是 tap 就算在 stop 之后才跑到 unlock，也只是解锁一把仍然有效的锁；
+   *   就算 set_enabled(true) 在 teardown 途中把闸重新打开，tap 也只是往一个
+   *   没人读的环里写几帧。两个洞同时闭死，而且**与在途计数的时序无关**。
+   *
+   * g_gate_enabled=false + 等在途仍保留（收尾更干净、日志更好读），
+   * 但它不再是安全性的承重墙。 */
+
+  g_gate_enabled = false;
+  for (i = 0; i < 200 && g_gate_taps_inflight > 0; i++)
+    {
+      usleep(1000);
+    }
+
+  if (g_gate_taps_inflight > 0)
+    {
+      /* 等超时也不再是危险信号（下面不销毁任何东西），但值得记一笔：
+       * 说明有 tap 线程被拖住了，是别的问题的线索。 */
+      printf("[门控] ★ 停止时仍有 %d 个 tap 在途（已不再销毁锁，无害；"
+             "但说明录音线程被拖住过）\n",
+             g_gate_taps_inflight);
+    }
+
   g_gate_stop = true;
   pthread_join(g_gate_thread, NULL);
   g_gate_thread_valid = false;
-  g_gate_enabled = false;
 
-  if (g_gate_ring != NULL)
-    {
-      free(g_gate_ring);
-      g_gate_ring = NULL;
-    }
-
-  if (g_gate_lock_valid)
-    {
-      pthread_mutex_destroy(&g_gate_lock);
-      g_gate_lock_valid = false;
-    }
+  /* ⚠ 不 free(g_gate_ring)、不 pthread_mutex_destroy(&g_gate_lock)、
+   * 不把 g_gate_lock_valid 置回 false —— 理由见上。下次 start 会复用它们。 */
 
   g_gate_ring_head = 0;
   g_gate_ring_count = 0;

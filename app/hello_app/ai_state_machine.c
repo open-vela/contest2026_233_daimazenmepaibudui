@@ -74,8 +74,32 @@ static const char *g_event_names[SM_EVENT_MAX] =
 static const uint32_t g_default_timeouts[SM_STATE_MAX] =
 {
   [SM_STATE_IDLE]        = 0,        /* 待机状态不超时 */
-  [SM_STATE_LISTENING]   = 10000,    /* 监听10秒超时 */
-  [SM_STATE_AI_TALKING]  = 30000,    /* AI对话30秒超时 */
+  /* 监听超时：10 秒 → 20 秒（2026-10-23）。
+   * 它现在测的是"**多久没有任何声音推进**"，不是"进入监听多久了"——
+   * 见 sm_kick_timer() 的说明，录音累积每帧都会续期。所以这 20 秒真正
+   * 表达的是"唤醒了但一直不出声就放弃"，给老人留足想词的时间。
+   * 原来的 10 秒还得再扣掉 VAD 判"说完了"要的那段连续静音
+   * （`AUDIO_VAD_SILENCE_TIMEOUT_MS`，见 ai_audio.h —— **具体秒数以那个宏
+   * 为准，这里刻意不写死**，历史上写过的 3 秒/4 秒都已经过时）。扣完实际
+   * 能说话的时间很短，句子稍长就被 TIMEOUT 打回 IDLE，后面的 VOICE_COMPLETE
+   * 还会被吞掉。 */
+  [SM_STATE_LISTENING]   = 20000,    /* 监听 20 秒无声音才超时 */
+  /* AI 对话一轮的兜底上界（ASR HTTPS + 大模型 + TTS 合成 + 整段播放）。
+   * 2026-10-19 从 30 秒抬到 90 秒：TTS 改零拷贝后整段播放最长 2 MB ≈ 64 秒
+   * （300 字上限的回复），30 秒会在一轮正常长回复还没念完时就把状态打回
+   * IDLE（不掐播放，但界面状态先乱、完成事件被当噪音丢掉）。90 秒 =
+   * 播放 64 + 前置链路 ~25 + 余量。
+   *
+   * 2026-10-25 再从 90 秒抬到 180 秒，同一个理由、换了个数：TTS 切块从
+   * 64 字改成 24 字（mimo_voice.c 的 MIMO_TTS_CHUNK_CHARS）之后，同样 300 字
+   * 的回复块数翻近三倍、每块单独付一次 TLS 握手，整段念完实打实变长；
+   * 按实测推算是 ASR 20 + LLM 35 + TTS 约 100 秒，90 秒又会开始"说到一半
+   * 状态先回 IDLE"。180 秒盖得住最坏情况。
+   *
+   * 这个数只是**界面状态**的兜底，不是自愈主力：真正把卡死的轮捞回来的是
+   * round_watchdog_tick()（ASR 20s / LLM 35s / TTS 25s 无进展即作废），
+   * 那条快得多（最慢 35 秒），所以这里抬高不会让"卡住"变得更难恢复。 */
+  [SM_STATE_AI_TALKING]  = 180000,
   [SM_STATE_CARE_REMIND] = 5000,     /* 提醒播放5秒 */
   [SM_STATE_ALARM]       = 60000     /* 报警状态60秒 */
 };
@@ -294,6 +318,26 @@ static sm_state_t sm_idle_transition(void *ctx, sm_event_t event)
         /* 保持待机状态 */
 
         return SM_STATE_IDLE;
+
+      case SM_EVENT_VOICE_DETECTED:
+        /* 有人开始说话 —— 待机里收到它，说明说话比状态机先到一步
+         * （典型：LISTENING 刚超时回 IDLE，用户还在说）。原来走 default
+         * 被静默吞掉，于是说话没反应。现在直接收进监听。 */
+
+        return SM_STATE_LISTENING;
+
+      case SM_EVENT_VOICE_COMPLETE:
+        /* 一段话说完了 —— 原来这里同样走 default 被吞掉，这就是
+         * "说完必须点提交、点了有时也没反应"的另一半原因：
+         * 「提交」和 VAD 自动断句共用 speech_capture_complete()，最后
+         * 都是这一条 SM_EVENT_VOICE_COMPLETE，一旦超时回了 IDLE 就双双
+         * 失效。说完了本来就是要送 ASR 要回答，直接进 AI 对话。 */
+
+        /* 这里用 printf 而不是 SM_DEBUG：SM_DEBUG 在非 DEBUG 构建下是空宏，
+         * 而这条恰恰是"以前会静默失败"的恢复路径 —— 烧录后要在串口上看得到
+         * 它有没有走到，才好判定问题②是否真的修好。 */
+        printf("[SM] IDLE 收到语音完成（超时后的恢复路径），直接送 AI 对话\n");
+        return SM_STATE_AI_TALKING;
 
       default:
         SM_DEBUG("IDLE: 忽略事件 %s", g_event_names[event]);
@@ -696,6 +740,27 @@ void sm_set_timeout(sm_context_t *ctx, sm_state_t state,
 
   SM_DEBUG("设置状态 %s 超时: %lu ms",
            g_state_names[state], (unsigned long)timeout_ms);
+}
+
+/**
+ * @brief  续期当前状态的超时计时（"这个状态还在推进，别超时"）
+ *
+ * 为什么必须有这个（2026-10-23，用户反馈"说完必须点提交"）：
+ * sm_run() 判超时用的是 `now - state_enter_tick`，而 state_enter_tick
+ * 只在状态**真的切换**时才重置（sm_handle_event 末尾的 if）。用户说一句
+ * 长话时状态一直停在 LISTENING 不动，计时器就从进来的那一刻一路跑到底 ——
+ * 10 秒 TIMEOUT 打回 IDLE，紧接着 VAD 判到的 VOICE_COMPLETE 被 IDLE 吞掉，
+ * 整句白说。录音线程每累积一帧调一次这个，超时就只在真的没声音时才触发。
+ */
+
+void sm_kick_timer(sm_context_t *ctx)
+{
+  if (ctx == NULL || !ctx->initialized)
+    {
+      return;
+    }
+
+  ctx->state_enter_tick = sm_get_tick_ms();
 }
 
 /**

@@ -40,6 +40,11 @@ if(CONFIG_LVX_USE_CONTEST2026_233_HELLO_APP)
     # （_flash/gen_tts_cache.py）逐字节一致，对拍见 _tts_cache_host_test/。
     # 同样自给自足：robot_ui 也 include 这个头文件（跨 app 的符号最终链接时解析）。
     tts_cache.c
+    # 说完之后立刻响一声的"我听见了"（S2.1）：预缓存命中说人话，没命中就播
+    # 程序合成的短提示音。**不缩短真实答复的等待**，只是把"没反应"换成
+    # "有回应感"。只依赖 ai_audio.h + tts_cache.h，robot_ui 也 include 这个头
+    # 文件（跨 app 的符号最终链接时解析），所以两个 app 的提示音是同一份。
+    prompt_ack.c
   )
 
   if(CONFIG_HELLO_APP_SOUND_EVENT)

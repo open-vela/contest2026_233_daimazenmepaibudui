@@ -86,6 +86,12 @@
  * 同样是自给自足的头文件 + 跨 app 的符号在最终链接时解析（和上面那个同一套）。 */
 #include "tts_cache.h"
 
+/* 说完之后立刻响一声的"我听见了"（S2.1，实现在 app/hello_app/prompt_ack.c）：
+ * 和 hello_app 那条常开麦链路**共用同一份**，两条路的听感一致。
+ * 为什么不放在 mimo_chat() 里统一带：那是跨 app 的对话接口，改动会波及
+ * 用它的人；这一层只管"说完有点动静"，落在各自的 worker 里最贴。 */
+#include "prompt_ack.h"
+
 /* 语音链路推界面的同进程直调入口（robot_ui_bridge.c/.h）：
  * ai_companion 不再只靠公网 MQTT 回传才知道要刷屏，见该头文件头的说明。
  * 本文件只提供三个薄门面（sanitize / ui_post / 弹面板抑制），
@@ -151,13 +157,17 @@ static bool g_ai_initialized = false;
 #define VOICE_PCM_MAX_BYTES   (16000 * 2 * 10)
 /* 少于 0.5 秒基本是误触或者根本没说话，不值得发一次网络请求 */
 #define VOICE_PCM_MIN_BYTES   (16000 * 2 / 2)
-/* TTS 输出缓冲：**必须和 ai_audio 的 AUDIO_PLAY_BUFFER_MS 对齐**（现在两边都是
- * 30 秒 = 960000 字节）—— audio_play_start() 是把整段 PCM 一次拷进自己的播放
- * 缓冲，这里比那边大就会在播放层 -ENOSPC 一声不响，比那边小则浪费可念的字数。
+/* TTS 输出缓冲容量（**已弃用**：实际容量是下面 s_tts_buf 的阶梯降级结果
+ * s_tts_cap，这个宏只是历史值留档）。
  *
- * 30 秒 ≈ 130 字：云端 TTS 现在是分块合成的（mimo_voice.c），更长的回复会在
- * 合成那层按"装得下多少念多少"截断并打日志（不会失败、也不会静默）。 */
-#define VOICE_TTS_BUF_BYTES   (16000 * 2 * 30)
+ * ⚠ 2026-10-19 起与 ai_audio 的 AUDIO_PLAY_BUFFER_MS **不再耦合**：TTS 播放
+ * 改走零拷贝（audio_play_start_ref，直读 s_tts_buf，不进 play_buf），
+ * play_buf 已从 70 秒砍回 16 秒（来龙去脉见 ai_audio.h 的
+ * AUDIO_PLAY_BUFFER_MS 注释 —— 两份 2.24 MB play_buf 曾把开机水位挤到
+ * 606 KB，hello_app 因此陷入崩溃重启死亡螺旋）。70 秒 ≈ 300 字
+ * （MIMO_TTS_TEXT_MAX 上限）仍是 s_tts_buf 阶梯第一档的目标：长回复完整
+ * 念完；再长的在合成那层按"装得下多少念多少"截断并打日志。 */
+#define VOICE_TTS_BUF_BYTES   (16000 * 2 * 70)
 #define VOICE_ASR_TEXT_MAX    512
 #define VOICE_REPLY_TEXT_MAX  2048
 
@@ -180,10 +190,45 @@ typedef struct {
     uint32_t        gen;                          /* 创建时的会话世代号 */
     unsigned char  *pcm;                          /* 本轮录音数据（任务持有） */
     size_t          pcm_len;
-    unsigned char  *tts;                          /* TTS 输出缓冲（懒分配） */
-    size_t          tts_cap;
     char            reply[VOICE_REPLY_TEXT_MAX];  /* 对话区显示的文字 */
 } voice_task_t;
+
+/* TTS 整段缓冲：进程级一份、**每轮复用、从不 free**（原来是每个任务懒
+ * malloc 2.24 MB、任务结束就 free —— 下一轮再要 2.24 MB 时堆已被 LVGL/
+ * TLS 切碎，大连续块经常要不到，合成直接失败或只剩兜底小缓冲。hello_app
+ * 那边 2026-10-17 晚"回复只念 2 个字"就是同型坑，修法相同：趁早分配、
+ * 阶梯降级、字节数打日志。只有工作线程会碰（每轮一个工作线程且不并发），
+ * 不加锁。 */
+static unsigned char *s_tts_buf;
+static size_t          s_tts_cap;
+
+static int ui_tts_buf_ensure(void)
+{
+    static const size_t ladder[] = {
+        16000 * 2 * 70,        /* 70 秒，300 字上限的回复能完整念完 */
+        16000 * 2 * 40,        /* 40 秒 ≈ 150 字 */
+        16000 * 2 * 20,        /* 20 秒 ≈ 75 字 */
+        16000 * 2 * 8,         /* 8 秒 */
+        32 * 1024              /* 兜底 */
+    };
+    size_t i;
+
+    if (s_tts_buf != NULL) {
+        return 0;
+    }
+
+    for (i = 0; i < sizeof(ladder) / sizeof(ladder[0]); i++) {
+        s_tts_buf = malloc(ladder[i]);
+        if (s_tts_buf != NULL) {
+            s_tts_cap = ladder[i];
+            printf("[VoiceChat] TTS 缓冲 %zu 字节已分配（第 %zu 档）\n",
+                   s_tts_cap, i + 1);
+            return 0;
+        }
+        printf("[VoiceChat] TTS 缓冲 %zu 字节分配失败，试下一档\n", ladder[i]);
+    }
+    return -1;
+}
 
 static void voice_task_unref(voice_task_t *task)
 {
@@ -197,7 +242,7 @@ static void voice_task_unref(voice_task_t *task)
 
     if (dead) {
         free(task->pcm);
-        free(task->tts);
+        /* task->tts 已并入进程级 s_tts_buf：从不 free，跨轮复用 */
         pthread_mutex_destroy(&task->lock);
         free(task);
     }
@@ -1018,6 +1063,21 @@ static void ask_finish(int confirmed, const char *src)
             printf("[Ask] 停铃：alarm_clear 返回非 OK（本来就没在响也是正常的）\n");
         }
 
+        /* ★ 2026-10-22：用户**主动**说「不用了」时，喇叭里那条语音追问也要
+         * 一起收摊 —— 原来只有"报警真的走起来了"才登记 ai_companion_ask_abort()
+         * （robot_ui_show_alarm() 那一处），于是用户明明点了不用了，hello_app
+         * 那条追问还在接着问第二轮「您还好吗？」、最后还往家人手机上推一条
+         * unconfirmed_FALL（真机日志就是这个形状）。
+         *
+         * 判据里特意排掉 src="超时"：20 秒没人应答**不是**用户的回答，
+         * 那种情况下"问满两轮仍没人应 → 推给家人"的安全网必须留着
+         * （见 ai_companion_main.c 的 ask_flow_unclear：误报比漏报更伤）。
+         * 只有按钮 / MQTT 这两条"有人真的答了"的路才把语音那条也一并按掉。 */
+        if (strcmp(src, "超时") != 0) {
+            printf("[Ask] 用户已作答（来源=%s），通知语音追问一并收摊\n", src);
+            ai_companion_ask_abort();
+        }
+
         printf("[Ask] 确认未通过（原因=%s，来源=%s）：不报警、停铃；"
                "同一原因 %u 秒内不再询问\n",
                reason, src,
@@ -1395,6 +1455,11 @@ static void voice_open_finish(void)
     pthread_mutex_unlock(&g_voice_audio_lock);
 }
 
+/* 定义都在后面，开麦线程/自动提交要用 */
+static void vad_callback(bool speech_detected, void *user_data);
+static void voice_ptt_vad_callback(bool speech_detected, void *user_data);
+static void voice_submit_handler(void *user_data);
+
 /**
  * @brief  开麦工作线程：停掉别人的录音 -> 真的开麦 -> 回报界面
  *
@@ -1454,16 +1519,34 @@ static void *voice_open_thread(void *arg)
     if (g_voice_open_token != token || !touch_ui_voice_chat_active()) {
         printf("[VoiceChat] 这一轮已被用户放弃，不开麦\n");
     } else {
-        /* 录音数据全交给 voice_record_callback 攒起来。VAD 不在这里开：
-         * 一问一答由用户按「提交」决定说完没有，不等静音超时。 */
+        /* 录音数据全交给 voice_record_callback 攒起来。
+         * 2026-10-19 用户需求"说完不用点提交"：VAD 打开，静音判定说完
+         * 自动提交（手动「提交」按钮保留，老人想提前收尾还能按）。
+         *
+         * 2026-10-25：静音时长**不再在这儿写死**，统一引用
+         * AUDIO_VAD_SILENCE_TIMEOUT_MS（ai_audio.h 是唯一来源）。
+         * 之前这里是 3000、hello_app 那边是 8000，两条链路判停手感不一样，
+         * 改一处漏一处。想调快慢只改 ai_audio.h 那一个宏。
+         *
+         * ⚠ 顺带记一条真机教训：这段判据在 2026-10-25 之前其实**从来没触发过**。
+         * 能量门槛写死 300，而这台机器的房间底噪帧能量就有 729 —— 每一帧都算
+         * 「有声」，静音帧计数每帧清零，走不到超时。自动提交一直是死的，
+         * 靠的是面板那个「提交」按钮。门槛已经改成自适应（见 ai_audio.h），
+         * 现在这个超时才真正有意义。 */
         memset(&rec_cfg, 0, sizeof(rec_cfg));
-        rec_cfg.enable_vad = false;
+        rec_cfg.enable_vad = true;
+        rec_cfg.silence_timeout_ms = AUDIO_VAD_SILENCE_TIMEOUT_MS;
         rec_cfg.data_callback = voice_record_callback;
         rec_cfg.user_data = NULL;
 
         ret = audio_record_start(&g_audio_ctx, &rec_cfg);
         if (ret == 0) {
             opened = true;
+            /* VAD 事件槽是整机一份（ai_audio 里只有 ctx->vad_callback 一个）：
+             * 轮到语音聊天这一轮就换成我们的自动提交回调；整轮结束
+             * （播完/取消）必须还原成主状态机那个 vad_callback，
+             * 理由同摔倒检测那几处的"槽位还原"。 */
+            audio_vad_enable(&g_audio_ctx, voice_ptt_vad_callback, NULL);
         } else {
             printf("[VoiceChat] audio_record_start 失败: %d\n", ret);
             fail = "录音设备打不开（板级拒了这次 START）";
@@ -1472,7 +1555,7 @@ static void *voice_open_thread(void *arg)
 
     if (opened) {
         sm_handle_event(&g_sm_ctx, SM_EVENT_WAKEUP);
-        touch_ui_set_voice_status("正在录音…\n说完点「提交」");
+        touch_ui_set_voice_status("正在录音…\n说完就行，不用点提交");
         ui_post(ROBOT_STATUS_LISTENING, ROBOT_FACE_THINKING, "聆听中...\n请说话。");
         printf("[VoiceChat] 麦克风已开（这一轮独占，直到提交/取消/放完）\n");
     } else {
@@ -1499,6 +1582,9 @@ static void *voice_open_thread(void *arg)
     return NULL;
 }
 
+static void voice_chat_handler(void *user_data);   /* 定义在后面；自动接轮要用 */
+static void voice_reopen_async(void *arg);         /* 同上 */
+
 /* 播放完成回调（在 audio 的播放线程里跑 —— **不是 LVGL 线程**）。
  * 播放要持续好几秒，期间用户可能关窗甚至又开了一轮；用放音时记下的世代号
  * 一比就知道这条"播放完成"该不该写进界面（同一个时刻只可能有一段在放，
@@ -1515,11 +1601,146 @@ static void voice_play_complete_callback(void *user_data)
         return;
     }
 
-    touch_ui_set_voice_status("回复完成\n点「再说一次」继续，或按 × 关闭");
+    /* 2026-10-19 用户需求"自主对话"：一轮放完不再等用户点「再说一次」，
+     * 面板还开着就自动把下一轮麦开起来 —— 说完就答、答完再听，全程免按键。
+     * 投到 LVGL 线程是因为 voice_chat_handler 头两行直接碰控件。 */
+    touch_ui_set_voice_status("这一轮完成，正在准备下一轮…\n直接说话就行");
     touch_ui_voice_chat_round_done();
+
+    if (ui_async_call(voice_reopen_async, NULL) != LV_RESULT_OK) {
+        printf("[VoiceChat] 自动接轮投递失败，停在「再说一次」等用户\n");
+        touch_ui_set_voice_status("回复完成\n点「再说一次」继续，或按 × 关闭");
+    }
 
     /* 一轮彻底结束（含最后一段 TTS 放完）：放常态听音回来 */
     ambient_listen_resume();
+}
+
+/* ── 流式 TTS（2026-10-24，与 hello_app 的 llm_complete_callback 同一份
+ * 改造、同一处动机：用户要"边出字边说话"）─────────────────────────────
+ *
+ * 上一版是"首句 + 剩余"两段式：治好了"整条合成完才出声"，但屏幕（对话区）
+ * 还是一次性把全文写完，字全出来了、声音还在往出走。这一版拆成逐句 N 块，
+ * **念到哪儿、显示到哪儿**：开播一块才把这一句写进对话区。
+ *
+ * 生产者 = voice_speak_reply（语音工作线程），逐块合成、逐块发布，队列深度 1；
+ * 消费者 = voice_speak_chunk_complete（音频播放线程），等发布位、取块、起播。
+ * 同步沿用 volatile + 发布位（单核 32 位对齐读写原子），乒乓两个 PCM 槽
+ * 保证生产者写下一块时不会踩到正在播的那一块。
+ *
+ * ⚠ 回调里**不能**碰 task：voice_worker 会在 voice_speak_reply 返回后立刻
+ * voice_task_unref(task)，那时播放还在跑 —— 所以对话区文字放静态副本
+ * s_speak_shown，走 touch_ui_set_voice_reply（内部是 voice_post_text 投递，
+ * 跨线程安全，voice_speak_reply 这个工作线程本来就在这么用）。 */
+
+static unsigned char *s_pcm[2];
+static size_t         s_pcm_cap;          /* 每槽容量 = s_tts_cap / 2 */
+
+static volatile bool   s_speak_next_ready;  /* 有一块合成好了等着播 */
+static volatile size_t s_speak_next_len;
+static volatile int    s_speak_next_slot;
+static volatile size_t s_speak_next_rbeg;   /* 这一块在 s_speak_text 里的 [beg,end) */
+static volatile size_t s_speak_next_rend;
+static volatile bool   s_speak_prod_done;
+static uint32_t        s_speak_seq;         /* 轮次代号：每来一轮回复 +1 */
+
+static char   s_speak_text[VOICE_REPLY_TEXT_MAX + 1];   /* 正文副本（送 TTS，原样） */
+static char   s_speak_shown[VOICE_REPLY_TEXT_MAX + 256]; /* 对话区已显示前缀（清洗后） */
+static size_t s_speak_text_pos;
+
+/* 一块放完（audio 播放线程）：取下一块接着播；没有下一块就整轮收尾 */
+static void voice_speak_chunk_complete(void *user_data)
+{
+    char chunk[1024];
+    char clean[1024];
+    int spins = 0;
+    size_t len;
+    size_t rbeg;
+    size_t rend;
+    size_t n;
+    int slot;
+
+    (void)user_data;
+
+    /* 上限 90 秒（2026-10-23，和 hello_app 那份同一处 bug、同一处修）。
+     * 20 秒是悬崖：一条长回复分好几块，一到点就把正文无声丢掉，而且合成
+     * 还在跑，跑完会把上一轮的块发布出来被下一轮当成自己的播掉
+     * （见 voice_speak_reply 里 s_speak_seq 的说明）。 */
+    while (!s_speak_next_ready && !s_speak_prod_done && spins < 9000) {
+        usleep(10000);
+        spins++;
+    }
+
+    printf("[VoiceChat] 块间空档 %u ms%s\n", (unsigned)spins * 10,
+           s_speak_next_ready ? "" : "（没等到下一块）");
+
+    if (!s_speak_next_ready) {
+        if (!s_speak_prod_done) {
+            printf("[VoiceChat] ★ 等了 90 秒下一块还没合成完，本轮放弃后文"
+                   "—— 这是异常，查网络/合成耗时\n");
+        }
+        voice_play_complete_callback(NULL);
+        return;
+    }
+
+    len  = s_speak_next_len;
+    rbeg = s_speak_next_rbeg;
+    rend = s_speak_next_rend;
+    slot = s_speak_next_slot;
+
+    /* 归还槽位：起播前翻面。生产者只写刚刚空出来的那一槽（乒乓），
+     * 正在播的这槽它不碰，所以提前放行是安全的。 */
+    s_speak_next_ready = false;
+
+    if (len == 0) {
+        voice_play_complete_callback(NULL);
+        return;
+    }
+
+    /* 文字随声推进：这一块开播的这一刻，对话区才出到这一句。
+     * 清洗要**逐块**做（对话区那份和送 TTS 那份不是一个东西：TTS 拿原样，
+     * emoji 它自己会读；对话区要洗掉 emoji / Markdown，见 voice_speak_reply）。
+     * 切块都是在句末标点处切的，不会把一个词劈两半。 */
+    if (rend > rbeg && rbeg < sizeof(s_speak_text)) {
+        n = rend - rbeg;
+        if (n > sizeof(chunk) - 1) {
+            n = sizeof(chunk) - 1;
+        }
+        memcpy(chunk, s_speak_text + rbeg, n);
+        chunk[n] = '\0';
+        sanitize_for_display(chunk, clean, sizeof(clean));
+
+        n = strlen(s_speak_shown);
+        if (n + strlen(clean) < sizeof(s_speak_shown)) {
+            strcat(s_speak_shown, clean);
+        }
+        touch_ui_set_voice_reply(s_speak_shown);
+    }
+
+    prompt_ack_stop(&g_audio_ctx);   /* 真话要出声，先收掉"我听见了" */
+
+    if (audio_play_start_ref(&g_audio_ctx,
+                             (const int16_t *)s_pcm[slot],
+                             len / sizeof(int16_t),
+                             voice_speak_chunk_complete, NULL) == 0) {
+        printf("[VoiceChat] 下一块开始播放（%zu 字节，槽 %d）\n", len, slot);
+        return;
+    }
+
+    printf("[VoiceChat] ★ 下一块起播失败，本轮收尾\n");
+    voice_play_complete_callback(NULL);
+}
+
+/* 自动接轮：投到 LVGL 线程再调 voice_chat_handler（它直接碰控件）。
+ * 面板已经关了就什么都不做 —— 用户按 × 就是说"这一场聊完了"。 */
+static void voice_reopen_async(void *arg)
+{
+    (void)arg;
+
+    if (touch_ui_voice_chat_active()) {
+        printf("[VoiceChat] 自动开启下一轮录音（不用点「再说一次」）\n");
+        voice_chat_handler(NULL);
+    }
 }
 
 /* 把一段回复文字合成语音并播放（从 voice_llm_reply_callback 抽出来复用，只从
@@ -1531,12 +1752,11 @@ static void voice_play_complete_callback(void *user_data)
  * 才显示"正在播放…"，失败就把 errno 一起显示出来。 */
 static void voice_speak_reply(voice_task_t *task, const char *response)
 {
-    char   shown[VOICE_REPLY_TEXT_MAX + 256];  /* 清洗后给界面看的那份
-                                                * （每个列表项最多涨 1 字节，
-                                                *  留点余量免得尾字被切） */
     char   status[64];
     size_t tts_len = 0;
+    size_t consumed = 0;   /* 首句吃掉 response 的字节数，剩余部分接着合成 */
     size_t used;
+    uint32_t seq;          /* 本轮代号，尾段发布前要对上（见下方说明） */
     int ret;
 
     if (!voice_task_alive(task)) {
@@ -1544,34 +1764,64 @@ static void voice_speak_reply(voice_task_t *task, const char *response)
     }
 
     /* 界面和 TTS 用的是两份不同的文本：
-     *   shown    -> 对话区（去掉 emoji / Markdown，字库渲染不了的不显示成方块）
-     *   response -> voice_tts_speak()（原样送云端，emoji 它自己会读） */
-    sanitize_for_display(response, shown, sizeof(shown));
+     *   s_speak_shown -> 对话区（逐块清洗，字库渲染不了的不显示成方块）
+     *   s_speak_text  -> 送云端 TTS（原样，emoji 它自己会读）
+     * 不再一次性把全文写进对话区，改成"念到哪儿、显示到哪儿"，见上面
+     * "流式 TTS"那段。 */
+    printf("[VoiceChat] AI 回复: %s\n", response);
+
+    strncpy(s_speak_text, response, sizeof(s_speak_text) - 1);
+    s_speak_text[sizeof(s_speak_text) - 1] = '\0';
+    s_speak_text_pos = 0;
 
     used = strlen(task->reply);
     if (used < sizeof(task->reply) - 1) {
-        snprintf(task->reply + used, sizeof(task->reply) - used,
-                 "\n\n智爱：%s", shown);
+        snprintf(task->reply + used, sizeof(task->reply) - used, "\n\n智爱：");
     }
-    printf("[VoiceChat] AI 回复: %s\n", response);
+    strncpy(s_speak_shown, task->reply, sizeof(s_speak_shown) - 1);
+    s_speak_shown[sizeof(s_speak_shown) - 1] = '\0';
 
-    /* TTS：文字 -> 16k/单声道/s16le。缓冲走堆，随任务释放。 */
+    /* TTS：文字 -> 16k/单声道/s16le。缓冲走进程级 s_tts_buf（跨轮复用，
+     * 阶梯降级的来龙去脉见 s_tts_buf 定义处），对半分给两个乒乓槽。 */
     voice_task_show(task, "正在合成语音…");
 
-    if (task->tts == NULL) {
-        task->tts_cap = VOICE_TTS_BUF_BYTES;
-        task->tts = malloc(task->tts_cap);
-    }
-    if (task->tts == NULL) {
+    if (ui_tts_buf_ensure() != 0) {
         printf("[VoiceChat] TTS 缓冲分配失败\n");
         voice_task_show(task, "内存不足\n请重试");
         touch_ui_voice_chat_round_done();
         return;
     }
 
-    ret = voice_tts_speak(response, task->tts, task->tts_cap, &tts_len);
-    if (ret < 0 || tts_len == 0) {
-        printf("[VoiceChat] 语音合成失败: ret=%d tts_len=%zu\n", ret, tts_len);
+    s_pcm[0]  = s_tts_buf;
+    s_pcm[1]  = s_tts_buf + s_tts_cap / 2;
+    s_pcm_cap = s_tts_cap / 2;
+
+    s_speak_next_ready = false;
+    s_speak_next_len   = 0;
+    s_speak_next_slot  = 0;
+    s_speak_next_rbeg  = 0;
+    s_speak_next_rend  = 0;
+    s_speak_prod_done  = false;
+
+    /* 本轮代号：逐块合成是整条流水线里最慢的一段。上一轮的生产者若拖到
+     * 这里才跑完，会把上一轮的块写进发布位，下一轮的播放回调就把它当成
+     * 这一轮播出来（听感是"回答串台"）。每轮 +1，发布前对号，对不上就是
+     * 迟到的旧数据，直接扔。 */
+    seq = ++s_speak_seq;
+
+    /* 首块用小上限（20 字）早出声；后续块用大上限（64 字）少空档。 */
+    ret = mimo_tts_speak_head(s_speak_text, s_pcm[0], s_pcm_cap,
+                              MIMO_TTS_HEAD_CHUNK_CHARS, &tts_len, &consumed);
+    if (ret < 0 || tts_len == 0 || consumed == 0) {
+        printf("[VoiceChat] 首句合成失败: ret=%d tts_len=%zu\n", ret, tts_len);
+
+        /* 出不了声也要让字上屏，别让人以为面板坏了 */
+        {
+            size_t p = strlen(s_speak_shown);
+            sanitize_for_display(s_speak_text, s_speak_shown + p,
+                                 sizeof(s_speak_shown) - p);
+        }
+        touch_ui_set_voice_reply(s_speak_shown);
 
         if (ret < 0) {
             snprintf(status, sizeof(status), "语音合成失败 (%d)\n请重试", ret);
@@ -1587,29 +1837,104 @@ static void voice_speak_reply(voice_task_t *task, const char *response)
         return;
     }
 
-    if (!voice_task_alive(task)) {   /* 合成也要几秒，中途可能被关窗 */
-        return;
+    s_speak_text_pos = consumed;
+
+    /* 第 1 块的文字这一刻上屏（后几块由播放回调在开播时追加） */
+    {
+        char chunk[1024];
+        char clean[1024];
+        size_t n = consumed;
+
+        if (n > sizeof(chunk) - 1) {
+            n = sizeof(chunk) - 1;
+        }
+        memcpy(chunk, s_speak_text, n);
+        chunk[n] = '\0';
+        sanitize_for_display(chunk, clean, sizeof(clean));
+        if (strlen(s_speak_shown) + strlen(clean) < sizeof(s_speak_shown)) {
+            strcat(s_speak_shown, clean);
+        }
+        touch_ui_set_voice_reply(s_speak_shown);
     }
 
-    /* audio_play_start() 会先把 PCM 拷进自己的播放缓冲，所以 task 随后释放
-     * 不影响播放。半双工设备此刻已经在录音结束时就腾出来了（见提交那一步）。 */
+    /* 零拷贝（audio_play_start_ref）：第 1 块 PCM 从乒乓槽直读进设备，
+     * 后续块在另一槽上合成 —— 正被读的槽没人写，互不干扰。
+     * play_buf 因此保持 512 KB（崩溃死亡螺旋的教训，见 ai_audio.h）。 */
+    /* ★ 真答复首块要出声了，先把"我听见了"收掉。audio_play_start_ref() 对
+     * 在播的东西返回 -EBUSY 不顶替（ai_audio.c），不停掉就会走下面的
+     * "起播失败"分支、整轮回复就地收尾，听感是叮一声就没下文。
+     * prompt_ack_stop() 在没响时是空操作。 */
+    prompt_ack_stop(&g_audio_ctx);
     g_voice_playing_gen = task->gen;
-    ret = audio_play_start(&g_audio_ctx, (const int16_t *)task->tts,
-                           tts_len / 2, voice_play_complete_callback, NULL);
+    ret = audio_play_start_ref(&g_audio_ctx, (const int16_t *)s_pcm[0],
+                               tts_len / sizeof(int16_t),
+                               voice_speak_chunk_complete, NULL);
     if (ret < 0) {
-        printf("[VoiceChat] 播放失败: %d\n", ret);
+        printf("[VoiceChat] 首句播放失败: %d\n", ret);
         snprintf(status, sizeof(status), "播放失败 (%d)\n请重试", ret);
         voice_task_show(task, status);
         ui_post(ROBOT_STATUS_IDLE, ROBOT_FACE_HAPPY, NULL);   /* 工作线程：投递 */
         touch_ui_voice_chat_round_done();
-    } else {
-        /* 到这里才真的在出声，之前一直显示的是"正在合成语音…"。
-         * 状态栏跟着改成"说话中"（扬声器在响，和"聆听中"是两回事）。
-         * ⚠️ 本函数跑在语音工作线程里，改界面只能投递。 */
-        voice_task_show(task, "正在播放…");
-        ui_post(ROBOT_STATUS_SPEAKING, ROBOT_FACE_HAPPY, NULL);
+        return;
     }
-    /* 播放成功则由 voice_play_complete_callback 收尾 */
+
+    /* 到这里就开始出声了（原来这里还在"正在合成语音…"干等整条）。
+     * ⚠️ 本函数跑在语音工作线程里，改界面只能投递。 */
+    voice_task_show(task, "正在播放…");
+    ui_post(ROBOT_STATUS_SPEAKING, ROBOT_FACE_HAPPY, NULL);
+
+    /* 生产者：逐块合成、逐块发布，队列深度 1。第 1 块在播，本线程合成第 2 块。 */
+    {
+        int fill = 1;
+
+        while (s_speak_text[s_speak_text_pos] != '\0') {
+            int waits = 0;
+
+            while (s_speak_next_ready && seq == s_speak_seq && waits < 9000) {
+                usleep(10000);
+                waits++;
+            }
+
+            if (seq != s_speak_seq) {
+                printf("[VoiceChat] 本轮已作废（seq %u != 当前 %u），停止生产\n",
+                       (unsigned)seq, (unsigned)s_speak_seq);
+                return;
+            }
+
+            if (waits >= 9000) {
+                printf("[VoiceChat] ★ 等消费者取走上一块等了 90 秒，停止生产\n");
+                break;
+            }
+
+            /* 后续块用大上限（64 字），理由同 hello_app 生产者循环那条注释。 */
+            ret = mimo_tts_speak_head(s_speak_text + s_speak_text_pos,
+                                      s_pcm[fill], s_pcm_cap,
+                                      MIMO_TTS_CHUNK_CHARS, &tts_len, &consumed);
+            if (ret < 0 || tts_len == 0 || consumed == 0) {
+                printf("[VoiceChat] 第 %zu 字节起的块合成失败: %d，正文到此为止\n",
+                       s_speak_text_pos, ret);
+                break;
+            }
+
+            s_speak_next_rbeg = s_speak_text_pos;
+            s_speak_text_pos += consumed;
+            s_speak_next_rend = s_speak_text_pos;
+
+            s_speak_next_slot  = fill;
+            s_speak_next_len   = tts_len;
+            s_speak_next_ready = true;   /* 发布位最后写 */
+
+            fill ^= 1;
+        }
+    }
+
+    if (seq != s_speak_seq) {
+        return;
+    }
+
+    /* 告诉消费者：没有下一块了。它把队列里剩的那块播完就整轮收尾。 */
+    s_speak_prod_done = true;
+    /* 整轮收尾由 voice_speak_chunk_complete / voice_play_complete_callback 走 */
 }
 
 /* 工作线程：ASR -> mimo_chat -> TTS -> 播放。
@@ -1626,6 +1951,13 @@ static void *voice_worker(void *arg)
     }
 
     printf("[VoiceChat] 开始识别 (%zu 字节)\n", task->pcm_len);
+
+    /* ★ S2.1 本地即时反馈音：识别之前先响一声"我听见了"。
+     * ASR 是整段上传的阻塞 HTTPS（1 秒起），放后面就没意义了。
+     * 必须在 worker 线程上调：起播会过 audio_prepare_output() 停录音，
+     * 录音线程里调它是自己停自己。失败不用管，只是没听到这一声。 */
+    prompt_ack_play(&g_audio_ctx);
+
     ret = voice_asr_recognize(task->pcm, task->pcm_len, text, sizeof(text));
 
     if (!voice_task_alive(task)) {
@@ -1740,6 +2072,11 @@ static void voice_submit_handler(void *user_data)
         audio_record_stop(&g_audio_ctx);
     }
 
+    /* 麦克风关了：VAD 事件槽还原给主状态机（这一轮的自动提交回调不再需要；
+     * 不还原的话下一次别处开麦的 VAD 事件会打进这条已结束的链）。
+     * 下一轮 voice_open_thread 开麦时会再换成自动提交回调。 */
+    audio_vad_enable(&g_audio_ctx, vad_callback, NULL);
+
     /* 麦克风已经关了：状态栏不该再显示「聆听中」
      * （后面这段是识别/思考/播放，由弹窗里的状态行如实显示进度） */
     voice_ui_idle();
@@ -1831,6 +2168,135 @@ static void voice_submit_handler(void *user_data)
      * LVGL 的自动回收打架 */
 }
 
+/* ── 说完自动提交（2026-10-19 用户需求"不要说完话点提交才回答我"）─────────
+ *
+ * ai_audio 的录音线程在"检测到语音 -> 静音超时（这里 3s）"后从 VAD 回调里
+ * 报 speech end。回调跑在**录音线程**上，而收尾要做的 voice_submit_handler
+ * 里有 audio_record_stop()（join 录音线程）—— 在回调里直接调就是自己 join
+ * 自己，必死锁。所以回调只投事，真正收尾由一条 detached 短命线程做。
+ *
+ * 手动「提交」按钮保留：老人想提前收尾照样能按，两条路都通到
+ * voice_submit_handler（它自己有令牌和录音状态的护栏，重复触发无害）。
+ */
+
+/* 自动提交的落地（LVGL 线程）：噪声门在这里重查一遍，然后要么本地拒收、
+ * 要么走 voice_submit_handler —— 后者和手动「提交」按钮同一条路，本来就
+ * 假定自己在 LVGL 线程上（voice_ui_idle 直接碰控件）。 */
+static void voice_ptt_autosubmit_async(void *arg)
+{
+    unsigned char *pcm;
+    size_t pcm_len = 0;
+    int32_t peak = 0;
+
+    (void)arg;
+
+    /* 3 秒静音窗口里用户可能已经关窗/手动提交：面板没了就什么都不做。 */
+    if (!touch_ui_voice_chat_active()) {
+        return;
+    }
+
+    /* 噪声门：VAD 只看 20ms 帧能量，短促的碰麦/敲击也能过；整段峰值太低
+     * 就别浪费一次云端识别 —— 和 hello_app 主链路同口径（peak<300）。 */
+    pthread_mutex_lock(&g_voice_lock);
+    pcm = g_voice_pcm;
+    pcm_len = g_voice_pcm_len;
+    if (pcm != NULL) {
+        const int16_t *p = (const int16_t *)pcm;
+        size_t n = pcm_len / sizeof(int16_t);
+        size_t i;
+
+        for (i = 0; i < n; i++) {
+            int32_t v = p[i];
+
+            if (v < 0) {
+                v = -v;
+            }
+            if (v > peak) {
+                peak = v;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_voice_lock);
+
+    printf("[VoiceChat] VAD 自动提交：峰值检查 peak=%d\n", (int)peak);
+
+    if (pcm == NULL || pcm_len < VOICE_PCM_MIN_BYTES || peak < 300) {
+        /* 没听到有效人声：停麦、丢缓冲、按钮放回「再说一次」。
+         * 不送云端（省一次识别），本地回一句让用户重说。 */
+        g_voice_open_token++;
+
+        if (audio_is_recording(&g_audio_ctx)) {
+            audio_record_stop(&g_audio_ctx);
+        }
+        voice_ui_idle();
+        audio_vad_enable(&g_audio_ctx, vad_callback, NULL);   /* 槽位还原 */
+
+        pthread_mutex_lock(&g_voice_lock);
+        free(g_voice_pcm);
+        g_voice_pcm = NULL;
+        g_voice_pcm_len = 0;
+        g_voice_pcm_full = false;
+        pthread_mutex_unlock(&g_voice_lock);
+
+        touch_ui_set_voice_status("我刚才没听清楚\n靠近一点，直接说话就行");
+        touch_ui_voice_chat_round_done();
+        return;
+    }
+
+    printf("[VoiceChat] VAD 说完自动提交（不用点按钮）\n");
+    voice_submit_handler(NULL);
+}
+
+static void *voice_ptt_autosubmit_thread(void *arg)
+{
+    (void)arg;
+
+    /* 3 秒静音窗口里用户完全可能已经关窗 / 手动提交了：
+     * 面板没了或没在录音，这一下什么都不碰。 */
+    if (!touch_ui_voice_chat_active() || !audio_is_recording(&g_audio_ctx)) {
+        return NULL;
+    }
+
+    /* 真正的收尾（停麦 / 提交）碰 LVGL 控件，投回 LVGL 线程做。 */
+    if (ui_async_call(voice_ptt_autosubmit_async, NULL) != LV_RESULT_OK) {
+        printf("[VoiceChat] 自动提交投递失败，退回手动「提交」\n");
+        touch_ui_set_voice_status("自动提交失败\n请点「提交」");
+    }
+
+    return NULL;
+}
+
+/* VAD 回调（录音线程上）：只在"语音结束"时投一条自动提交线程。 */
+static void voice_ptt_vad_callback(bool speech_detected, void *user_data)
+{
+    pthread_attr_t attr;
+    pthread_t tid;
+
+    (void)user_data;
+
+    if (speech_detected) {
+        /* 起始沿只更新状态行（touch_ui_set_voice_status 内部 lv_async_call，
+         * 从任何线程调都安全）。 */
+        printf("[VoiceChat] VAD: 检测到说话\n");
+        touch_ui_set_voice_status("听到你了…\n说完停一下就行，不用点提交");
+        return;
+    }
+
+    printf("[VoiceChat] VAD: 语音结束（静音超时），准备自动提交\n");
+
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    /* 栈不用大：噪声门算峰值 + 交接给 voice_submit_handler（后者再起
+     * 32KB 的 voice_worker）。16KB 和 voice_open_thread 同一档。 */
+    pthread_attr_setstacksize(&attr, 16384);
+
+    if (pthread_create(&tid, &attr, voice_ptt_autosubmit_thread, NULL) != 0) {
+        printf("[VoiceChat] 自动提交线程启动失败，退回手动「提交」\n");
+        touch_ui_set_voice_status("自动提交失败\n请点「提交」");
+    }
+    pthread_attr_destroy(&attr);
+}
+
 /* 「×」：用户放弃这一轮。停录音、丢缓冲；在途的工作线程靠世代号自动作废。 */
 static void voice_cancel_handler(void *user_data)
 {
@@ -1843,6 +2309,7 @@ static void voice_cancel_handler(void *user_data)
     if (audio_is_recording(&g_audio_ctx)) {
         audio_record_stop(&g_audio_ctx);
     }
+    audio_vad_enable(&g_audio_ctx, vad_callback, NULL);   /* VAD 槽位还原 */
 
     /* 麦克风关了、这一轮也丢了：状态栏回待机（否则会一直显示「聆听中」） */
     voice_ui_idle();
@@ -2150,8 +2617,25 @@ static void on_ai_command_received(const char *action, const char *param)
     }
     else if (strcmp(action, "ai_reply") == 0) {
         /* 显示 AI 回复。param 是云端/MQTT 下发的原文，可能带 emoji 或 Markdown，
-         * 显示前先清洗（字库渲染不了的码点会变成方块）；只洗显示这份。 */
-        char shown[256];
+         * 显示前先清洗（字库渲染不了的码点会变成方块）；只洗显示这份。
+         * 2026-10-19 256→1024：和 ROBOT_UI_BRIDGE_TEXT_MAX 对齐，长回复
+         * 不再在 MQTT 旁路这道口上被砍成 85 个字。 */
+        char shown[1024];
+
+        /* ⚠️ 自回环（2026-10-21 修）：hello_app 出一条回复会**同时**走两条路 ——
+         * 主路同进程直调 robot_ui_bridge_voice_reply()（已经把这行写上屏了），
+         * 旁路 publish 到 zhi_ai/<client_id>/command 给手机/PC 看。可是本机的
+         * network_task 也订着**同一个** topic，于是自己发的这条又绕回来进了
+         * 本回调，把同一行字再渲染一次 —— 用户看到的就是"智爱：…"连着两条
+         * 一模一样的（对话区是按轮堆行的，一条变两条特别显眼）。
+         * 判据：bridge 就绪 = 主路那次直调必定已经上屏了 → 这条是自回环，
+         * 只当给手机/PC 的广播，本机界面不再动。bridge 没就绪（界面还在起、
+         * 或压根没有 hello_app 的直调这条路）时才是"只有 MQTT 这一条路"，
+         * 照常上屏 —— 那正是旁路存在的意义。 */
+        if (robot_ui_bridge_is_ready()) {
+            printf("[AI] ai_reply 自回环，本机界面已由直调通道显示过，跳过\n");
+            return;
+        }
 
         sanitize_for_display(param, shown, sizeof(shown));
         ui_post(ROBOT_STATUS_SPEAKING, ROBOT_FACE_HAPPY, shown);
@@ -2171,8 +2655,16 @@ static void on_ai_command_received(const char *action, const char *param)
          * 不到自己说了什么」，就是这句话。让老人看见"板子听清了什么"，他才敢接着聊。
          *
          * 和 ai_reply 一样，param 是 ASR/云端来的原文，可能带 emoji 或 Markdown，
-         * 显示前先清洗（只洗显示这份）。 */
-        char shown[256] = "";
+         * 显示前先清洗（只洗显示这份）。缓冲与 ai_reply 同步提到 1024。 */
+        char shown[1024] = "";
+
+        /* 自回环同上：publish_user_said() 是"直调 + publish"两条一起走的，
+         * 这条 MQTT 消息绕回来时主路早已上屏（用户截图里「你说：你好。」
+         * 连着两条就是它），跳过。 */
+        if (robot_ui_bridge_is_ready()) {
+            printf("[AI] user_said 自回环，本机界面已由直调通道显示过，跳过\n");
+            return;
+        }
 
         /* 先弹面板、再写文字：两者都是 lv_async_call，投递顺序就是执行顺序。
          * 反过来先写后弹，这句识别文字会落在"面板还没建好"的空档里被丢掉。 */
@@ -2213,6 +2705,17 @@ static void on_ai_command_received(const char *action, const char *param)
          * touch_ui_set_voice_state() 内部都是 lv_async_call，不能在这里直接碰控件
          * （跨线程改 LVGL 会撞 rendering_in_progress 断言把 app 打死）。
          * 面板没开着时 touch_ui_set_voice_state() 自己是空操作，不用先判断。 */
+
+        /* 自回环同 user_said / ai_reply：hello_app 报状态是"直调 + publish"
+         * 两条一起走的，这条绕回来时主路早已把状态刷过了。状态本身是幂等的
+         * （同一档刷两次看不出来），但 speaking 那一下会**顺手自动弹面板** ——
+         * 用户刚手动关掉面板又被自己的回声弹开，就是这条。bridge 就绪时跳过。 */
+        if (robot_ui_bridge_is_ready()) {
+            printf("[AI] voice_state 自回环(%s)，本机界面已由直调通道更新过，跳过\n",
+                   param);
+            return;
+        }
+
         if (strcmp(param, "speaking") == 0) {
             /* ⚠️ **不要**把 "listening" 放进来：hello_app 是开机自启的，它一启动就
              * 进入 listening 状态并推一条 listening —— 那样开机第一眼看到的就是语音
@@ -3054,6 +3557,10 @@ static int reminder_play_exclusive(audio_context_t *ctx,
 
     printf("[Reminder] %s：直接出声（半双工由 audio_play_start 内部处理）\n", who);
 
+    /* 到点提醒可能正好撞上一轮对话刚说完、"我听见了"还在响：不收掉的话
+     * audio_play_start 返回 -EBUSY，这声提醒就整个不响了。 */
+    prompt_ack_stop(ctx);
+
     ret = audio_play_start(ctx, data, frames, reminder_play_done, &done);
 
     if (ret < 0) {
@@ -3758,6 +4265,9 @@ static int fall_speak_question(void)
         }
     }
 
+    /* 跌倒询问是救命那句话，撞上提示音时它优先（提示音让路）。 */
+    prompt_ack_stop(&g_audio_ctx);
+
     ret = audio_play_start(&g_audio_ctx, (const int16_t *)pcm, pcm_len / 2,
                            fall_play_done, &done);
     free(pcm);      /* audio_play_start 已经把 PCM 拷进自己的播放缓冲 */
@@ -4173,6 +4683,11 @@ static void *time_sync_thread(void *arg)
       if (time_sync_once() == 0)
         {
           printf("[TimeSync] 完成（第 %d 次尝试）\n", i);
+
+          /* 钟拨正了，把关怀任务按新时间重算一遍 —— 开机时钟是错的，
+           * 不重算的话所有任务的"下次触发"都停在错误时间线上，对时
+           * 瞬间集体过期触发（晚上十点半连网也念"早上好"的那 bug）。 */
+          care_reschedule_all(&g_care_ctx);
           return NULL;
         }
 
@@ -4410,7 +4925,7 @@ int main(int argc, char *argv[])
 
     /* ===== 打开"语音链路直调界面"这道闸门 =====
      * 放在这里而不是更早：到这一行 LVGL 已经初始化、主屏和触摸 UI 都建好了，
-     * 之后 lv_async_call 投进来的东西一定会被 LVGL 线程消费掉。
+     * 之后 ui_async_call 投进来的东西一定会被主循环的 ui_async_pump() 消费掉。
      * 之前（比如 lv_init() 还没跑）就放行的话，ai_companion 那边先跑起来时
      * 推过来的会攒在队列里没人处理 —— 那正是我们要避免的"看着没反应"。 */
     robot_ui_bridge_set_ready(true);
@@ -4423,6 +4938,10 @@ int main(int argc, char *argv[])
         static bool net_ok   = false;
         static int  time_tick = 0;
         static int  reminder_tick = 0;
+
+        /* 取走其他线程投递来的界面操作（ui_async.c 的队列）。必须在 LVGL
+         * 线程调（本循环就是）；泵在回调锁外执行，回调里再投递也安全。 */
+        ui_async_pump();
 
         /* 面板内容对不上（开机丢帧 / 面板被复位过）⇒ 把整屏判脏，下面这一帧
          * 就会重画一整屏。必须在 LVGL 线程里调（本循环就是），函数内部自己限速。 */

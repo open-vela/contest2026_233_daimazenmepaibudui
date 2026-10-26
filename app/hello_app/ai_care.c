@@ -305,6 +305,29 @@ static void *care_thread_func(void *arg)
 
   while (!ctx->care_stop)
     {
+      /* 对时跳变自愈（2026-10-15）：开机时钟是错的，任务的下次触发时间全
+       * 停在错误时间线上；网络对时把钟拨正的瞬间，那些值集体变成"早已过期"
+       * → 全部立即触发（晚上十点半连网也念"早上好"）。这里在每次检查任务
+       * 之前先看时钟有没有大跳（前跳 >5 分钟或回拨 >1 分钟即视为对时），
+       * 有就先按新时间重算整个任务表再检查。两个关怀实例（robot_ui 与
+       * hello_app 各一份 g_care_ctx）以及将来新增的实例都自动覆盖。 */
+
+      {
+        time_t now = time(NULL);
+
+        if (ctx->last_clock_obs != 0
+            && (now > ctx->last_clock_obs + 300
+                || now < ctx->last_clock_obs - 60))
+          {
+            CARE_DEBUG("检测到时钟跳变（%lu -> %lu），重算任务表",
+                       (unsigned long)ctx->last_clock_obs,
+                       (unsigned long)now);
+            care_reschedule_all(ctx);
+          }
+
+        ctx->last_clock_obs = now;
+      }
+
       /* 检查所有任务 */
 
       care_check_tasks(ctx);
@@ -1109,4 +1132,36 @@ void care_init_default_tasks(care_context_t *ctx)
   care_add_task(ctx, &activity);
 
   CARE_DEBUG("默认关怀任务初始化完成: %d 个任务", ctx->task_count);
+}
+
+/**
+ * @brief  按当前系统时间重算所有已启用任务的下次触发时间
+ *
+ * 见 ai_care.h 的声明注释：开机时钟是错的，对时成功后必须重算一次，
+ * 否则所有任务的"下次触发"都停在错误时间线上，对时瞬间集体过期触发
+ * （晚上十点半连网 → 早上好/午餐/下午好一窝蜂全念）。
+ *
+ * 并发说明：本函数会从对时线程调用，而 care_thread 可能正在遍历任务表。
+ * 这里的写入全是 32 位对齐字（Cortex-M 上原子），最坏情况是某个任务在
+ * 重算瞬间按旧值多触发一次，不会撕裂结构 —— 可接受，不加新锁。
+ */
+
+void care_reschedule_all(care_context_t *ctx)
+{
+  int i;
+
+  if (ctx == NULL)
+    {
+      return;
+    }
+
+  for (i = 0; i < ctx->task_count; i++)
+    {
+      if (ctx->tasks[i].state == CARE_TASK_ENABLED)
+        {
+          care_calc_next_trigger(&ctx->tasks[i]);
+        }
+    }
+
+  CARE_DEBUG("已按当前时间重算 %d 个任务的下次触发", ctx->task_count);
 }

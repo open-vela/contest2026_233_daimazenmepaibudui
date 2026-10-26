@@ -133,8 +133,13 @@ static uint32_t voice_start_tick = 0;
  * 撑到几千像素高。这里固定 VOICE_HISTORY_ROUNDS 轮，写满一轮就把最老的整个
  * 删掉重建，所以行数和内存都有上限，面板不会被撑破。
  * 每轮两个 label（voice_hist_user / voice_hist_ai）：字号和颜色不同，
- * 老人不用细读也能扫一眼分出哪句是自己说的。 */
-#define VOICE_HISTORY_ROUNDS 3
+ * 老人不用细读也能扫一眼分出哪句是自己说的。
+ *
+ * 2026-10-23 从 3 抬到 8：用户反馈"和 AI 说几次话记录好像消失了"。3 轮太浅，
+ * 聊到第 4 轮就把开头那轮顶掉，人还盯着屏幕就看着记录没了。对话区本来就
+ * 开了纵向滚动（voice_chat_box），多几轮只是往下多滚一点，不会撑破面板；
+ * 8 轮 16 个 label，内存仍然有硬上限。 */
+#define VOICE_HISTORY_ROUNDS 8
 static lv_obj_t *voice_hist_hint = NULL;                    /* 还没说话时的占位行 */
 static lv_obj_t *voice_hist_user[VOICE_HISTORY_ROUNDS];     /* 每轮的"你说：…" */
 static lv_obj_t *voice_hist_ai[VOICE_HISTORY_ROUNDS];       /* 每轮的"智爱：…" */
@@ -211,8 +216,11 @@ static void create_menu_panel(menu_type_t type);
 static void create_setting_panel(void);
 static void create_new_reminder_panel(void);
 static void create_back_button(lv_obj_t *parent);
-static void create_menu_item(lv_obj_t *parent, const char *title,
+static void create_menu_grid(lv_obj_t *parent);
+static void create_menu_tile(lv_obj_t *parent, const char *title,
                             const char *subtitle, int index);
+static void menu_page_prev_handler(lv_event_t *e);
+static void menu_page_next_handler(lv_event_t *e);
 static void create_reminder_add_button(lv_obj_t *parent);
 static void create_reminder_list_items(lv_obj_t *parent);
 static void create_reminder_item(lv_obj_t *parent, const char *title,
@@ -581,11 +589,9 @@ static void create_menu_panel(menu_type_t type)
     /* 根据菜单类型创建内容 */
     switch (type) {
         case MENU_TYPE_MAIN:
-            create_menu_item(content, "语音聊天", "与机器人对话", 0);
-            create_menu_item(content, "查看提醒", "查看今日提醒", 1);
-            create_menu_item(content, "设置", "音量、亮度等", 2);
-            create_menu_item(content, "紧急呼叫", "联系家人", 3);
-            create_menu_item(content, "关于", "版本信息", 4);
+            /* 一页 2×2 四个大按钮（见 create_menu_grid 的说明）。
+             * 「关于」不再占主菜单的坑，并到设置页末尾。 */
+            create_menu_grid(content);
             break;
 
         case MENU_TYPE_REMIND:
@@ -610,53 +616,174 @@ static void create_menu_panel(menu_type_t type)
     create_back_button(menu_panel);
 }
 
-/* ==================== 创建菜单项 ==================== */
-static void create_menu_item(lv_obj_t *parent, const char *title,
+/* ==================== 主菜单：一页 2×2 四个大按钮 ====================
+ *
+ * 2026-10-24 用户点名「菜单页面改成一个页面放 4 个按钮」：老人眼神和手指
+ * 都不利索，一屏四个大格子比原来五条 88px 竖排列表好找也好摁。
+ * （同一天点的「整个改成横屏」试过，MADCTL 换轴在真机上乱码，已回退竖屏；
+ * 格子布局在竖屏下 2 列 × 2 行同样成立，不需要跟着横屏走。）
+ *
+ * 分页：一格一页的上限写死 MENU_PAGE_ITEMS(=4)。当前主菜单**正好四项**
+ * （语音聊天/查看提醒/设置/紧急呼叫），所以只会有一页；「关于」并进设置页
+ * —— 它是版本信息，不值得占掉老人一眼就要找到的四个坑之一。
+ * 将来真超过 4 项，下面这套分页（◀ 页码 ▶）自动生效，不会挤成第五个格子。
+ */
+#define MENU_GRID_COLS  2
+#define MENU_GRID_ROWS  2
+#define MENU_PAGE_ITEMS (MENU_GRID_COLS * MENU_GRID_ROWS)
+
+typedef struct
+{
+    const char *title;
+    const char *subtitle;
+    int         index;   /* menu_item_event_handler 的 case 下标 */
+} menu_entry_t;
+
+static int s_menu_page = 0;
+
+/* 主菜单四项。下标必须和 menu_item_event_handler 的 case 一一对应。 */
+static const menu_entry_t s_menu_main[] =
+{
+    { "语音聊天", "和我说说话",   0 },
+    { "查看提醒", "今天的安排",   1 },
+    { "设置",     "音量、亮度等", 2 },
+    { "紧急呼叫", "联系家人",     3 },
+};
+
+static void menu_page_prev_handler(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    touch_ui_play_sound("click");
+    if (s_menu_page > 0) s_menu_page--;
+    touch_ui_show_menu(MENU_TYPE_MAIN);
+}
+
+static void menu_page_next_handler(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    touch_ui_play_sound("click");
+    s_menu_page++;
+    touch_ui_show_menu(MENU_TYPE_MAIN);
+}
+
+/* 一个大格子：标题一行 + 副标题一行，整体居中。 */
+static void create_menu_tile(lv_obj_t *parent, const char *title,
                             const char *subtitle, int index)
 {
-    /* 菜单项按钮 - 用 lv_btn 确保触摸事件可响应。
-     * 布局：左列「大标题 + 灰副标题」两行，右侧 ">" 提示可进 ——
-     * 原来的"[语] 语音聊天  与机器人对话"一行塞三个东西太挤（2026-10-14
-     * 用户反馈"很乱"），改成健康 APP 常见的两行列表项。 */
     lv_obj_t *item = lv_btn_create(parent);
-    lv_obj_set_size(item, LV_PCT(100), 88);
+    lv_obj_set_height(item, 106);
+    lv_obj_set_flex_grow(item, 1);
     lv_obj_add_style(item, &style_menu_item, 0);
-    lv_obj_set_flex_flow(item, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(item, LV_FLEX_ALIGN_SPACE_BETWEEN,
+    /* 格子里两行居中叠放，不再搞左右分栏 + 右箭头 —— 大格子里那个箭头
+     * 对老人是噪声，点哪儿都能进。 */
+    lv_obj_set_flex_flow(item, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(item, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_left(item, 18, 0);
-    lv_obj_set_style_pad_right(item, 18, 0);
-    lv_obj_set_style_pad_top(item, 10, 0);
-    lv_obj_set_style_pad_bottom(item, 10, 0);
-    lv_obj_add_event_cb(item, menu_item_event_handler, LV_EVENT_CLICKED, (void *)(intptr_t)index);
+    lv_obj_set_style_pad_all(item, 8, 0);
+    lv_obj_set_style_pad_row(item, 4, 0);
+    lv_obj_add_event_cb(item, menu_item_event_handler, LV_EVENT_CLICKED,
+                        (void *)(intptr_t)index);
 
-    /* 左列：标题 + 副标题 */
-    lv_obj_t *text_col = lv_obj_create(item);
-    lv_obj_set_size(text_col, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
-    lv_obj_set_style_bg_opa(text_col, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(text_col, 0, 0);
-    lv_obj_set_style_pad_all(text_col, 0, 0);
-    lv_obj_set_flex_flow(text_col, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(text_col, LV_FLEX_ALIGN_START,
-                          LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_row(text_col, 2, 0);
-    lv_obj_remove_flag(text_col, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t *title_label = lv_label_create(text_col);
+    lv_obj_t *title_label = lv_label_create(item);
     lv_label_set_text(title_label, title);
     lv_obj_set_style_text_font(title_label, &lv_font_ui_24, 0);
     lv_obj_set_style_text_color(title_label, THEME_TEXT_PRIMARY, 0);
 
-    lv_obj_t *sub_label = lv_label_create(text_col);
-    lv_label_set_text(sub_label, subtitle);
-    lv_obj_set_style_text_color(sub_label, THEME_TEXT_SECONDARY, 0);
-    lv_obj_set_style_text_font(sub_label, &lv_font_ui_20, 0);
+    if (subtitle != NULL && subtitle[0] != '\0')
+    {
+        lv_obj_t *sub_label = lv_label_create(item);
+        lv_label_set_text(sub_label, subtitle);
+        lv_obj_set_style_text_color(sub_label, THEME_TEXT_SECONDARY, 0);
+        lv_obj_set_style_text_font(sub_label, &lv_font_ui_20, 0);
+    }
+}
 
-    /* 右箭头 */
-    lv_obj_t *arrow = lv_label_create(item);
-    lv_label_set_text(arrow, ">");
-    lv_obj_set_style_text_font(arrow, &lv_font_ui_24, 0);
-    lv_obj_set_style_text_color(arrow, THEME_GREEN, 0);
+/* 一行两个格子 */
+static void create_menu_row(lv_obj_t *parent,
+                           const menu_entry_t *ents, int n)
+{
+    lv_obj_t *row = lv_obj_create(parent);
+    lv_obj_set_size(row, LV_PCT(100), 106);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_style_pad_all(row, 0, 0);
+    lv_obj_set_style_pad_column(row, 12, 0);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    for (int i = 0; i < n && i < MENU_GRID_COLS; i++)
+    {
+        create_menu_tile(row, ents[i].title, ents[i].subtitle, ents[i].index);
+    }
+    /* 一行不满两个：补一个占位把位置占住，免得单个格子被 flex_grow 撑满整行 */
+    for (int i = n; i < MENU_GRID_COLS; i++)
+    {
+        lv_obj_t *spacer = lv_obj_create(row);
+        lv_obj_set_height(spacer, 106);
+        lv_obj_set_flex_grow(spacer, 1);
+        lv_obj_set_style_bg_opa(spacer, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(spacer, 0, 0);
+        lv_obj_remove_flag(spacer, LV_OBJ_FLAG_SCROLLABLE);
+    }
+}
+
+static void create_menu_grid(lv_obj_t *parent)
+{
+    int count = (int)(sizeof(s_menu_main) / sizeof(s_menu_main[0]));
+    int pages = (count + MENU_PAGE_ITEMS - 1) / MENU_PAGE_ITEMS;
+    if (pages < 1) pages = 1;
+    if (s_menu_page >= pages) s_menu_page = pages - 1;
+    if (s_menu_page < 0) s_menu_page = 0;
+
+    int base = s_menu_page * MENU_PAGE_ITEMS;
+
+    for (int r = 0; r < MENU_GRID_ROWS; r++)
+    {
+        int first = base + r * MENU_GRID_COLS;
+        int n = count - first;
+        if (n <= 0) break;
+        if (n > MENU_GRID_COLS) n = MENU_GRID_COLS;
+        create_menu_row(parent, &s_menu_main[first], n);
+    }
+
+    /* 超过一页才画翻页条；一页搞定时整块不出现 —— 老人面前少一样要点的东西 */
+    if (pages > 1)
+    {
+        lv_obj_t *bar = lv_obj_create(parent);
+        lv_obj_set_size(bar, LV_PCT(100), 52);
+        lv_obj_set_style_bg_opa(bar, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(bar, 0, 0);
+        lv_obj_set_style_pad_all(bar, 0, 0);
+        lv_obj_set_flex_flow(bar, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(bar, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_remove_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *prev = lv_btn_create(bar);
+        lv_obj_set_size(prev, 96, 52);
+        lv_obj_add_style(prev, &style_menu_item, 0);
+        lv_obj_add_event_cb(prev, menu_page_prev_handler, LV_EVENT_CLICKED, NULL);
+        lv_obj_t *lp = lv_label_create(prev);
+        lv_label_set_text(lp, "<");
+        lv_obj_set_style_text_font(lp, &lv_font_ui_24, 0);
+        lv_obj_center(lp);
+
+        lv_obj_t *info = lv_label_create(bar);
+        lv_label_set_text_fmt(info, "%d / %d", s_menu_page + 1, pages);
+        lv_obj_set_style_text_font(info, &lv_font_ui_24, 0);
+        lv_obj_set_style_text_color(info, THEME_TEXT_SECONDARY, 0);
+
+        lv_obj_t *next = lv_btn_create(bar);
+        lv_obj_set_size(next, 96, 52);
+        lv_obj_add_style(next, &style_menu_item, 0);
+        lv_obj_add_event_cb(next, menu_page_next_handler, LV_EVENT_CLICKED, NULL);
+        lv_obj_t *ln = lv_label_create(next);
+        lv_label_set_text(ln, ">");
+        lv_obj_set_style_text_font(ln, &lv_font_ui_24, 0);
+        lv_obj_center(ln);
+    }
 }
 
 /* ==================== 创建「新增提醒」按钮 ==================== */
@@ -853,7 +980,7 @@ static void create_new_reminder_panel(void)
     new_reminder_panel = lv_obj_create(current_screen);
     lv_obj_set_size(new_reminder_panel, LV_PCT(100), LV_PCT(100));
     lv_obj_align(new_reminder_panel, LV_ALIGN_TOP_MID, 0, 0);
-    /* 内容一屏放得下（~412px / 450），不给滚动：老人误划一下把保存按钮
+    /* 内容一屏放得下（可用高约 300px，超了就滚），不给滚动：老人误划一下把保存按钮
      * 划出屏幕是最糟的，而且省掉整个面板的滚动重绘 */
     lv_obj_remove_flag(new_reminder_panel, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_bg_color(new_reminder_panel, THEME_BG_PAGE, 0);
@@ -956,6 +1083,17 @@ static void create_setting_panel(void)
 
     /* 提醒间隔 */
     create_interval_setting(content, "提醒间隔", user_settings.remind_interval, 3);
+
+    /* 关于（原主菜单第五项，2026-10-24 主菜单定成一页四格后挪到这里） */
+    lv_obj_t *btn_about = lv_btn_create(content);
+    lv_obj_set_size(btn_about, LV_PCT(80), 60);
+    lv_obj_add_style(btn_about, &style_back_btn, 0);
+    lv_obj_add_event_cb(btn_about, menu_item_event_handler, LV_EVENT_CLICKED,
+                        (void *)(intptr_t)4);
+    lv_obj_t *lbl_about = lv_label_create(btn_about);
+    lv_label_set_text(lbl_about, "关于");
+    lv_obj_set_style_text_font(lbl_about, &lv_font_ui_24, 0);
+    lv_obj_center(lbl_about);
 
     /* 恢复默认设置按钮 */
     lv_obj_t *btn_reset = lv_btn_create(content);
@@ -1853,9 +1991,13 @@ typedef struct {
 
 /* 一条贴进 label 的话最多多少字节（UTF-8）。
  * AI 回复可能很长，不设上限的话一个 label 能撑出几千像素高 —— 对话区虽然有
- * 滚动条，但"一屏只有一句"就不像对话了。main.c 送显示前用的也是 256 上下的
- * 缓冲，这里按同一个量级截，截断处补一个"…"（U+2026，字库里有这个字形）。 */
-#define VOICE_TEXT_MAX 240
+ * 滚动条，但"一屏只有一句"就不像对话了。截断处补一个"…"（U+2026，字库里
+ * 有这个字形）。
+ * 2026-10-19 从 240 提到 1024：240 只装得下约 80 个汉字，是"长答案屏幕上
+ * 只显示一部分"的第二道截断（第一道在 robot_ui_bridge.h 的 256）。1024 ≈
+ * 340 字，和 TTS 一次能念的上限（MIMO_TTS_TEXT_MAX=300 字）配套 —— 屏幕上
+ * 看到多少，就能听到多少；更长的按这个上限截并补"…"。 */
+#define VOICE_TEXT_MAX 1024
 
 /* 把要显示的一段文字规整进定长缓冲（保证不出界、不留半个汉字）：
  *   - 丢掉控制字符（\r 会让 LVGL 的断行算错，响铃/退格之类更是乱码来源），
@@ -2761,7 +2903,7 @@ void touch_ui_show_checkin(uint64_t checkin_id, uint32_t timeout_ms,
     checkin_panel = lv_obj_create(current_screen);
     lv_obj_set_size(checkin_panel, LV_PCT(100), LV_PCT(100));
     lv_obj_align(checkin_panel, LV_ALIGN_TOP_MID, 0, 0);
-    /* 内容一屏放得下（~320px / 450），不给滚动（理由同新建提醒面板） */
+    /* 内容一屏放得下（可用高约 300px），不给滚动（理由同新建提醒面板） */
     lv_obj_remove_flag(checkin_panel, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_bg_color(checkin_panel, THEME_BG_PAGE, 0);
     lv_obj_set_style_bg_opa(checkin_panel, LV_OPA_COVER, 0);
@@ -3004,6 +3146,8 @@ static void fall_panel_build(void)
     lv_obj_set_flex_flow(fall_panel, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(fall_panel, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    /* 这一页是「必须作答」的安全页，留白给两颗 80 高的大按钮留出余量 ——
+     * 文案再多一行也不会把「有」挤出屏幕。 */
     lv_obj_set_style_pad_all(fall_panel, 16, 0);
     lv_obj_set_style_pad_row(fall_panel, 14, 0);
     /* 面板不滚动：老人不小心划一下就把按钮划出屏幕，那是最糟的 */

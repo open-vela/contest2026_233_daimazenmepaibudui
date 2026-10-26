@@ -3860,7 +3860,7 @@ static int step_lcdmirror(FAR const char *sub, FAR const char *ip, int port,
  *   输入解析吃掉），所以改成 PC 写一行命令、由 NSH 执行。
  *
  *   参数必给（缺了直接报错退出，不靠 atoi 的 0 蒙过去）；x/y 是面板坐标，
- *   负数和越界都会被钳到 0..389 / 0..449（钳位在 lcd_mirror_inject_touch 里）。
+ *   负数和越界都会被钳到面板内 0..W-1 / 0..H-1（竖屏 390×450，钳位在 lcd_mirror_inject_touch 里）。
  *   **镜像没在跑时注入是无效的**（界面那边根本不会来取），所以这里提示一句，
  *   但不算 FAIL —— 这条命令本身是成功的。
  *

@@ -8,30 +8,21 @@
 | `vendor_sifli-boot-fixes.patch` | `vendor/sifli` | `chips/sf32lb52/{sifli_uart,sifli_irq,sf32lb_flash}.c` | **要**：不修编不过/起不来 |
 | `vendor_sifli-rtc-alarm-fix.patch` | `vendor/sifli` | `chips/sf32lb52/sf32lb_rtc.c` | **要**：不修 RTC alarm 永不触发 |
 | `vendor_sifli-lcd-brightness.patch` | `vendor/sifli` | `boards/sf32lb52/drivers/lcd/sf32lb_lcd.c` + `.../lcd/co5300.c` | **要**：不修亮度只有 0/100。**2026-09-16 起还带上**：面板重新初始化 `sf32lb_lcd_panel_reinit()`（黑屏救回，`hw_test lcdreinit`）+ 12 步 `[lcdreinit]` 诊断日志 + 关掉"开机第三次复位期间被 SETPOWER 插队"那个竞态 + **面板 QSPI 时钟 48MHz→24MHz**（`co5300.c` 一处，带一键回退），见下 |
-| `vendor_sifli-lcd-content-lost.patch` | `vendor/sifli` | `boards/sf32lb52/drivers/lcd/sf32lb_lcd.c` | **要**：面板就绪前/被重初始化后的静默丢帧改记账（`take_content_lost`），上层整屏判脏重画（需在上一条之后） |
 | `vendor_sifli-usb-rndis.patch` | `vendor/sifli` | `chips/sf32lb52/sf32lb_usbdev.c` | **要**：不修 USB 枚举失败（Code 10） |
-| `vendor_sifli-usb-rndis-txpktrdy-ep0.patch` | `vendor/sifli` | `chips/sf32lb52/sf32lb_usbdev.c` | **要**：不修重流量下 TX FIFO 冲走在途包 → 数据通道整体死亡（ARP FAILED + watchdog、EP0 却活着）；另含 EP0 supersede 竞态修复（需在上一条之后） |
 | `nuttx-usbdev-rndis.patch` | `nuttx` | `drivers/usbdev/rndis.c` | **要**：不修 RX 会永久停摆 |
 | `nuttx-usbdev-rndis-nomem.patch` | `nuttx` | `drivers/usbdev/rndis.c` | **要**：不修 -ENOMEM 会把 USB 栈打死（需在上一条之后） |
-| `nuttx-usbdev-rndis-rdlock.patch` | `nuttx` | `drivers/usbdev/rndis.c` | **要**：不修 SMP 双臂 rdreq 竞态 → RX 永久卡死；另含 INIT 清队列、QUERY 竞态修复（需在上两条之后） |
 | `apps-ai-agent-velaclaw-sdk.patch` | `packages/ai_agent` | `CMakeLists.txt` | **要**：不补 `velaclaw_client_open` 链不上 |
 | `apps-ai-agent-llm-clock-fix.patch` | `packages/ai_agent` | `src/core/agent_loop.c` | **要**：不修 `ask` 永远报超时 |
 | `apps-ai-agent-vela-tls-chunked-end.patch` | `packages/ai_agent` | `src/infra/vela_tls.c` | **要**：不修 chunked 响应卡 120 秒 |
 | `apps-ai-agent-vela-tls-no-block-close.patch` | `packages/ai_agent` | `src/infra/vela_tls.c` | **要**：不修语音永远停在「处理中」（需在上一条之后） |
 | `apps-ai-agent-vela-tls-pool-owner.patch` | `packages/ai_agent` | `src/infra/vela_tls.c` | **要**：不修 TLS 连接池跨 task group 误关 fd（需在前两条之后） |
 | `vendor_sifli-uart-rx-dma-reinit.patch` | `vendor/sifli` | `chips/sf32lb52/sifli_uart.c` | **要**：给板级开一个 `sifli_uart_reinit_rx_dma(idx)` 入口。不补这一条，板级音频恢复里那记"复位整块 DMAC1"会把**串口（控制台）RX 的 DMA 通道**一起抹掉 → **控制台永久收不到命令**（板子还活着、日志照打）。详见文末那一节 |
-| `nuttx-audio-drain-fix.patch` | `nuttx` | `audio/audio.c` + `arch/arm/src/arm_m/Make.defs` | **要**：本板音频半双工、上层却全局单状态机——常开麦把状态顶在 RUNNING 后其他 app 的 OUTPUT CONFIGURE 被静默吞掉 → 全程无声。本补丁放行 OUTPUT 对 INPUT 的抢占；另带 `CONFIG_ARM_M_SYSTICK`→`CONFIG_ARM_SYSTICK` 的 Make.defs 笔误修正（不修 arm_systick.c 编不进） |
+| `apps-ai-agent-local-client-no-working-status.patch` | `packages/ai_agent` | `src/core/agent_loop.c` | **要**：不修则**语音收到占位话当回复、真回复永久丢失**（表现为「正在思考中」念完就没下文），见文末那一节 |
+| `nuttx-audio-drain-fix.patch` | `nuttx` | `arch/arm/src/arm_m/Make.defs` + `audio/audio.c` | **要**：不修则麦克风会「回一句就再也不说话」。**2026-10-26 追加第三笔**：会话记账说谎导致 STOP 永久让路（详见下文「audio.c 的三次状态机钉死」） |
 
 补丁文件本身是给「上游树被重新 sync 之后要重打」用的场景留的：这三棵树的改动
-**都已经直接改在工作区里、未提交**。板级（`boards/`）的改动**不再属于这一套**，见下。
-
-⚠️ **2026-10-15 分层说明**：`nuttx-usbdev-rndis{,-nomem}`、`vendor_sifli-usb-rndis`、
-`vendor_sifli-lcd-brightness` 这四个旧补丁是**当时**工作区的快照。此后工作区又继续
-演进（rdlock 竞态、TXPKTRDY 守门、EP0 supersede、content_lost 记账、audio 半双工抢占），
-所以它们**已不能再单独 `--reverse` 通过**。现在每个仓库的完整恢复序列是
-「旧补丁 → 增量补丁」分层叠加，叠加后与当前工作区 `cmp` **逐字节相同**
-（2026-10-15 逐仓库实测）。各轮节内写的「reverse 通过」是**当时属实的历史记录**，
-当前状态以本段与文末「2026-10-15 增量补丁」一节为准。
+**都已经直接改在工作区里、未提交**，所以补丁都能 `git apply --check --reverse` 通过
+（= 和当前工作区逐字对应）。板级（`boards/`）的改动**不再属于这一套**，见下。
 
 ## 板级改动不走补丁了（2026-09-15 清理）
 
@@ -460,15 +451,9 @@ cd <openvela 工作区>/vendor/sifli
 git apply <本仓库>/patches/vendor_sifli-boot-fixes.patch
 git apply <本仓库>/patches/vendor_sifli-rtc-alarm-fix.patch
 git apply <本仓库>/patches/vendor_sifli-lcd-brightness.patch
-git apply <本仓库>/patches/vendor_sifli-lcd-content-lost.patch   # 2026-10-15 增量，需上一条就位
-git apply <本仓库>/patches/vendor_sifli-usb-rndis.patch          # USB（见「USB RNDIS 上网功能」一节）
-git apply <本仓库>/patches/vendor_sifli-usb-rndis-txpktrdy-ep0.patch
-git apply <本仓库>/patches/vendor_sifli-uart-rx-dma-reinit.patch
 ```
 
 打之前先 `git apply --check <补丁>`（或 `--check --reverse` 看是不是已经打过了）。
-⚠️ 2026-10-15 起：`lcd-brightness` / `usb-rndis` 两个旧补丁打完后还要各接一枚增量补丁，
-才是当前工作区的完整状态（见文末一节）。
 
 ## 说明
 
@@ -490,17 +475,11 @@ git apply <本仓库>/patches/vendor_sifli-uart-rx-dma-reinit.patch
 # 1) nuttx 侧：RNDIS 网卡驱动修复
 cd <openvela 工作区>/nuttx
 git apply <本仓库>/patches/nuttx-usbdev-rndis.patch
-git apply <本仓库>/patches/nuttx-usbdev-rndis-nomem.patch
-git apply <本仓库>/patches/nuttx-usbdev-rndis-rdlock.patch
 
 # 2) vendor_sifli 侧：USB device 控制器驱动修复 + 清理
 cd <openvela 工作区>/vendor/sifli
 git apply <本仓库>/patches/vendor_sifli-usb-rndis.patch
-git apply <本仓库>/patches/vendor_sifli-usb-rndis-txpktrdy-ep0.patch
 ```
-
-（2026-10-15 起每侧都追加了增量补丁 —— 只打 2026-09 那两条旧的已经**不够**了，
-详见文末「2026-10-15 增量补丁」一节。）
 
 ## nuttx-usbdev-rndis.patch（`nuttx/drivers/usbdev/rndis.c`）
 
@@ -766,7 +745,6 @@ Assertion failed at /drivers/usbdev/rndis.c:1820   task: robot_ui
 cd <openvela 工作区>/nuttx
 git apply <本仓库>/patches/nuttx-usbdev-rndis.patch
 git apply <本仓库>/patches/nuttx-usbdev-rndis-nomem.patch
-git apply <本仓库>/patches/nuttx-usbdev-rndis-rdlock.patch   # 2026-10-15 增量，需前两条就位
 ```
 
 ## 验证
@@ -1213,88 +1191,191 @@ int sifli_uart_reinit_rx_dma(int idx)
 `audio_test audfix`（打一记）→ 再敲命令（应正常）→ 跑十几分钟看是否中途变聋。
 若变聋，改成只清 `last_index`、不碰 NX 记账。
 
+
 ---
 
-# 2026-10-15 增量补丁（四枚：rndis rdlock / usbdev TXPKTRDY+EP0 / lcd content_lost / audio 半双工抢占）
+# local_client 渠道的第一条状态话吃掉一次性回调 → 语音收到「正在思考中」当回复、真回复丢失（2026-10-16 新增补丁）
 
-背景：2026-09 导出的旧补丁系列是**当时**工作区的快照。10 月中旬又在三棵上游树里
-继续修了一批问题（见各补丁头注释），旧补丁不再与工作区逐字对应。本节四枚补丁把
-差量补齐——**每枚都是「旧序列叠加后的基线 → 当前工作区」的精确 diff**，四枚依次
-打完后与工作区 `cmp` 逐字节相同（生成当天逐仓库实测，方法见文末）。
+## 现象
 
-## 应用顺序（按仓库）
+语音对话（按「提交」或 VAD 触发）此后：
 
-```bash
-# nuttx —— 三枚按序（后一枚依赖前一枚的基线）
-cd <openvela 工作区>/nuttx
-git apply <本仓库>/patches/nuttx-usbdev-rndis.patch
-git apply <本仓库>/patches/nuttx-usbdev-rndis-nomem.patch
-git apply <本仓库>/patches/nuttx-usbdev-rndis-rdlock.patch
-git apply <本仓库>/patches/nuttx-audio-drain-fix.patch          # 独立文件，任意顺序
-
-# vendor/sifli —— 两枚各接在自己的旧补丁之后
-cd <openvela 工作区>/vendor/sifli
-git apply <本仓库>/patches/vendor_sifli-lcd-brightness.patch
-git apply <本仓库>/patches/vendor_sifli-lcd-content-lost.patch
-git apply <本仓库>/patches/vendor_sifli-usb-rndis.patch
-git apply <本仓库>/patches/vendor_sifli-usb-rndis-txpktrdy-ep0.patch
+```
+[trace:6ad1fdce00000000] BEGIN chat=elder_companion chan=local_client
+[LLM] AI回复: 正在思考中...            ← 上屏并被 TTS 念出来
+[Bridge] AI 回复已上屏: 正在思考中...
+        ← 到此为止。之后没有 iter=0、没有 END status=、没有 TTS 播报真回复
 ```
 
-## 各补丁治什么
+界面上就是"一直停在思考中，回复迟迟不来"。串口里**看不到 `[trace:...] END`**
+（`agent_trace_end()` 的四条出口都在同一个函数的尾部，只要走到就一定打印，
+所以"没有 END"= 那一轮没走完）。占位话是 5 句里随机挑的，所以每次看到的
+措辞不一样（"正在思考中..."/"稍等，处理中..."/"让我查一下..."…）。
 
-### nuttx-usbdev-rndis-rdlock.patch（`nuttx/drivers/usbdev/rndis.c`，基线 = 前两枚 rndis 补丁）
+本仓库的语音链路走 `local_client`：`app/hello_app/ai_llm.c` 里
+`velaclaw_client_open("elder_companion")` → `velaclaw_ask()`。
 
-- **SMP 双臂竞态（2026-10-12 真机卡死根因）**：bulk OUT 重臂有两个并发调用点
-  （`rxdispatch` 尾部 / `freewrreq` 完成回调），裸读 `rdreq_submitted` 的
-  检查-然后-动作会双次 `EP_SUBMIT` 同一 rdreq → UDC 队列损坏 → RX 永久死亡。
-  修法 = 新增 `priv->rdlock`（`spin_lock_irqsave`）串行化全部访问点，
-  `EP_SUBMIT`/`EP_CANCEL` 一律放锁外（防 UDC 同步完成回调嵌套死锁）。
-- **-ENOMEM 断言降级为丢包**（挂起的 rxdispatch 尾部统一 unblock + 重臂）。
-- **INIT 清会话残留**：重连时上一会话的挂起状态作废，不再 stall QUERY。
-- **QUERY 永不 stall**：`outlen` 边界检查 + 应答补齐。
+## 根因（两条叠加）
 
-### vendor_sifli-usb-rndis-txpktrdy-ep0.patch（`vendor/sifli/chips/sf32lb52/sf32lb_usbdev.c`，基线 = usb-rndis 补丁）
+1. **`velaclaw_ask()` 是一次性异步回调语义。**
+   `packages/ai_agent/src/sdk/velaclaw_client_local.c` 的 `tap_callback()` 里，
+   async 分支是"调用回调 **并把 `c->async_cb` 置 NULL**"：
 
-- **TXPKTRDY 守门（2026-10-14 深夜，重流量数据通道死亡根因）**：
-  `sf32lb52_wrrequest` 开头查 TXPKTRDY（EP0 用 `USB_CSR0_TXPKTRDY`=0x0002，
-  其它端点 `USB_TXCSR_TXPKTRDY`=0x0001，寄存器同址 `hw->csr0_txcsr`），
-  上一包还没被主机取走就一个字节不碰 FIFO、原样返回等 TX-complete 中断。
-  不修的话 `epwrite` 的 FLUSHFIFO 会冲走在途包，且这颗 MUSB 类内核在
-  TXPKTRDY 置位期间被 flush 后 TX 状态机可整体卡死 → wrreq 池耗尽 →
-  hasfreereqs 恒 false → **整条数据通道死而 EP0 活**（主机症状：ARP FAILED +
-  NETDEV WATCHDOG transmit queue timed out，控制通道却正常）。
-- **EP0 supersede（冷启动 "RNDIS init failed, -32" 根因）**：SETUPEND 表示
-  新 SETUP 顶掉了在途控制传输；停泊等待数据段的 class/vendor OUT 请求标记
-  作废（`g_ep0superseded`），不再把新 SETUP 的 8 字节当"数据"喂给驱动；
-  另加 `count0 == 0` 重复服务守卫（INTRTX CONTROL 与 INtrRX EP0 双路进
-  同一处理函数，第一次已清 RXPKTRDY，第二次空包会把停泊请求以空数据段
-  派发 → -EINVAL → ep0 STALL → 主机 bind -32）。
+   ```c
+   if (c->async_cb) {
+       void (*cb)(...)= c->async_cb;
+       c->async_cb = NULL;      /* ★ 用完即清 */
+       ...
+       cb(0, msg->content, ck);
+       return;
+   }
+   ```
 
-### vendor_sifli-lcd-content-lost.patch（`vendor/sifli/boards/sf32lb52/drivers/lcd/sf32lb_lcd.c`，基线 = lcd-brightness 补丁；co5300.c 无差量）
+   也就是**本渠道收到的第一条 outbound 消息，就把这次 ask 的回调消耗掉了**。
 
-面板就绪前 putrun/putarea 的静默丢弃、以及面板（重）初始化（SWRESET 清 GRAM）
-都记账到 `s_content_lost`/`s_drop_count`；导出 `sf32lb_lcd_take_content_lost()`
-（取走即清零）/ `sf32lb_lcd_drop_count()` 给板级 `robot_ui_bridge_lcd_check`
-轮询——看到 true 就把整屏判脏重画。治"重初始化后画面与 LVGL 记账不一致"。
+2. **框架往这个渠道发了一条状态话，而且它比真回复先到。**
+   `src/core/agent_loop.c` 的 `send_working_status()` 在 ReAct 循环开头
+   **无条件**发出（`agent_loop.c` 的 `for (iteration...)` 第一行）。
+   它本来就有跳过名单 —— 注释写着"voice 要跳过，因为 TTS 合成状态话浪费时间内存"——
+   **但名单里只有 `AGENT_CHAN_FEISHU` / `VOICE` / `QUICKAPP` / `WEIXIN`，
+   没有 `local_client`**（该渠道名是 `velaclaw_client_local.c` 里文件私有的
+   `#define CLIENT_CHANNEL "local_client"`，不是 `AGENT_CHAN_*` 之一）。
 
-### nuttx-audio-drain-fix.patch（`nuttx/audio/audio.c` + `arch/arm/src/arm_m/Make.defs`，HEAD 基线，不依赖任何旧补丁）
+叠加后果：
 
-- **半双工抢占（2026-10-11 真机定案，治全程无声）**：本板音频半双工、上层是全局
-  单状态机——常开麦把状态顶在 RUNNING 后，其他 app 的 OUTPUT CONFIGURE 被
-  OPEN 门静默吞掉（返回 OK、驱动毫不知情），PCM 全写在录音会话上、DAC/功放
-  从未打开，每块都等 DMA 超时被丢。修法：OUTPUT 在 INPUT 会话运行时抢占——
-  直调下层 `stop` 拆掉录音会话并显式落 PREPARED，让这次 CONFIGURE 必定转发；
-  hello_app 的录音监听守护随后自动重开麦。反向（INPUT 抢 OUTPUT）故意不放行。
-- **Make.defs 笔误**：`CONFIG_ARM_M_SYSTICK` → `CONFIG_ARM_SYSTICK`
-  （.config 里真实符号是后者，原条件恒假 → `arm_systick.c` 从未参与编译）。
+```
+velaclaw_ask() 注册一次性 async_cb
+  → agent 循环开头发「正在思考中...」(channel=local_client)
+  → tap_callback 命中 → 调用回调、async_cb 置 NULL
+      ↑ 这次 ask 的回调被状态话吃掉了
+  → 约 9 秒后真回复到达 → tap_callback 走 else(sync) 分支：
+        c->reply_text = strdup(...); sem_post(&c->reply_sem);
+      ↑ 而上层 ai_llm.c 等的是自己的 backend_sem、注册的是 async 回调，
+        没有任何人读 reply_text、也没有人等 reply_sem
+  → 消息随后被 agent_main.c 的 outbound 派发 free(msg.content)
+```
 
-## 验证方法与结果（2026-10-15）
+**所以真回复不是"没回来"，是回来之后进了一个没人收的信箱。**
 
-每枚补丁都做了「重建基线 → apply → 与工作区 `cmp`」闭环：
+## 修改
 
-1. `git show HEAD:<file>` 取 HEAD 版本进临时目录；
-2. 按序 `patch -p1 --fuzz=0` 打该仓库的旧补丁序列（audio 例外，无旧序列）；
-3. `diff -u -L a/<file> -L b/<file>` 基线 vs 工作区 → 生成增量补丁；
-4. 在基线上 `patch -p1 --fuzz=0` 打新补丁，`cmp` 工作区文件。
+`src/core/agent_loop.c`：把 `local_client` 补进那条跳过判据（两处，共 3 行）。
 
-四枚结果：`RNDIS_OK / USB_OK / LCD_OK / AUDIO_OK`（逐字节相同）。
+```c
+/* local_client 渠道名。必须与 src/sdk/velaclaw_client_local.c 的
+ * CLIENT_CHANNEL 逐字一致（那边是文件私有的 #define，没有对外头文件，
+ * 所以这里只能重写一份字面串）。改一处必须改另一处。 */
+#define AGENT_CHAN_LOCAL_CLIENT "local_client"
+...
+    if (strcmp(msg->channel, AGENT_CHAN_FEISHU) == 0
+        || strcmp(msg->channel, AGENT_CHAN_VOICE) == 0
+        || strcmp(msg->channel, AGENT_CHAN_LOCAL_CLIENT) == 0   /* ★ 新增 */
+#ifdef CONFIG_FEATURE_SYSTEM_VELACLAW
+        || strcmp(msg->channel, AGENT_CHAN_QUICKAPP) == 0
+#endif
+        || strcmp(msg->channel, AGENT_CHAN_WEIXIN) == 0) {
+        return;
+    }
+```
+
+不改 velaclaw 的 SDK 语义（一次性回调是它的契约），只把"往这个渠道发状态话"
+这个多余动作去掉 —— 这与该函数头注释里"voice 要跳过"的原意一致。
+
+## 应用方式
+
+```bash
+cd <openvela 工作区>/packages/ai_agent
+git apply <本仓库>/patches/apps-ai-agent-local-client-no-working-status.patch
+```
+
+## 验证
+
+- `git apply --check --reverse` 通过（补丁与已改好的工作区逐字对应）；
+  并从原始文件正向 `patch -p1 --dry-run` 通过。
+- 固件里可见 `strings nuttx | grep local_client` 出现三处，其中一处为
+  `AGENT_CHAN_LOCAL_CLIENT "local_client"`（新增判据）。
+- 上板（同一轮语音对话，改前 vs 改后）：
+
+```
+改前： BEGIN chan=local_client
+      [LLM] AI回复: 正在思考中...          ← 占位话抢跑
+      [Bridge] AI 回复已上屏: 正在思考中...
+      (无 iter= / 无 END)
+
+改后： BEGIN chan=local_client
+      [llm] OpenAI API with tools (model: mimo-v2.5, 16622 bytes)
+      [llm] Response: 292 bytes text, 0 tool calls, finish=end_turn
+      [trace:...] iter=0 tool=(none) latency=9426ms llm=ok backend=0
+      [trace:...] END status=ok iters=1 tools=0 llm_ms=9426 elapsed=10s
+```
+
+- 附带效果：占位话被念那一次 TTS 请求不再发出，串口里
+  `[vela_tls] Another HTTPS request is in flight, running without serialization`
+  也随之消失（少一次与 LLM 并发的 TLS 请求）。
+
+---
+
+## `nuttx-audio-drain-fix.patch` — `audio/audio.c` 的三次状态机钉死
+
+同一句话的三种写法：**上层 ioctls 全返回 OK，硬件却一次都没被叫醒**。
+NuttX 音频上层是**全局单状态机**，转发有门：CONFIGURE 只在 `OPEN/PREPARED`
+（或抢占后、或非 INPUT/OUTPUT 类型）才送到驱动，START 只在 `PREPARED/XRUN`
+才送到驱动。**被门吞掉的请求照样 `return OK`** —— 所以 app 侧完全看不出异常。
+
+### 三次根因
+
+| # | 时间 | 病灶 | 修法 |
+|---|------|------|------|
+| 1 | 2026-10-10 | STOP 后没人发 COMPLETE → `DRAINING` 无限期钉着 | `sf32lb52_audio_stop` 在 hw_stop 成功后补发 `AUDIO_CALLBACK_COMPLETE` |
+| 2 | 2026-10-11 | 常开麦把状态顶在 `RUNNING`，别的 app 的播放 CONFIGURE 全被吞 → PCM 写进录音会话、DAC/功放从未打开 | `audio_configure` 加**驱动级抢占**：OUTPUT 在 INPUT 会话运行时直调下层 stop 拆掉录音会话；反向不放行（麦不能杀声音） |
+| 3 | 2026-10-26 | **会话记账说谎**（本补丁新增） | 见下 |
+
+### 第三次：`priv->state` 说谎 → 所有 STOP 永久让路
+
+`audio_stop` 真停硬件的放行判据是 `audio_getnstate() <= AUDIO_STATE_PREPARED`，
+而 `audio_getnstate()` 取的是**其它 fd 的 `priv->state` 最大值**。两处无条件写
+把这本账写脏：
+
+1. `audio_start` / `audio_resume` 末尾**不管有没有转发给驱动**都写
+   `priv->state = AUDIO_STATE_RUNNING` —— 一个**根本没起来的会话**从此永久举着
+   「我在跑」。
+2. 半双工抢占（上表第 2 笔）直调 `lower->ops->stop()` **绕过 `audio_stop()`**，
+   而 `priv->state = OPEN` 那句只写在 `audio_stop()` 里 —— 被抢那个 fd 的记账
+   永远停在 `RUNNING`，没人清。
+
+一个假 `RUNNING` 就能让**所有** `audio_stop()` 进不了真停硬件那个分支 → 硬件
+停不下来 → 永远没人发 COMPLETE → 状态机钉在 `RUNNING` → 往后每一次
+CONFIGURE/START 都被静默吞掉却照样返回 OK。
+
+**真机指纹**（和上表第 2 笔那次是同一个形状）：
+
+```
+AUDIO_IN: started (16000 Hz, 1 ch, 16 bit)     ← ioctl 成功，打了 22 次
+                                                 从无 AUDIO: hw_start 真跑了
+[监听守护] 录音标志说在录、驱动却没会话（armed=0 busy=0）：判定僵尸会话
+```
+
+触发点是**第一句回复起播**（OUTPUT 抢 INPUT 那一下），所以症状正是
+**「回了一句就再也不说话」**。
+
+**修法**：`audio_start` / `audio_resume` / `audio_pause` / `audio_configure`
+四处记账改成**只有真转发给了驱动才写**；抢占后新增 `audio_forget_sessions()`
+强制作废别人 `> PREPARED` 的记账；并加 5 条实证 syslog 抓复发：
+
+```
+audio: START 被吞 / CONFIGURE 被吞 / PAUSE 被吞 / RESUME 被吞
+audio: STOP 没停到硬件（status=%d nstate=%d，本 fd 记账 %d）
+audio: 清掉 %d 个陈旧的会话记账（半双工抢占拆掉了别人的会话）
+```
+
+**⚠️ 尚未定论**：2026-10-26 真机 150 秒验收 3 轮全答、`判定僵尸会话` 0 次、
+`被吞` 0 次，但 `清掉 %d 个陈旧的会话记账` **一次都没打** —— 预期「每次回复起播
+就清一次」落空。回看日志才发现 hello_app 自己是**先停麦再播**（`AUDIO_IN: stopped`
+早于 `hw_start playback=1`），压根不走抢占那条路，所以真正下毒的多半是上面第 1 条。
+**要再压一轮长测才能定论**，别把「抢占清理」当成已验证的修复。
+
+### 判据
+
+- 每次开麦，串口必须有 `AUDIO: hw_start 真跑了：playback=0`。
+  只有 `AUDIO_IN: started` 而没有它 = 状态机还被吞，病没好。
+- 上面 5 条 syslog **出现一次是修复在动手，不是 bug**；连着刷屏才是没修透。

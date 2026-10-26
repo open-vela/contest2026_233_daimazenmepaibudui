@@ -17,6 +17,7 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <pthread.h>
+#include <time.h>
 
 /****************************************************************************
  * Pre-processor Definitions
@@ -173,6 +174,8 @@ typedef struct
   volatile bool       care_stop;        /* 停止标志 */
   bool                care_thread_valid;
   uint32_t            check_interval_ms; /* 检查间隔(毫秒) */
+  time_t              last_clock_obs;   /* 上次观察到的系统时间：对时跳变时
+                                         * 关怀线程据此自动重算任务表（0=首次） */
 
   /* 用户数据 */
   void               *user_data;        /* 用户自定义数据 */
@@ -408,5 +411,17 @@ care_task_t *care_create_sleep_task(uint8_t hour, uint8_t minute);
  */
 
 void care_init_default_tasks(care_context_t *ctx);
+
+/**
+ * @brief  按当前系统时间重算所有已启用任务的下次触发时间
+ * @param  ctx: 关怀上下文指针
+ *
+ * 开机时板子还没对时（time() 接近 1970/默认值），任务的 next_trigger_time
+ * 是拿错误时间算的；等网络对时把钟拨正的瞬间，那些"下次触发"全变成早已过期
+ * → 全部立即触发（2026-10-15 晚上的现场：晚上十点半连上网，早上好/午餐/
+ * 下午好/晚餐/晚上好一口气全念）。对时成功后调一次本函数即愈。
+ */
+
+void care_reschedule_all(care_context_t *ctx);
 
 #endif /* __AI_CARE_H */

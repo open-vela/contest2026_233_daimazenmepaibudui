@@ -185,6 +185,27 @@ int sm_register_state(sm_context_t *ctx,
 void sm_set_timeout(sm_context_t *ctx, sm_state_t state, uint32_t timeout_ms);
 
 /**
+ * @brief  续期当前状态的超时计时（"这个状态还在推进，别超时"）
+ * @param  ctx: 状态机上下文指针
+ *
+ * 2026-10-23 新增，专治"说到一半被打断"。原来超时是从**进入状态**那一刻
+ * 起算的死表（见 sm_run()：elapsed = now - state_enter_tick），而
+ * state_enter_tick 只在**状态真的切换**时才重置（sm_handle_event 末尾那句
+ * if (next_state != ctx->current_state)）。也就是说用户开始说话那一刻
+ * speech_capture_begin() 发的 WAKEUP 若本来就已经在 LISTENING 里，走的是
+ * default 分支、返回同一个状态 —— 计时器根本不带停的。
+ *
+ * 后果：LISTENING 那个上限还得再扣掉 VAD 判"说完了"要的那段连续静音
+ * （`AUDIO_VAD_SILENCE_TIMEOUT_MS`，见 ai_audio.h，**以那个宏为准**），
+ * 实际可用说话时长所剩无几；一超过就 TIMEOUT 回 IDLE，紧接着 VAD 报的
+ * VOICE_COMPLETE 被 IDLE 的 default 分支直接吞掉（"忽略事件"），于是既不送
+ * ASR、也不出回答 —— 这就是"说完必须点提交、而且点了有时也没反应"的根源。
+ *
+ * 有了它，录音累积每推进一帧就续期，超时就只在"真的一点声音都没有"时
+ * 才触发，语义终于和它该保护的东西对齐。 */
+void sm_kick_timer(sm_context_t *ctx);
+
+/**
  * @brief  强制切换状态（绕过转换处理）
  * @param  ctx: 状态机上下文指针
  * @param  new_state: 目标状态

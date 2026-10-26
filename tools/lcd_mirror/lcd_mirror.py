@@ -204,6 +204,9 @@ assert TOUCH_FMT.size == 8
 MAX_FRAME_BYTES = 8 * 1024 * 1024
 MAX_DIM = 4096
 
+# 板端是竖屏 390x450（CO5300 玻璃原生方向；2026-10-24 试过横屏，MADCTL 换轴
+# 在真机上是乱码，已回退）。这两个值必须和 lcd_mirror.h 的 LCD_MIRROR_PANEL_W/H
+# 一致，否则下面的 x+w<=W / y+h<=H 校验会把每一帧都丢掉。
 DEFAULT_W, DEFAULT_H = 390, 450
 
 
@@ -295,8 +298,8 @@ def widget_to_panel(wx, wy, panel_w, panel_h, rotate, scale):
 #   * 板端每 3 秒补发一帧整屏关键帧，所以丢了任何一帧都会自己长回来。
 # 这里刻意**不加门**：没有"连续 N 帧不合格就放弃 / 就重连"之类的判断。
 
-PANEL_MAX_X = DEFAULT_W      # 帧矩形不许超出面板：x + w <= 390
-PANEL_MAX_Y = DEFAULT_H      #                        y + h <= 450
+PANEL_MAX_X = DEFAULT_W      # 帧矩形不许超出面板：x + w <= DEFAULT_W(390)
+PANEL_MAX_Y = DEFAULT_H      #                        y + h <= DEFAULT_H(450)
 
 
 def check_header(m0, m1, ver, flags, x, y, w, h, seq, plen):

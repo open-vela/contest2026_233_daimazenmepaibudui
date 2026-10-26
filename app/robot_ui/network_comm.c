@@ -158,6 +158,35 @@ static const char *g_mqtt_broker_list[] = {
 
 static bool g_mqtt_broker_pinned = false;
 
+/* ---- 回环压制：跟"上一条收到的"比，一模一样就不打印、不回调 ----
+ *
+ * 背景：本板订阅了自己发布的主题（zhi_ai/<client_id>/command），broker 会把
+ * 自己刚发的那条原样推回来，于是每条 voice_state / AI 回复都打印两遍、
+ * 回调也白白跑第二遍。回环的两条在**接收序列里必然相邻**，所以只需记住
+ * "上一条收到的"就够了 —— 不必知道"自己发过什么"，也就不必管某条消息是
+ * 排队发的还是直调的。
+ *
+ * 判据刻意做得**没有一行能越界、没有一个跳转**（这是本文件第二次改这里了，
+ * 上一版在收包主路径上用了 strcmp 比 payload 并 break 跳出 switch，上板后
+ * 触发卡死，已整体回退，教训记在此处）：
+ *   - 长度先取好、且各自夹在本数组范围内，比不出就按"不是回环"处理；
+ *   - 用 memcmp 比**定长**，不看终止符；
+ *   - if/else 走直路，不用 break 也不用 continue，让函数末尾的
+ *     pos = total; 在任何一条路径下都必然执行。
+ *
+ * ⚠️ 不加锁的理由：这两个量只在 mqtt_parse_packet() 里读写，而该函数只被
+ *    network_task 调用（收包单线程、串行）。若将来挪到别的线程，必须加锁。
+ * 只影响"打印与回调"，不碰发送路径、不碰 socket。 */
+#define MQTT_ECHO_TOPIC_MAX    128
+#define MQTT_ECHO_PAYLOAD_MAX  1024
+
+static char   g_last_rx_topic[MQTT_ECHO_TOPIC_MAX];
+static size_t g_last_rx_topic_len = 0;
+static char   g_last_rx_payload[MQTT_ECHO_PAYLOAD_MAX];
+static size_t g_last_rx_payload_len = 0;
+static bool   g_last_rx_valid = false;
+static unsigned g_mqtt_echo_ignored = 0;   /* 累计压制了几条（只作观测） */
+
 /* 把配置里的 mqtt_broker 应用到 mqtt_config。没配就什么都不做。
  *
  * 为什么配上之后要"钉住"（不降级）：演示现场队友的智能灯挂在
@@ -2703,23 +2732,58 @@ static int mqtt_parse_packet(void)
                     memcpy(payload, &buffer[cur], payload_len);
                     payload[payload_len] = '\0';
 
-                    printf("Received: topic=%s qos=%d, payload=%s\n",
-                           topic, qos, payload);
+                    /* ★ 回环判定：跟"上一条收到的"比。全程定长、有上界、
+                     * 没有跳转语句（理由与上一次的教训见 g_last_rx_* 注释）。 */
+                    size_t now_tl = strlen(topic);
+                    size_t now_pl = strlen(payload);
+                    bool is_echo = false;
 
-                    /* 命令/诊断进来时的第一条线索，和 report_diag() 的
-                     * "[DIAG] tx ..." 配成一对：
-                     *   只有 rx 没有 tx —— 收到了，但分发那边没认（或响应发不出去）；
-                     *   连 rx 都没有   —— 请求根本没到板子（订阅没了 / 发在别的 broker）。 */
-                    if (strstr(payload, "\"action\"") != NULL) {
-                        char action[32];
-
-                        diag_peek_action(payload, action, sizeof(action));
-                        printf("[DIAG] rx action=%s topic=%s\n", action, topic);
+                    if (g_last_rx_valid
+                        && now_tl == g_last_rx_topic_len
+                        && now_pl == g_last_rx_payload_len
+                        && now_tl < MQTT_ECHO_TOPIC_MAX
+                        && now_pl < MQTT_ECHO_PAYLOAD_MAX
+                        && memcmp(topic, g_last_rx_topic, now_tl) == 0
+                        && memcmp(payload, g_last_rx_payload, now_pl) == 0) {
+                        is_echo = true;
                     }
 
-                    /* 调用回调 */
-                    if (mqtt_callback) {
-                        mqtt_callback(topic, payload);
+                    if (is_echo) {
+                        /* 回环：不打印、不回调，也不更新"上一条"
+                         * （保持它能继续压住后续重复的推送）。 */
+                        g_mqtt_echo_ignored++;
+                    }
+                    else {
+                        /* 正常消息：先记成"上一条"，再照原样往下处理。 */
+                        if (now_tl < MQTT_ECHO_TOPIC_MAX
+                            && now_pl < MQTT_ECHO_PAYLOAD_MAX) {
+                            memcpy(g_last_rx_topic, topic, now_tl);
+                            g_last_rx_topic[now_tl] = '\0';
+                            g_last_rx_topic_len = now_tl;
+                            memcpy(g_last_rx_payload, payload, now_pl);
+                            g_last_rx_payload[now_pl] = '\0';
+                            g_last_rx_payload_len = now_pl;
+                            g_last_rx_valid = true;
+                        }
+
+                        printf("Received: topic=%s qos=%d, payload=%s\n",
+                               topic, qos, payload);
+
+                        /* 命令/诊断进来时的第一条线索，和 report_diag() 的
+                         * "[DIAG] tx ..." 配成一对：
+                         *   只有 rx 没有 tx —— 收到了，但分发那边没认（或响应发不出去）；
+                         *   连 rx 都没有   —— 请求根本没到板子（订阅没了 / 发在别的 broker）。 */
+                        if (strstr(payload, "\"action\"") != NULL) {
+                            char action[32];
+
+                            diag_peek_action(payload, action, sizeof(action));
+                            printf("[DIAG] rx action=%s topic=%s\n", action, topic);
+                        }
+
+                        /* 调用回调 */
+                        if (mqtt_callback) {
+                            mqtt_callback(topic, payload);
+                        }
                     }
                 }
                 break;

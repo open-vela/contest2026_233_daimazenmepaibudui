@@ -12,10 +12,72 @@ index a228cd42be4..a4820a80388 100644
  endif
  
 diff --git a/audio/audio.c b/audio/audio.c
-index 35e1344a92e..8e773c52cc6 100644
+index 35e1344a92e..474ea7819b6 100644
 --- a/audio/audio.c
 +++ b/audio/audio.c
-@@ -469,6 +469,7 @@ static int audio_configure(FAR struct file *filep,
+@@ -385,6 +385,61 @@ static inline int audio_getnstate(FAR struct audio_upperhalf_s *upper,
+   return nstate;
+ }
+ 
++/****************************************************************************
++ * Name: audio_forget_sessions
++ *
++ * Description:
++ *   把其它 fd 身上"我手里有活会话"的记账清回 OPEN，可选地打一行告警。
++ *
++ *   专供**半双工抢占**那条路用。抢占是直调 lower->ops->stop() 拆掉正在跑的
++ *   那个会话（见 audio_configure 里的说明），**绕过了 audio_stop()** —— 而
++ *   priv->state = OPEN 那句只写在 audio_stop() 里。于是被抢的那个 fd 从此
++ *   永久举着 RUNNING，而 audio_stop() 的放行判据恰好是
++ *   "audio_getnstate() <= PREPARED"（见下），它一个人就能把**所有** STOP
++ *   挡在门外：硬件停不下来、COMPLETE 永远不发、上层状态机顶在 RUNNING，
++ *   往后每一次 CONFIGURE/START 都被那道门静默吞掉却照样返回 OK。
++ *
++ *   真机指纹（2026-10-26）：串口 "AUDIO_IN: started" 打了 22 次、
++ *   "hw_start 真跑了" 一次都没有，armed=0 busy=0，监听守护每 5 秒
++ *   "判定僵尸会话" 重开一圈，麦克风永久失聪 —— 而触发点正是第一句回复
++ *   起播时 OUTPUT 抢 INPUT 那一下。
++ *
++ * Input Parameters:
++ *   upper  - 上半部
++ *   cur    - 本次调用者自己的会话（不清它：它马上要接着起，状态由它自己写）
++ *   why    - 触发原因，只用来打日志；NULL 表示静默
++ *
++ ****************************************************************************/
++
++static void audio_forget_sessions(FAR struct audio_upperhalf_s *upper,
++                                  FAR struct audio_openpriv_s *cur,
++                                  FAR const char *why)
++{
++  FAR struct audio_openpriv_s *priv;
++  int cleared = 0;
++  irqstate_t flags;
++
++  flags = spin_lock_irqsave(&upper->spinlock);
++  for (priv = upper->head; priv != NULL; priv = priv->flink)
++    {
++      if (priv != cur && priv->state > AUDIO_STATE_PREPARED)
++        {
++          priv->state = AUDIO_STATE_OPEN;
++          cleared++;
++        }
++    }
++
++  spin_unlock_irqrestore(&upper->spinlock, flags);
++
++  if (cleared > 0)
++    {
++      syslog(LOG_WARNING,
++             "audio: 清掉 %d 个陈旧的会话记账（%s）—— 不清的话它们会把所有 "
++             "STOP 永久挡在门外\n",
++             cleared, why != NULL ? why : "?");
++    }
++}
++
+ /****************************************************************************
+  * Name: audio_try_enqueue
+  *
+@@ -469,6 +524,7 @@ static int audio_configure(FAR struct file *filep,
    FAR struct audio_lowerhalf_s *lower = upper->dev;
    FAR const struct audio_caps_s *caps = &cap_desc->caps;
    FAR struct audio_openpriv_s *priv = filep->f_priv;
@@ -23,7 +85,7 @@ index 35e1344a92e..8e773c52cc6 100644
    int ret = OK;
  
    DEBUGASSERT(lower->ops->configure != NULL);
-@@ -476,7 +477,40 @@ static int audio_configure(FAR struct file *filep,
+@@ -476,7 +532,66 @@ static int audio_configure(FAR struct file *filep,
    audinfo("configure: status=%d ac_type: %" PRIu8 " \n",
      upper->status->state, caps->ac_type);
  
@@ -57,10 +119,180 @@ index 35e1344a92e..8e773c52cc6 100644
 +
 +      audio_setstate(upper, AUDIO_STATE_PREPARED);
 +      preempted = true;
++
++      /* ★ 被抢的那个 fd 的 priv->state 还停在 RUNNING，必须一并作废
++       * （2026-10-26）。上面这句 lower->ops->stop() 绕过了 audio_stop()，
++       * 而 priv->state = OPEN 只写在 audio_stop() 里 —— 会话被拆了、记账
++       * 却没清，于是它永久举着"我有活会话"，之后**所有** audio_stop() 的
++       * 放行判据（audio_getnstate() <= PREPARED）恒假，硬件永远停不下来、
++       * 永远没人发 COMPLETE，状态机钉死，CONFIGURE/START 全被静默吞掉。
++       * 触发点恰好是第一句回复起播（OUTPUT 抢 INPUT），真机症状就是
++       * 「回了一句就再也不说话」。 */
++
++      audio_forget_sessions(upper, priv, "半双工抢占拆掉了别人的会话");
 +    }
 +
++  /* 转发门（2026-10-21 放宽到 PREPARED）：
++   *
++   * 原来只在 OPEN（或抢占后、或非 INPUT/OUTPUT 类型）转发，于是
++   * "CONFIGURE 过了、还没 START"的 PREPARED 态会把后续 CONFIGURE **静默吞掉**
++   * （返回 OK、驱动毫不知情）。半双工抢占之后这道门是致命的：抢占把状态显式
++   * 落到 PREPARED，接着录音侧重启的 CONFIGURE(INPUT) 正好撞上这道门被吞掉 ——
++   * 驱动看到的 pending_playback 还是那次抢占留下的 true，录音会话带着
++   * playback=1 的标签启动（串口铁证 "hw_start 真跑了：playback=1"），
++   * L5 恢复守卫看着"健康的播放"永久跳过、RX 冻死。
++   *
++   * PREPARED 的语义就是"配好了、还没起"——在这个状态重配一次是**合法**的
++   * （换方向、换采样率都要走这条路），转发它没有任何"改正在跑的会话"的风险：
++   * 真正在跑是 RUNNING/PAUSED，那两个仍然被这道门挡着。 */
++
    if (upper->status->state == AUDIO_STATE_OPEN ||
++      upper->status->state == AUDIO_STATE_PREPARED ||
 +      preempted ||
        (caps->ac_type != AUDIO_TYPE_INPUT &&
         caps->ac_type != AUDIO_TYPE_OUTPUT))
      {
+@@ -501,9 +616,24 @@ static int audio_configure(FAR struct file *filep,
+       upper->info.samplerate =
+           caps->ac_controls.hw[0] | (caps->ac_controls.b[3] << 16);
+       memcpy(&upper->info.codec, &caps->ac_codec, sizeof(caps->ac_codec));
++
++      /* 只有**真的转发给了驱动**才配记账成本 fd "配好了、还没起"
++       * （2026-10-26）。原来这句挂在 if 外面，被门吞掉的 CONFIGURE 也会把
++       * priv->state 改掉：轻则把一个正在跑的 fd 从 RUNNING 降级成 PREPARED
++       * （别人的 STOP 看到 nstate <= PREPARED 就敢停它的硬件），重则让一个
++       * 根本没配过的 fd 冒充 PREPARED。priv->state 是 audio_stop() 放行判据
++       * 的唯一来源，这本账只能记实。 */
++
++      priv->state = AUDIO_STATE_PREPARED;
++    }
++  else
++    {
++      syslog(LOG_WARNING,
++             "audio: CONFIGURE 被吞（status=%d type=%d），驱动没收到，"
++             "不改本 fd 的会话记账（%d）\n",
++             upper->status->state, caps->ac_type, priv->state);
+     }
+ 
+-  priv->state = AUDIO_STATE_PREPARED;
+   return ret;
+ }
+ 
+@@ -546,9 +676,18 @@ static int audio_pause(FAR struct file *filep)
+         }
+ 
+       audio_setstate(upper, AUDIO_STATE_PAUSED);
++
++      /* 同 audio_start：被吞的请求不许记账（2026-10-26）。PAUSED > PREPARED，
++       * 乱记一笔就能把所有 STOP 挡在门外。 */
++
++      priv->state = AUDIO_STATE_PAUSED;
++      return OK;
+     }
+ 
+-  priv->state = AUDIO_STATE_PAUSED;
++  syslog(LOG_WARNING,
++         "audio: PAUSE 被吞（status=%d nstate=%d），驱动没收到，"
++         "不改本 fd 的会话记账（%d）\n",
++         upper->status->state, nstate, priv->state);
+   return OK;
+ }
+ 
+@@ -590,9 +729,19 @@ static int audio_resume(FAR struct file *filep)
+         }
+ 
+       audio_setstate(upper, AUDIO_STATE_RUNNING);
++
++      /* 同 audio_start：只有真的转发给了驱动才配记账成"我手里有活会话"
++       * （2026-10-26）。audio_start 在 PAUSED 态会直接绕进本函数，所以这里
++       * 漏一笔和 start 漏一笔是一样的后果 —— 一个没起来的会话永久举着
++       * RUNNING，把所有 STOP 挡在门外。 */
++
++      priv->state = AUDIO_STATE_RUNNING;
++      return OK;
+     }
+ 
+-  priv->state = AUDIO_STATE_RUNNING;
++  syslog(LOG_WARNING,
++         "audio: RESUME 被吞（status=%d），驱动没收到，不改本 fd 的会话记账"
++         "（%d）\n", upper->status->state, priv->state);
+   return OK;
+ }
+ 
+@@ -652,9 +801,26 @@ static int audio_start(FAR struct file *filep)
+         }
+ 
+       audio_setstate(upper, AUDIO_STATE_RUNNING);
++
++      /* ★ 只有**真的转发给了驱动**才配记账成本 fd "我手里有活会话"
++       * （2026-10-26）。原来这句挂在 if 外面，被门吞掉的 START 也会把
++       * priv->state 置成 RUNNING —— 等于让一个**根本没起来的会话**永久
++       * 举着"我在跑"，而 audio_stop() 的放行判据是
++       * audio_getnstate() <= PREPARED，它一个人就能把之后**所有** STOP
++       * 挡在门外：硬件停不下来、COMPLETE 永远不发、上层状态机顶在
++       * RUNNING，往后每一次 CONFIGURE/START 都被静默吞掉却照样返回 OK。
++       * 真机指纹：串口 "AUDIO_IN: started" 打了 22 次、"hw_start 真跑了"
++       * 一次都没有，armed=0 busy=0，监听守护每 5 秒"判定僵尸会话"重开
++       * 一圈，麦克风永久失聪。被吞时保持原值（CONFIGURE 留下的 PREPARED）
++       * 才是实话：配好了，但没起。 */
++
++      priv->state = AUDIO_STATE_RUNNING;
++      return OK;
+     }
+ 
+-  priv->state = AUDIO_STATE_RUNNING;
++  syslog(LOG_WARNING,
++         "audio: START 被吞（status=%d），驱动没收到，不改本 fd 的会话记账"
++         "（%d）\n", upper->status->state, priv->state);
+   return OK;
+ }
+ 
+@@ -682,10 +848,26 @@ static int audio_stop(FAR struct file *filep)
+ 
+   DEBUGASSERT(upper != NULL && lower->ops->stop != NULL);
+ 
++  /* 硬件 STOP 的放行条件（2026-10-21 放宽）：
++   *
++   * 原来要求 nstate == AUDIO_STATE_OPEN —— 也就是"别的 fd 一个都没配过"才允许
++   * 真的停硬件。可是只要有一个别的 fd 走过 CONFIGURE，它的 priv->state 就会被
++   * audio_configure 末尾那句无条件置成 PREPARED（哪怕这次 CONFIGURE 已经被
++   * 上面的门吞掉了、驱动根本没收到），于是它一个人就能把**所有** STOP 永久挡
++   * 在门外：状态机顶在 RUNNING，之后所有 CONFIGURE/START 被吞，串口表现是
++   * "AUDIO_IN: started" 打了却没有 "hw_start 真跑了"、read 每轮 -110、
++   * rxstuck 循环永不停止。robot_ui 的语音镜像面板常驻一个配过没起的 fd，
++   * 就是真机上把 hello_app 录音钉死的那一个（2026-10-21 现场）。
++   *
++   * PREPARED 的语义是"配好了、还没起"——它手里**没有**硬件会话，不该有资格
++   * 否决别人停硬件。真正需要让路的只有那些手里有活会话的：PAUSED / XRUN /
++   * DRAINING / RUNNING（见 audio_getnstate 的取值顺序，这四个都 > PREPARED）。
++   * 反过来，活跃播放（RUNNING）仍然挡得住录音侧的 STOP，半双工让路不变。 */
++
+   nstate = audio_getnstate(upper, priv);
+   if ((upper->status->state == AUDIO_STATE_RUNNING ||
+        upper->status->state == AUDIO_STATE_PAUSED) &&
+-      nstate == AUDIO_STATE_OPEN)
++      nstate <= AUDIO_STATE_PREPARED)
+     {
+       audinfo("stop: nstate=%d status=%d\n", nstate, upper->status->state);
+       tstate = upper->status->state;
+@@ -712,6 +894,20 @@ static int audio_stop(FAR struct file *filep)
+           return ret;
+         }
+     }
++  else if (upper->status->state == AUDIO_STATE_RUNNING ||
++           upper->status->state == AUDIO_STATE_PAUSED ||
++           upper->status->state == AUDIO_STATE_DRAINING)
++    {
++      /* 硬件明明还说自己在跑，这次 STOP 却**没停到硬件**就放行了。正常情况下
++       * 是"别人手里有活会话、我该让路"（半双工），但同一个形状也会是
++       * "陈旧记账在挡路"—— 后者就是麦克风永久失聪的开始。落一行实证，
++       * 下次一看 nstate 便知是谁在挡。 */
++
++      syslog(LOG_WARNING,
++             "audio: STOP 没停到硬件（status=%d nstate=%d，本 fd 记账 %d）"
++             "—— 若 nstate 是陈旧记账，接下来 CONFIGURE/START 会被静默吞掉\n",
++             upper->status->state, nstate, priv->state);
++    }
+ 
+   priv->state = AUDIO_STATE_OPEN;
+   return OK;
