@@ -8168,71 +8168,78 @@ static void process_ai_dialogue(sm_context_t *ctx)
              (size_t)((frames - send_frames) * sizeof(int16_t)));
     }
 
-  /* ★ 2026-11-02：追问/急救的短回答（「没事」实测约 500 ms）在尾部补静音到
-   *   1 秒再送。真机对照：500 ms 的「没事」→ 火山返回 No text recognized(-61)；
-   *   2 秒的「救命啊救命啊」→ 正常识别。短句本身没问题，是服务端端点判定
-   *   需要一点尾巴。只在 ask_mode 且不足 1 秒时补，普通对话的音频不动。 */
+  /* ★ 2026-11-02：送 ASR 前统一做两件事（只改副本，不动录音/播放）：
+   *
+   *   ① **低电平增益**：真机大量 1.4~1.9 秒语音峰值只有 1600~2200
+   *      （正常说话 3000+），火山判“没人声”直接 -61。峰值低于 3000 时
+   *      抬到约 6000（最多 6×）。这条对**普通对话**同样生效 —— 用户反馈
+   *      “收音不好”，不是麦克风坏，是这段音频电平太低。
+   *   ② **追问/急救短句补静音到 1 秒**：500 ms 的「没事」服务端端点判定
+   *      不够，2 秒的「救命啊救命啊」才稳定。
+   *
+   *   先算峰值，只有确实需要增益/补静音时才 malloc 一份副本；
+   *   长音频（>5 秒）不做增益，避免为几百 KB 的副本折腾堆。 */
   int16_t       *pad_buf    = NULL;
   const int16_t *asr_ptr    = send_ptr;
   size_t         asr_frames = send_frames;
 
-  /* ★ 2026-11-02：报警听窗也补。急救的「没事」走的是普通对话识别
-   *   （g_ask_phase 不是 LISTENING），只判 ask_mode 会漏掉 —— 真机那次
-   *   「没事」只有 560 ms，ASR 直接 -61。 */
-  if ((ask_mode || voice_emerg_is_active()) &&
-      asr_frames > 0 && asr_frames < 48000)
+  if (asr_frames > 0 && asr_frames <= 80000)
     {
-      size_t orig   = asr_frames;
-      size_t target = (orig < 16000) ? 16000 : orig;   /* 至少 1 秒 @16 kHz */
+      int32_t maxabs    = 0;
+      bool    need_pad  = (ask_mode || voice_emerg_is_active()) &&
+                          (asr_frames < 16000);
+      bool    need_gain;
+      size_t  target;
 
-      pad_buf = calloc(target, sizeof(int16_t));
-      if (pad_buf != NULL)
+      for (size_t k = 0; k < asr_frames; k++)
         {
-          int32_t maxabs = 0;
-
-          memcpy(pad_buf, send_ptr, orig * sizeof(int16_t));
-
-          for (size_t k = 0; k < orig; k++)
+          int32_t v = asr_ptr[k] < 0 ? -(int32_t)asr_ptr[k] : asr_ptr[k];
+          if (v > maxabs)
             {
-              int32_t v = pad_buf[k] < 0 ? -(int32_t)pad_buf[k] : pad_buf[k];
-              if (v > maxabs)
+              maxabs = v;
+            }
+        }
+
+      need_gain = (maxabs > 100 && maxabs < 3000);
+      target    = need_pad ? 16000 : asr_frames;   /* 补静音时至少 1 秒 */
+
+      if (need_pad || need_gain)
+        {
+          pad_buf = calloc(target, sizeof(int16_t));
+          if (pad_buf != NULL)
+            {
+              memcpy(pad_buf, asr_ptr, asr_frames * sizeof(int16_t));
+
+              if (need_gain)
                 {
-                  maxabs = v;
+                  int32_t gain = 6000 / maxabs;
+
+                  if (gain > 6) gain = 6;
+                  if (gain < 2) gain = 2;
+
+                  for (size_t k = 0; k < asr_frames; k++)
+                    {
+                      int32_t v = (int32_t)pad_buf[k] * gain;
+
+                      if (v > 32767)  v = 32767;
+                      if (v < -32768) v = -32768;
+
+                      pad_buf[k] = (int16_t)v;
+                    }
+
+                  printf("[AI] ASR 音频增益 x%ld（原始峰值 %ld）\n",
+                         (long)gain, (long)maxabs);
                 }
-            }
 
-          /* ★ 2026-11-02：**过轻的追问/急救音频先抬电平再送 ASR**。
-           *   真机（20:16 报警听窗）：「没事」原始峰值只有 444（正常说话
-           *   3000+），火山直接判"没人声"→ No text recognized，老人只能
-           *   干等按钮。抬高只动 ASR 的副本，不影响播放/录音。 */
-          if (maxabs > 100 && maxabs < 1500)
-            {
-              int32_t gain = 6000 / maxabs;
-
-              if (gain > 8) gain = 8;
-              if (gain < 2) gain = 2;
-
-              for (size_t k = 0; k < orig; k++)
+              if (need_pad)
                 {
-                  int32_t v = (int32_t)pad_buf[k] * gain;
-
-                  if (v > 32767)  v = 32767;
-                  if (v < -32768) v = -32768;
-
-                  pad_buf[k] = (int16_t)v;
+                  printf("[AI] 追问短句补静音：%zu → %zu 帧\n",
+                         asr_frames, target);
                 }
 
-              printf("[AI] 追问短句增益 x%ld（原始峰值 %ld）\n",
-                     (long)gain, (long)maxabs);
+              asr_ptr    = pad_buf;
+              asr_frames = target;
             }
-
-          if (target != orig)
-            {
-              printf("[AI] 追问短句补静音：%zu → %zu 帧\n", orig, target);
-            }
-
-          asr_ptr    = pad_buf;
-          asr_frames = target;
         }
     }
 

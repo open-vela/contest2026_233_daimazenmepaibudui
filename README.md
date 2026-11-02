@@ -239,7 +239,7 @@ contest2026_233_daimazenmepaibudui/
 - `/data` 是 tmpfs：提醒、设置重启丢失。
 - 普通问答首字约 20 秒（ASR ~8s + LLM ~8s + TTS 首块 ~2s）。
 - 实时检索条数受 Tavily 索引限制（中文约 1~3 条）；已取消「第X条详细说说」专门路径。
-- TLS 出站连接堆积（`[TCP] pool` / `st[D…]` 指纹）已在内核定位并修复：TIME_WAIT 到期后补 `tcp_free`，池满时回收已跑过 close work 的 CLOSED 条目；修复已编译，尚需长时间真机回归。
+- TLS 出站连接堆积（`[TCP] pool` / `st[D…]` 指纹）已在内核修复：TIME_WAIT 到期补 `tcp_free`，并在每次新建连接时主动回收僵尸 CLOSED 条目；45 分钟真机回归 `pool` 稳定在 5~7、`D` 为 0~1。
 - 录音 8 秒卡读已加 `owner_gen` 修复，需长时间真机验证。
 
 ## 10. 文档索引

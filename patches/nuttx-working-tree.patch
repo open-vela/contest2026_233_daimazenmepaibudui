@@ -1300,7 +1300,7 @@ index 5cebec18b7f..dc0fb31876b 100644
  #endif /* CONFIG_NET_TCP */
  #endif /* __INCLUDE_NUTTX_NET_TCP_H */
 diff --git a/net/tcp/tcp_conn.c b/net/tcp/tcp_conn.c
-index 685cf266791..399d5729ec2 100644
+index 685cf266791..3aeb3e5e1c6 100644
 --- a/net/tcp/tcp_conn.c
 +++ b/net/tcp/tcp_conn.c
 @@ -597,6 +597,88 @@ int tcp_selectport(uint8_t domain,
@@ -1392,7 +1392,45 @@ index 685cf266791..399d5729ec2 100644
  /****************************************************************************
   * Name: tcp_alloc
   *
-@@ -643,6 +725,22 @@ FAR struct tcp_conn_s *tcp_alloc(uint8_t domain)
+@@ -619,6 +701,37 @@ FAR struct tcp_conn_s *tcp_alloc(uint8_t domain)
+ 
+   tcp_conn_list_lock();
+ 
++  /* ★ 2026-11-02：**主动回收“僵尸 CLOSED”连接**。
++   *
++   *   22:55 真机 12 分钟：pool 2→33、D0→25，TIME_WAIT 分支的修补只覆盖了
++   *   一部分关闭路径 —— 服务端直接 RST / 短连接会绕过 TIME_WAIT，
++   *   状态直达 CLOSED，而 close 回调早已释放，没人 free。
++   *
++   *   判据：crefs==0（没有 socket 引用）+ TCP_CLOSED（没有 TCP 会话）+
++   *   TCP_CLOSE_DIRECT（close work 已跑过，tcp_free 不会早退）。
++   *   每新建一条连接最多回收一条，池子就不会只涨不降；
++   *   真正活着的连接一条都不会满足这个判据。 */
++
++  if (g_tcp_connections.nalloc > 4)
++    {
++      FAR struct tcp_conn_s *dead =
++        (FAR struct tcp_conn_s *)g_active_tcp_connections.head;
++
++      while (dead != NULL)
++        {
++          if (dead->crefs == 0 &&
++              dead->tcpstateflags == TCP_CLOSED &&
++              (dead->flags & TCP_CLOSE_DIRECT) != 0)
++            {
++              nwarn("WARNING: reaping leaked CLOSED conn %p\n", dead);
++              tcp_free(dead);
++              break;
++            }
++
++          dead = (FAR struct tcp_conn_s *)dead->sconn.s_node.flink;
++        }
++    }
++
+   /* Return the entry from the head of the free list */
+ 
+   conn = mempool_allocate(&g_tcp_connections, 0);
+@@ -643,6 +756,22 @@ FAR struct tcp_conn_s *tcp_alloc(uint8_t domain)
  
            /* Is this connection in a state we can sacrifice. */
  
@@ -1415,7 +1453,7 @@ index 685cf266791..399d5729ec2 100644
            if ((tmp->crefs == 0) &&
                (tmp->tcpstateflags == TCP_CLOSED     ||
                 tmp->tcpstateflags == TCP_CLOSING    ||
-@@ -650,7 +748,8 @@ FAR struct tcp_conn_s *tcp_alloc(uint8_t domain)
+@@ -650,7 +779,8 @@ FAR struct tcp_conn_s *tcp_alloc(uint8_t domain)
                 tmp->tcpstateflags == TCP_FIN_WAIT_2 ||
                 tmp->tcpstateflags == TCP_TIME_WAIT  ||
                 tmp->tcpstateflags == TCP_LAST_ACK)  &&

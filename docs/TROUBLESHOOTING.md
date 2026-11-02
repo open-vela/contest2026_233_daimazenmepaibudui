@@ -187,8 +187,11 @@ audio: STOP 没停到硬件（status=5 nstate=5） / 会话[0] #N priv->state=5 
   - `net/tcp/tcp_timer.c`：TIME_WAIT 到期且 `crefs==0 && TCP_CLOSE_DIRECT`
     时直接 `tcp_free`；
   - `net/tcp/tcp_conn.c`：池满回收条件放宽，允许复用已跑过 close work 的
-    CLOSED 条目。
-- 观察：修复后 `D` 应在 TIME_WAIT 到期（约 2 分钟）后回落；仍单调上涨就把
+    CLOSED 条目；并在 `tcp_alloc` 里**每新建一条连接主动回收一条**
+    `crefs==0 + CLOSED + TCP_CLOSE_DIRECT` 的僵尸条目（服务端 RST/短连接
+    会绕过 TIME_WAIT，仅靠定时器不够）。
+- 验证：修复后 45 分钟真机运行 `pool` 稳定在 `5~7`、`D` 为 `0~1`；
+  修复前同长度测试为 `pool 6→29 / D0→21`。仍单调上涨就把
   `[TCP] pool` 行和 `[TLS-FD] open/close` 成对发出来。
 
 ## 9. 烧录 / 启动
