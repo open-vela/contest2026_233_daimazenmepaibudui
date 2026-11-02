@@ -8079,6 +8079,89 @@ static bool realtime_try(const char *text, sm_context_t *ctx)
 }
 
 /**
+ * @brief  本地时间/日期快路（不经过云端）
+ *
+ * 真机：问「现在几点了」原来要 ASR(~6s) + velaclaw LLM(~11s) + TTS(~2s)，
+ * 20 秒才出声。时间和日期是本地 RTC 就能回答的事，直接一句话念。
+ * 本构建没开 CONFIG_LIBC_LOCALTIME，localtime 等于 gmtime —— 手动 +8h。
+ */
+
+static bool time_fast_try(const char *text, sm_context_t *ctx)
+{
+  static const char *const kw[] =
+  {
+    "几点", "现在时间", "什么时间", "几号", "日期", "星期几", "周几",
+    "今天星期", "今天几",
+  };
+
+  static const char *const wd[] =
+  {
+    "日", "一", "二", "三", "四", "五", "六",
+  };
+
+  char   reply[160];
+  time_t now;
+  struct tm tm_buf;
+  size_t i;
+  bool   hit      = false;
+  bool   want_date = false;
+
+  if (text == NULL || text[0] == '\0')
+    {
+      return false;
+    }
+
+  for (i = 0; i < sizeof(kw) / sizeof(kw[0]); i++)
+    {
+      if (strstr(text, kw[i]) != NULL)
+        {
+          hit = true;
+          break;
+        }
+    }
+
+  if (!hit)
+    {
+      return false;
+    }
+
+  if (strstr(text, "几号") != NULL || strstr(text, "日期") != NULL ||
+      strstr(text, "星期") != NULL || strstr(text, "周几") != NULL)
+    {
+      want_date = true;
+    }
+
+  now = time(NULL);
+  if (now < 1704067200)          /* 还没对时：交给大模型/联网对时后再答 */
+    {
+      return false;
+    }
+
+  now += 8 * 3600;               /* UTC+8 */
+  if (gmtime_r(&now, &tm_buf) == NULL)
+    {
+      return false;
+    }
+
+  if (want_date)
+    {
+      snprintf(reply, sizeof(reply),
+               "今天是 %d 月 %d 日，星期%s。现在 %d 点 %d 分。",
+               tm_buf.tm_mon + 1, tm_buf.tm_mday, wd[tm_buf.tm_wday % 7],
+               tm_buf.tm_hour, tm_buf.tm_min);
+    }
+  else
+    {
+      snprintf(reply, sizeof(reply), "现在是 %d 点 %d 分。",
+               tm_buf.tm_hour, tm_buf.tm_min);
+    }
+
+  printf("[时间快路] %s\n", reply);
+  llm_complete_callback(reply, 0, ctx);
+  return true;
+}
+
+/**
  * @brief  报警听窗的 ASR 兜底：火山空结果时用 MiMo 再识别一遍
  *
  * 真机（2026-11-02 23:5x）：报警听窗里老人说「没事」，火山多次返回
@@ -8599,6 +8682,11 @@ static void process_ai_dialogue(sm_context_t *ctx)
     }
 
   if (selfintro_fast_try(text_buf, ctx))
+    {
+      goto dlg_done;
+    }
+
+  if (time_fast_try(text_buf, ctx))
     {
       goto dlg_done;
     }
