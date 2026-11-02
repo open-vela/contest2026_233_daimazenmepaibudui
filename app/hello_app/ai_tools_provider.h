@@ -45,6 +45,34 @@ extern "C" {
 
 #define AI_TOOL_REPORT_EMERGENCY "report_emergency"
 
+/* 定时提醒工具：老人说「八点提醒我吃药」时，真在板子的提醒页建上一条，到点
+ * 弹窗 + 响铃。
+ *
+ * 落地走 mimo_reminder_apply()（mimo_voice.c）—— 与面板语音那条链路的
+ * add_reminder **共用同一份**截断/归一化/hook 调用，不会两条链路漂移。真正
+ * 写进提醒列表并重挂 RTC 闹钟的是 robot_ui 启动时注册的 voice_add_reminder()，
+ * 所以提醒**在设定当时就出现在提醒页**，不是到点才冒出来。
+ *
+ * ⚠️ 与上面同理：这个名字是模型调用时的唯一凭据，清单 JSON
+ * （ai_tools_provider.c 的 AI_TOOLS_ADD_REMINDER_JSON）和 execute 的分支都认
+ * 它，改名等于把这条链从模型手里摘掉。 */
+
+#define AI_TOOL_ADD_REMINDER     "add_reminder"
+
+/* 语音改音量/亮度（「声音小一点」「把亮度调到最亮」）。
+ *
+ * 与 add_reminder 同理：落地走 mimo_settings_apply()（mimo_voice.c）——
+ * 面板语音那条链路的 adjust_setting 也走它，参数校验和 hook 缺失兜底只有一
+ * 份，不会两条链路漂移。真正改 user_settings + 下发硬件 + 存盘的是 robot_ui
+ * 启动时注册的 touch_ui_settings_apply()，**和设置页拖滑块同一条路**，所以
+ * 语音调完再打开设置页，滑块就停在新值上。
+ *
+ * ⚠️ 与上面同理：这个名字是模型调用时的唯一凭据，清单 JSON
+ * （ai_tools_provider.c 的 AI_TOOLS_ADJUST_SETTING_JSON）和 execute 的分支都
+ * 认它，改名等于把这条链从模型手里摘掉。 */
+
+#define AI_TOOL_ADJUST_SETTING   "adjust_setting"
+
 /* device_id 缺省值。**必须和 ai_companion_main.c 里的 LIGHT_DEVICE_ID 是
  * 同一个值**：队友的灯模拟器只认这一台，模型没提哪个灯时我们替它补上。
  * 那个宏在 ai_companion_main.c 里是文件私有的，这里只能各写一份，改一处

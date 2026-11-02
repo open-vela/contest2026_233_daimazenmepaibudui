@@ -9,7 +9,7 @@
 编译时被打进固件里了（genromfs → romfs_etc.c → 链接进 nuttx.bin）。
 
 
-两个特殊文件（都是本机生成、**不进版本库**，见 .git/info/exclude）：
+两个特殊文件（都是本机生成、**不进版本库**，见仓库根目录 .gitignore）：
 
   push_key.txt        手机推送的 device key，运行时被 network_comm.c 读走。
   agent_config.json   ai_agent 的凭据（大模型 key、火山 ASR/TTS 凭据）。

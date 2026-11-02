@@ -10,6 +10,7 @@
 
 #include <nuttx/config.h>
 #include <nuttx/clock.h>     /* clock_systime_ticks / TICK2MSEC：开机起算的运行时长 */
+#include <nuttx/sched.h>     /* sched_dumpstack：卡住线程的调用栈诊断 */
 #include <nuttx/net/tcp.h>   /* tcp_conn_probe()：连接池只读快照，见下方 [TCP] 行 */
 #include <netinet/in.h>      /* ntohs()：[TCP] 行把对端端口转主机序打印 */
 #include <stdio.h>
@@ -26,6 +27,10 @@
 #include "ai_state_machine.h"
 #include "ai_audio.h"
 #include "ai_llm.h"
+/* mimo_chat() 直连兜底：velaclaw/ai_agent 那条 IPC 静默超时（-110）时改走它
+ * 出回答，见 llm_complete_callback 里的兜底那一段。 */
+#include "mimo_voice.h"
+#include "tools/tool_web_search.h"   /* news_search：新浪免 key，新闻快路复用 */
 #include "ai_sound_detect.h"
 #include "sound_event.h"
 #include "ai_care.h"
@@ -79,6 +84,10 @@
  * "说完到有点动静"压到 1 秒上下，体感差别很大。robot_ui 用的是同一份
  * prompt_ack.c（跨 app 符号最终链接时解析）。 */
 #include "prompt_ack.h"
+
+/* 语音急救报警（喊「救命」不需唤醒词 → 响铃 → 10 秒说「没事」就停，否则 Bark）。
+ * 会话闸门（喊了唤醒词才回话）的判定就在本文件里，两者是绑在一起做的。 */
+#include "voice_emerg.h"
 
 /****************************************************************************
  * Pre-processor Definitions
@@ -141,6 +150,9 @@
 /* 同一阵响声的防抖时间：这段时间内再来一次检测直接丢掉 */
 #define ASK_DEBOUNCE_MS          10000
 
+/* 敲击求救：15 秒内连敲两下才算（单下不报，见 sound_event_cb 里的说明）。 */
+#define ASK_IMPACT_CONFIRM_WINDOW_MS 15000
+
 /* 每轮追问最多听多久（毫秒）。
  *
  * 这个值**必须大于** `AUDIO_VAD_SILENCE_TIMEOUT_MS`（ai_audio.h）加一次 ASR
@@ -163,8 +175,18 @@
 /* ASR 结果缓冲 */
 #define ASK_ANSWER_MAX           256
 
-/* 报警/推送里的详情串长度 */
-#define ASK_DETAIL_MAX           192
+/* 报警/推送里的详情串长度。
+ *
+ * ⚠ 192 是**不够的，会真截断**（2026-10-28 抓到 -Wformat-truncation）：
+ *   ask_flow_escalate 拼的是「检测到%s（置信度 %.2f），老人回答「%s」」，
+ *   最后那个 %s 是 ASK_ANSWER_MAX=256 的整句识别文本（最多 255 字节），
+ *   光它一项就超了 192。截断截的正好是**报给家人的报警详情** —— 老人说了
+ *   什么被砍掉一半，这个场景里是最不该省的地方。
+ *   最坏 ≈ 「检测到」9 + 类型名 ~12 + 「（置信度 x.xx），老人回答「」」38
+ *        + 回答 255 + 「」3 ≈ 317 字节，取 448 留足余量。
+ *   顺带记一条通用纪律：这个库里的 -Wformat-truncation **都是真截断**，
+ *   一律加大缓冲解决，不要用 pragma 压掉。 */
+#define ASK_DETAIL_MAX           448
 
 /* 追问回答的判定结果 */
 #define ASK_VERDICT_REASSURED    0    /* 不用帮忙 */
@@ -458,6 +480,19 @@ static bool     g_speech_capturing = false;
  * 别的线程（dialogue_worker 里的 ASR 失败/结果为空）自己就安全，直接调
  * prompt_ack_play_kind()，不用绕这一道。 */
 static volatile bool g_say_miss_pending = false;
+
+/* 「我这边有点问题」要出声的请托（2026-10-26）。
+ *
+ * 这一条**和上面那个理由不一样**，别照着上一条就直接调：我方失败的三个出口
+ * （LLM 请求失败 / TTS 缓冲没了 / 首句合成失败）在响完之后**必定**跟着一次
+ * sm_handle_event() 收尾，而状态机回到"听"要开麦，audio_record_start() 一看
+ * 在播就 audio_play_stop()（ai_audio.c 的半双工切割）。就地起播的下场是
+ * 播放线程刚起、还没出声就被自己收尾那一下掐掉 —— 听感还是"一声不吭"。
+ *
+ * 所以这里也走挂起：置标志先让状态机收尾干净，main_loop_task 下一拍
+ * （≤100 ms）在安静的设备上说。失败路径上多等 100 ms 无所谓，
+ * 稳过"响了又没响"。 */
+static volatile bool g_say_fail_pending = false;
 
 /* 预滚 + 麦克风健康观测（都只在录音线程写，别的线程最多在收尾点读一次快照）。
  *
@@ -815,7 +850,11 @@ static void speech_capture_begin(sm_context_t *ctx)
    * 抢跑 —— 不认，否则就是把状态机从"正在说"切到"正在听"，用户听到的
    * 正是"AI 说话被打断"。 */
 
-  if (g_audio_ctx.record_hold)
+  /* 报警确认期的听窗例外：录音让路锁（record_hold）是 AI 整轮播报用的，
+   * 报警期它就是"铃在响"的同义词。铃已经停下时放行，否则「没事」永远
+   * 进不了累积缓冲。铃还在响（audio_is_playing）仍然不认。 */
+  if (g_audio_ctx.record_hold &&
+      !(voice_emerg_is_active() && !audio_is_playing(&g_audio_ctx)))
     {
       printf("[VAD] 整轮播报中丢弃语音开始（不让旁边的声音把 AI 从说切到听）\n");
       return;
@@ -922,8 +961,30 @@ static uint32_t     g_round_started_ms;   /* 这一轮起算时刻 */
 static uint32_t     g_round_phase_ms;     /* 当前相位起算时刻 */
 static uint32_t     g_round_progress_ms;  /* 最近一次真有进展的时刻（TTS 判停滞用） */
 
-#define ROUND_ASR_MAX_MS    20000
-#define ROUND_LLM_MAX_MS    35000
+/* 「假忙」计时：sm 说 AI_TALKING、可什么都没在播、也没一轮在跑，是从哪一刻
+ * 起算的（0 = 当前不算假忙）。攒够 SM_FAKE_BUSY_GRACE_MS 才动手，理由见
+ * round_watchdog_tick 里那段长注释。 */
+
+#define SM_FAKE_BUSY_GRACE_MS   3000
+static uint32_t     g_fake_busy_since;
+
+/* ASR 相位上限。**20000 是错的，真机实测不够用**（2026-10-29）：
+ * 火山 v3 一次识别的 e2e 实测 13148 / 15427 ms（`[volc_asr] Recognized: …
+ * e2e=15427ms`），也就是说「说完 → 文本到手」本身就可能占掉 15 秒上下，
+ * 20 秒的上限只留 5 秒余量；网络一抖就误判成「卡死」把整轮作废
+ * （真机轮 9/11/15/18 都是 20067~20730 ms 被判死的）。
+ * 取 30000：够覆盖慢网下的识别，又不至于无限等 —— 整轮还有
+ * ROUND_TOTAL_MAX_MS 95 秒兜极端。嫌快/嫌慢就动这一个数。 */
+#define ROUND_ASR_MAX_MS    30000
+/* LLM 相位上限。**35000 是错的，比一道带工具的题还短**（2026-10-29 真机）：
+ * 轮 7 问「你好，今天济南天气怎么样？」，串口实测各段 —— velaclaw 第一轮
+ * 12.7 秒才回工具调用、查天气（两次 TLS 握手）约 10 秒、第二轮等到 -110，
+ * 这时才轮到 mimo_chat 直连兜底；兜底又要把工具从头跑一遍。也就是说
+ * **一道带工具的题怎么也要 40 秒上下**，35 秒的上限注定把它判死，
+ * 老人那边是「说了没反应」。
+ * 取 45000 而不是更大：整轮还有 ROUND_TOTAL_MAX_MS 95 秒兜极端，
+ * 这里只求「够跑完一道带工具的题」，不是无限等。嫌慢/嫌长就动这一个数。 */
+#define ROUND_LLM_MAX_MS    45000
 #define ROUND_TOTAL_MAX_MS  95000
 #define ROUND_TTS_STALL_MAX_MS  25000   /* TTS 连续 25s 没进展 = 卡死 */
 #define ROUND_TTS_MAX_MS       240000   /* TTS 硬上限 4 分钟，只兜极端 */
@@ -1500,8 +1561,147 @@ static void audio_data_callback(const int16_t *data, size_t frames,
  * 每 20ms 一次的录音回调一起锁进去，不值。
  */
 
+/* ===========================================================================
+ * 会话闸门：喊了「你好，openvela」才回话，2 分钟没动静锁回去
+ * ===========================================================================
+ * 为什么要有它：现在 KWS 只是**并行触发器**（kws_dtw.h 写明的），不喊唤醒词
+ * 板子照样听、照样回。对老人家里来说，电视声、旁人说话都会把 AI 引起来。
+ * 闸门之后，喊了唤醒词才解锁 2 分钟；2 分钟没动静就锁回去。
+ *
+ * 三条硬规则（都是用户拍板的）：
+ *   ①「任何一段语音都算有动静」→ 只要会话**已经开**，每段语音都续期。
+ *     ⚠ 锁定期间说话**不续期** —— 否则电视一响就永不锁了。
+ *   ② 急救词**不受闸门限制**（emerg_classify() 在闸门之前判），
+ *     「救命」锁着也要能报警。
+ *   ③ 锁定时说话 → **不出声**，只上屏提示（screen_hint_locked）。
+ *
+ * ⚠ ask_mode 必须放行：摔倒/异常声音检测的追问回答也走 process_ai_dialogue()
+ *   （:6853 附近 ask_mode = (g_ask_phase == ASK_PHASE_LISTENING)）。挡了它，
+ *   「需要帮忙/没事」就被闸门吃掉，那一模块直接废掉 —— 用户明确要求不动它。
+ *   所以闸门的判定点放在 ask_mode 那个分支**之后**。
+ *
+ * 回退：把 SESSION_GATE_ENABLE 置 0，行为逐字回到"什么都回"的现状。
+ *
+ * ★★ 2026-10-31 用户拍板：**取消唤醒词**。原话「我权衡决定：取消唤醒词。
+ *   现在集中问题在板子现有功能的稳定性上」。所以：
+ *     · 闸门关掉（下面这个宏 = 0）—— 说话就回，不用先喊唤醒词；
+ *     · 唤醒词命中不再开锁、不再问候、不再替它开麦，只留一行日志
+ *       （见 kws_wake_tick 里的 KWS_WAKE_ENABLE）。
+ *   要把唤醒词整套找回来：这两个宏都设 1 就行，别的一个字都不用动。
+ *   （原设计的取舍还在：唤醒问候是 live TTS，1~3 秒阻塞 HTTPS + 3 秒播放，
+ *   而板子半双工、喇叭响时麦克风是聋的 —— 问候会吃掉老人抢话的头几个字。
+ *   这是"取消"的次要好处，不是主因；主因是漏命中把人锁在门外。）
+ * ========================================================================= */
+
+#ifndef SESSION_GATE_ENABLE
+#define SESSION_GATE_ENABLE   0
+#endif
+
+/* 唤醒词启用开关（0 = 取消唤醒词，2026-10-31 用户拍板）。
+ * 判据定义在这里是因为下面 session_unlock() 的守卫要用它 —— 宏必须先于
+ * 第一个使用点，否则 -Wundef 会抱怨"未定义按 0 算"。
+ * 语义见 kws_wake_tick 上面那节长注释。 */
+
+#ifndef KWS_WAKE_ENABLE
+#define KWS_WAKE_ENABLE       0
+#endif
+
+#ifndef SESSION_WINDOW_MS
+#define SESSION_WINDOW_MS     (2 * 60 * 1000)
+#endif
+
+/* 0 = 已锁；否则是"锁回来的时刻"（自开机起的 ms） */
+
+static volatile uint32_t g_session_until_ms = 0;
+
+static bool session_is_open(void)
+{
+#if !SESSION_GATE_ENABLE
+  return true;
+#else
+  uint32_t now = main_now_ms();
+
+  return g_session_until_ms != 0 && now < g_session_until_ms;
+#endif
+}
+
+/* 只有唤醒词启用时才有人调它（kws_wake_tick 的 KWS_WAKE_ENABLE 分支）。
+ * 唤醒词一取消就是没人用的死代码 —— 加个守卫免得挂 -Wunused-function
+ * 警告，以后新出的警告才有得看（排查稳定性全靠警告没噪音）。 */
+
+#if KWS_WAKE_ENABLE
+static void session_unlock(const char *why)
+{
+  g_session_until_ms = main_now_ms() + SESSION_WINDOW_MS;
+  printf("[会话] 解锁（%s），%d 秒内不喊唤醒词也能聊\n",
+         why, SESSION_WINDOW_MS / 1000);
+}
+#endif
+
+static void session_renew(void)
+{
+  g_session_until_ms = main_now_ms() + SESSION_WINDOW_MS;
+}
+
+/**
+ * @brief  锁定后说话的提示：**不出声**，只上屏
+ *
+ * robot_ui_bridge_voice_reply() 本来就是只写状态/表情/对话区的
+ * （robot_ui_bridge.c:137），出声是另外的 ask_speak()/TTS —— 所以不用新建
+ * "只上屏"的变体，直接调它就行。
+ */
+
+static void screen_hint_locked(void)
+{
+  printf("[会话] 已锁定，忽略（喊「你好，openvela」解锁）\n");
+  robot_ui_bridge_voice_reply("已锁定，请说「你好，openvela」再和我说话");
+}
+
+/* ★ 唤醒问候（2026-10-31 用户指定措辞）。
+ *
+ * 用户原话：「我说唤醒词之后，板子要回应：你好！有什么需要帮助的吗？」
+ * 原来唤醒之后只有那声 0.43 秒的「嗯，我在」（没预缓存时连这句话都不念，
+ * 只有一声"嘟"）—— 等于没回应。现在真的念出上面那句。
+ *
+ * 代价要说清：live TTS 是阻塞 HTTPS（实测 1~3 秒）+ 播放约 3 秒，而且板子
+ * **半双工**（喇叭在响时麦克风是聋的）。所以老人如果抢在问候语说完之前开口，
+ * 头几个字会被吃掉。正常交互本来就是"喊唤醒词 -> 听它答 -> 再说事"，
+ * 这个窗口通常踩不到；真踩到了，下一轮重问就行。
+ *
+ * 所以另起分离线程做（同 miss_speak_worker 那条路），主循环一秒都不卡。 */
+static void miss_speak_kick(prompt_ack_kind_t kind);
+
+/* 这一轮的「嗯，我在」要不要跳过：唤醒问候已经说过了，再补一声就是两句话
+ * （而且第二声会把还在播的问候顶掉）。一次性标志，用掉即清。 */
+static volatile bool g_wake_greet_pending;
+
+/* ★★ 2026-10-31 用户拍板：**取消唤醒词**。
+ *
+ * 唤醒词命中**只留一行日志**：不开锁、不问候、不替它开麦、不清缓冲。
+ * 板子回到"常开麦，说话就回"的形态 —— 这正是闸门加进去之前的行为，
+ * 也是优先级①「稳定性（别又不能对话了）」要求的形态。
+ *
+ * 为什么取消（用户原话：「我权衡决定：取消唤醒词。现在集中问题在板子
+ * 现有功能的稳定性上」）：真机上漏命中比命中多，漏一次就等于把人锁在
+ * 门外（闸门形态下），老人换个距离换个嗓子就失灵；而"什么词都不用喊"
+ * 这件事本身没有任何坏处 —— 电视声会误触发，但误触发的代价是多说一句
+ * 话，比"喊了不理人"轻得多。
+ *
+ * ★ 要把唤醒词整套找回来：KWS_WAKE_ENABLE 置 1，**同时** SESSION_GATE_ENABLE
+ *   置 1。只开前者 = 只是多一声问候（没有闸门就没有"开锁"这回事）。
+ *
+ * ⚠ 原来这里还有一段「状态机卡在 AI_TALKING 但没在播」的假忙自愈。
+ *   那条**必须留下，但不能留在这里** —— 它过去只在唤醒词命中时才跑，
+ *   唤醒词一取消它就成了死代码，而"sm 卡在 AI_TALKING 出不来"正是
+ *   「AI 不回答」的成因之一（超时是 180 秒，老人等不起）。
+ *   已经搬到 round_watchdog_tick()，每拍都看，不依赖任何词。
+ *
+ * （KWS_WAKE_ENABLE 定义在上面 session_unlock 那一带，这里不再重复。） */
+
 static void kws_wake_tick(sm_context_t *ctx)
 {
+  (void)ctx;
+
   if (!g_kws_hit)
     {
       return;
@@ -1514,20 +1714,57 @@ static void kws_wake_tick(sm_context_t *ctx)
       return;
     }
 
-  /* 正忙就丢弃：判据和 listen_supervise_tick() 的"正忙"保持一致 */
+#if !KWS_WAKE_ENABLE
+
+  /* 取消唤醒词的形态：只留这行，什么都不做。
+   * g_speech_frames 也**不清** —— 那是"丢掉唤醒词本身这几个字"用的，
+   * 现在没有唤醒词要丢，清掉反而会吃掉老人正说着的前半句。 */
+
+  printf("[KWS] 命中唤醒词（slot0）—— 唤醒词已取消，只记录，不改变任何行为\n");
+
+#else
+
+  /* ===== 以下是唤醒词启用时的完整行为（2026-10-31 默认关闭）===== */
+
+  /* ★★ 唤醒词命中 = 用户在喊我们，**无条件开锁**。
+   *
+   * 原来这里是"正忙就整条丢弃（连开锁一起）"。那在会话闸门之前是无害的 ——
+   * 没有闸门，丢了照样回话。加了闸门之后，唤醒词成了**唯一**的开锁手段，
+   * 再丢一次就是把用户锁在门外。真机实测就这么翻的车：
+   *
+   *   [KWS] 命中唤醒词（slot0，距离 1502 ≤ 阈值 1800）      ← 明明命中了
+   *   [KWS] 命中唤醒词，但当前正忙（AITalking/播报/追问），丢弃  ← 被扔了
+   *
+   * 所以：**开锁永远做，不参与"忙不忙"的判断。** */
+
+  session_unlock("唤醒词命中");
+
+  /* 但**不打断正在响的东西**：「响铃不能中断」是硬要求，播报/追问同理。 */
 
   if (audio_is_playing(&g_audio_ctx) ||
       g_ask_phase != ASK_PHASE_IDLE ||
       sm_get_state(ctx) == SM_STATE_AI_TALKING)
     {
-      printf("[KWS] 命中唤醒词，但当前正忙（AITalking/播报/追问），丢弃\n");
+      printf("[KWS] 命中唤醒词：正在响/追问，不打断这一轮（会话已解锁）\n");
       return;
     }
 
   printf("[KWS] 唤醒词命中：从这一刻起收用户的话"
          "（丢掉已累积的 %zu 帧 = 唤醒词本身）\n", g_speech_frames);
 
+  /* ★ 唤醒应答：「你好！有什么需要帮助的吗？」说在**开始收话之前**这一拍
+   *   起线程，和收话并行 —— 主循环不等它。本轮后面那声「嗯，我在」跳过
+   *   （g_wake_greet_pending），否则两句话，而且第二声会把问候顶掉。
+   *   ⚠ 代价：live TTS 阻塞 HTTPS 1~3 秒 + 播放约 3 秒，而半双工下喇叭响时
+   *   麦克风是聋的 —— 老人抢在问候说完前开口，头几个字会被吃掉。 */
+
+  g_wake_greet_pending = true;
+  miss_speak_kick(PROMPT_ACK_KIND_GREET);
+  printf("[KWS] 唤醒应答已起线程：%s\n", PROMPT_GREET_TEXT);
+
   speech_capture_begin(ctx);
+
+#endif
 }
 
 /****************************************************************************
@@ -1599,6 +1836,29 @@ static void gate_voice_tick(sm_context_t *ctx)
     }
 
   g_gate_voice_hint = false;
+
+  /* ★ 2026-11-01：报警确认期必须能听见「没事」。
+   *
+   *   原来下面那条"正忙就丢弃"在报警时也生效（铃响 = 播报、sm = AI_TALKING），
+   *   于是老人说「没事」被直接丢掉；而 voice_emerg 的听窗又只录音、不跑 ASR，
+   *   结果整条链路上没有任何一处会识别这句「没事」—— 现场就是"说没事没反应"，
+   *   只能点屏幕按钮。
+   *
+   *   半双工下铃响时麦克风确实聋，所以只在**铃停下来的听窗**放行；
+   *   状态机是不是 AI_TALKING、有没有追问页都不再拦 —— 这三条在报警期
+   *   都是"铃在响"的副产物，不是真的在跟用户对话。 */
+
+  if (voice_emerg_is_active() && !audio_is_playing(&g_audio_ctx))
+    {
+      if (g_speech_capturing)
+        {
+          return;          /* VAD 已经在收这句话了 */
+        }
+
+      printf("[急救] 听窗内收到人声 -> 开麦收「没事」\n");
+      speech_capture_begin(ctx);
+      return;
+    }
 
   /* 正忙就丢弃：和 kws_wake_tick / listen_supervise_tick 的判据一致
    * （喇叭在响 / 送 ASR / 追问中都不打断，而且这时候 VAD 正在收同一段音频） */
@@ -1996,6 +2256,16 @@ int ai_companion_voice_submit(void)
 
 #define LISTEN_SUPERVISE_WANT_MUTE_MS  5000
 
+/* 被播报抢走设备之后，多久之内**不把"没在录"当成故障**（2026-10-29）。
+ * 报警声是 sf32lb52_alarm.c 一轮一轮放的，一轮之间有停顿，整场最长 60 秒。
+ * 只按上面那个 5 秒算，第 6 秒守护就会去抢设备、把正在放的那一段掐掉
+ * （真机那一场就是这么把播报打断的）。每次真被抢走都把这个时间戳刷新，
+ * 于是整场播报都不去抢，播完 8 秒内自然恢复。
+ * 取 8 秒：盖得住一轮之间的停顿，又不至于播完之后聋太久。
+ * 真要是播放标志卡住不放，LISTEN_SUPERVISE_FORCE_MS（80 秒）那条照旧越过
+ * 一切强行恢复，不会永久聋着。嫌长/嫌短就动这一个数。 */
+#define LISTEN_SUPERVISE_STOLEN_GRACE_MS  8000
+
 /* 【2026-10-16 新增】第四条判据："僵尸会话"——录音标志说在录，驱动却根本
  * 没有会话（armed=0 busy=0）。真机形状（2026-09-16 凌晨开机后第一轮）：
  * ract=1 / wait=-1（线程不在 read 里）/ idle 涨到 50 秒以上 / 驱动计数全程
@@ -2032,6 +2302,14 @@ static uint32_t g_listen_zombie_since;     /* "标志说在录、驱动却没会
                                             * 0 = 没这情况（判据见
                                             * LISTEN_SUPERVISE_ZOMBIE_MS 头顶那段） */
 static bool     g_listen_zombie_logged;    /* 这一次僵尸已报过一行（别 100ms 刷一行） */
+static bool     g_listen_stolen_logged;    /* 这一次「被播报抢走」已报过一行。
+                                            * 只在录音回来时才复位（listen_supervise_tick
+                                            * 那条"还活着"早退里），所以一场播报
+                                            * 只出一行 —— 2026-10-29 那 28 行
+                                            * 「录音线程异常中断」就是没节流。 */
+static uint32_t g_listen_stolen_at;        /* 最近一次被播报抢走的时刻（0=还没发生过）。
+                                            * 每次真被抢走都刷新，配合
+                                            * LISTEN_SUPERVISE_STOLEN_GRACE_MS 用。 */
 
 /**
  * @brief  监听守护：录音不活跃就按退避把它重新拉起来
@@ -2199,11 +2477,49 @@ static void listen_supervise_tick(sm_context_t *ctx)
       g_listen_dead_since = 0;
       g_listen_mute_since = 0;
       g_listen_mute_logged = false;      /* 录音回来了，下一次断开可以重新报一行 */
+      g_listen_stolen_logged = false;    /* 同上：下次真被抢走可以再报一行 */
       g_audio_ctx.record_died = false;   /* 活着就说明上一代的死亡标记没意义了 */
+      g_audio_ctx.record_stolen = false; /* 同上：死因标记一起作废 */
       return;
     }
 
   now = main_now_ms();
+
+  /* 【2026-10-29】被抢走的不算死 —— 这是**半双工的正常让路**，不是故障。
+   *
+   * read 返回 0/EOF 而本层没让它停 ＝ 对面按设计接管了 /dev/audio/audio0。
+   * ★ 关键：抢的人可能压根不带 audio_context_t —— 报警声是
+   *   board/contest_board/src/sf32lb52_alarm.c:282 直接 open() 那个设备、
+   *   裸 write() 出声的，hello_app 这边的 audio_is_playing() 从头到尾都是假，
+   *   所以上面那句「扬声器在响就别抢设备」拦不住它。
+   * 于是下面那条「异常中断 → 紧急重开」每来一次就把设备抢回来一次，
+   * 连着把正在放的那一段打死。真机 2026-10-29 报警按钮按 5 次的现场：
+   * 录音线程 28 次「异常中断」、播放 7 次「等播放完成超时」、
+   * 3 次「播放卡死 5 秒没往前走」—— 之后好几分钟不能对话。
+   *
+   * 处置：只让路，不抢。清掉死因标记、把"要常听却没在录"的计时归零
+   * （对面正在放，那段时间当然没在录，不该算进 5 秒里），然后这一拍就走。
+   * 播完之后那条兜底会在 5 秒内把麦要回来；真要是播放标志卡住不放，
+   * 下面 stale（80 秒）那条照旧会越过一切强行恢复，不会永久聋着。 */
+
+  if (g_audio_ctx.record_stolen)
+    {
+      g_audio_ctx.record_stolen = false;
+      g_audio_ctx.record_died   = false;
+
+      if (!g_listen_stolen_logged)
+        {
+          g_listen_stolen_logged = true;
+          printf("[监听守护] 录音是被播报抢走设备的（半双工正常让路，不是故障）："
+                 "不抢设备，等播完再由「要常听却没在录」那条路恢复\n");
+        }
+
+      g_listen_mute_since  = 0;
+      g_listen_mute_logged = false;
+      g_listen_retry_armed = false;
+      g_listen_stolen_at   = (now != 0) ? now : 1;
+      return;
+    }
 
   /* 【2026-09-21 新加】"want 立着却一直没在录"的计时（判据和取值理由见
    * LISTEN_SUPERVISE_WANT_MUTE_MS 头顶那一段）。能走到这里就说明
@@ -2218,6 +2534,19 @@ static void listen_supervise_tick(sm_context_t *ctx)
 
   want_mute = ((int32_t)(now - g_listen_mute_since) >=
                (int32_t)LISTEN_SUPERVISE_WANT_MUTE_MS);
+
+  /* 【2026-10-29】刚被播报抢走设备就不算"要常听却没在录" —— 那是半双工的正常
+   * 让路，对面正在放。理由和取值见 LISTEN_SUPERVISE_STOLEN_GRACE_MS 头顶：
+   * 报警声整场最长 60 秒、一轮之间还有停顿，只按 5 秒算的话第 6 秒就会去抢
+   * 设备把正在放的掐掉。每次真被抢走都会刷新那个时间戳，所以整场播报都不抢，
+   * 播完 8 秒内自然恢复；80 秒那条 stale 兜底照旧在。 */
+
+  if (want_mute && g_listen_stolen_at != 0 &&
+      (int32_t)(now - g_listen_stolen_at) <
+        (int32_t)LISTEN_SUPERVISE_STOLEN_GRACE_MS)
+    {
+      want_mute = false;
+    }
 
   /* 记下"从哪一刻起听不见了"：只在第一次发现不活跃时置位。
    * 0 是保留值（表示还没断），真拿到 0 就退一格用 1，代价是那一轮少算 1ms。 */
@@ -2272,6 +2601,27 @@ static void listen_supervise_tick(sm_context_t *ctx)
       printf("[监听守护] 录音线程卡在设备读里 %d ms（驱动一次等满只有 5 秒上界，"
              "说明那次等待的超时丢了）：判定这一次会话已死，停掉再重开\n",
              rx_wait);
+
+      /* ★ 2026-11-01：卡住时把**那个线程**的调用栈打出来。
+       *   这一族卡死已经查了两轮（owner_gen 修了"心跳被取消"，但线程仍可能
+       *   卡在 HAL 的无界自旋里）。没有 PC 就只能继续猜；有栈就能直接定到
+       *   bf0_hal_audprc.c / bf0_hal_dma.c 的哪一行。
+       *   60 秒最多打一次，避免一次测试刷爆串口。 */
+
+      {
+        static uint32_t last_dump;
+        pid_t rtid = (pid_t)g_audio_ctx.record_thread;
+
+        if (rtid > 0 &&
+            (last_dump == 0 || (uint32_t)(now - last_dump) >= 60000u))
+          {
+            last_dump = now;
+            printf("[监听守护] 卡住线程 tid=%d 的调用栈（定位卡在哪个 HAL）：\n",
+                   (int)rtid);
+            sched_dumpstack(rtid);
+          }
+      }
+
       died = true;
     }
 
@@ -2452,6 +2802,22 @@ static void listen_supervise_tick(sm_context_t *ctx)
       audio_record_stop(&g_audio_ctx);
       audio_vad_disable(&g_audio_ctx);
       g_audio_started = false;
+
+      /* ★ 2026-10-26：停完再补这一下。
+       *
+       * 上面那次 audio_record_stop() 里那个 AUDIOIOC_STOP **很可能被拒**
+       * ——串口铁证是 `audio: STOP 没停到硬件（status=5 nstate=5，本 fd 记账 0）`，
+       * 有个别的 fd 的 priv->state 卡在 RUNNING，把 audio_stop() 的放行判据
+       * （其它 fd 的 nstate <= PREPARED）恒判为假。于是全局状态机钉在 RUNNING，
+       * 紧跟着的 CONFIGURE/START 全被静默吞掉却照样返回 OK，麦克风永久失聪：
+       * 没轮次、没回复、连失败提示音都不会响（提示音也是轮次走到失败出口才响的）。
+       *
+       * 内核里对症的自愈（audio_forget_sessions）只在「OUTPUT 抢 INPUT」时触发，
+       * 而这个死锁里压根不会有播放 —— 自愈一辈子等不到。这里主动替它打那一下。
+       * 幂等：设备好好的时候白花几毫秒，所以每轮自愈都调，不用先判定。 */
+
+      audio_reclaim_stale(zombie    ? "僵尸会话" :
+                          stalled   ? "卡在读里" : "要常听却没在录");
     }
 
   /* 重开之前清场：上一段会话可能死在"人正说话"中间，g_speech_capturing
@@ -2719,6 +3085,30 @@ static void sound_detect_callback(sound_type_t type, float confidence,
  * 防的是将来有人把模型阈值调松之后误报直接冒到界面上。 */
 #define SOUND_EVENT_MIN_CONF 0.50f
 
+/* ==========================================================================
+ * ★ 统一报警路径（2026-10-31）
+ * ==========================================================================
+ * 用户原话：「ai 报警和自主本地检测到摔倒和异常声音报警是**一个路径**，
+ * 都要按我说的来」——
+ *
+ *   响铃不许断 → 10 秒内说「没事」或点屏幕按钮取消、不通知家人
+ *   → 否则 Bark 通知家人 → 持续响 + 30 秒重发 → 期间说「没事」仍可停。
+ *
+ * 之前这一条（本地摔倒/异常声）走的是**另一套**：robot_ui_alarm_ring() 起铃
+ * + 20 秒追问页，20 秒没人答就按「不用了」—— **不报警、停铃**。和上面那份
+ * 规格正好相反。2026-10-31 真机日志就是这个形状：
+ *
+ *   [小模型] ★命中 fall（置信度 0.67，第 45 窗）
+ *   [门控] 本地小模型命中: 疑似跌倒撞击 -> 先响铃
+ *   [Ask]   询问页已弹出：原因=疑似跌倒撞击 67%
+ *   [Ask]   询问超时（20 秒无人应答），自动按「不用了」处理
+ *   [Ask]   确认未通过（来源=超时）：不报警、停铃     <-- 老人真摔了就没人知道
+ *
+ * 改法：把这一条也交给 voice_emerg.c（语音急救那条已经把上面整套实现了），
+ * 唯一的报警引擎就是它。想整体退回旧的 20 秒追问那套，
+ * 把 voice_emerg.h 里的 ALARM_UNIFY_VOICE_EMERG 改成 0。
+ * ======================================================================== */
+
 /**
  * @brief  本地小模型（摔倒 / 敲击 / 尖叫）命中回调
  *
@@ -2735,6 +3125,7 @@ static void sound_detect_callback(sound_type_t type, float confidence,
 static void sound_event_cb(int cls, float conf, void *arg)
 {
   static uint32_t last_ms[SOUND_EVENT_SCREAM + 1];
+  static uint32_t first_impact_ms;
   sound_type_t type;
   const char *what;
   char reason[64];
@@ -2767,21 +3158,75 @@ static void sound_event_cb(int cls, float conf, void *arg)
       return;
     }
 
-  /* 已经有一轮追问在跑：不叠加，也不排队 */
+  /* 已经有一轮追问 / 一轮统一报警在跑：不叠加，也不排队。
+   * 后半个条件是 2026-10-31 加的：统一报警路径下不再走追问流程，
+   * 防重入的判据要换成"voice_emerg 在不在报警"。 */
 
-  if (g_ask_phase != ASK_PHASE_IDLE)
+  if (g_ask_phase != ASK_PHASE_IDLE
+#if ALARM_UNIFY_VOICE_EMERG
+      || voice_emerg_is_active()
+#endif
+     )
     {
-      printf("[门控] 追问流程进行中，忽略本地小模型这次命中（%s %.2f）\n",
+      printf("[门控] 已有一轮报警/追问在跑，忽略本地小模型这次命中（%s %.2f）\n",
              sound_event_class_name(cls), (double)conf);
       return;
     }
 
-  /* 防抖：同一类 10 秒内只上报一次。模型那 8s 不应期是按"类"记窗口号的，
-   * 同一个声响本来就会连着出好几个窗，这里再压一道，顺便挡住"同一类里
-   * 换了个声响"（例如连着敲两下）。 */
-
   now = main_now_ms();
-  if (last_ms[cls] != 0 && now - last_ms[cls] < ASK_DEBOUNCE_MS)
+
+  /* ★ 2026-11-01：**fall 和 knock 都按"撞击"计数**，15 秒内两次才报警。
+   *
+   *   真机数据：用户连敲桌子时，模型 top1=fall 0.57~0.63 出现多次，
+   *   knock 一次都没有；而开机的持续环境噪声也是 fall 0.74。也就是说
+   *   模型分不清"敲击/跌倒/噪声"，单靠阈值（0.55 误报 / 0.80 漏真敲）
+   *   切不开。所以：
+   *
+   *     · 单次置信度 ≥ 0.80  → 非常像的真事件，直接报警；
+   *     · 15 秒内第二次撞击（fall/knock 任意组合）→ 确认求救，报警；
+   *     · 单次 0.55~0.80     → 只记时间，不报警（开机的单发噪声落在这里）。
+   *
+   *   模型侧 fall/knock 的不应期都降到 2 秒（SE_REFRACT_WIN_IMPACT），
+   *   连敲两下能各自出一次命中；下面的通用 10 秒防抖对撞击跳过，
+   *   否则第二下会被当成"同类重复"吞掉。 */
+
+  if (cls == SOUND_EVENT_FALL || cls == SOUND_EVENT_KNOCK)
+    {
+      if (conf >= 0.80f)
+        {
+          printf("[门控] 撞击置信度 %.2f ≥ 0.80 -> 单次直接报警\n",
+                 (double)conf);
+          first_impact_ms = 0;
+        }
+      else if (first_impact_ms != 0 &&
+               (uint32_t)(now - first_impact_ms) <=
+                   ASK_IMPACT_CONFIRM_WINDOW_MS)
+        {
+          printf("[门控] 15 秒内第二次撞击（间隔 %u ms，%s %.2f）"
+                 "-> 确认求救，进入报警\n",
+                 (unsigned)(now - first_impact_ms),
+                 sound_event_class_name(cls), (double)conf);
+          first_impact_ms = 0;
+        }
+      else
+        {
+          first_impact_ms = now;
+          printf("[门控] 第一次撞击（%s %.2f），先不报警；"
+                 "15 秒内再来一次才报\n",
+                 sound_event_class_name(cls), (double)conf);
+          return;
+        }
+    }
+  else
+    {
+      first_impact_ms = 0;   /* 别的类插进来，重新从第一下算 */
+    }
+
+  /* 防抖：同一类 10 秒内只上报一次（撞击由上面的两次确认逻辑负责，
+   * 不再套这一层，否则第二下会被这里吞掉）。 */
+
+  if (cls != SOUND_EVENT_FALL && cls != SOUND_EVENT_KNOCK &&
+      last_ms[cls] != 0 && now - last_ms[cls] < ASK_DEBOUNCE_MS)
     {
       printf("[门控] 同类（%s）距上次上报 %u ms，防抖忽略\n",
              sound_event_class_name(cls), (unsigned)(now - last_ms[cls]));
@@ -2811,7 +3256,7 @@ static void sound_event_cb(int cls, float conf, void *arg)
   snprintf(reason, sizeof(reason), "%s %d%%", what,
            (int)(conf * 100.0f + 0.5f));
 
-  printf("[门控] 本地小模型命中: %s（%s → %s, 置信度 %.2f）→ 先响铃\n",
+  printf("[门控] 本地小模型命中: %s（%s → %s, 置信度 %.2f）→ 走统一报警路径\n",
          what, sound_event_class_name(cls),
          sound_detect_get_type_name(type), (double)conf);
 
@@ -2826,6 +3271,19 @@ static void sound_event_cb(int cls, float conf, void *arg)
    *   点「是的，报警」 ⇒ 走既有报警页那条收口，铃不停、连着一路响。
    * 起铃失败也不拦流程：询问页照旧会弹，只是这一次不响（那一行日志会说明原因）。 */
 
+#if ALARM_UNIFY_VOICE_EMERG
+  /* ★ 统一报警路径：铃 + 10 秒确认 + 「没事」取消 + 超时 Bark + 30 秒重发
+   *   + 持续响 —— 全在 voice_emerg 里，和语音说「救命」那条是**同一份实现**。
+   *
+   *   这里**不再走追问流程**，两个理由：
+   *     ① 语音追问会开口说话（「请问需要帮助吗？」），和"响铃不能中断"抢
+   *        半双工的喇叭 —— 一说话铃就停，正好违反硬要求；
+   *     ② 它那 20 秒超时是按「不用了」处理的（停铃、不报警），和用户要的
+   *        "10 秒内不答就直接联系家人"正好相反。 */
+
+  g_last_abnormal_ms = now;
+  voice_emerg_trigger(sound_detect_get_type_name(type), reason);
+#else
   (void)robot_ui_alarm_ring(reason);
 
   /* 复用既有的「异常声 → 追问流程」：和 sound_detect_callback() 一样只置标志，
@@ -2840,6 +3298,7 @@ static void sound_event_cb(int cls, float conf, void *arg)
   g_ask_play_done = false;
   g_ask_answer[0] = '\0';
   g_ask_phase = ASK_PHASE_PENDING;
+#endif
 
   /* 「是否报警？」询问框（红屏）：任何线程可调，内部自己投到 LVGL 线程 */
 
@@ -3210,6 +3669,90 @@ static int ask_classify(const char *text)
     {
       if (strstr(text, g_ask_sos_keywords[i]) != NULL)
         {
+          return ASK_VERDICT_EMERGENCY;
+        }
+    }
+
+  return ASK_VERDICT_UNCLEAR;
+}
+
+/* ===========================================================================
+ * 语音急救词（唤醒词闸门的旁路）
+ * ===========================================================================
+ * 老人喊「救命」「着火了」这类话时，**不许被唤醒词闸门挡掉**，要直接走报警。
+ * 位置在 process_ai_dialogue() 的最前面（灯控/提醒/送大模型之前）。
+ *
+ * ⚠ 否定表**故意不复用 g_ask_neg_keywords**，虽然那张表看起来现成。理由：
+ *   那张表里有「没事」「还好」「挺好」这类**宽安抚词**，它的口径是「老人回答
+ *   一个是非问题（需要帮忙吗）」。拿它来过滤一句急救宣言会漏掉真急救 ——
+ *   「我没事，就是胸口疼」「他挺好，但我摔了」都会被前面的安抚词压掉。
+ *   安全取向：**宁可误报一次假警打扰家人，也不能漏掉真急救**。
+ *
+ *   所以这里的否定表只收**无歧义的"别动手"**：别报 / 不要报 / 不用报 /
+ *   别叫 / 不要叫 / 不用叫 / 开玩笑 / 逗你。像「我没摔」「没着火」这种
+ *   都不收 —— 「他没摔，但是我胸口疼」里就带着它们，收了会吃掉真急救。
+ *
+ * ⚠ 正表严格只用用户拍板的那 10 个词，不扩。扩词的代价是假警报，
+ *   比如收「帮」「疼」「痛」（g_ask_sos_keywords 里有）——
+ *   「帮我看看这个」「有点头痛」都会直接拉警报。
+ *
+ * 判定顺序**必须**否定在前、急救在后，和 ask_classify() 同一个道理：
+ * 「别报警」三个字里就含「报警」。
+ * ========================================================================= */
+
+static const char *const g_voice_sos_neg_keywords[] =
+{
+  "别报", "不要报", "不用报", "别叫", "不要叫", "不用叫",
+  "开玩笑", "逗你",
+};
+
+static const char *const g_voice_sos_keywords[] =
+{
+  "救命", "报警", "打110", "着火", "起火", "冒烟",
+  "我不舒服", "胸口疼", "摔了", "摔倒",
+  /* ★ 2026-11-02：ASR 误听变体 —— 真机把「救命」听成过这些 */
+  "救民", "九命", "就命", "救命啊", "救命的", "救命啊快来",
+  "快来人", "来人啊", "有人吗", "救命啊快来人",
+  "着火了", "着火啦", "起火了", "冒烟了",
+  "我不舒服啊", "我难受", "我疼", "摔了呀", "我摔倒了",
+  "打120", "叫救护车", "叫医生", "快救我",
+};
+
+/**
+ * @brief  判定一句识别结果是不是「不喊唤醒词也该报警」的急救话
+ * @return ASK_VERDICT_EMERGENCY = 是；ASK_VERDICT_UNCLEAR = 不是
+ *
+ * 只回这两值，不复用 ASK_VERDICT_REASSURED ——「没事」那一路归报警确认流程
+ * （voice_emerg.c）管，那是报警响起来之后的事，跟这里"要不要报警"是两件事。
+ */
+
+static int emerg_classify(const char *text)
+{
+  size_t i;
+
+  if (text == NULL || text[0] == '\0')
+    {
+      return ASK_VERDICT_UNCLEAR;
+    }
+
+  for (i = 0; i < sizeof(g_voice_sos_neg_keywords) /
+                  sizeof(g_voice_sos_neg_keywords[0]); i++)
+    {
+      if (strstr(text, g_voice_sos_neg_keywords[i]) != NULL)
+        {
+          printf("[急救词] 否定命中「%s」，不报警: %s\n",
+                 g_voice_sos_neg_keywords[i], text);
+          return ASK_VERDICT_UNCLEAR;
+        }
+    }
+
+  for (i = 0; i < sizeof(g_voice_sos_keywords) /
+                  sizeof(g_voice_sos_keywords[0]); i++)
+    {
+      if (strstr(text, g_voice_sos_keywords[i]) != NULL)
+        {
+          printf("[急救词] 命中「%s」-> 走报警: %s\n",
+                 g_voice_sos_keywords[i], text);
           return ASK_VERDICT_EMERGENCY;
         }
     }
@@ -4000,6 +4543,16 @@ static char   g_tts_text[LLM_MAX_OUTPUT_LENGTH + 1];
 static char   g_tts_shown[LLM_MAX_OUTPUT_LENGTH + 1]; /* 屏上正在显示的前缀 */
 static size_t g_tts_text_pos;               /* 生产者已经合成到哪个字节 */
 
+/* 送去大模型的那句用户原话，留给 llm_complete_callback 做直连兜底用。
+ * 发之前抄一份（process_ai_dialogue 里的 text_buf 是栈上的，回调那会儿早没了）。
+ * ⚠️ 不是跨轮安全的：llm_send_text 用 -EBUSY 把并发挡掉，所以"发 → 回调"
+ * 这段时间里不会再有人写它；但一轮的回调迟到到下一轮之后，兜底会拿新句子去问。
+ * 那种情况本来就被 g_round 校验作废了（见 llm_complete_callback 里的核对）。 */
+static char   g_llm_sent_text[LLM_MAX_INPUT_LENGTH];
+
+/* mimo_chat() 直连兜底的答案槽。和 g_tts_text 一样大，避免兜底那条被截在半句上。 */
+static char   g_llm_fallback_reply[LLM_MAX_OUTPUT_LENGTH + 1];
+
 /* ── 轮次收摊 / 排空判据 / 轮次看门狗（S1.1）─────────────────────────────
  *
  * 这三样是小智那套「世代代数 + 排空后再开听 + 主任务单线程推进」在本机
@@ -4127,12 +4680,84 @@ static void round_watchdog_tick(sm_context_t *ctx)
       round_hold_give("轮次看门狗：持锁超期");
     }
 
+  /* ★ 2026-11-01：**报警 3 分钟兜底**（不依赖 voice_emerg 工作线程）。
+   *
+   *   voice_emerg 的到点检查只在工作线程的听窗里跑（ve_on_tick）；真机 v24
+   *   出现过「#43 听 … 起」之后没有「收」、也没有「180 秒到点」——工作线程
+   *   卡在某一轮里，铃就一直响（用户看到的就是"报警页面卡了"）。
+   *   主循环 100ms 一拍、只要 hello_app 还活着就一定会跑到这里：
+   *   到 180 秒无条件 voice_emerg_cancel()，铃/推送/页面都能收。
+   *   加 static 防重：工作线程没及时落到 CANCELLED 时不要每 100ms 刷一次。 */
+
+  {
+    static bool autostop_forced;
+
+    if (voice_emerg_is_active() &&
+        voice_emerg_elapsed_ms() >= VOICE_EMERG_AUTOSTOP_MS)
+      {
+        if (!autostop_forced)
+          {
+            autostop_forced = true;
+            printf("[急救] ★ 主循环兜底：%d 秒到点，强制收摊\n",
+                   VOICE_EMERG_AUTOSTOP_MS / 1000);
+            voice_emerg_cancel("主循环超时兜底");
+          }
+      }
+    else if (!voice_emerg_is_active())
+      {
+        autostop_forced = false;
+      }
+  }
+
+  now = main_now_ms();
+
   if (g_round_phase == ROUND_PHASE_IDLE)
     {
+      /* ★★ 2026-10-31：「假忙」自愈搬到这里，**每拍都看**。
+       *
+       * 原来它只在 kws_wake_tick()（唤醒词命中）里跑 —— 唤醒词一取消就成
+       * 死代码，而这个形状恰恰是「AI 不回答」最常见的一种：
+       *
+       *   状态机说 AI_TALKING（超时 180 秒！），可实际上什么都没在播、
+       *   也没有一轮在跑 —— 上一轮被拒后 sm 没复位，就在这儿挂满 3 分钟，
+       *   期间每一次提交都被"正忙"吃掉。老人看到的就是"说了不理人"。
+       *
+       * 判据收得很死（三条同时成立才算假忙），误伤面接近 0：
+       *   ① 没有一轮在跑（g_round_phase == IDLE）—— 有轮在跑就不是假忙；
+       *   ② 追问流程没在跑（g_ask_phase == IDLE）—— 摔倒那条追问不动它；
+       *   ③ 状态机说在说、可喇叭一点声都没有 —— 真在播就绝不动它
+       *      （「响铃不能中断」是硬要求）。
+       * 再加 3 秒宽限：进 AI_TALKING 到起播之间本来就有几十~几百毫秒空档
+       * （ASR/LLM 那两段 playing 也确实是 false），不给宽限会把正常的轮次
+       * 掐死在摇篮里。3 秒 vs 原来那个 180 秒超时，老人等的是秒级。 */
+
+      if (sm_get_state(ctx) == SM_STATE_AI_TALKING &&
+          g_ask_phase == ASK_PHASE_IDLE &&
+          !audio_is_playing(&g_audio_ctx))
+        {
+          if (g_fake_busy_since == 0)
+            {
+              g_fake_busy_since = now;
+            }
+          else if ((int32_t)(now - g_fake_busy_since) >=
+                   SM_FAKE_BUSY_GRACE_MS)
+            {
+              printf("[轮次] ★★ 状态机卡在 AI_TALKING 但 %d ms 没在播、"
+                     "也没一轮在跑（假忙）—— 拉回可听，别让它挂到 180 秒超时\n",
+                     SM_FAKE_BUSY_GRACE_MS);
+              g_fake_busy_since = 0;
+              sm_handle_event(ctx, SM_EVENT_AI_ERROR);
+            }
+        }
+      else
+        {
+          g_fake_busy_since = 0;
+        }
+
       return;
     }
 
-  now = main_now_ms();
+  g_fake_busy_since = 0;
 
   /* TTS 段不看墙钟总长，只判"停滞"（理由见上面 ROUND_PHASE 那段注释）：
    * 念得久不是病，念不动才是。 */
@@ -4351,7 +4976,98 @@ static void llm_complete_callback(const char *response, int error,
 
   if (error != 0)
     {
+      /* ★ 2026-10-26 直连兜底。**先说清楚它不是为"正常的慢"准备的**：
+       * 真机实测一轮健康对话 `latency=11454ms`（见 ai_llm.h 里 LLM_HTTP_TIMEOUT_MS
+       * 那段），所以 LLM_HTTP_TIMEOUT_MS 必须盖得住它 —— 我一度把它调到 8000，
+       * 结果在答案到达前 3.4 秒就把一轮好好的回答判死了，那是错的，已改回 30000。
+       * 这里只在**真挂死**时兜底。
+       *
+       * 真挂死的形态（2026-10-26 串口取证）：agent_loop 收到了消息、`llm_chat_tools`
+       * 也拼好了请求并打出 `[llm] OpenAI API with tools (...)`，TLS 握手 OK，然后
+       * **卡在 llm_http_call 的 HTTPS 收发里再也不出来** —— `HTTP call failed` /
+       * `API error` / `All %d retries failed` 全都一行不打（那条出错路径本身也是
+       * 静默的，见 llm_proxy.c:762-765），于是 agent_loop 那条任务永久占住，
+       * 一条回复都不发，我方只能等到看门狗到点回 -ETIMEDOUT(-110)。
+       * 这一族和板子 RNDIS 批端点楔死（NETDEV WATCHDOG 5 秒 TX 超时）是同一类。
+       *
+       * ⚠️ 更正一条**已证伪**的旧判断：曾经以为是「消息进 message_bus 后没人取」，
+       * 理由是 velaclaw_client_open 的检查是空壳、push_inbound 不校验消费者。
+       * 前两条仍是事实，但结论错了 —— agent_loop 是活的（它靠 `NL fast path` 本地
+       * 答过时间问题，279 ms 就回；串口有 `[agent] Dispatching response →
+       * local_client:elder_companion`）。别再往那个方向查。
+       *
+       * 改走 mimo_chat() 直连：同一个 key、同一个 host，ASR/TTS 走的正是这条路。
+       * ⚠️ 它和仍卡着的那条 HTTPS 是并发的，vela_tls 会打 `Another HTTPS request
+       * is in flight, running without serialization`，实测兜底自己也可能失败
+       * （真机上是 -12）。所以兜底失败了不要惊讶，那是撞上同一个挂死，不是新毛病。
+       *
+       * ⚠️ 迟到的 velaclaw 回包不会造成双份播报：它只写 backend_reply + post 一次
+       * 信号量，真正调 llm_complete_callback 的是请求线程；下一次请求开头那圈
+       * sem_trywait 排水（ai_llm.c:435）会把它收掉。 */
+
+      printf("[LLM] AI请求失败: %d（velaclaw 那条），改走 mimo_chat 直连兜底\n",
+             error);
+
+      /* ★ 兜底是**从头再问一遍**，得给它一份完整的时间预算。
+       *
+       * 真机 2026-10-29（轮 7）实测到的死法：velaclaw 那条跑掉 25 秒以上才
+       * 等到 -110，这时 LLM 相位已经烧掉一大半；兜底刚开始跑第一轮工具，
+       * 轮次看门狗就到了，整轮作废 —— **兜底在结构上永远跑不完一道带工具的
+       * 题**，因为它的预算=总预算减去已经烧掉的时间。老人那边是「说了没反应」。
+       *
+       * 这里把 LLM 相位**重新起算**：兜底是新的一整轮尝试，理应有它自己的
+       * 一份预算，不能替前面那条卡死的路买单。极端情况仍有整轮
+       * ROUND_TOTAL_MAX_MS 95 秒兜着，所以这不是「无限等」。 */
+      if (g_round_phase == ROUND_PHASE_LLM)
+        {
+          printf("[轮次] 直连兜底开始，LLM 相位重新起算（新的一整轮尝试）\n");
+          round_phase_set(ROUND_PHASE_LLM);
+        }
+
+      g_llm_fallback_reply[0] = '\0';
+      {
+        int fb = mimo_chat(g_llm_sent_text, g_llm_fallback_reply,
+                           sizeof(g_llm_fallback_reply));
+
+        /* ★★ 2026-10-31：判据原来是 `fb == 0` 才算成功，**恒为假** ——
+         *   mimo_chat() 成功返回的是**正文长度**（mimo_voice.c 结尾那句
+         *   `ret = (int)strlen(reply_out); return ret;`，非空正文必然 ≥1），
+         *   失败返回负 errno，它**永远不会返回 0**。于是兜底每次都真的拿到了
+         *   答案、每次都走 else 被当成"也失败"扔掉，老人听到的是
+         *   「我这边有点问题」。真机铁证（2026-10-31 一段测试里两次）：
+         *       [LLM] 直连兜底成功…
+         *       [mimo] chat: 回复 174 字节
+         *       [LLM] 直连兜底也失败（174），按原路报错   ← 174 就是答案长度
+         *   判 `fb > 0`（长度）即可；保留正文非空的双保险，两者的语义一致。 */
+
+        if (fb > 0 && g_llm_fallback_reply[0] != '\0')
+          {
+            printf("[LLM] 直连兜底成功（%d 字节，%u 个字符），用这条回复往下走\n",
+                   fb, (unsigned)strlen(g_llm_fallback_reply));
+            response = g_llm_fallback_reply;
+            error = 0;
+          }
+        else
+          {
+            printf("[LLM] 直连兜底也失败（返回 %d，%s），按原路报错\n",
+                   fb, fb < 0 ? "负值=错误码" : "零长=空回复");
+          }
+      }
+    }
+
+  if (error != 0)
+    {
       printf("[LLM] AI请求失败: %d\n", error);
+
+      /* 我方掉了，不能一声不吭（2026-10-26，用户原话「明明屏幕上有字了，
+       * 但是没有开口说话」；老人看不到屏，静音对他就是"不回复"）。
+       *
+       * 说"我这边有点问题"而不是"没听清"：老人没说错，让他再问一遍只会
+       * 撞上同一个故障。文案走 PROMPT_FAIL_TEXT 上屏给镜像看，喇叭那声
+       * 挂起给 main_loop_task 说（就地起播会被下面这句收尾掐掉）。 */
+      robot_ui_bridge_voice_reply(PROMPT_FAIL_TEXT);
+      g_say_fail_pending = true;
+
       round_phase_set(ROUND_PHASE_IDLE);
       sm_handle_event(ctx, SM_EVENT_AI_ERROR);
       return;
@@ -4419,6 +5135,9 @@ static void llm_complete_callback(const char *response, int error,
       printf("[TTS] 缓冲分配失败，跳过合成\n");
       /* 出不了声，至少把字摆上屏，别让人以为面板坏了 */
       robot_ui_bridge_voice_reply(response);
+      /* 屏上已经有正文了，只补喇叭那声（2026-10-26，见 g_say_fail_pending）。
+       * 这条不该是网络问题，重试没意义 —— 堆就是没有。 */
+      g_say_fail_pending = true;
       round_phase_set(ROUND_PHASE_IDLE);
       sm_handle_event(ctx, SM_EVENT_AI_RESPONSE);
       return;
@@ -4429,6 +5148,13 @@ static void llm_complete_callback(const char *response, int error,
 
   strncpy(g_tts_text, response, sizeof(g_tts_text) - 1);
   g_tts_text[sizeof(g_tts_text) - 1] = '\0';
+
+  /* 出声前清洗：Markdown 记号 + 工具结果 JSON 整块不能念出来（模型有时会把
+   * {"ok":false,"error":{...}} 这种工具返回原样抄进回复，老人会听到一串「引号
+   * ok 冒号 false」）。mimo_voice.c 一份，两条链路共用。 */
+
+  tts_text_sanitize(g_tts_text);
+
   g_tts_text_pos = 0;
   g_tts_shown[0] = '\0';
 
@@ -4478,10 +5204,39 @@ static void llm_complete_callback(const char *response, int error,
 
   ret = mimo_tts_speak_head(g_tts_text, g_tts_pcm[0], g_tts_pcm_cap,
                             MIMO_TTS_HEAD_CHUNK_CHARS, &chunk_len, &consumed);
+
+  /* ★ 首句失败先隔 300 ms 重试一次再认输（2026-10-26，修用户报的「有时候
+   * 听到了我的问题，不回复」）。
+   *
+   * 为什么值得重试：首句合成是一次 HTTPS，失败里绝大多数是网络/TLS 抖一下
+   * —— 那种是**瞬时**的，再来一次有很大概率就过了。而认输的代价是整轮彻底
+   * 不出声，用户听到的就是"问了没反应"。
+   *
+   * 为什么要等 300 ms：TLS 断链重建要时间，立刻重试容易撞上同一个坏连接，
+   * 那次重试就是白付一次握手。300 ms 够底层把连接丢掉重建，又远短于人能
+   * 察觉的停顿（本来这后面还有几秒合成）。
+   *
+   * 为什么只重试首句：首句是"出没出声"的分水岭 —— 它失败 = 这一轮彻底哑；
+   * 后续块失败只是少念一段，前面已经出过声了，重试反而把空档拖长。 */
   if (ret < 0 || chunk_len == 0 || consumed == 0)
     {
-      printf("[TTS] 首句合成失败: %d\n", ret);
+      printf("[TTS] 首句合成失败: %d（隔 300 ms 重试一次）\n", ret);
+      usleep(300 * 1000);
+      chunk_len = 0;
+      consumed  = 0;
+      ret = mimo_tts_speak_head(g_tts_text, g_tts_pcm[0], g_tts_pcm_cap,
+                                MIMO_TTS_HEAD_CHUNK_CHARS, &chunk_len,
+                                &consumed);
+    }
+
+  if (ret < 0 || chunk_len == 0 || consumed == 0)
+    {
+      printf("[TTS] 首句合成重试后仍失败: %d\n", ret);
       robot_ui_bridge_voice_reply(response);   /* 出不了声也要让字上屏 */
+      /* 屏上已经有正文了，只补喇叭那声（见 g_say_fail_pending）。
+       * 重试都过了这一轮还是不出声，老人必须听见点什么，否则他会以为
+       * 机器坏了 / 自己没说清，然后再问一遍，再撞一次同样的故障。 */
+      g_say_fail_pending = true;
       round_phase_set(ROUND_PHASE_IDLE);
       sm_handle_event(ctx, SM_EVENT_AI_RESPONSE);
       return;
@@ -4498,6 +5253,19 @@ static void llm_complete_callback(const char *response, int error,
 
   /* 第一句开播的这一刻，屏上才出这一句 */
   memcpy(g_tts_shown, g_tts_text, consumed);
+  /* ★ 2026-11-01：**长回复自动打开语音面板**。
+   *
+   *   主屏那行 AI 字幕是"最多两行 + LV_LABEL_LONG_DOT"（刻意给脸让位），
+   *   长回复必然在末尾显示省略号。用户的原话就是"说到后面屏幕上的字变成
+   *   了省略号"。两行字幕不改布局，长回复时把语音面板打开——面板里的
+   *   `voice_reply_lbl` 是 WRAP/可滚动，能看到完整正文。
+   *   阈值 96 字节（约 32 个汉字）：短回复不弹面板，免得打扰。 */
+
+  if (response != NULL && strlen(response) > 96)
+    {
+      robot_ui_bridge_voice_panel_open();
+    }
+
   g_tts_shown[consumed] = '\0';
   robot_ui_bridge_voice_reply(g_tts_shown);
 
@@ -4900,18 +5668,24 @@ static light_intent_t light_intent_classify(const char *text)
 }
 
 /**
- * @brief  说一句灯控回话（复用现成的 TTS + 播放链路，**预缓存优先**）
+ * @brief  说一句**写死文案的**本机回话（复用现成的 TTS + 播放链路，预缓存优先）
+ * @param  what  只进日志：这句回话是哪条快路说的（"灯控回话"/"提醒回话"）
  * @return 0 已开始播放, 负值失败（调用方负责收尾状态机）
  *
- * ★ 预缓存优先（2026-09-19 加）：这四句回话全是写死的宏（LIGHT_REPLY_ON/OFF、
- *   LIGHT_FAIL_ON/OFF，见本文件 :173-178），PC 上早就合成好、随固件打进 ROMFS 了
- *   （查表规则见 tts_cache.h 头上）。命中就 open + read 几十 KB + 起播，
- *   **一个字节的网络都不走** —— 这条尤其值当：`语音开灯` 是我们最拿得出手的
- *   演示动作，可它原来必须先过一次阻塞 HTTPS 才说得出话，网络一慢，用户看到的是
- *   "灯亮了但机器人半天不吭声"。回落仍然保留：没预生成的文案照旧走 live TTS。
+ * ★ 预缓存优先（2026-09-19 加）：这些回话全是写死的宏（LIGHT_REPLY_ON/OFF、
+ *   LIGHT_FAIL_ON/OFF、REMINDER_REPLY_*，见本文件 :173-178 和提醒快路那节），
+ *   PC 上早就合成好、随固件打进 ROMFS 了（查表规则见 tts_cache.h 头上）。命中就
+ *   open + read 几十 KB + 起播，**一个字节的网络都不走** —— 这条尤其值当：
+ *   `语音开灯` 是我们最拿得出手的演示动作，可它原来必须先过一次阻塞 HTTPS 才
+ *   说得出话，网络一慢，用户看到的是"灯亮了但机器人半天不吭声"。回落仍然保留：
+ *   没预生成的文案照旧走 live TTS。
+ *
+ * ★ 2026-10-30 从 light_speak 改名/加 what 参数：定提醒快路也要用同一条播报
+ *   路，而日志里写着"灯控回话"会把串口排障的人带偏（这种坑这个项目已经踩过
+ *   一次了）。行为一行没改，只是标签跟着调用方走。
  */
 
-static int light_speak(sm_context_t *ctx, const char *text)
+static int intent_speak(sm_context_t *ctx, const char *text, const char *what)
 {
   static unsigned char *tts_buf = NULL;
   static size_t tts_buf_size = 0;
@@ -4928,15 +5702,15 @@ static int light_speak(sm_context_t *ctx, const char *text)
       ret = audio_play_start(&g_audio_ctx, (const int16_t *)cached,
                                     cached_len / sizeof(int16_t),
                                     play_complete_callback, ctx);
-      printf("[意图] 灯控回话出声（预缓存 %zu 字节 ≈ %zu ms，不出网）: %s\n",
-             cached_len, cached_len * 1000 / (16000 * 2), text);
+      printf("[意图] %s出声（预缓存 %zu 字节 ≈ %zu ms，不出网）: %s\n",
+             what, cached_len, cached_len * 1000 / (16000 * 2), text);
 
       /* 起播已经把数据 memcpy 进播放缓冲了，这里可以立刻还掉（同 ask_speak）。 */
       free(cached);
 
       if (ret < 0)
         {
-          printf("[意图] 灯控回话播放启动失败: %d\n", ret);
+          printf("[意图] %s播放启动失败: %d\n", what, ret);
           return ret;
         }
 
@@ -4963,12 +5737,12 @@ static int light_speak(sm_context_t *ctx, const char *text)
         }
     }
 
-  printf("[意图] 灯控回话没预缓存，回落 live TTS（这次要走网络）: %s\n", text);
+  printf("[意图] %s没预缓存，回落 live TTS（这次要走网络）: %s\n", what, text);
 
   ret = voice_tts_speak(text, tts_buf, tts_buf_size, &tts_len);
   if (ret < 0 || tts_len == 0)
     {
-      printf("[意图] 灯控回话合成失败: %d\n", ret);
+      printf("[意图] %s合成失败: %d\n", what, ret);
       return ret < 0 ? ret : -EIO;
     }
 
@@ -4983,12 +5757,148 @@ static int light_speak(sm_context_t *ctx, const char *text)
                                 play_complete_callback, ctx);
   if (ret < 0)
     {
-      printf("[意图] 灯控回话播放启动失败: %d\n", ret);
+      printf("[意图] %s播放启动失败: %d\n", what, ret);
       return ret;
     }
 
-  printf("[意图] 灯控回话出声: %s\n", text);
+  printf("[意图] %s出声: %s\n", what, text);
   return OK;
+}
+
+/* ==========================================================================
+ * 「我刚才没听清楚」/「我这边有点问题」必须**真的念出来**
+ * ==========================================================================
+ *
+ * 现场（2026-10-29）：用户报「『我刚才没听清楚，您再说一遍好吗？』没有出声」。
+ * 根因两层，都查实了：
+ *
+ *   ① 三句固定话术的 PCM **一句都不在 ROMFS 里**。按 tts_cache.h 的
+ *      归一化 + FNV-1a 32 规则逐个算过文件名：
+ *          PROMPT_MISS_TEXT  → 39e82801.pcm
+ *          PROMPT_ACK_TEXT   → 899d77a7.pcm
+ *          PROMPT_FAIL_TEXT  → 7447897a.pcm
+ *      ROMFS 里那 18 个 pcm（MANIFEST.txt 列的）一个都不匹配。而
+ *      prompt_ack_play_kind() 查不到缓存就只合成一声 0.33 秒的"嘟"，
+ *      **永远不念那句话**（prompt_ack.c 自己写明"文案在这里只当查表的 key 用，
+ *      板子自己不出声念它"）。
+ *      （算哈希的脚本自己先错过一次：拿 MANIFEST 的第 4 列当文案，实际是第 5 列，
+ *       18 条全对不上才发现。改过来 18/18 对上，所以上面这三个文件名可信。）
+ *
+ *   ② 预合成工具（_flash/gen_tts_cache.py）只在 Windows 那台机器上，
+ *      这边跑不了 —— 所以"把 PCM 补进 ROMFS"短期不成立，只能在代码里兜。
+ *
+ * 处置：查不到预缓存就回落 live TTS **真念一遍**（和 intent_speak / ask_speak
+ * 同一条路），连网络都不行才退到那声"嘟"（至少有反应）。
+ *
+ * ★ 为什么必须另起线程：live TTS 是阻塞 HTTPS（实测 1~3 秒），而这两句原来是
+ *   main_loop_task 的 100 ms 一拍里**就地**调 prompt_ack_play_kind() 的。
+ *   就地做网络等于把整条主循环卡住好几秒 —— 那期间守护、看门狗、UI 全停摆，
+ *   比不出声还糟。所以挂起标志照旧，只是消费那一拍改成起一条分离线程。 */
+
+#define MISS_SPOKEN_BUF_BYTES  (128 * 1024)   /* 这两句最长 20 字 ≈ 5 秒 ≈ 160 KB，
+                                               * 128 KB 够；不够会由 voice_tts_speak
+                                               * 按缓冲长度截断，不会溢出。 */
+
+static void miss_play_done(void *arg)
+{
+  (void)arg;
+  /* 出声完毕。这两句是"顺带的提示"，不参与轮次记账 —— 用
+   * play_complete_callback 会去发 AI_RESPONSE、把状态机往 AI_TALKING 那边带，
+   * 而这两句本来就是"这一轮没成，回到待机"的场景，不能那么做。 */
+}
+
+static void *miss_speak_worker(void *arg)
+{
+  /* ★ 2026-10-31 起这一条也承担唤醒问候（PROMPT_ACK_KIND_GREET）：
+   *   文案统一从 prompt_ack_text() 取，不在这里再写死一份。 */
+  prompt_ack_kind_t kind = (prompt_ack_kind_t)(intptr_t)arg;
+  const char       *text = prompt_ack_text(kind);
+  unsigned char   *cached = NULL;
+  size_t           cached_len = 0;
+  unsigned char   *buf;
+  size_t           tts_len = 0;
+  int              ret;
+
+  /* ---- ① 预缓存命中：亚毫秒，不出网，直接念 ---- */
+
+  if (tts_cache_load(text, &cached, &cached_len) == 0)
+    {
+      prompt_ack_stop(&g_audio_ctx);   /* 真话要出声，先收掉"我听见了" */
+      ret = audio_play_start(&g_audio_ctx, (const int16_t *)cached,
+                             cached_len / sizeof(int16_t),
+                             miss_play_done, NULL);
+      free(cached);   /* 起播已 memcpy 进播放缓冲（同 intent_speak） */
+
+      if (ret < 0)
+        {
+          printf("[提示音] 起播失败 %d\n", ret);
+        }
+      else
+        {
+          printf("[提示音] 出声（预缓存 %zu 字节）: %s\n", cached_len, text);
+        }
+
+      return NULL;
+    }
+
+  /* ---- ② 没预生成：live TTS 真念 ---- */
+
+  buf = malloc(MISS_SPOKEN_BUF_BYTES);
+  if (buf == NULL)
+    {
+      /* 连 128 KB 都要不到就退回那声"嘟"，总比一声不吭强。 */
+      prompt_ack_play_kind(&g_audio_ctx, kind);
+      return NULL;
+    }
+
+  printf("[提示音] 没预缓存「%s」，回落 live TTS 真念一遍（要走网络）\n", text);
+
+  ret = voice_tts_speak(text, buf, MISS_SPOKEN_BUF_BYTES, &tts_len);
+  if (ret < 0 || tts_len == 0)
+    {
+      printf("[提示音] live TTS 合成失败 %d，退回提示音\n", ret);
+      free(buf);
+      prompt_ack_play_kind(&g_audio_ctx, kind);
+      return NULL;
+    }
+
+  prompt_ack_stop(&g_audio_ctx);
+  ret = audio_play_start(&g_audio_ctx, (const int16_t *)buf,
+                         tts_len / sizeof(int16_t),
+                         miss_play_done, NULL);
+  if (ret < 0)
+    {
+      printf("[提示音] 起播失败 %d\n", ret);
+    }
+  else
+    {
+      printf("[提示音] 出声（live TTS %zu 字节 ≈ %zu ms）: %s\n",
+             tts_len, tts_len * 1000 / (16000 * 2), text);
+    }
+
+  free(buf);   /* 同上：起播已 memcpy，可以立刻还 */
+  return NULL;
+}
+
+/* 起一条分离线程去说。起不来就地退化成那声"嘟"（prompt_ack_play_kind 本身
+ * 不出网、不阻塞，就地调是安全的）。 */
+
+static void miss_speak_kick(prompt_ack_kind_t kind)
+{
+  pthread_attr_t attr;
+  pthread_t      tid;
+
+  pthread_attr_init(&attr);
+  pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+
+  if (pthread_create(&tid, &attr, miss_speak_worker,
+                     (void *)(intptr_t)kind) != 0)
+    {
+      printf("[提示音] 说话线程起不来，退回提示音\n");
+      prompt_ack_play_kind(&g_audio_ctx, kind);
+    }
+
+  pthread_attr_destroy(&attr);
 }
 
 /**
@@ -5043,13 +5953,931 @@ static void handle_light_intent(sm_context_t *ctx, light_intent_t intent)
   /* 播报期间状态机还留在 AI_TALKING：voice_state 会由 audio_is_playing()
    * 算成"正在说话"，监听守护也正好因为 AI_TALKING 不去碰麦克风。 */
 
-  if (light_speak(ctx, speech) < 0)
+  if (intent_speak(ctx, speech, "灯控回话") < 0)
     {
       /* 说不出话也得收尾，不能让这一轮悬着 */
 
       printf("[意图] 灯控回话没能出声，直接收尾\n");
       sm_handle_event(ctx, SM_EVENT_AI_RESPONSE);
     }
+}
+
+/* ---- 本机定提醒（"八点提醒我吃药"就地建好，不送大模型）----
+ *
+ * ★ 2026-10-30 加，起因是真机回归（board_boot.log）：三轮
+ *   「定凌晨2点10分的上厕所提醒 / 定凌晨1:25喝水提醒 / 设置凌晨1:35的喝水提醒」，
+ *   ASR 全部识别正确，模型回了「好的，提醒已经设好了…」，可 trace 行是
+ *   `iter=0 tool=(none)`、`[llm] Response: 123 bytes text, 0 tool calls`，
+ *   `[AI_TOOLS] add_reminder` 一行都没有 —— **提醒压根没建**。
+ *   同一次会话里 tool=get_weather / adjust_setting / web_search 都调得出来，
+ *   adjust_setting 尤其关键：它证明我们的 provider 注册着、工具确实发给模型了。
+ *   所以**不是工具没注册，是 mimo-v2.6-flash 在"定提醒"这类话上不肯调工具、
+ *   然后谎报成功**。
+ *
+ * 光给工具 description 加"防谎报"是赌它下次老实；这里直接自己做掉：
+ * 句子里**同时**有提醒词 + 一个无歧义的时刻，就本机建好、本机回话，这一轮
+ * 不送大模型（和上面灯控快路同一个形状：命中 → 直接做完 + 回话；拿不准 →
+ * 照原路送大模型）。
+ *
+ * ★ 触发条件刻意收紧，宁可漏做也不错做：
+ *   ① 必须有提醒词（提醒 / 提个醒 / 记一下 / 叫我 / 喊我）；
+ *   ② 时刻必须**无歧义**：要么被"凌晨/早上/上午/中午/下午/晚上/…"这类时段词
+ *      罩着（"下午三点"= 15:00，"晚上八点"= 20:00，"晚上十二点"= 00:00），
+ *      要么本身是 13:00 这种一眼 24 小时制的。光一个"三点"分不清上午下午，
+ *      一律退回大模型；
+ *   ③ 句里出现取消/删除/别提醒/改一下这类字眼（那是删改，不是新建），或者
+ *      解析出两个时刻（"八点和九点各提醒一次"），一律退回大模型；
+ *   ④ "半小时后叫我"这种相对时刻不做 —— 要读 RTC 再折算，多一处出错的地方，
+ *      退回大模型。
+ *   拿不准就交出去，宁可多跑一次云，也不猜时间 —— 猜错的后果是到点不响，
+ *   老人会以为提醒功能坏了（同 5.1 里"板子不会替你猜时间"那条纪律）。
+ *
+ * ★ 退回大模型的那些话，现在也不许它谎报了：两份工具清单都补了和
+ *   adjust_setting 同款的防谎报硬话（ai_tools_provider.c 的
+ *   AI_TOOLS_ADD_REMINDER_JSON、mimo_voice.c 的 MIMO_TOOL_REMINDER_JSON），
+ *   并把原来那句主动勾它说谎的「调用成功就真的建好了，可以直接告诉用户已经
+ *   设好、到点会响」改掉了。
+ *
+ * ★ 回话刻意把时刻和事项念回去（"好，设好了，凌晨两点十分提醒您上厕所"）：
+ *   万一哪天解析错了，老人当场听得出不对，还能再说一遍 —— 这是给自己留的
+ *   验收口，不是为了好听。代价是这句没法预生成（每次文案都不一样），走
+ *   live TTS；仍然比原来"大模型整轮 + TTS"快。
+ */
+
+/* 提醒词。取**最早出现**的那一个来切标题（light_kw_find 的语义：位置最靠前的
+ * 胜出，位置相同时取表里靠前的，所以长的写在前面）。 */
+static const char *const g_reminder_keywords[] =
+{
+  "提醒一下", "提醒我", "提醒", "提个醒", "记得提醒", "记一下",
+  "叫我", "喊我", "叫一下", "喊一下", "到点叫", "到点喊",
+  NULL
+};
+
+/* 取消 / 删改类字眼：出现就退回大模型（那是删提醒、改提醒，不是建提醒） */
+static const char *const g_reminder_cancel_keywords[] =
+{
+  "取消", "删除", "删掉", "去掉", "不要了", "不用了", "别提醒", "别叫我",
+  "别喊我", "关掉", "关闭", "撤销", "撤掉", "改一下", "改到", "改个",
+  "换成", "改提醒", "不提醒",
+  NULL
+};
+
+/* 时段词 → 怎么把口语小时折算成 24 小时制。
+ *
+ * 12 点的特例必须分开：「晚上十二点」是 00:00，「下午十二点」是 12:00。
+ * 另外 "夜里两点" 是 02:00 不是 14:00 —— 1~4 点跟晚上/夜里这类词连用时
+ * 说的都是后半夜，所以 small_as_is 那一列把它挡下来。 */
+typedef struct
+{
+  const char *word;
+  int add12;         /* 除 12 点、1~4 点以外要不要 +12 */
+  int twelve_zero;   /* 正好 12 点时算 0 点（1）还是 12 点（0） */
+  int small_as_is;   /* 1~4 点不加 12（1） */
+} rem_period_t;
+
+static const rem_period_t g_reminder_periods[] =
+{
+  /* 天没亮：凌晨三点 = 03:00，凌晨十二点 = 00:00 */
+  { "凌晨", 0, 1, 1 }, { "清晨", 0, 1, 1 }, { "半夜", 0, 1, 1 },
+  { "深夜", 0, 1, 1 }, { "夜里", 0, 1, 1 }, { "夜间", 0, 1, 1 },
+
+  /* 上午：早上八点 = 08:00，上午十二点 = 12:00 */
+  { "早上", 0, 0, 1 }, { "今早", 0, 0, 1 }, { "早晨", 0, 0, 1 },
+  { "上午", 0, 0, 1 }, { "午前", 0, 0, 1 },
+
+  /* 中午 / 下午：中午一点 = 13:00，下午十二点 = 12:00 */
+  { "中午", 1, 0, 0 }, { "正午", 1, 0, 0 }, { "下午", 1, 0, 0 },
+  { "午后", 1, 0, 0 }, { "傍晚", 1, 0, 0 }, { "黄昏", 1, 0, 0 },
+
+  /* 晚上：晚上八点 = 20:00，晚上十二点 = 00:00，晚上五点 = 17:00 */
+  { "晚上", 1, 1, 1 }, { "今晚", 1, 1, 1 }, { "晚间", 1, 1, 1 },
+
+  { NULL, 0, 0, 0 }
+};
+
+/* 解析出来的时刻 + 它在原句里的位置（位置用来把这一段从标题里抹掉） */
+typedef struct
+{
+  int hh;
+  int mm;
+  size_t pos;        /* 时段词（若有）起始字节，没有时段词就是时刻起始 */
+  size_t len;        /* 时段词 + 时刻 共几字节 */
+} rem_time_t;
+
+/* 标题缓冲：mimo_reminder_apply 那边按 20 个字截（MIMO_REMINDER_TITLE_CHARS，
+ * 私有宏），20 字 × 4 字节 + 省略号 + 结尾零 = 85，取 96 留点余量。 */
+#define REMINDER_TITLE_BUF     96
+
+/* 回话缓冲：「好，设好了，」15 + 时段 6 + 数字 6 + 「点」「分」8 + 「提醒您」9
+ * + 标题 95 ≈ 139，取 256 留足余量（这个库的 -Wformat-truncation 都是真截断，
+ * 一律加大缓冲，不要 pragma 压掉）。 */
+#define REMINDER_REPLY_BUF     256
+
+/* 抹标题时的工作缓冲：ASR 给的整句最多 512 字节（LIGHT_TEXT_MAX）。 */
+#define REMINDER_SRC_MAX       512
+
+/* 下面这些汉字全是 BMP 汉字（中文数字/时段词/标点都在 U+4E00~U+9FFF 或
+ * U+FF01~U+FF5E），UTF-8 一律 3 字节，写死比到处 strlen() 好读。 */
+#define CN_LEN                 3
+
+/**
+ * @brief  解析一个 0~59 的数（阿拉伯数字或中文数字）
+ * @param  p    输入
+ * @param  len  输出：吃掉的字节数（可为 NULL）
+ * @return 数值；解析不出返回 -1
+ *
+ * 只支持 0~59 —— 这里只用来解析"几点"和"几分"，够了。"两" 算 2
+ * （老人说"两点十分"比"二点十分"多得多）。
+ */
+
+static int reminder_parse_num(const char *p, size_t *len)
+{
+  static const char *const digit[10] =
+  {
+    "零", "一", "二", "三", "四", "五", "六", "七", "八", "九"
+  };
+  size_t n;
+  int d;
+  int e;
+  int v;
+
+  if (p == NULL || *p == '\0')
+    {
+      return -1;
+    }
+
+  /* ① 阿拉伯数字，最多两位 */
+
+  if (p[0] >= '0' && p[0] <= '9')
+    {
+      v = p[0] - '0';
+      n = 1;
+      if (p[1] >= '0' && p[1] <= '9')
+        {
+          v = v * 10 + (p[1] - '0');
+          n = 2;
+        }
+
+      if (len != NULL)
+        {
+          *len = n;
+        }
+
+      return v;
+    }
+
+  /* ② "两" 就是 2 */
+
+  if (strncmp(p, "两", CN_LEN) == 0)
+    {
+      if (len != NULL)
+        {
+          *len = CN_LEN;
+        }
+
+      return 2;
+    }
+
+  /* ③ "十" 开头：十 / 十一 … 十九 */
+
+  if (strncmp(p, "十", CN_LEN) == 0)
+    {
+      n = CN_LEN;
+      v = 10;
+
+      for (d = 1; d <= 9; d++)
+        {
+          if (strncmp(p + n, digit[d], CN_LEN) == 0)
+            {
+              v += d;
+              n += CN_LEN;
+              break;
+            }
+        }
+
+      if (len != NULL)
+        {
+          *len = n;
+        }
+
+      return v;
+    }
+
+  /* ④ "一"…"九" 开头：单个数字，或者 "二十 / 二十一 / 三十五" 这种 */
+
+  for (d = 1; d <= 9; d++)
+    {
+      if (strncmp(p, digit[d], CN_LEN) != 0)
+        {
+          continue;
+        }
+
+      n = CN_LEN;
+
+      if (strncmp(p + n, "十", CN_LEN) != 0)
+        {
+          if (len != NULL)
+            {
+              *len = n;
+            }
+
+          return d;
+        }
+
+      v = d * 10;
+      n += CN_LEN;
+
+      for (e = 1; e <= 9; e++)
+        {
+          if (strncmp(p + n, digit[e], CN_LEN) == 0)
+            {
+              v += e;
+              n += CN_LEN;
+              break;
+            }
+        }
+
+      if (len != NULL)
+        {
+          *len = n;
+        }
+
+      return v;
+    }
+
+  return -1;
+}
+
+/**
+ * @brief  p 开头是不是一个"时刻"写法
+ * @param  hh / mm  输出（可为 NULL）
+ * @return 吃掉的字节数；不是时刻写法返回 0
+ *
+ * 认两种：
+ *   ① 阿拉伯 `H:MM` / `HH:MM`（半角冒号，也认全角"："）
+ *   ② 「N点」「N点M分」「N点半」「N点一刻」「N点三刻」「N点整/点钟」，
+ *      里的 N、M 都认阿拉伯数字和中文数字（"两点十分""八点""七点半"）。
+ *
+ * ★ 这里**不管**上午下午 —— 时段词是回看的（见 reminder_parse_time），
+ *   因为"下午三点"里"下午"和"三点"中间还可能夹着别的字。
+ */
+
+static size_t reminder_time_token(const char *p, int *hh, int *mm)
+{
+  size_t hn = 0;
+  size_t mn = 0;
+  size_t n;
+  size_t colon;
+  int h;
+  int mi;
+
+  if (p == NULL || *p == '\0')
+    {
+      return 0;
+    }
+
+  /* ---- ① H:MM ---- */
+
+  if (p[0] >= '0' && p[0] <= '9')
+    {
+      h = reminder_parse_num(p, &hn);
+
+      if (h >= 0 && h <= 23)
+        {
+          if (p[hn] == ':')
+            {
+              colon = 1;
+            }
+          else if (strncmp(p + hn, "：", CN_LEN) == 0)
+            {
+              colon = CN_LEN;
+            }
+          else
+            {
+              colon = 0;
+            }
+
+          if (colon > 0)
+            {
+              mi = reminder_parse_num(p + hn + colon, &mn);
+
+              if (mi >= 0 && mi <= 59)
+                {
+                  if (hh != NULL)
+                    {
+                      *hh = h;
+                    }
+
+                  if (mm != NULL)
+                    {
+                      *mm = mi;
+                    }
+
+                  return hn + colon + mn;
+                }
+            }
+        }
+
+      /* 不是冒号写法就落到 ② 继续试（"2点10分"的 "2" 就是这么走下来的） */
+    }
+
+  /* ---- ② N点…… ---- */
+
+  h = reminder_parse_num(p, &hn);
+  if (h < 0 || h > 23)
+    {
+      return 0;
+    }
+
+  n = hn;
+  if (strncmp(p + n, "点", CN_LEN) != 0)
+    {
+      return 0;
+    }
+
+  n += CN_LEN;
+  mi = 0;
+
+  if (strncmp(p + n, "半", CN_LEN) == 0)
+    {
+      mi = 30;
+      n += CN_LEN;
+    }
+  else if (strncmp(p + n, "一刻", 2 * CN_LEN) == 0)
+    {
+      mi = 15;
+      n += 2 * CN_LEN;
+    }
+  else if (strncmp(p + n, "三刻", 2 * CN_LEN) == 0)
+    {
+      mi = 45;
+      n += 2 * CN_LEN;
+    }
+  else if (strncmp(p + n, "整", CN_LEN) == 0)
+    {
+      n += CN_LEN;
+    }
+  else if (strncmp(p + n, "钟", CN_LEN) == 0)
+    {
+      n += CN_LEN;
+    }
+  else
+    {
+      int got = reminder_parse_num(p + n, &mn);
+
+      if (got >= 0 && got <= 59)
+        {
+          mi = got;
+          n += mn;
+
+          if (strncmp(p + n, "分", CN_LEN) == 0)
+            {
+              n += CN_LEN;
+            }
+        }
+    }
+
+  if (hh != NULL)
+    {
+      *hh = h;
+    }
+
+  if (mm != NULL)
+    {
+      *mm = mi;
+    }
+
+  return n;
+}
+
+/**
+ * @brief  在整句里找第一个**无歧义**的时刻
+ * @return 0 找到；-1 没有，或者有但说不清上午下午
+ *
+ * "无歧义"的判据见文件头上那节。位置记在 out->pos/len（含时段词），
+ * 调用方靠它把这一段从标题里抹掉。
+ */
+
+static int reminder_parse_time(const char *text, rem_time_t *out)
+{
+  const char *p;
+
+  if (text == NULL || out == NULL)
+    {
+      return -1;
+    }
+
+  for (p = text; *p != '\0'; )
+    {
+      size_t tpos = (size_t)(p - text);
+      int hh = 0;
+      int mm = 0;
+      size_t tlen = reminder_time_token(p, &hh, &mm);
+
+      if (tlen > 0)
+        {
+          const rem_period_t *best = NULL;
+          size_t best_pos = 0;
+          size_t look_from;
+          size_t i;
+
+          /* 回看时段词：取时刻之前**最近**出现的那个
+           * （"早上八点晚上别忘了"里，"八点"该跟"早上"走）。
+           * 只往回看 64 字节 —— 时段词和时刻之间隔不了这么远，
+           * 而整句逐字节试全部时段词是 O(len²) ，不划算。 */
+
+          look_from = (tpos > 64) ? (tpos - 64) : 0;
+
+          for (i = 0; g_reminder_periods[i].word != NULL; i++)
+            {
+              size_t wlen = strlen(g_reminder_periods[i].word);
+              size_t s;
+
+              for (s = look_from; s + wlen <= tpos; s++)
+                {
+                  if (best != NULL && s <= best_pos)
+                    {
+                      continue;
+                    }
+
+                  if (strncmp(text + s, g_reminder_periods[i].word, wlen) == 0)
+                    {
+                      best = &g_reminder_periods[i];
+                      best_pos = s;
+                    }
+                }
+            }
+
+          if (best == NULL)
+            {
+              /* 没时段词：只有 13:00 这种一眼 24 小时制的才就地建。
+               * "1:25"/"三点"到底指凌晨还是下午，说不清，退回大模型。 */
+
+              if (hh < 13)
+                {
+                  return -1;
+                }
+            }
+          else if (hh >= 13)
+            {
+              /* 已经是 24 小时制，别再加 */
+            }
+          else if (hh == 12)
+            {
+              hh = best->twelve_zero ? 0 : 12;
+            }
+          else if (best->add12 && !(best->small_as_is && hh >= 1 && hh <= 4))
+            {
+              hh += 12;
+            }
+
+          if (hh < 0 || hh > 23 || mm < 0 || mm > 59)
+            {
+              return -1;
+            }
+
+          out->hh = hh;
+          out->mm = mm;
+          out->pos = (best != NULL) ? best_pos : tpos;
+          out->len = (tpos + tlen) - out->pos;
+          return 0;
+        }
+
+      /* 前进一个 UTF-8 码点（别从续字节中间再起一次匹配） */
+
+      p++;
+      while ((*p & 0xc0) == 0x80)
+        {
+          p++;
+        }
+    }
+
+  return -1;
+}
+
+/* 标题清噪：keyword 之后（或之前）那一小段里把动词/客套话抹掉，剩下的就是
+ * "提醒做什么"。只从**两头**抹，中间一个字都不动 —— 中间乱抹会把
+ * 「给我妈打电话」抹成「妈打电话」，那种标题比脏一点更糟。
+ *
+ * ★ 纪律是**宁欠勿过**：标题脏一点（「给我设个」）老人还认得出、列表里也
+ *   能删；标题抹错了（「妈打电话」）他就认不出来了。
+ *
+ * ⚠ 所以 "给我" **故意不收**：「提醒我**给我**妈打电话」里的"给我"是
+ *   "给我妈"的一部分，抹了就把人称抹没了。要覆盖「给我设个提醒」这种，
+ *   收的是整词「给我设个/给我定个/…」，不是「给我」。
+ *
+ * lead_person 只抹一次：「我给我妈打电话」抹掉第一个"我"就该停，
+ * 再抹"给我"又把人称抹没了。 */
+
+static const char *const g_title_lead_person[] =
+{
+  "帮我", "替我", "为我", "我",
+  NULL
+};
+
+/* ⚠ 单字"定"在这里是权衡过的：「定的上厕所」「定八点吃药」里的"定"就是
+ * 动词，不抹标题就脏；代价是「定金」这种会被抹成「金」。这个场景里前者
+ * 多得多，认了。单字"设"**故意不收** —— 「设备」「设置」都以它开头，
+ * 抹了会把「设备要充电」变成「备要充电」；"设置/设个"按整词收。 */
+static const char *const g_title_lead_verb[] =
+{
+  "提醒一下", "提醒", "一下", "一个",
+  "给我设个", "给我定个", "给我建个", "给我弄个",
+  "设个", "定个", "建个", "弄个", "设置", "定时", "定",
+  "先", "然后", "接着", "请", "麻烦",
+  "到点", "到时", "准时", "那个", "这个", "的", "了",
+  NULL
+};
+
+static const char *const g_title_tail[] =
+{
+  "的", "了", "吧", "啊", "呢", "呀", "哦", "嗯",
+  NULL
+};
+
+/**
+ * @brief  0~59 的中文数字（"五""十""二十五"），只给回话念着用
+ *
+ * ★ 必须念中文，不能念 "25 分"：TTS 遇到 "25" 念成"二十五"还是"二五"是
+ *   它自己定的，老人听不准就没法核对 —— 而这句回话存在的唯一理由就是让他
+ *   当场核对时刻。
+ */
+
+static void reminder_cn_num(char *out, size_t cap, int v)
+{
+  static const char *const digit[10] =
+  {
+    "零", "一", "二", "三", "四", "五", "六", "七", "八", "九"
+  };
+  int tens;
+  int ones;
+
+  if (cap == 0)
+    {
+      return;
+    }
+
+  if (v < 0 || v > 59)
+    {
+      /* 不该走到这（调用方传的是已校验的分钟），兜一下别念出乱码 */
+
+      snprintf(out, cap, "%d", v);
+      return;
+    }
+
+  tens = v / 10;
+  ones = v % 10;
+
+  if (tens == 0)
+    {
+      snprintf(out, cap, "%s", digit[ones]);
+    }
+  else if (tens == 1)
+    {
+      snprintf(out, cap, "十%s", (ones > 0) ? digit[ones] : "");
+    }
+  else
+    {
+      snprintf(out, cap, "%s十%s", digit[tens], (ones > 0) ? digit[ones] : "");
+    }
+}
+
+/**
+ * @brief  把 24 小时制时刻翻回口语（"凌晨两点十分"），好让老人当场核对
+ *
+ * 只是念得顺，**不参与任何判定** —— 解析以 reminder_parse_time 为准。
+ */
+
+static void reminder_reply_build(char *out, size_t cap, int hh, int mm,
+                                 const char *title)
+{
+  static const char *const cn[13] =
+  {
+    "", "一", "两", "三", "四", "五", "六", "七", "八", "九", "十",
+    "十一", "十二"
+  };
+  char min_cn[16];
+  const char *period;
+  int h12;
+
+  if (cap == 0)
+    {
+      return;
+    }
+
+  if (hh < 6)
+    {
+      period = "凌晨";
+    }
+  else if (hh < 12)
+    {
+      period = "早上";
+    }
+  else if (hh == 12)
+    {
+      period = "中午";
+    }
+  else if (hh < 18)
+    {
+      period = "下午";
+    }
+  else
+    {
+      period = "晚上";
+    }
+
+  h12 = hh % 12;
+  if (h12 == 0)
+    {
+      h12 = 12;
+    }
+
+  if (mm == 0)
+    {
+      snprintf(out, cap, "好，设好了，%s%s点提醒您%s", period, cn[h12], title);
+    }
+  else if (mm == 30)
+    {
+      snprintf(out, cap, "好，设好了，%s%s点半提醒您%s", period, cn[h12], title);
+    }
+  else
+    {
+      reminder_cn_num(min_cn, sizeof(min_cn), mm);
+      snprintf(out, cap, "好，设好了，%s%s点%s分提醒您%s", period, cn[h12],
+               min_cn, title);
+    }
+}
+
+/**
+ * @brief  从原句里抠出"提醒做什么"
+ * @param  text / tlen  整句
+ * @param  tm           已解析出的时刻（这一段要抹掉）
+ * @param  kwpos / kwlen 提醒词的位置和长度
+ * @param  out / cap    输出标题（调用方保证至少 REMINDER_TITLE_BUF）
+ *
+ * 切法：提醒词**之后**那段有内容就用它（"提醒我吃药"→"吃药"），
+ * 没有就用提醒词**之前**那段（"定八点吃药提醒"→"吃药"）。
+ * 都空就退回"提醒" —— 宁可标题平一点，也别把空标题塞进提醒页。
+ */
+
+static void reminder_title_build(const char *text, size_t tlen,
+                                 const rem_time_t *tm,
+                                 size_t kwpos, size_t kwlen,
+                                 char *out, size_t cap)
+{
+  char work[REMINDER_SRC_MAX + 1];
+  const char *src;
+  size_t srclen;
+  size_t i;
+  size_t n;
+  size_t start;
+
+  if (cap == 0)
+    {
+      return;
+    }
+
+  out[0] = '\0';
+
+  if (tlen > REMINDER_SRC_MAX)
+    {
+      tlen = REMINDER_SRC_MAX;
+    }
+
+  /* ① 抄一份，把时刻那一段抹成空格 —— 字节位置不动，好按 kw 位置切，
+   *    免得切出来的标题里还夹着"凌晨2点10分"。 */
+
+  memcpy(work, text, tlen);
+  work[tlen] = '\0';
+
+  for (i = 0; i < tm->len && (tm->pos + i) < tlen; i++)
+    {
+      work[tm->pos + i] = ' ';
+    }
+
+  /* ② 切：优先 kw 之后，其次 kw 之前 */
+
+  start = kwpos + kwlen;
+  src = work + start;
+  srclen = (tlen > start) ? (tlen - start) : 0;
+
+  n = 0;
+  for (i = 0; i < srclen && n < cap - 1; i++)
+    {
+      size_t sep = light_sep_len(src + i);
+
+      if (sep > 0)
+        {
+          i += sep - 1;
+          continue;
+        }
+
+      out[n++] = src[i];
+    }
+
+  out[n] = '\0';
+
+  if (n == 0 && kwpos > 0)
+    {
+      src = work;
+      srclen = kwpos;
+      n = 0;
+      for (i = 0; i < srclen && n < cap - 1; i++)
+        {
+          size_t sep = light_sep_len(src + i);
+
+          if (sep > 0)
+            {
+              i += sep - 1;
+              continue;
+            }
+
+          out[n++] = src[i];
+        }
+
+      out[n] = '\0';
+    }
+
+  /* ③ 两头抹噪 */
+
+  for (i = 0; g_title_lead_person[i] != NULL; i++)
+    {
+      size_t wlen = strlen(g_title_lead_person[i]);
+
+      if (n >= wlen && strncmp(out, g_title_lead_person[i], wlen) == 0)
+        {
+          memmove(out, out + wlen, n - wlen + 1);
+          n -= wlen;
+          break;      /* 只抹一次，理由见 g_title_lead_person 上面 */
+        }
+    }
+
+  for (;;)
+    {
+      bool shaved = false;
+
+      for (i = 0; g_title_lead_verb[i] != NULL; i++)
+        {
+          size_t wlen = strlen(g_title_lead_verb[i]);
+
+          if (n >= wlen && strncmp(out, g_title_lead_verb[i], wlen) == 0)
+            {
+              memmove(out, out + wlen, n - wlen + 1);
+              n -= wlen;
+              shaved = true;
+              break;
+            }
+        }
+
+      if (!shaved)
+        {
+          break;
+        }
+    }
+
+  for (;;)
+    {
+      bool shaved = false;
+
+      for (i = 0; g_title_tail[i] != NULL; i++)
+        {
+          size_t wlen = strlen(g_title_tail[i]);
+
+          if (n >= wlen && strcmp(out + n - wlen, g_title_tail[i]) == 0)
+            {
+              n -= wlen;
+              out[n] = '\0';
+              shaved = true;
+              break;
+            }
+        }
+
+      if (!shaved)
+        {
+          break;
+        }
+    }
+
+  if (n == 0)
+    {
+      snprintf(out, cap, "提醒");
+    }
+}
+
+/* 建好了 / 没建成各说一句固定文案。刻意**不带**时间和事项 —— 带了就合成不了
+ * 预缓存（每次文案都不一样），而失败这句最需要的是"一定出得了声"。
+ * 成功那句是带时间和事项的（见 reminder_reply_build），走 live TTS。 */
+#define REMINDER_REPLY_FAIL    "这个提醒没设好，您再说一遍好吗"
+
+/**
+ * @brief  本机定提醒快路（命中就地建好 + 回话，这一轮不送大模型）
+ * @return 1 这一轮已经处理完（建好了，或者明确建不了），
+ *         0 拿不准，照原路送大模型
+ */
+
+static int reminder_intent_try(sm_context_t *ctx, const char *text)
+{
+  rem_time_t tm;
+  const char *kw;
+  const char *p;
+  size_t kwpos = 0;
+  size_t kwlen;
+  size_t tlen;
+  char title[REMINDER_TITLE_BUF];
+  char used[REMINDER_TITLE_BUF];
+  char hhmm[8];
+  char reply[REMINDER_REPLY_BUF];
+  int ret;
+
+  if (text == NULL || *text == '\0')
+    {
+      return 0;
+    }
+
+  tlen = strlen(text);
+
+  /* ① 取消 / 删改 → 那不是新建，退回大模型 */
+
+  kw = light_kw_find(g_reminder_cancel_keywords, text, &kwpos);
+  if (kw != NULL)
+    {
+      printf("[意图] 提醒句含取消/删改字眼「%s」，不就地建，交给大模型\n", kw);
+      return 0;
+    }
+
+  /* ② 必须有提醒词 */
+
+  kw = light_kw_find(g_reminder_keywords, text, &kwpos);
+  if (kw == NULL)
+    {
+      return 0;
+    }
+
+  kwlen = strlen(kw);
+
+  /* ③ 时刻必须解析得出来，且无歧义 */
+
+  if (reminder_parse_time(text, &tm) != 0)
+    {
+      printf("[意图] 提醒句没解析出无歧义的时刻，交给大模型: %s\n", text);
+      return 0;
+    }
+
+  /* ④ 句里还有第二个"时刻"字样子串就拿不准（"八点和九点各提醒一次"）。
+   *    这里只看字面、不再判歧义 —— 反正有两个就退回大模型。 */
+
+  for (p = text + tm.pos + tm.len; *p != '\0'; p++)
+    {
+      if (reminder_time_token(p, NULL, NULL) > 0)
+        {
+          printf("[意图] 提醒句含两个时刻，拿不准，交给大模型: %s\n", text);
+          return 0;
+        }
+    }
+
+  /* ⑤ 抠标题 */
+
+  reminder_title_build(text, tlen, &tm, kwpos, kwlen, title, sizeof(title));
+
+  /* ⑥ 落地。和工具那条同一个入口（mimo_reminder_apply）—— 标题截断、
+   *    时间归一化、hook 兜底都在那一份里，别在这里再抄一遍。 */
+
+  snprintf(hhmm, sizeof(hhmm), "%02d:%02d", tm.hh, tm.mm);
+  used[0] = '\0';
+
+  ret = mimo_reminder_apply(hhmm, title, used, sizeof(used));
+  if (ret < 0)
+    {
+      /* 建不了就明说，绝不让它变成"说设好了其实没有"。
+       * 这一轮照样收掉（return 1）：再送大模型它多半还是那句谎话。 */
+
+      printf("[意图] 提醒就地建失败: %d（%s %s），明说没建成\n", ret, hhmm,
+             title);
+
+      if (intent_speak(ctx, REMINDER_REPLY_FAIL, "提醒回话") < 0)
+        {
+          printf("[意图] 提醒回话没能出声，直接收尾\n");
+          sm_handle_event(ctx, SM_EVENT_AI_RESPONSE);
+        }
+
+      return 1;
+    }
+
+  /* ⑦ 回话把时刻和事项念回去，老人当场能核对 */
+
+  reminder_reply_build(reply, sizeof(reply), tm.hh, tm.mm,
+                       (used[0] != '\0') ? used : title);
+
+  printf("[意图] 提醒就地建好: %s %s（不送大模型）→ 回话「%s」\n", hhmm,
+         (used[0] != '\0') ? used : title, reply);
+
+  if (intent_speak(ctx, reply, "提醒回话") < 0)
+    {
+      printf("[意图] 提醒回话没能出声，直接收尾\n");
+      sm_handle_event(ctx, SM_EVENT_AI_RESPONSE);
+    }
+
+  return 1;
 }
 
 /**
@@ -5351,7 +7179,18 @@ static void *dialogue_worker(void *arg)
        * 失败不用管：-EBUSY 说明真答复已经先出声了（正常竞态），其它负值
        * 只是没听到这一声，不影响本轮对话继续往下走。 */
 
-      prompt_ack_play(&g_audio_ctx);
+      if (g_wake_greet_pending)
+        {
+          /* ★ 唤醒问候（「你好！有什么需要帮助的吗？」）刚说过，这一声
+           *   「嗯，我在」跳过 —— 两句话啰嗦，而且 prompt_ack 那条会把
+           *   还在播的问候顶掉（半双工下听着是"你好的你有"这种破句）。 */
+          g_wake_greet_pending = false;
+          printf("[提示音] 唤醒问候刚说过，这一声「嗯，我在」跳过\n");
+        }
+      else
+        {
+          prompt_ack_play(&g_audio_ctx);
+        }
 
       process_ai_dialogue(ctx);
     }
@@ -5410,6 +7249,720 @@ static void dialogue_request(sm_context_t *ctx)
   sem_post(&g_dlg_sem);
 }
 
+/* ===== S2.5 · 送 ASR 之前剪掉头尾的纯静音 ==============================
+ *
+ * VAD 的静音超时是 1000 ms（AUDIO_VAD_SILENCE_TIMEOUT_MS），所以每段送上去
+ * 的音频**尾巴上都挂着整整一秒静音**；开头还叠着 SPEECH_PREROLL_SAMPLES 那
+ * 300 ms 预卷。这些是纯静音，却照样要 base64 成 ~1.33 倍体量传上去。实测
+ * 「说完 → ASR 文本到手」是 2728 ms，上传体量是其中主要可控项之一。
+ *
+ * ★ 判据取「逐采样 |幅度| < 门」，**不取帧能量**：帧能量是 ai_audio.c 的
+ * 内部量（一帧若干采样），拿来找边界会切出半帧的怪长度，而且它不在这里。
+ *
+ * ★ 门取 100，**故意远低于**降噪门那条 300：
+ *     真说话实测峰值 ≥ 778、纯噪声峰值只有 ~88（见 g_speech_peak 定义处）。
+ *   100 落在两者之间且偏向**不剪** —— 宁可少剪，也绝不切进话头/话尾。
+ *   环境一吵（噪声峰值本身就 ≥ 100）这段就退化成 no-op，不会误伤。
+ *
+ * ★ 剪完两侧各留 300 ms 填充：保住起音/收音的过渡段，也给服务端的端点
+ *   检测留余量（和开头那 300 ms 预卷同量级）。
+ *
+ * ★ 只写本地量，**绝不写回 g_dlg_ptr / g_dlg_frames** —— 那两个是这一轮的
+ *   快照，追问流程和兜底路径可能还在读；改了它们看到的长度就和缓冲对不上了。
+ *
+ * 回退：把 ASR_TRIM_SILENCE_PEAK 改成 0，整段原样送，就是今天的行为。 */
+
+#define ASR_TRIM_SILENCE_PEAK  100
+#define ASR_TRIM_KEEP_SAMPLES  (16000 * 3 / 10)   /* 两侧各留 300 ms */
+
+static void asr_trim_silence(const int16_t *pcm, size_t frames,
+                             const int16_t **out_ptr, size_t *out_frames)
+{
+  size_t first = 0;
+  size_t last;
+  size_t start;
+  size_t end;
+  size_t keep = ASR_TRIM_KEEP_SAMPLES;
+  int    v;
+
+  *out_ptr    = pcm;
+  *out_frames = frames;
+
+  if (pcm == NULL || frames == 0)
+    {
+      return;
+    }
+
+  last = frames;
+
+  while (first < frames)
+    {
+      v = pcm[first];
+
+      if (v < 0)
+        {
+          v = -v;      /* int32 中转，-32768 也不会溢出 */
+        }
+
+      if ((uint32_t)v >= ASR_TRIM_SILENCE_PEAK)
+        {
+          break;
+        }
+
+      first++;
+    }
+
+  /* 整段都低于门：说明这段本来就没打算剪（或门定高了）。**原样送**，
+   * 不要剪成 0 长度把一句真话弄没。 */
+  if (first >= frames)
+    {
+      return;
+    }
+
+  while (last > first)
+    {
+      v = pcm[last - 1];
+
+      if (v < 0)
+        {
+          v = -v;
+        }
+
+      if ((uint32_t)v >= ASR_TRIM_SILENCE_PEAK)
+        {
+          break;
+        }
+
+      last--;
+    }
+
+  start = (first > keep) ? (first - keep) : 0;
+  end   = last + keep;
+
+  if (end > frames)
+    {
+      end = frames;
+    }
+
+  if (end <= start)
+    {
+      return;          /* 理论上到不了，兜底原样送 */
+    }
+
+  *out_ptr    = pcm + start;
+  *out_frames = end - start;
+}
+
+/* ==========================================================================
+ * ★ 2026-11-01 天气快速通道
+ *
+ * 真机：问「济南历城区天气怎么样」——
+ *   ASR 9.6s → velaclaw 第一轮 45s 等到 -110 → 直连兜底又把工具跑一遍 ~45s
+ *   → 首字出声 **105 秒**。天气是"一次 HTTP 就能答"的问题，根本不该经过
+ *   ReAct 工具决策链。
+ *
+ * 做法：识别到天气意图 + 已知城市 → 直接 mimo_weather_lookup()（Open-Meteo
+ * geocode + forecast）→ 结果交给现有的流式 TTS 回调（llm_complete_callback）。
+ * 预计 ASR 10s + 天气 HTTP 5s + TTS 首块 2.4s ≈ 17s。
+ *
+ * 安全阀（任何一条不满足就**回落到原来的大模型路径**，行为不变）：
+ *   · 没有天气关键词；
+ *   · 句子里出现了一个**不在已知城市表**里的城市名（不能猜成默认城市）；
+ *   · 天气接口返回"没找到/不可用/没拿到"。
+ * ======================================================================== */
+
+static const char *const g_weather_kw[] =
+{
+  "天气", "气温", "下雨", "下雪", "冷不冷", "热不热", "刮风", "湿度",
+};
+
+static const char *const g_known_cities[] =
+{
+  "济南", "北京", "上海", "广州", "深圳", "天津", "重庆", "成都", "杭州",
+  "南京", "武汉", "西安", "郑州", "青岛", "烟台", "潍坊", "临沂", "济宁",
+  "淄博", "泰安", "威海", "日照", "东营", "德州", "聊城", "滨州", "菏泽",
+  "枣庄", "哈尔滨", "沈阳", "长春", "石家庄", "太原", "合肥", "长沙",
+  "南昌", "福州", "厦门", "昆明", "贵阳", "南宁", "海口", "兰州", "西宁",
+  "银川", "乌鲁木齐", "呼和浩特", "拉萨", "苏州", "无锡", "宁波", "温州",
+  "大连", "东莞", "佛山", "珠海", "三亚", "桂林",
+};
+
+/* 这些前缀出现在"城市"位置时说明用户没说城市（"今天天气怎么样"）。 */
+static const char *const g_weather_prefix_noise[] =
+{
+  "今天", "明天", "后天", "现在", "请问", "帮我", "查一下", "看看", "你好",
+  "问一下", "一下", "的", "外面", "外面天气",
+};
+
+/* 把 ℃ / km/h 换成 TTS 念得清的中文。 */
+static void weather_tts_friendly(const char *in, char *out, size_t cap)
+{
+  size_t o = 0;
+  const char *p = in;
+
+  if (out == NULL || cap == 0)
+    {
+      return;
+    }
+
+  while (p != NULL && *p != '\0' && o + 16 < cap)
+    {
+      if (strncmp(p, "℃", 3) == 0)
+        {
+          memcpy(out + o, "度", 3);
+          o += 3;
+          p += 3;
+        }
+      else if (strncmp(p, "km/h", 4) == 0)
+        {
+          memcpy(out + o, "公里每小时", 15);
+          o += 15;
+          p += 4;
+        }
+      else
+        {
+          out[o++] = *p++;
+        }
+    }
+
+  out[o] = '\0';
+}
+
+/**
+ * @brief  天气快速通道。返回 true = 已经交给 TTS 回调（本轮到止）。
+ */
+
+static bool weather_fast_try(const char *text, sm_context_t *ctx)
+{
+  const char *kwpos = NULL;
+  const char *window;
+  char city[32] = "";
+  char raw[256];
+  char reply[256];
+  size_t i;
+  const char *q;
+
+  if (text == NULL || text[0] == '\0')
+    {
+      return false;
+    }
+
+  for (i = 0; i < sizeof(g_weather_kw) / sizeof(g_weather_kw[0]); i++)
+    {
+      kwpos = strstr(text, g_weather_kw[i]);
+      if (kwpos != NULL)
+        {
+          break;
+        }
+    }
+
+  if (kwpos == NULL)
+    {
+      return false;          /* 不是天气问题 */
+    }
+
+  /* 取关键词前最多 60 字节作为"城市窗口"，在窗口里找已知城市。
+   * 用 strstr 找子串而不是解析语法：中文没有空格，老人会把城市和区县
+   * 连在一起说（"济南历城区"），子串匹配正好能抓到"济南"。 */
+
+  window = (kwpos - text > 60) ? (kwpos - 60) : text;
+
+  {
+    const char *best = NULL;
+    size_t      best_len = 0;
+
+    for (i = 0; i < sizeof(g_known_cities) / sizeof(g_known_cities[0]); i++)
+      {
+        const char *hit = strstr(window, g_known_cities[i]);
+        size_t      len = strlen(g_known_cities[i]);
+
+        if (hit != NULL && hit + len <= kwpos &&
+            (best == NULL || hit > best ||
+             (hit == best && len > best_len)))
+          {
+            best     = hit;
+            best_len = len;
+          }
+      }
+
+    if (best != NULL)
+      {
+        snprintf(city, sizeof(city), "%.*s", (int)best_len, best);
+      }
+  }
+
+  if (city[0] == '\0')
+    {
+      /* 没找到已知城市：看"城市位置"是不是只剩时间/客套词。
+       * 只剩这些 → 用默认城市（济南）；否则说明用户说的是一个我们
+       * 不认识的城市的名字，**不能猜**，回落到大模型路径。 */
+      char probe[64];
+      size_t n = (size_t)(kwpos - window);
+      int changed = 1;
+
+      if (n >= sizeof(probe))
+        {
+          n = sizeof(probe) - 1;
+        }
+
+      memcpy(probe, window, n);
+      probe[n] = '\0';
+
+      while (changed)
+        {
+          changed = 0;
+          for (i = 0; i < sizeof(g_weather_prefix_noise) /
+                          sizeof(g_weather_prefix_noise[0]); i++)
+            {
+              size_t pl = strlen(g_weather_prefix_noise[i]);
+
+              if (strncmp(probe, g_weather_prefix_noise[i], pl) == 0)
+                {
+                  memmove(probe, probe + pl, strlen(probe + pl) + 1);
+                  changed = 1;
+                  break;
+                }
+            }
+        }
+
+      /* 去掉中文标点后如果没剩东西 → 没说城市 */
+      q = probe;
+      while (*q != '\0' &&
+             (strncmp(q, "，", 3) == 0 || strncmp(q, "。", 3) == 0 ||
+              strncmp(q, "！", 3) == 0 || strncmp(q, "？", 3) == 0 ||
+              strncmp(q, "、", 3) == 0 || *q == ' '))
+        {
+          q += (strncmp(q, "，", 3) == 0 || strncmp(q, "。", 3) == 0 ||
+                strncmp(q, "！", 3) == 0 || strncmp(q, "？", 3) == 0 ||
+                strncmp(q, "、", 3) == 0) ? 3 : 1;
+        }
+
+      if (q[0] != '\0')
+        {
+          printf("[天气快路] 不认识的城市的说法「%s」，回落到大模型\n", probe);
+          return false;
+        }
+
+      snprintf(city, sizeof(city), "%s", "济南");
+    }
+
+  printf("[天气快路] 城市=%s，直接查 Open-Meteo（跳过 velaclaw/LLM）\n", city);
+
+  if (mimo_weather_lookup(city, raw, sizeof(raw)) != 0 ||
+      raw[0] == '\0' ||
+      strstr(raw, "没找到") != NULL || strstr(raw, "不可用") != NULL ||
+      strstr(raw, "没拿到") != NULL || strstr(raw, "查不了") != NULL)
+    {
+      printf("[天气快路] 查询失败/城市不认识（%s），回落到大模型\n", raw);
+      return false;
+    }
+
+  weather_tts_friendly(raw, reply, sizeof(reply));
+  printf("[天气快路] 回复：%s\n", reply);
+
+  llm_complete_callback(reply, 0, ctx);
+  return true;
+}
+
+/* ==========================================================================
+ * ★ 2026-11-01 自我介绍快速通道
+ *
+ * 用户点名：AI 回答"你能做什么"时**必须**用他给的那句模板，一字不改。
+ * velaclaw 和 mimo_chat 两条 prompt 里都写了模板，但真机那次 ASR 只转出
+ * 「你好你好」，模型按问候回了一句通用介绍 —— 输入没触发模板。
+ *
+ * 这里再加一道**本地快路**：识别文本里只要出现能力/身份关键词，就直接念
+ * 模板，不经过任何大模型（不受模型心情、上下文、工具轮影响）。
+ * 局限：ASR 必须把关键词转出来；ASR 丢字时快路也触发不了。
+ * ======================================================================== */
+
+static bool selfintro_fast_try(const char *text, sm_context_t *ctx)
+{
+  static const char *const kw[] =
+  {
+    "你是谁", "你叫什么", "你能做什么", "你会做什么", "你能干什么",
+    "你能干嘛", "你会什么", "你有什么功能", "你能帮我做什么",
+    "你可以做什么", "你都能做什么", "介绍一下自己", "自我介绍",
+  };
+
+  /* 用户原话，一字不改（末句「的的」是原话，别改）。 */
+
+  static const char tmpl[] =
+    "我是智爱助手，可以和您聊天，答时间，查天气，设提醒，"
+    "紧急响铃联系家人，上网搜索消息，还能修改音量和亮度，"
+    "有什么需要帮忙的的和我说。";
+
+  size_t i;
+
+  if (text == NULL || text[0] == '\0')
+    {
+      return false;
+    }
+
+  for (i = 0; i < sizeof(kw) / sizeof(kw[0]); i++)
+    {
+      if (strstr(text, kw[i]) != NULL)
+        {
+          printf("[自介快路] 命中「%s」-> 直接念固定模板\n", kw[i]);
+          llm_complete_callback(tmpl, 0, ctx);
+          return true;
+        }
+    }
+
+  return false;
+}
+
+/* ==========================================================================
+ * ★ 2026-11-02 新闻概括（用户问「第X条详细说说」）
+ *
+ *   新闻快路念完 5 条标题后，用户想了解某一条的具体内容。
+ *   这里存最近一次搜索的标题，用户说「第X条」「详细说说」「概括一下」时，
+ *   用 Tavily 搜那条标题拿正文摘要，念前 2~3 句。
+ *   不经过大模型 —— 直接从 Tavily 的 content 字段截取。
+ * ======================================================================== */
+
+static char g_news_titles[5][128];
+static int  g_news_count = 0;
+
+static bool news_detail_try(const char *text, sm_context_t *ctx)
+{
+  static const char *const kw[] =
+  {
+    "详细", "概括", "讲讲", "说说", "说一下", "介绍", "内容", "讲什么",
+    "第一条", "第二条", "第三条", "第四条", "第五条",
+    "第1条", "第2条", "第3条", "第4条", "第5条",
+    "1条", "2条", "3条", "4条", "5条",
+  };
+
+  char     json[256];
+  char     out[2048];
+  char     reply[400];
+  int      idx = -1;
+  size_t   i;
+  int      ret;
+  const char *title;
+
+  if (g_news_count == 0 || text == NULL || text[0] == '\0')
+    {
+      return false;
+    }
+
+  /* 判断是不是"想了解某条新闻" */
+  {
+    bool hit = false;
+
+    for (i = 0; i < sizeof(kw) / sizeof(kw[0]); i++)
+      {
+        if (strstr(text, kw[i]) != NULL)
+          {
+            hit = true;
+            break;
+          }
+      }
+
+    if (!hit)
+      {
+        return false;
+      }
+  }
+
+  /* 解析第几条（支持中文数字和阿拉伯数字） */
+  if (strstr(text, "一") != NULL || strstr(text, "1") != NULL)      idx = 0;
+  else if (strstr(text, "二") != NULL || strstr(text, "2") != NULL)  idx = 1;
+  else if (strstr(text, "三") != NULL || strstr(text, "3") != NULL)  idx = 2;
+  else if (strstr(text, "四") != NULL || strstr(text, "4") != NULL)  idx = 3;
+  else if (strstr(text, "五") != NULL || strstr(text, "5") != NULL)  idx = 4;
+
+  if (idx < 0 || idx >= g_news_count)
+    {
+      /* 没指定第几条 → 概括第一条 */
+      idx = 0;
+    }
+
+  title = g_news_titles[idx];
+  printf("[新闻概括] 第 %d 条「%s」-> 搜正文\n", idx + 1, title);
+
+  /* ★ 2026-11-02：用 **tool_news_search_execute**（带 topic=news），
+   *   不是通用 web_search —— 通用搜索对新闻标题经常返回 0 条或不相关内容。
+   *   news_search 走 Tavily topic=news，能找到对应新闻的正文摘要。 */
+  snprintf(json, sizeof(json), "{\"query\":\"%s\"}", title);
+  out[0] = '\0';
+  ret = tool_news_search_execute(json, out, sizeof(out));
+  if (ret != 0 || out[0] == '\0')
+    {
+      printf("[新闻概括] 搜正文失败（%d），回落到大模型\n", ret);
+      return false;
+    }
+
+  /* 取第一条结果的 content 前 200 字节（Tavily 输出格式：1. 标题\n   URL\n   内容） */
+  {
+    const char *body = strstr(out, "\n   ");
+    size_t n = 0;
+
+    if (body != NULL)
+      {
+        body += 4;   /* skip "\n   " */
+        /* 跳过 URL 行 */
+        const char *nl = strchr(body, '\n');
+        if (nl != NULL) body = nl + 1;
+        /* 跳过前导空格 */
+        while (*body == ' ') body++;
+
+        while (body[n] != '\0' && body[n] != '\n' && n < 200)
+          {
+            n++;
+          }
+        while (n > 0 && ((unsigned char)body[n] & 0xc0) == 0x80)
+          {
+            n--;
+          }
+        memcpy(reply, body, n);
+        reply[n] = '\0';
+      }
+    else
+      {
+        /* 没有 content 格式，取第一条标题行 */
+        snprintf(reply, sizeof(reply), "%s", out);
+      }
+  }
+
+  printf("[新闻概括] 摘要：%s\n", reply);
+  llm_complete_callback(reply, 0, ctx);
+  return true;
+}
+
+/* ==========================================================================
+ * ★ 2026-11-01 新闻快速通道
+ *
+ * 真机：问「今天有什么国际新闻吗」——新浪 5 条、Tavily 8191 字节**都搜到了**，
+ * 但最后那次 LLM 汇总调用失败（`[agent] LLM call failed (iter 2)`），
+ * 用户听到的是「网络好像不太稳」。搜索没坏，是"搜完再让大模型总结"这一步
+ * 挂在云端 LLM 上。
+ *
+ * 新闻这种"取头条念出来"的需求不需要大模型：直接复用 ai_agent 的
+ * tool_news_search_execute()（**Tavily 优先、新浪免 key 兜底**），取前几条
+ * 标题直接交给 TTS。失败就回落原路径。
+ * ======================================================================== */
+
+static bool news_fast_try(const char *text, sm_context_t *ctx)
+{
+  static const char *const kw[] =
+  {
+    "新闻", "头条", "要闻", "热点", "时事", "国际消息", "国内消息",
+  };
+
+  char   json[128];
+  char   out[1024];
+  char   reply[960];
+  size_t i;
+  size_t n;
+  bool   hit = false;
+  int    ret;
+
+  if (text == NULL || text[0] == '\0')
+    {
+      return false;
+    }
+
+  for (i = 0; i < sizeof(kw) / sizeof(kw[0]); i++)
+    {
+      if (strstr(text, kw[i]) != NULL)
+        {
+          hit = true;
+          break;
+        }
+    }
+
+  if (!hit)
+    {
+      return false;
+    }
+
+  /* ★ 2026-11-02：**用简单短查询**。
+   *   真机实测：长查询（如"娱乐圈 明星 最新消息 动态"）在板子上 Tavily 直接
+   *   失败（可能 URL 编码问题），退回新浪给的是财经。PC 实测简单短词全部
+   *   返回 5 条对应类别：「娱乐新闻」→ 明星/影视，「时事新闻」→ 政治/国际。 */
+
+  {
+    const char *q = "今日新闻";
+
+    if (strstr(text, "娱乐") != NULL || strstr(text, "八卦") != NULL ||
+        strstr(text, "明星") != NULL)
+      q = "娱乐新闻";
+    else if (strstr(text, "体育") != NULL || strstr(text, "球") != NULL)
+      q = "体育新闻";
+    else if (strstr(text, "科技") != NULL || strstr(text, "手机") != NULL ||
+             strstr(text, "AI") != NULL)
+      q = "科技新闻";
+    else if (strstr(text, "政治") != NULL || strstr(text, "时政") != NULL ||
+             strstr(text, "时事") != NULL)
+      q = "时事新闻";
+    else if (strstr(text, "军事") != NULL)
+      q = "军事新闻";
+    else if (strstr(text, "财经") != NULL || strstr(text, "股票") != NULL ||
+             strstr(text, "经济") != NULL)
+      q = "财经新闻";
+    else if (strstr(text, "国际") != NULL)
+      q = "国际新闻";
+    else if (strstr(text, "健康") != NULL || strstr(text, "养生") != NULL)
+      q = "健康新闻";
+
+    snprintf(json, sizeof(json), "{\"query\":\"%s\"}", q);
+  }
+
+  out[0] = '\0';
+  ret = tool_news_search_execute(json, out, sizeof(out));
+  if (ret != 0 || out[0] == '\0')
+    {
+      printf("[新闻快路] 搜索没取到（%d），回落到大模型\n", ret);
+      return false;
+    }
+
+  /* ★ 2026-11-02：念**标题 + 内容摘要**，不只念标题。
+   *
+   *   Tavily 的输出是：
+   *       1. 标题
+   *          https://…        ← 不念 URL
+   *          正文摘要…         ← 念前 40 字（用户说"说不全"）
+   *       2. …
+   *   新浪的输出是：
+   *       （以下是新浪财经的最新市场要闻…）   ← 免责声明，跳过
+   *       1. 标题（来源 日期）
+   *   提取逻辑：编号行 → 标题；下一行是 URL 则跳过；再下一行是内容摘要，
+   *   截前 40 字念出来。每条 = 标题 + 摘要，最多 3 条。 */
+
+  {
+    const char *p = out;
+    size_t      w = 0;
+    int         taken = 0;
+
+    while (*p != '\0' && taken < 3 && w + 20 < sizeof(reply))
+      {
+        const char *eol = strchr(p, '\n');
+        size_t      len = eol ? (size_t)(eol - p) : strlen(p);
+
+        if (len >= 2 && p[0] >= '1' && p[0] <= '9' && p[1] == '.')
+          {
+            size_t k;
+
+            /* 标题 */
+            for (k = 0; k < len && w + 2 < sizeof(reply); k++)
+              {
+                if (p[k] != '*') reply[w++] = p[k];
+              }
+            reply[w++] = '\n';
+
+            /* 往后找内容摘要行（跳过 URL 行） */
+            {
+              const char *q = eol ? eol + 1 : NULL;
+              int skipped = 0;
+
+              while (q != NULL && skipped < 3)
+                {
+                  const char *qe = strchr(q, '\n');
+                  size_t qlen = qe ? (size_t)(qe - q) : strlen(q);
+
+                  /* URL 行（含 http 或以 www 开头）→ 跳过 */
+                  if (qlen > 10 && (strstr(q, "http") == q || strstr(q, "www.") == q))
+                    {
+                      q = qe ? qe + 1 : NULL;
+                      skipped++;
+                      continue;
+                    }
+
+                  /* 内容摘要行 → 截前 40 字念出来 */
+                  if (qlen > 4 && q[0] == ' ')
+                    {
+                      const char *body = q;
+                      while (*body == ' ') body++;
+                      size_t blen = strlen(body);
+                      if (blen > 60) blen = 60;
+                      while (blen > 0 && ((unsigned char)body[blen] & 0xc0) == 0x80) blen--;
+                      for (k = 0; k < blen && w + 2 < sizeof(reply); k++)
+                        {
+                          if (body[k] != '*') reply[w++] = body[k];
+                        }
+                      reply[w++] = '\n';
+                      break;
+                    }
+
+                  q = qe ? qe + 1 : NULL;
+                  skipped++;
+                }
+            }
+
+            taken++;
+          }
+
+        if (eol == NULL) break;
+        p = eol + 1;
+      }
+
+    reply[w] = '\0';
+
+    if (w == 0)
+      {
+        /* 没有编号条目（别的格式）：跳过开头的声明行，原样截 220 字节 */
+        const char *start = out;
+
+        while (*start == '（' || *start == '*')
+          {
+            const char *eol = strchr(start, '\n');
+
+            if (eol == NULL)
+              {
+                break;
+              }
+
+            start = eol + 1;
+          }
+
+        n = strlen(start);
+        if (n > 220)
+          {
+            n = 220;
+          }
+
+        while (n > 0 && ((unsigned char)start[n] & 0xc0) == 0x80)
+          {
+            n--;
+          }
+
+        memcpy(reply, start, n);
+        reply[n] = '\0';
+      }
+  }
+
+  /* 存标题供「详细说说第X条」用 */
+  g_news_count = 0;
+  {
+    const char *p = reply;
+    while (*p != '\0' && g_news_count < 5)
+      {
+        const char *nl = strchr(p, '\n');
+        size_t len = nl ? (size_t)(nl - p) : strlen(p);
+        if (len >= 2 && p[0] >= '1' && p[0] <= '9' && p[1] == '.')
+          {
+            size_t k = 0;
+            for (size_t j = 2; j < len && k < 126; j++)
+              {
+                if (p[j] != '*') g_news_titles[g_news_count][k++] = p[j];
+              }
+            g_news_titles[g_news_count][k] = '\0';
+            g_news_count++;
+          }
+        if (nl == NULL) break;
+        p = nl + 1;
+      }
+  }
+
+  printf("[新闻快路] 取到头条，直接念（Tavily 优先 / 新浪兜底，跳过 LLM 汇总）：%s\n",
+         reply);
+
+  llm_complete_callback(reply, 0, ctx);
+  return true;
+}
+
 /**
  * @brief  处理AI对话的本体（在AI_TALKING状态调用，见 sm_ai_talking_enter）
  */
@@ -5418,6 +7971,8 @@ static void process_ai_dialogue(sm_context_t *ctx)
 {
   char text_buf[512] = {0};
   light_intent_t light_intent;
+  const int16_t *send_ptr;
+  size_t send_frames;
   size_t frames;
   int ret;
 
@@ -5473,21 +8028,70 @@ static void process_ai_dialogue(sm_context_t *ctx)
    * speech_capture_complete 的说明）。 */
 
   printf("[AI] 正在进行语音识别...\n");
-  ret = voice_asr_recognize((const unsigned char *)g_dlg_ptr,
-                            frames * sizeof(int16_t),
-                            text_buf, sizeof(text_buf));
 
-  /* 识别这一段是唯一可能耗时几秒的同步调用。期间这一轮可能已经作废
-   * （用户又说了一句开了新一轮 / 轮次看门狗判 ASR 相位超时）—— 迟到的旧结果
-   * 一律扔掉，不许再往界面、云端、播放器上贴（S1.1 的代数纪律）。 */
-  if (g_dlg_round != g_round)
+  /* S2.5：剪掉头尾纯静音再送（见 asr_trim_silence 头顶那一段）。
+   * 判据：下面这行「剪掉头尾静音」该在长句上出现，且省下的毫秒数
+   * 接近「静音超时 1000ms + 预卷 300ms」的量级；短句不出现也正常。 */
+
+  send_ptr    = g_dlg_ptr;
+  send_frames = frames;
+  asr_trim_silence(g_dlg_ptr, frames, &send_ptr, &send_frames);
+
+  if (send_frames != frames)
     {
-      printf("[AI] 识别结果迟到（快照是第 %lu 轮，现在是第 %lu 轮），作废\n",
-             (unsigned long)g_dlg_round, (unsigned long)g_round);
-      goto dlg_done;
+      printf("[AI] ASR 剪掉头尾静音：%zu 帧 → %zu 帧（省 %zu ms 音频，"
+             "上传少 %zu 字节）\n",
+             frames, send_frames,
+             (size_t)((frames - send_frames) * 1000 / 16000),
+             (size_t)((frames - send_frames) * sizeof(int16_t)));
     }
 
-  if (ret < 0)
+  ret = voice_asr_recognize((const unsigned char *)send_ptr,
+                            send_frames * sizeof(int16_t),
+                            text_buf, sizeof(text_buf));
+
+  /* ★ 2026-11-02：迟到的 ASR 结果**不再一律丢弃**。
+   *
+   *   真机：录音卡 8 秒 → 看门狗重开 → VAD 误触 → g_round 从 5 跳到 6 →
+   *   ASR 结果回来被判"迟到"扔掉 → 用户说了话却完全没反应。
+   *   改成：只在差 2 轮以上才丢（说明用户真的又说了好几句）；
+   *   差 1 轮时新一轮往往还没产出任何东西，旧结果照样用。
+   *   代价是极少数情况下可能两句回复，远好过"说了没反应"。 */
+  if (g_dlg_round != g_round)
+    {
+      uint32_t gap = g_round - g_dlg_round;
+
+      if (gap > 1)
+        {
+          printf("[AI] 识别结果迟到（快照是第 %lu 轮，现在是第 %lu 轮，"
+                 "差 %lu 轮），作废\n",
+                 (unsigned long)g_dlg_round, (unsigned long)g_round,
+                 (unsigned long)gap);
+          goto dlg_done;
+        }
+
+      printf("[AI] 识别结果迟到 1 轮（第 %lu → %lu），但新一轮还没产出"
+             "内容，照样用\n",
+             (unsigned long)g_dlg_round, (unsigned long)g_round);
+    }
+
+  /* ★ -ENODATA(-61) 不算后端坏了：后端走完全程、就是没听出字。
+   *
+   * 真机实测（2026-10-28，新固件 15 次说完）：9 次落到这一支，全部只打一行
+   * 「语音识别失败: -61」就退回 IDLE —— 老人那边是**说了没反应**，跟"设备坏了"
+   * 分不出来，正是反复报上来的"听到了不回复"。原因不是 ASR 坏，是声音太轻
+   * （那 9 次峰值 305~1765、RMS 17~182；听出字的 6 次峰值 974~4368、
+   * RMS 129~263），火山判断这段里没有人声。
+   *
+   * 所以它落到下面「空文本」那一支的同一条出路：响一声"没听清，您再说一遍
+   * 好吗？"（S4.3）。
+   *
+   * **故意不回落 MiMo 再识别一遍**（voice_asr.c 里"空文本一律不回落"那条
+   * 规矩是对的，别动）：弱音/VAD 误触发时 MiMo 会**编出字来** —— 真机见过
+   * 把底噪认成「男同学。」「同居。」，然后大模型一本正经答起南通、重庆的
+   * 天气，答一个你从没问过的问题，比不答更糟。响一声请你靠近说大点声，
+   * 是这条路上唯一诚实的做法。 */
+  if (ret < 0 && ret != -ENODATA)
     {
       printf("[AI] 语音识别失败: %d\n", ret);
 
@@ -5497,6 +8101,11 @@ static void process_ai_dialogue(sm_context_t *ctx)
         }
       else
         {
+          /* 出声请托走 pending 标志，**不能在这儿直接起播**：下面紧跟着
+           * 一次 sm_handle_event() 收尾，状态机回"听"要开麦，
+           * audio_record_start() 一看在播就 audio_play_stop() 把这声掐了
+           * （见 g_say_fail_pending 那段注释的完整理由）。 */
+          g_say_fail_pending = true;
           sm_handle_event(ctx, SM_EVENT_AI_ERROR);
         }
 
@@ -5509,7 +8118,15 @@ static void process_ai_dialogue(sm_context_t *ctx)
        * 当没听见。既不回传界面、也不送大模型，照原来"识别为空"的收尾走 ——
        * 追问流程记一笔空回答，常听链路由 AI_ERROR 退回 IDLE，随后接着听。 */
 
-      printf("[AI] 语音识别结果为空(或只有空白/标点)，当没听见\n");
+      if (ret == -ENODATA)
+        {
+          printf("[AI] 语音识别没听出字（%d，后端走完了但没转写出东西），"
+                 "当没听见\n", ret);
+        }
+      else
+        {
+          printf("[AI] 语音识别结果为空(或只有空白/标点)，当没听见\n");
+        }
 
       if (ask_mode)
         {
@@ -5517,6 +8134,11 @@ static void process_ai_dialogue(sm_context_t *ctx)
         }
       else
         {
+          /* S4.3「没听清」必须出声（走 pending，理由同上）。
+           * 文案用 PROMPT_MISS_TEXT，和峰值门那一支（speech_capture_complete）
+           * 是同一句 —— 将来合成进 ROMFS 时按文案算哈希查表，两处必须逐字一样。 */
+          robot_ui_bridge_voice_reply(PROMPT_MISS_TEXT);
+          g_say_miss_pending = true;
           sm_handle_event(ctx, SM_EVENT_AI_ERROR);
         }
 
@@ -5547,6 +8169,109 @@ static void process_ai_dialogue(sm_context_t *ctx)
       goto dlg_done;
     }
 
+  /* =====================================================================
+   * 语音急救 / 「没事」/ 会话闸门（2026-10-31）
+   * =====================================================================
+   * 位置是钉死的：
+   *   · 在 ask_mode 那一支**之后** —— 摔倒/异常声音检测的追问回答绝不能
+   *     被下面拦掉（用户明确要求不动那一模块）；
+   *   · 在 reminder_intent_try **之前** —— 「救命」比设提醒优先；
+   *   · 急救词判定在会话闸门**之前** —— 锁着也必须能报警。
+   * =================================================================== */
+
+  {
+    int emerg = emerg_classify(text_buf);
+
+    /* ①「没事」取消报警。
+     * ⚠ 必须先判「这不是一句急救话」才认「没事」：「我没事，就是胸口疼」
+     *   里的「没事」会把刚起的报警停掉，而那句恰恰是真急救。
+     *   判定顺序和 ask_classify() 同一个道理 —— 急救在前、安抚在后。 */
+
+    if (emerg != ASK_VERDICT_EMERGENCY)
+      {
+        voice_emerg_on_text(text_buf);
+      }
+
+    /* ② 急救词：**无条件**，不受会话闸门限制 —— 锁着也要能报警。
+     *   命中就地起铃，这一轮不送大模型。 */
+
+    if (emerg == ASK_VERDICT_EMERGENCY)
+      {
+        voice_emerg_trigger("voice_sos", text_buf);
+
+        /* ★ 2026-11-01：**补上确认页**。
+         *
+         *   本地声音那条（sound_event_cb）在 voice_emerg_trigger() 之后还调了
+         *   ui_post_ask_alarm()，所以屏幕会弹「报警确认页」；而语音关键词这条
+         *   （喊「救命」）只起了铃 —— 用户看到的现象就是"响铃但没有报警页面"，
+         *   只能干等/断电。
+         *
+         *   这里补同一条页：页面上的「我没事，取消」按钮最终走
+         *   robot_ui 的 ask_finish(confirmed=0) → voice_emerg_cancel(src)，
+         *   和说「没事」是**同一条**取消路径（见 robot_ui/main.c:1169）。 */
+
+        ui_post_ask_alarm(text_buf);
+        round_phase_set(ROUND_PHASE_IDLE);
+
+        /* 同④：这一轮没送大模型，得把 sm 推回去，否则它在 AI_TALKING
+         * 上挂 180 秒，把后面的唤醒词全吃掉（详见④的长注释）。 */
+
+        sm_handle_event(ctx, SM_EVENT_AI_ERROR);
+        goto dlg_done;
+      }
+  }
+
+  /* ③ 报警正在响：这句不送大模型（铃不能被 AI 说话盖掉）。
+   *   但上面①已经给过「没事」停铃的机会了。 */
+
+  if (voice_emerg_is_active())
+    {
+      printf("[急救] 报警中，这句不送大模型\n");
+      round_phase_set(ROUND_PHASE_IDLE);
+
+      /* 同④。 */
+
+      sm_handle_event(ctx, SM_EVENT_AI_ERROR);
+      goto dlg_done;
+    }
+
+  /* ④ 会话闸门：锁着就不出声，只上屏。 */
+
+  if (!session_is_open())
+    {
+      screen_hint_locked();
+      round_phase_set(ROUND_PHASE_IDLE);
+
+      /* ★★ 这一轮到此为止，**必须**把状态机推回去（2026-10-31）。
+       *
+       * 进这一轮之前，VAD 的 SM_EVENT_VOICE_COMPLETE 已经把 sm 送进
+       * AI_TALKING（ai_state_machine.c:340），而 AI_TALKING 的超时是
+       * **180 秒**（ai_state_machine.c:102）。dlg_done 只还识别槽、推不动
+       * 状态机，所以拒绝之后 sm 会在 AI_TALKING 上挂满 3 分钟 —— 这期间
+       * kws_wake_tick() 的"正忙"检查会把每一次唤醒词命中都吃掉。
+       * 真机日志（2026-10-31）就是这个形状，用户因此觉得"唤醒词几乎
+       * 检测不到、想干脆去掉"。这里推一下就断根了。 */
+
+      sm_handle_event(ctx, SM_EVENT_AI_ERROR);
+      goto dlg_done;
+    }
+
+  /* 续期：只有**已经开**的会话才算"有动静"。锁定期间说话不续期 ——
+   * 否则电视一响就永不锁了。 */
+
+  session_renew();
+
+  /* 本机定提醒意图（2026-10-30）：命中就地建好 + 回话，这一轮不再送大模型。
+   * 放在灯控**前面**是因为「提醒我八点开灯」里两个意图都有 —— 这句话真要做
+   * 的是建提醒，不是现在就开灯。没提时刻/时刻有歧义/取消删改的一律返回 0，
+   * 照原路送大模型。判据见 reminder_intent_try 上面那节。 */
+
+  if (reminder_intent_try(ctx, text_buf))
+    {
+      round_phase_set(ROUND_PHASE_IDLE);   /* 本机回话是单段播报，不走这条流水线 */
+      goto dlg_done;
+    }
+
   /* 本机灯控意图：命中就直接做完（device_cmd + 回话 + 播报），
    * 这一轮不再送大模型；拿不准的（否定/歧义）返回 NONE，照原路送大模型。 */
 
@@ -5574,6 +8299,30 @@ static void process_ai_dialogue(sm_context_t *ctx)
       goto dlg_done;
     }
 
+  /* ★ 2026-11-01：新闻/天气走快速通道（直接取数据 + TTS），
+   * 不再经过 velaclaw（真机 -110 45s）和直连兜底（又 45s）那条慢链；
+   * 新闻还绕开"搜完再让 LLM 总结"这一步（真机上 LLM 汇总会挂）。
+   * 任何条件不满足它自己返回 false，下面原路照走。 */
+  if (news_detail_try(text_buf, ctx))
+    {
+      goto dlg_done;
+    }
+
+  if (selfintro_fast_try(text_buf, ctx))
+    {
+      goto dlg_done;
+    }
+
+  if (news_fast_try(text_buf, ctx))
+    {
+      goto dlg_done;
+    }
+
+  if (weather_fast_try(text_buf, ctx))
+    {
+      goto dlg_done;
+    }
+
   round_phase_set(ROUND_PHASE_LLM);
 
   if (g_net_started)
@@ -5591,6 +8340,12 @@ static void process_ai_dialogue(sm_context_t *ctx)
    * 表现就是"完全不能对话"。所以先给它两三次机会，别一撞就丢。 */
   for (int attempt = 0; attempt < 3; attempt++)
     {
+      /* 抄一份用户原话给回调做直连兜底用（text_buf 是栈上的，回调那会儿早没了）。
+       * 放在循环里是白抄两三次无所谓；放在循环外反而会在 goto dlg_done 的路上
+       * 漏掉。见 g_llm_sent_text 那段注释。 */
+      strncpy(g_llm_sent_text, text_buf, sizeof(g_llm_sent_text) - 1);
+      g_llm_sent_text[sizeof(g_llm_sent_text) - 1] = '\0';
+
       /* 每次动手前核一次：-EBUSY 的那 300ms 里用户可能已经又开口了。 */
       if (g_dlg_round != g_round)
         {
@@ -5834,10 +8589,22 @@ static void *main_loop_task(void *arg)
       /* 5.1c 「没听清」出声的代跑（S4.3）：录音线程只置 g_say_miss_pending，
        *     这里替它说。放在看门狗之后、不占关键路径；没要说是两次判断就返回。 */
 
+      /* 【2026-10-29】这两句必须**真念出来**，不能只"嘟"一声 —— 见
+       * miss_speak_worker 头顶那一大段（三句固定话术的 PCM 一句都不在 ROMFS，
+       * 而 prompt_ack_play_kind 查不到缓存就只响一声提示音）。
+       * 走 miss_speak_kick：真念要出网，出网会阻塞，所以丢给分离线程，
+       * 这一拍 100 ms 立刻还给主循环。 */
+
+      if (g_say_fail_pending)
+        {
+          g_say_fail_pending = false;
+          miss_speak_kick(PROMPT_ACK_KIND_FAIL);
+        }
+
       if (g_say_miss_pending)
         {
           g_say_miss_pending = false;
-          prompt_ack_play_kind(&g_audio_ctx, PROMPT_ACK_KIND_MISS);
+          miss_speak_kick(PROMPT_ACK_KIND_MISS);
         }
 
       /* 5.2 录音卡死的串口观测（**只打印**，不做任何恢复动作）：
@@ -6321,11 +9088,28 @@ int main(int argc, char *argv[])
 
   /* 3.5 注册语音 ASR/TTS 后端
    *
-   * 两套都注册，然后按配置选：
-   *   - 配置里有非空的 api_key + llm_host（开机从 agent_config.json 拷进
-   *     /data/ai_agent/config/config.json）-> 用小米 MiMo（mimo_voice.c）；
-   *   - 否则回落到火山引擎（volc_asr/volc_tts，需要 volc_api_key 等凭据）。
-   * 火山那条路保留不动：队友的凭据以后可能还会用。
+   * 两套都注册，然后按配置选。ASR 和 TTS **分开选**，因为两者的取舍
+   * 完全相反：
+   *
+   * ASR —— 配了 volc_api_key 就**火山优先**。理由：火山「流式语音识别
+   *   模型 2.0」是唯一能判方言的（目标用户是老人，可能说济南话）；小米
+   *   MiMo 网关的 language 参数实测是摆设，12 种取值（含 zz-ZZ）转写
+   *   逐字节一样，换不掉模型能力。
+   *   ⚠️ 这条换来的是"可能听错"，不是"可能不回答"：voice_asr_recognize
+   *   里有回落，火山一旦报错（key 失效/网络断/协议错）立刻换 MiMo 重试，
+   *   对话不会因此断。空文本不回落（那是真没说话，回落只会白跑一趟网络）。
+   *
+   * TTS —— **2026-11-01 改成火山「语音合成模型2.0」优先**。
+   *
+   *   上一轮"MiMo 优先"的理由是"出声最不能缺，换后端可能不出声"；但真机
+   *   证明 MiMo TTS 才是更不稳的那条：配额 429、单块响应超 896KB 被截断、
+   *   降级到火山又因为资源 ID 用错（旧豆包 10029）而 403 —— 整机彻底无声。
+   *
+   *   用户已开通「语音合成模型2.0」，PC 实测：
+   *     X-Api-Key: <volc_api_key>  +  X-Api-Resource-Id: seed-tts-2.0
+   *     speaker: zh_female_vv_uranus_bigtts  →  HTTP 200 + PCM
+   *   所以这里火山优先，MiMo 只做**单块兜底**（mimo_tts_speak_head 里
+   *   火山失败就这一块直连 MiMo），两条路都保留。
    */
 
   printf("[初始化] 正在注册语音后端...\n");
@@ -6334,26 +9118,56 @@ int main(int argc, char *argv[])
   volc_asr_register();
   volc_tts_register();
 
-  if (mimo_voice_available())
+  /* ★ 2026-11-01：本进程也要加载搜索 key。
+   *
+   *   `tool_web_search.c` 的 `s_tavily_key` 是**每个 app 各一份静态变量**：
+   *   ai_agent 进程启动时调过 tool_web_search_init()，所以它的 web_search
+   *   能用 Tavily；而 hello_app 的新闻快路直接调 tool_news_search_execute()，
+   *   从没初始化过 → 这份 key 是空的 → 只能落到新浪财经（免 key）。
+   *   用户配置了 tavily_key 却"只走新浪"，根因就是这里。 */
+
+  tool_web_search_init();
+
+  /* ── TTS：火山「语音合成模型2.0」优先，没配才用 MiMo ── */
+  if (volc_asr_available() && voice_tts_set_backend("volcengine") == 0)
     {
-      if (voice_asr_set_backend("mimo") == 0
-          && voice_tts_set_backend("mimo") == 0)
+      mimo_tts_prefer_volc(1);
+      printf("[初始化] TTS 后端: 火山引擎 (volcengine, seed-tts-2.0, "
+             "%s)\n", "zh_female_vv_uranus_bigtts");
+    }
+  else if (mimo_voice_available() && voice_tts_set_backend("mimo") == 0)
+    {
+      printf("[初始化] TTS 后端: MiMo (mimo)（火山凭据未配置）\n");
+    }
+  else
+    {
+      printf("[警告] TTS 后端都不可用\n");
+    }
+
+  /* ── ASR：配了火山凭据就火山优先（能听方言），否则 MiMo ── */
+  if (volc_asr_available() && voice_asr_set_backend("volcengine") == 0)
+    {
+      printf("[初始化] ASR 后端: 火山引擎 (volcengine)"
+             "（方言自动判别，出错自动回落 MiMo）\n");
+    }
+  else if (mimo_voice_available())
+    {
+      if (voice_asr_set_backend("mimo") == 0)
         {
-          printf("[初始化] 语音后端: MiMo (mimo)\n");
+          printf("[初始化] ASR 后端: MiMo (mimo)"
+                 "（没配 volc_api_key）\n");
         }
       else
         {
-          printf("[警告] MiMo 后端注册异常，回落到火山引擎\n");
+          printf("[警告] MiMo ASR 后端注册异常，回落到火山引擎\n");
           voice_asr_set_backend("volcengine");
-          voice_tts_set_backend("volcengine");
         }
     }
   else
     {
-      printf("[初始化] 语音后端: 火山引擎 (volcengine)"
+      printf("[初始化] ASR 后端: 火山引擎 (volcengine)"
              "（配置里没有 api_key + llm_host）\n");
       voice_asr_set_backend("volcengine");
-      voice_tts_set_backend("volcengine");
     }
 
   /* 分配语音段累积缓冲区。
@@ -6390,6 +9204,19 @@ int main(int argc, char *argv[])
    *   模板怎么来：① 固件里带（把 slotN.tpl 放进 etc/assets/kws/ 一起打包，
    *   开机自动装，这是"重启后还有"的唯一途径）；② 现场录（kws_dtw.h 的
    *   kws_enroll()，只在本次开机有效，见 kws_update_enabled）。 */
+
+  /* 语音急救报警：喊「救命」不需唤醒词 → 响铃 → 10 秒说「没事」就停，
+   * 否则 Bark 通知家人。响铃走 g_audio_ctx 的 audio_play_start()（那条路有
+   * "播完还麦"），所以必须在 audio_init() 之后起。
+   * 失败也不拦启动 —— 只是急救功能没有，本地语音链路照常。 */
+
+  printf("[初始化] 正在初始化语音急救模块...\n");
+  ret = voice_emerg_init(&g_audio_ctx);
+  if (ret < 0)
+    {
+      printf("[警告] 语音急救模块初始化失败: %d（急救报警不可用，对话照常）\n",
+             ret);
+    }
 
   printf("[初始化] 正在初始化唤醒词模块...\n");
   ret = kws_init();
@@ -6631,6 +9458,227 @@ int main(int argc, char *argv[])
     }
 
   printf("[运行] 系统已启动, 按 Ctrl+C 退出\n\n");
+
+  /* ★ 2026-10-31 这一版的**落地标记**。串口开机看到它 = 唤醒词整套已取消
+   *   （不闸门、不问候、命中只留一行日志）；看不到就是还跑着旧固件。
+   *   烧没烧上，一眼可辨，不用再靠行为反推。 */
+
+  printf("[版本] 取消唤醒词：不闸门、不问候、命中只留一行日志 + 假忙自愈搬到看门狗（2026-10-31）\n");
+
+  /* ★ 同日第四条：LLM 直连兜底的判据修正。
+   *
+   *   原来判 `fb == 0` 才算成功，可 mimo_chat() 成功返回的是**正文长度**、
+   *   失败返回负 errno，它永远不会返回 0 —— 兜底每次都真的拿到了答案、
+   *   每次都被当成"也失败"扔掉，老人听到「我这边有点问题」。
+   *   真机铁证（一段测试里两次）：`chat: 回复 174 字节` 紧跟着
+   *   `直连兜底也失败（174），按原路报错`。
+   *   串口开机看到这一行 = 判据已改成看长度。 */
+
+  printf("[版本] LLM 直连兜底判据修正：mimo_chat 返回正文长度，原来恒判失败（2026-10-31）\n");
+
+  /* ★ 同日第二条落地标记：音频驱动的**单读者守卫** + hw_stop 连发 3 次唤醒。
+   *   针对"录音线程卡在设备读里 8039 ms / 放弃 join / 会话 1→7 泄漏"那一簇
+   *   （第二个读者把第一个的 5 秒心跳 wd_cancel 掉，第一次等待从此没上界）。
+   *   串口开机看到它 = 驱动那两处也落地了。 */
+
+  printf("[版本] 录音单读者守卫 + stop 连发唤醒（2026-10-31）\n");
+
+  /* ★ 同日第三条：摔倒/异常声那条链的**根因修复 + 逐段可观测**。
+   *
+   * 根因：门控每 200ms 滑一跳（3200 样本），却把整窗 10240 样本喂给
+   *   sound_event_feed —— 而那是**流式**前端（自己攒 0.64 秒窗、每 200ms
+   *   出一次推理，契约写着"允许任意切分地连续调用"）。等于同一段音频被喂
+   *   3.2 遍、还带"前进 3200 / 倒退 7040"的锯齿，模型听到的是世界上不存在
+   *   的声音，3/4 投票永远凑不齐。改成只喂新的一跳。
+   *
+   * 可观测：门控逐窗一行（限速）+ 15 秒汇总 + 小模型每窗 top-1/票数/拒因。
+   *   在这之前，测试跑完串口里既看不到"喂了几个窗"，也看不到"是不是全被判
+   *   成人声送去云端了"，五个候选病因一个都排除不掉。
+   *
+   * 串口开机看到它 = 这一版落地了。 */
+
+  printf("[版本] 摔倒检测喂模型修重叠窗 + 逐段可观测（2026-10-31）\n");
+
+  /* ★ 2026-11-01 v13：人声窗**只允许 SCREAM 类**触发。
+   *
+   *   10-31 那条"人声窗也喂小模型"修好了尖叫不触发，但把副作用也带进来了：
+   *   真机 11 分钟里 5 次误报，全部来自"门控判成人声、模型判成 knock/fall"
+   *   （fall 0.71 / knock 0.56/0.57/0.71/0.67），一说话就报警。
+   *   现在人声窗只让 scream 这一维投票，fall/knock 只从非人声（撞击/倒地）
+   *   窗触发；模型认不出尖叫时，门控照旧把这段人声送云端走「救命/报警/
+   *   着火」关键词那条路。
+   *   串口开机看到这一行 = 这一版落地了；旧那行"人声窗也喂小模型"不该再出现。 */
+
+  printf("[版本] 人声窗只允许尖叫类触发：说话/喊叫不再误判成敲击跌倒报警（2026-11-01）\n");
+
+  /* ★ 同日 v13 第二条：报警确认期的语音捕获放行。
+   *   原来 "没事" 三重被拦：门控按"正忙"丢弃、speech_capture_begin 见
+   *   record_hold 早退、状态机 ALARM/AI_TALKING 忽略 WAKEUP/VOICE_COMPLETE。
+   *   现在铃停下来的听窗里直接开麦，走 dialogue_request 无条件投递那条路，
+   *   识别到「没事」就回调 voice_emerg_on_text()。 */
+
+  printf("[版本] 报警听窗放行「没事」：铃停时开麦，语音取消不再被忙判据丢掉（2026-11-01）\n");
+
+  /* ★ v14（2026-11-01 第二轮）：人声"余温" 2.5 秒。
+   *   真机第二轮日志：scream 分数恒 0.00~0.01（模型没有可用的尖叫检测），
+   *   而 fall 0.57 / knock 0.71 的误报全部紧跟在人声窗之后的尾几跳 ——
+   *   门控判成"非人声"喂进去的。现在人声后 2.5 秒内的所有喂入都按人声
+   *   处理（只允许 scream），真正宽带的撞击声不受影响。 */
+
+  printf("[版本] 人声余温 2.5 秒只认尖叫：喊叫/说话的尾音不再被误判成敲击跌倒（2026-11-01）\n");
+
+  /* ★ v15：fall/knock 门槛 0.55 → 0.80 + 声音未回落不报。
+   *   真机 2026-11-01 开机 50 秒、无人操作，一段 rms≈0.05 的持续环境噪声
+   *   被攒成「跌倒 74%」直接响铃；之前说话的尾音也报过 knock 0.71。
+   *   实测误报全在 0.57~0.74，0.80 是能把它们全部挡掉、又保留"非常像"的
+   *   真撞击的门槛。 */
+
+  printf("[版本] fall 门槛 0.80 + 声音未回落不报：持续噪声不再自己报警（2026-11-01）\n");
+
+  /* ★ v16：knock 改"15 秒内连敲两下" + TTS 修复。
+   *   knock 真事件/误报置信度完全重叠（0.64~0.73 vs 0.57~0.71），阈值切不开；
+   *   TTS 块 64→32 字，且响应截断（-EPROTO）不再触发降级 —— 10-31 那一版
+   *   就是因为一个 140 字节的块超了 896KB 响应缓冲，被粘性降级到火山，
+   *   而火山这个 key 没开通 TTS（403），整机彻底无声。 */
+
+  printf("[版本] 敲击=15秒内连敲两下 + TTS 块 64→32 字/截断不再降级/火山403切回 MiMo（2026-11-01）\n");
+
+  /* ★ v17：火山「语音合成模型2.0」正式接上并设为 TTS 首选。
+   *   资源 ID 旧的豆包 10029 → seed-tts-2.0；音色 → zh_female_vv_uranus_bigtts；
+   *   响应缓冲 128KB → 512KB（2.0 的 base64 响应比 MiMo 大得多）。 */
+
+  printf("[版本] TTS 首选火山语音合成2.0（seed-tts-2.0 / vv_uranus），"
+         "MiMo 单块兜底（2026-11-01）\n");
+
+  /* ★ v18：天气快速通道（跳过 velaclaw/LLM，直接 Open-Meteo）。
+   *   真机问天气原来 105 秒才出声：velaclaw -110 浪费 45 秒 + 直连兜底
+   *   又跑一遍工具 45 秒。现在识别到天气意图就直接查、直接念。 */
+
+  printf("[版本] 天气快速通道：跳过 velaclaw/LLM 直接查 Open-Meteo（2026-11-01）\n");
+
+  /* ★ v19：录音链路"5 秒心跳被下一条 read 取消"的洞。
+   *   旧守卫 `rx_busy && !rx_aborted` 会在 stop 之后放行新读者，新读者进门
+   *   nxsem_reset + wd_cancel 把旧读者的心跳拆掉 → 旧读者永久卡在读里（串口
+   *   「卡在设备读里 8 秒 / 放弃 join / 会话数只涨不跌」）。现在每个读者登记
+   *   rx_owner_gen，只有 owner 才能清 rx_busy；新读者一律让路，6.5 秒才抢占。 */
+
+  printf("[版本] 录音 owner_gen 单读者守卫：stop 不再取消旧读者的 5s 心跳，"
+         "卡 8s 根治（2026-11-01）\n");
+
+  /* ★ v20：新闻快速通道 + 撞击两次确认。
+   *   新闻：新浪 5 条/Tavily 都搜到过，最后 LLM 汇总挂掉 → 直接念新浪头条。
+   *   撞击：模型把连敲判成 fall 0.57，0.80 门槛导致"敲击没反应"；现在
+   *   fall/knock 都算撞击，0.55 起算，15 秒内两次或单次 ≥0.80 报警。 */
+
+  printf("[版本] 新闻快速通道（新浪免 key 直接念）+ 撞击 fall/knock 15s 内两次"
+         "或单次 ≥0.80（2026-11-01）\n");
+
+  /* ★ v21：修两处 v20 真机暴露的问题：
+   *   ① "声音还在持续" veto 原来是逐窗判的，把真敲也挡了（★命中=0）；
+   *      改成连续 >6 秒才算持续声。
+   *   ② 新闻快路截前 220 字节，正好念到新浪的免责声明；改成从 "\n1." 起
+   *      只念前 3 条编号头条，并去掉 Markdown 星号。 */
+
+  printf("[版本] 撞击 veto 改为连续 >6s + 新闻快路只念编号头条（跳过免责声明）"
+         "（2026-11-01）\n");
+
+  /* ★ v22：搜索 key 的"两个 app 各一份静态变量"问题。
+   *   tool_web_search.c 的 s_tavily_key 是每进程一份；ai_agent 初始化过，
+   *   hello_app 的新闻快路没初始化 → Tavily 用不上、只能走新浪。
+   *   现在 hello_app 启动时调 tool_web_search_init()，且新闻工具改成
+   *   Tavily 优先、新浪兜底。 */
+
+  printf("[版本] hello_app 加载搜索 key + 新闻 Tavily 优先（新浪兜底）（2026-11-01）\n");
+
+  /* ★ v23：录音线程被打死的断言。
+   *   `Assertion failed at /sched/semaphore/sem_post.c:63`
+   *   `nxsem_post_slow ← audio_in_read ← audio_record_thread`
+   *   `sf32lb52_audio_in.c` 的 g_audio_in_lock 从 mutex 改成二值信号量：
+   *   没有"持有者"跟踪，post 不会再走那条断言。 */
+
+  printf("[版本] 录音锁改二值信号量：sem_post.c:63 断言（audio_in_read）修复"
+         "（2026-11-01）\n");
+
+  /* ★ v24：录音 8 秒卡读的**诊断**（不改行为）。
+   *   卡满 8 秒时 sched_dumpstack(录音线程)，把 PC 打在串口里；
+   *   下一轮据此定位到 bf0_hal_audprc.c / bf0_hal_dma.c 的具体自旋。 */
+
+  printf("[版本] 录音卡读 8s 时打印卡住线程调用栈（诊断）（2026-11-01）\n");
+
+  /* ★ v25：报警收摊修复。
+   *   ① 语音「救命」补确认页（原来只响铃、没页面）；
+   *   ② 主循环 100ms 一拍做 180 秒兜底（工作线程卡住也能收）；
+   *   ③ 通知后的听窗 1.2s→2.8s（说「没事」给 ASR 留够时间）。 */
+
+  printf("[版本] 语音救命补确认页 + 主循环 180s 兜底 + 通知后听窗 2.8s"
+         "（2026-11-01）\n");
+
+  /* ★ v26：长回复"话没说完" + 屏幕省略号。
+   *   火山 TTS 对 64 字（192 字节）的块返回 -22，全部回落 MiMo（10~16s/块），
+   *   25s TTS 停滞判据把整轮作废。火山分块改回 32 字（实测 40~96 字节全成功）。
+   *   主屏字幕两行 + 省略号是设计；长回复自动打开语音面板看完整正文。 */
+
+  printf("[版本] 火山 TTS 块 64→32 字修 -22 回落 + 长回复自动开语音面板"
+         "（2026-11-01）\n");
+
+  /* ★ v27：自我介绍快路 + Tavily 新闻模式。
+   *   ① ASR 只转出「你好你好」时模型答了通用问候；现在文本里出现
+   *      "你能做什么/你会什么/你是谁"等就直接念用户给的那句模板；
+   *   ② Tavily 新闻请求加 topic=news（原来返回「主页 - BBC News 中文」这种
+   *      网站首页，用户听到"只说了一句"）。 */
+
+  printf("[版本] 自我介绍快路 + Tavily 新闻 topic=news（2026-11-01）\n");
+
+  /* ★ v29：新闻查询按类别（娱乐/体育/科技/国际/财经）+ ASR 去掉会阻塞的
+   *   close_notify + ASR/Bark 补 fd 开/关追踪（定位 D 池泄漏的最后两块拼图）。 */
+
+  printf("[版本] 新闻按类别查询 + ASR 去 close_notify + ASR/Bark fd 追踪"
+         "（2026-11-01）\n");
+
+  /* ★ v32：Tavily 新闻去掉 days=7 限制、max_results 加到 10（中文娱乐新闻
+   *   在 Tavily 的 news 索引里更新慢，7 天限制只剩 1 条）；
+   *   报警听窗 2.8s→3.6s（VAD 判完"说完了"需要时间，太短音频被铃截断）。 */
+
+  printf("[版本] Tavily 新闻不限时间+10条 + 报警听窗 3.6s（2026-11-01）\n");
+
+  /* ★ v33：报警页/确认页收摊修复。
+   *   ① 确认期超时后面板不再关闭（「我没事，取消」按钮一直在）；
+   *   ② 报警页「返回」按钮同时停 voice_emerg 铃（原来只停板级警音）。 */
+
+  printf("[版本] 报警面板超时保留+返回按钮停铃（2026-11-01）\n");
+
+  /* ★ v34：**按钮点不动**的根因。
+   *   voice_emerg_cancel 在 LVGL 线程里调 audio_play_stop（有 join），
+   *   播放线程卡住时阻塞 UI —— 真机日志 UI 最大停 96 秒。
+   *   改成只置 g_cancel + sem_post，worker 线程自己收尾。
+   *   同时 alarm_sound_end 不再拿锁（单核写 bool 是原子的）。
+   *   「没事」ASR 变体扩展（没式/美事/妹事/不用/不要）。 */
+
+  printf("[版本] 按钮不再阻塞：cancel 去 audio_play_stop + alarm_end 去锁"
+         " + 没事 ASR 变体（2026-11-01）\n");
+
+  /* ★ v35：新闻类别用简单短词（长查询板子上 Tavily 直接失败）+
+   *   新闻概括功能（「详细说说第X条」→ 搜正文念摘要）。 */
+
+  printf("[版本] 新闻短查询分类 + 详细说说第X条概括（2026-11-02）\n");
+
+  /* ★ v36：迟到 ASR 结果不再一律丢弃（差 1 轮照样用）——
+   *   录音卡 8 秒后轮次跳变导致识别成功但用户听不到回复的根因。 */
+
+  printf("[版本] 迟到 ASR 差 1 轮照样用：修说了没反应（2026-11-02）\n");
+
+  /* ★ v38：语音链路三处修复。
+   *   ① VAD 最短语音 500→300ms（「救命」只有 0.5s，500ms 门槛不起判）；
+   *   ② 急救词加 20+ 个 ASR 误听变体（救民/九命/快来人/着火了…）；
+   *   ③ 报警确认期短句（≤15 字）一律当「没事」（ASR 误听变体追不完）。 */
+
+  printf("[版本] VAD 300ms + 急救词 20+ 变体 + 短句即没事（2026-11-02）\n");
+
+  /* ★ v38b：按钮取消后立刻掐铃（detached 线程调 audio_play_stop）——
+   *   v34 去掉 audio_play_stop 后铃要等 worker 1.2 秒才停，用户看到
+   *   "按钮关了铃还响"。 */
+
+  printf("[版本] 按钮取消即刻掐铃 + 短句即没事 + 急救词 20+ 变体（2026-11-02）\n");
 
   /* 起状态信标（纯仪表，见 state_beacon_task 的说明）。**起不来不算故障**：
    * 少一条诊断不影响功能，主循环照常跑，所以失败只留一行日志就往下走。 */

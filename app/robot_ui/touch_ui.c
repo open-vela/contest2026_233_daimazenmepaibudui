@@ -15,6 +15,12 @@
  * 不自己 open("/dev/lcd0") 拼 ioctl。 */
 #include "sf32lb52_backlight.h"
 
+/* 语音改音量/亮度（adjust_setting 工具）的 item / action 常量在这里 ——
+ * 那是跨 app 的协议（本文件是实现方，mimo_voice.c 是发起方），只有一份定义。
+ * 头很轻（<stddef.h> + mimo_location.h），不影响本文件的编译。 */
+#include "mimo_voice.h"
+#include <errno.h>
+
 /* 提醒的存与调度（app/robot_ui/reminder_sched.c）：
  * 提醒列表的数据放在那里，界面只在"加 / 删 / 查"时调它的接口，
  * 不再自己存一份（以前那份 static reminder_t reminders[] 只会显示、到点不响）。 */
@@ -195,8 +201,25 @@ static void *g_voice_mirror_reset_user_data = NULL;
  * 镜像面板走 g_voice_mirror_submit_cb 转发给 hello_app），避免复制两份弹窗代码。 */
 static bool voice_mirror_only = false;
 
-/* 设置持久化文件路径 */
-#define SETTINGS_FILE_PATH "/data/zhi_ai_settings.dat"
+/* 设置持久化文件路径。
+ *
+ * 两个位置，**运行时用真写探针挑一个**（见 settings_resolve_path）：
+ *   - /data/tf/...  TF 卡上的 vfat，掉电保留 —— 首选；
+ *   - /data/...     tmpfs，断电就清空 —— 没插卡时的退路。
+ *
+ * 以前只写 /data/...，而 /data 是 sifli_ap.c 里 nx_mount 的 tmpfs，
+ * 于是音量/亮度/自动提醒/提醒间隔**每次重启全部回默认**（音量回 70）。
+ * 代码里早先那段"开机时硬件那边还是默认音量，不补这一下会出现滑块显示 30、
+ * 声音还是 70"的注释，前提是设置文件留得住 —— 那个前提在本板上不成立。 */
+
+#define SETTINGS_FILE_PATH_TF  "/data/tf/zhi_ai_settings.dat"
+#define SETTINGS_FILE_PATH_TMP "/data/zhi_ai_settings.dat"
+
+/* 真写探针用的临时文件名。**不能拿 SETTINGS_FILE_PATH_TF 去探**：
+ * fopen(..., "w") 会把已有文件截断，一探就把上次存的设置抹了。 */
+
+#define SETTINGS_PROBE_PATH    "/data/tf/.zhi_ai_write_probe"
+
 #define SETTINGS_FILE_MAGIC 0x5A414953  /* "ZAIS" */
 #define SETTINGS_FILE_VERSION 1
 
@@ -428,6 +451,24 @@ void touch_ui_init(void)
     /* 加载持久化设置 */
     settings_load_from_file();
 
+    /* 开机要把亮度**真的下发一次**。前科：亮度以前只在拖滑块的那一刻才
+     * backlight_set()，存盘的数字只是个数字 —— 于是"语音把亮度调到 60 →
+     * 断电重启 → 设置页写着 60，屏幕却还是出厂亮度"。音量不用在这里做：
+     * main.c 注册 touch_ui_set_volume_cb() 时会把当前值重发一遍
+     * （见 touch_ui_set_volume_cb），已经覆盖到了。
+     *
+     * 亮度 0 不在开机下发（backlight_set(0) 是 DisplayOff）：存了个 0 就
+     * 黑屏起不来，老人没有任何办法把它调回来。真被设成 0 时这里只留一行日志，
+     * 屏幕保持上电亮度。 */
+    if (user_settings.brightness > 0) {
+        int ret = backlight_set(user_settings.brightness);
+        printf("settings: 开机亮度 %d -> %s\n", user_settings.brightness,
+               ret == OK ? "已下发" : "下发失败");
+    } else if (user_settings.brightness == 0) {
+        printf("settings: 存的亮度是 0，开机不下发（会黑屏起不来），"
+               "屏幕保持上电亮度\n");
+    }
+
     printf("touch_ui init done\n");
 }
 
@@ -627,10 +668,21 @@ static void create_menu_panel(menu_type_t type)
  * （语音聊天/查看提醒/设置/紧急呼叫），所以只会有一页；「关于」并进设置页
  * —— 它是版本信息，不值得占掉老人一眼就要找到的四个坑之一。
  * 将来真超过 4 项，下面这套分页（◀ 页码 ▶）自动生效，不会挤成第五个格子。
- */
+ *
+ * ★ 2026-10-29 用户点名「四个按钮换成在页面均匀放置的四个正方型」——
+ * 原来每格是 `flex_grow(1)` 撑满的**长方形**（一行两格各占半行宽 × 106 高），
+ * 现在改成**定死的正方形**（132×132），横竖两个方向都用同一个 12px 间隙、
+ * 整组居中。为什么间隙要两边一样：横竖不等就会看着"横着松、竖着紧"，
+ * 老人一眼看得出不齐，反而更难认。
+ *
+ * 尺寸是算出来的，不是拍的：内容区实测 390×310，减掉上下内缩 12+12 后
+ * 剩 286 高；两行 132 + 一行间隙 12 = 276 ≤ 286，两边都还有富余居中掉。
+ * 再大到 140 就塞不下两行了。 */
 #define MENU_GRID_COLS  2
 #define MENU_GRID_ROWS  2
 #define MENU_PAGE_ITEMS (MENU_GRID_COLS * MENU_GRID_ROWS)
+#define MENU_TILE_SIZE  132   /* 正方形边长（横竖都用它） */
+#define MENU_TILE_GAP   12    /* 格子之间的间隙，横竖同一个值 */
 
 typedef struct
 {
@@ -641,13 +693,16 @@ typedef struct
 
 static int s_menu_page = 0;
 
-/* 主菜单四项。下标必须和 menu_item_event_handler 的 case 一一对应。 */
+/* 主菜单四项。下标必须和 menu_item_event_handler 的 case 一一对应。
+ * 副标题一律 ≤5 个字：正方形格子内宽 132-16 = 116，20 号字每字约 20px，
+ * 6 个字（"音量、亮度等"）就是 120px，会折行把标题挤走 —— 所以那条
+ * 2026-10-29 起收成「音量、亮度」。 */
 static const menu_entry_t s_menu_main[] =
 {
-    { "语音聊天", "和我说说话",   0 },
-    { "查看提醒", "今天的安排",   1 },
-    { "设置",     "音量、亮度等", 2 },
-    { "紧急呼叫", "联系家人",     3 },
+    { "语音聊天", "和我说说话", 0 },
+    { "查看提醒", "今天的安排", 1 },
+    { "设置",     "音量、亮度", 2 },
+    { "紧急呼叫", "联系家人",   3 },
 };
 
 static void menu_page_prev_handler(lv_event_t *e)
@@ -666,13 +721,15 @@ static void menu_page_next_handler(lv_event_t *e)
     touch_ui_show_menu(MENU_TYPE_MAIN);
 }
 
-/* 一个大格子：标题一行 + 副标题一行，整体居中。 */
+/* 一个正方形格子：标题一行 + 副标题一行，整体居中。 */
 static void create_menu_tile(lv_obj_t *parent, const char *title,
                             const char *subtitle, int index)
 {
     lv_obj_t *item = lv_btn_create(parent);
-    lv_obj_set_height(item, 106);
-    lv_obj_set_flex_grow(item, 1);
+    /* ★ 正方形，尺寸定死（2026-10-29 用户要「四个正方型」）。
+     * 原来是 `set_height(106) + flex_grow(1)` —— flex_grow 会把格子拉满整行
+     * 宽，出来是长方形，不是正方形。 */
+    lv_obj_set_size(item, MENU_TILE_SIZE, MENU_TILE_SIZE);
     lv_obj_add_style(item, &style_menu_item, 0);
     /* 格子里两行居中叠放，不再搞左右分栏 + 右箭头 —— 大格子里那个箭头
      * 对老人是噪声，点哪儿都能进。 */
@@ -698,18 +755,20 @@ static void create_menu_tile(lv_obj_t *parent, const char *title,
     }
 }
 
-/* 一行两个格子 */
+/* 一行两个正方形格子：整行居中，格子之间固定 MENU_TILE_GAP。 */
 static void create_menu_row(lv_obj_t *parent,
                            const menu_entry_t *ents, int n)
 {
     lv_obj_t *row = lv_obj_create(parent);
-    lv_obj_set_size(row, LV_PCT(100), 106);
+    lv_obj_set_size(row, LV_PCT(100), MENU_TILE_SIZE);
     lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(row, 0, 0);
     lv_obj_set_style_pad_all(row, 0, 0);
-    lv_obj_set_style_pad_column(row, 12, 0);
+    lv_obj_set_style_pad_column(row, MENU_TILE_GAP, 0);
     lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START,
+    /* 居中（原来是 START）：一行只剩两个定宽方块，居中才和竖向那个居中
+     * 对得上，横竖间隙看着才一样宽。 */
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
@@ -717,16 +776,8 @@ static void create_menu_row(lv_obj_t *parent,
     {
         create_menu_tile(row, ents[i].title, ents[i].subtitle, ents[i].index);
     }
-    /* 一行不满两个：补一个占位把位置占住，免得单个格子被 flex_grow 撑满整行 */
-    for (int i = n; i < MENU_GRID_COLS; i++)
-    {
-        lv_obj_t *spacer = lv_obj_create(row);
-        lv_obj_set_height(spacer, 106);
-        lv_obj_set_flex_grow(spacer, 1);
-        lv_obj_set_style_bg_opa(spacer, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_width(spacer, 0, 0);
-        lv_obj_remove_flag(spacer, LV_OBJ_FLAG_SCROLLABLE);
-    }
+    /* 一行不满两个不用再补占位了：以前是 flex_grow 会把单个格子拉满整行，
+     * 得拿占位压住；现在是定宽方块 + 居中，缺一个就自然居中放。 */
 }
 
 static void create_menu_grid(lv_obj_t *parent)
@@ -739,13 +790,28 @@ static void create_menu_grid(lv_obj_t *parent)
 
     int base = s_menu_page * MENU_PAGE_ITEMS;
 
+    /* 行容器：撑满内容区高度，两行在里面**竖向也居中**，行间同样是
+     * MENU_TILE_GAP —— 这样横竖两个方向的间隙都是 12px，四个方块看着
+     * 就是"均匀放置"的（横竖不等会看着一边松一边紧，反而更难认）。 */
+    lv_obj_t *box = lv_obj_create(parent);
+    lv_obj_set_width(box, LV_PCT(100));
+    lv_obj_set_flex_grow(box, 1);
+    lv_obj_set_style_bg_opa(box, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(box, 0, 0);
+    lv_obj_set_style_pad_all(box, 0, 0);
+    lv_obj_set_style_pad_row(box, MENU_TILE_GAP, 0);
+    lv_obj_set_flex_flow(box, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(box, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_remove_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+
     for (int r = 0; r < MENU_GRID_ROWS; r++)
     {
         int first = base + r * MENU_GRID_COLS;
         int n = count - first;
         if (n <= 0) break;
         if (n > MENU_GRID_COLS) n = MENU_GRID_COLS;
-        create_menu_row(parent, &s_menu_main[first], n);
+        create_menu_row(box, &s_menu_main[first], n);
     }
 
     /* 超过一页才画翻页条；一页搞定时整块不出现 —— 老人面前少一样要点的东西 */
@@ -1104,6 +1170,21 @@ static void create_setting_panel(void)
     lv_label_set_text(lbl_reset, "恢复默认设置");
     lv_obj_set_style_text_font(lbl_reset, &lv_font_ui_24, 0);
     lv_obj_center(lbl_reset);
+
+    /* 存不住就老实说一句。现在存的是 /data 内存盘（tmpfs），断电清空，
+     * 而页面上这几个滑块看着跟"设好了"一样 —— 不标这一句，下次开机全回默认
+     * 就成了"莫名其妙自己变了"。插上 TF 卡后自动改存卡上，这句也就不再出现。
+     * 判据是 settings_resolve_path() 的真写探针（不是 stat，目录没卡也在）。 */
+    if (!touch_ui_settings_persistent()) {
+        lv_obj_t *lbl_volatile = lv_label_create(content);
+        lv_label_set_text(lbl_volatile, "没插 TF 卡，重启会丢");
+        lv_obj_set_style_text_font(lbl_volatile, &lv_font_ui_24, 0);
+        /* 配色用 THEME_GREEN_DARK 不是 THEME_TEXT_ON_GREEN：后者是"绿底上的白字"，
+         * 而这句是直接躺在页面浅绿底（THEME_BG_PAGE）上的，写白字等于看不见。 */
+        lv_obj_set_style_text_color(lbl_volatile, THEME_GREEN_DARK, 0);
+        lv_obj_set_width(lbl_volatile, LV_PCT(80));
+        lv_obj_set_style_text_align(lbl_volatile, LV_TEXT_ALIGN_CENTER, 0);
+    }
 
     /* 页脚大返回按钮（固定，不随内容滚走） */
     create_back_button(setting_panel);
@@ -1761,6 +1842,85 @@ void touch_ui_save_settings(void)
     settings_save_to_file();
 }
 
+/* ==================== 语音改音量/亮度 ==================== */
+
+/* 「调高/调低一档」是几格。10 是按老人的手感定的：一档能听出/看出差别，
+ * 又不会一步就到顶。要更细就改这一个数。 */
+#define SETTINGS_APPLY_STEP 10
+
+/* 语音说「声音小一点」「把亮度调到最亮」的落地入口（声明见 touch_ui.h）。
+ *
+ * 为什么要单独一条路、而不是让语音去模拟拖滑块：滑块是 create_setting_panel()
+ * 里建的控件，**只在设置页开着的时候存在**，而且只能在 LVGL 线程碰。语音的
+ * 工具跑在语音工作线程里，那时候设置页多半没开。所以这里只改 user_settings +
+ * 真下发硬件 + 存盘，界面一个控件都不碰 —— 下次打开设置页时滑块是按
+ * user_settings 重建的，自然就停在新值上（见 create_setting_panel）。
+ *
+ * 到顶/到底**不是失败**：返回当前值，模型据此告诉用户"已经是最大了"。
+ * 亮度那条先下发硬件再落值：背光驱动不认（真机上 1..99 有回 -ENOSYS 的前科）
+ * 就如实回错误码、值不落盘，不假装调好了。 */
+int touch_ui_settings_apply(int item, int action, int value)
+{
+    int cur;
+    int next;
+
+    switch (item) {
+    case MIMO_SET_ITEM_VOLUME:
+        cur = user_settings.volume;
+        break;
+    case MIMO_SET_ITEM_BRIGHTNESS:
+        cur = user_settings.brightness;
+        break;
+    default:
+        printf("settings: 语音改设置：不认识的项 %d\n", item);
+        return -EINVAL;
+    }
+
+    switch (action) {
+    case MIMO_SET_ACT_UP:
+        next = cur + SETTINGS_APPLY_STEP;
+        break;
+    case MIMO_SET_ACT_DOWN:
+        next = cur - SETTINGS_APPLY_STEP;
+        break;
+    case MIMO_SET_ACT_SET:
+        next = value;
+        break;
+    default:
+        printf("settings: 语音改设置：不认识的动作 %d\n", action);
+        return -EINVAL;
+    }
+
+    if (next < 0) next = 0;
+    if (next > 100) next = 100;
+
+    if (item == MIMO_SET_ITEM_BRIGHTNESS) {
+        int ret = backlight_set(next);
+        if (ret != OK) {
+            printf("settings: 语音改亮度 backlight_set(%d) 失败: %d\n",
+                   next, ret);
+            return ret;
+        }
+        user_settings.brightness = (uint8_t)next;
+    } else {
+        user_settings.volume = (uint8_t)next;
+        /* 和设置页拖滑块同一条路（见 setting_slider_event_handler）：音量是
+         * 音频硬件的事，界面这层只存了数字，必须回调给 main.c 去
+         * audio_set_volume()，否则改了等于没改。 */
+        if (g_volume_cb != NULL) {
+            g_volume_cb(next, g_volume_user_data);
+        }
+    }
+
+    settings_save_to_file();
+    printf("settings: 语音改%s -> %d（%s%d）\n",
+           item == MIMO_SET_ITEM_VOLUME ? "音量" : "亮度",
+           next, action == MIMO_SET_ACT_UP ? "+" :
+                 (action == MIMO_SET_ACT_DOWN ? "-" : "="),
+           action == MIMO_SET_ACT_SET ? value : SETTINGS_APPLY_STEP);
+    return next;
+}
+
 /* 显示设置详情 */
 void touch_ui_show_setting_detail(const char *title, const char *content)
 {
@@ -1901,11 +2061,48 @@ void touch_ui_set_volume_cb(volume_set_cb_t cb, void *user_data)
 
 /* ==================== 设置持久化 ==================== */
 
+/* 当前生效的存储位置。settings_resolve_path() 每次存/取之前都重判一次，
+ * 所以"中途插上 TF 卡后再拖一下音量"就能自动改存到卡上，不用重启。 */
+static const char *settings_path = SETTINGS_FILE_PATH_TMP;
+static bool settings_persistent = false;
+
+/* 判一次"这次存的到底留不留得住"。
+ *
+ * 判据是**真写一次**，不是 stat：/data/tf 这个目录是 sifli_ap.c 里 mkdir 出来的，
+ * 没插卡时目录照样在（mount 失败不影响 mkdir），stat 会一直说"有这个地方"。
+ * 探针文件用单独的名字，免得 fopen(...,"w") 把上次存的设置截断了。 */
+static void settings_resolve_path(void)
+{
+    FILE *fp = fopen(SETTINGS_PROBE_PATH, "w");
+    if (fp != NULL) {
+        fputc('1', fp);
+        fclose(fp);
+        remove(SETTINGS_PROBE_PATH);
+        settings_path = SETTINGS_FILE_PATH_TF;
+        settings_persistent = true;
+    } else {
+        settings_path = SETTINGS_FILE_PATH_TMP;
+        settings_persistent = false;
+    }
+
+    printf("settings: 存到 %s（%s）\n", settings_path,
+           settings_persistent ? "TF 卡，掉电保留" : "内存盘，重启会丢");
+}
+
+/* 设置页底部那句「没插 TF 卡，重启会丢」按这个决定显不显示。
+ * 建面板时调一次就够 —— 插卡这种事是开机时判的，中途变了下次进建面板才反映。 */
+bool touch_ui_settings_persistent(void)
+{
+    return settings_persistent;
+}
+
 static void settings_save_to_file(void)
 {
-    FILE *fp = fopen(SETTINGS_FILE_PATH, "wb");
+    settings_resolve_path();
+
+    FILE *fp = fopen(settings_path, "wb");
     if (!fp) {
-        printf("settings: save failed to open %s\n", SETTINGS_FILE_PATH);
+        printf("settings: save failed to open %s\n", settings_path);
         return;
     }
 
@@ -1920,7 +2117,9 @@ static void settings_save_to_file(void)
 
 static void settings_load_from_file(void)
 {
-    FILE *fp = fopen(SETTINGS_FILE_PATH, "rb");
+    settings_resolve_path();
+
+    FILE *fp = fopen(settings_path, "rb");
     if (!fp) {
         printf("settings: no saved file, using defaults\n");
         return;
@@ -2116,11 +2315,17 @@ static void voice_hist_clear_slot(int slot)
     }
 }
 
-/* 在对话区里造一行。字号/颜色由调用方给：用户那行小一号、蓝（THEME_ST_LISTENING），
- * 智爱那行大一号、深绿灰（浅色聊天底上的主文字色）—— 老人不用细读，
- * 扫一眼颜色就知道哪句是自己说的。
+/* 在对话区里造一行。字号/颜色由调用方给：用户那行小一号、在听那档色
+ * （THEME_ST_LISTENING），智爱那行大一号、主文字色（THEME_TEXT_PRIMARY）
+ * —— 老人不用细读，扫一眼颜色就知道哪句是自己说的。
+ *
+ * ★ 2026-10-29 换黄白主题时顺手修的：这里原来是**写死的两个十六进制**
+ * （用户蓝 0x1E88E5 / 智爱 0x2E3A32），等于绕开了 ui_theme.h 的
+ * 「禁止再散落 lv_color_hex 字面量」那条规矩 —— 换色调时它们不会跟着变，
+ * 就成了黄白页面上飘着两行旧绿旧蓝。改成收 lv_color_t、从主题宏取，
+ * 连带把参数类型从 uint32_t 换成 lv_color_t（不用再 lv_color_hex 转一道）。
  * pad_top 用间距把相邻两轮分开，不然两轮的四行字会挤成一坨。 */
-static lv_obj_t *voice_hist_new_label(const lv_font_t *font, uint32_t color,
+static lv_obj_t *voice_hist_new_label(const lv_font_t *font, lv_color_t color,
                                       int32_t pad_top)
 {
     lv_obj_t *lbl = lv_label_create(voice_chat_box);
@@ -2128,7 +2333,7 @@ static lv_obj_t *voice_hist_new_label(const lv_font_t *font, uint32_t color,
     lv_obj_set_width(lbl, LV_PCT(100));
     lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_font(lbl, font, 0);
-    lv_obj_set_style_text_color(lbl, lv_color_hex(color), 0);
+    lv_obj_set_style_text_color(lbl, color, 0);
     lv_obj_set_style_pad_top(lbl, pad_top, 0);
 
     return lbl;
@@ -2157,7 +2362,8 @@ static void voice_hist_push_user(const char *text)
     }
 
     voice_hist_clear_slot(slot);
-    voice_hist_user[slot] = voice_hist_new_label(&lv_font_ui_16, 0x1E88E5, 8);
+    voice_hist_user[slot] = voice_hist_new_label(&lv_font_ui_16,
+                                                THEME_ST_LISTENING, 8);
     voice_hist_set_line(voice_hist_user[slot], "你说：", text);
 
     voice_hist_next = (slot + 1) % VOICE_HISTORY_ROUNDS;
@@ -2183,7 +2389,8 @@ static void voice_hist_push_ai(const char *text)
         voice_hist_next = (slot + 1) % VOICE_HISTORY_ROUNDS;
     }
 
-    voice_hist_ai[slot] = voice_hist_new_label(&lv_font_ui_20, 0x2E3A32, 2);
+    voice_hist_ai[slot] = voice_hist_new_label(&lv_font_ui_20,
+                                              THEME_TEXT_PRIMARY, 2);
     voice_hist_set_line(voice_hist_ai[slot], "智爱：", text);
 
     voice_hist_pending = -1;

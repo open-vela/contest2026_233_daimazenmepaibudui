@@ -1,0 +1,1394 @@
+diff --git a/arch/arm/src/arm_m/Make.defs b/arch/arm/src/arm_m/Make.defs
+index a228cd42be4..a4820a80388 100644
+--- a/arch/arm/src/arm_m/Make.defs
++++ b/arch/arm/src/arm_m/Make.defs
+@@ -22,7 +22,7 @@
+ 
+ CMN_ASRCS += arm_exception.S arm_saveusercontext.S
+ 
+-ifeq ($(CONFIG_ARM_M_SYSTICK),y)
++ifeq ($(CONFIG_ARM_SYSTICK),y)
+   CMN_CSRCS += arm_systick.c
+ endif
+ 
+diff --git a/audio/audio.c b/audio/audio.c
+index 35e1344a92e..99d1deced35 100644
+--- a/audio/audio.c
++++ b/audio/audio.c
+@@ -80,6 +80,16 @@ struct audio_openpriv_s
+   FAR struct pollfd           *fd;
+   FAR struct audio_openpriv_s *flink;
+   struct file                 *usermq; /* User mode app's message queue */
++
++  /* ★ 2026-10-29：本会话的编号，从 1 起递增，只为**对上号**。
++   * 真机那句「会话[2] priv->state=5 ★就是它在挡」只知道"第三个 open 的 fd
++   * 在举着 RUNNING"，却不知道那是谁 —— 这板子上 open /dev/audio/audio0 的
++   * 有四五路（hello_app 录/放、robot_ui 录/放、板级报警铃 sf32lb52_alarm、
++   * 状态探针），一路一路猜要烧好几轮。
++   * open 时打一行「audio: open #N」，点名时把 #N 打出来，串口一比就知道
++   * 是谁赖着不走。纯日志，不改任何行为。 */
++
++  unsigned int                id;
+ };
+ 
+ /* This structure describes the state of the upper half driver */
+@@ -166,6 +176,8 @@ static int audio_open(FAR struct file *filep)
+   FAR struct audio_upperhalf_s *upper = inode->i_private;
+   FAR struct audio_openpriv_s *priv;
+   irqstate_t flags;
++  unsigned int myid = 0;   /* 本会话编号，锁内赋值、锁外打日志（见下方） */
++  int n = 0;               /* 开完共几个会话，同上 */
+   int ret;
+ 
+   priv = kmm_zalloc(sizeof(*priv));
+@@ -195,11 +207,44 @@ static int audio_open(FAR struct file *filep)
+         }
+     }
+ 
+-  flags = spin_lock_irqsave(&upper->spinlock);
+-  priv->flink = upper->head;
+-  filep->f_priv = priv;
+-  upper->head = priv;
+-  spin_unlock_irqrestore(&upper->spinlock, flags);
++  /* ★ 2026-10-29：编号 + 一行日志，见 audio_openpriv_s::id 的注释。
++   * 只在 open 时打一次（close 不打），别刷屏；配合 STOP 没停到硬件时
++   * 那份会话点名，就能对上号。
++   *
++   * ⚠️ 三件事的先后都是有讲究的（2026-10-30 修，头一版写坏过两次）：
++   *   ① 遍历 upper->head 必须在 spinlock 保护下 —— 锁外遍历就是裸读一个
++   *      随时被别人改的链表，读到野指针就是 HardFault。
++   *   ② syslog 绝不能在持有 upper->lock（mutex）时调 —— 串口慢的时候它会把
++   *      open 拖住，一路拖住 audio_init / 每轮录音的起动。所以这里只把
++   *      myid / n 记下来，真正打日志放在 errout 那边**释放 mutex 之后**。
++   *   ③ 首版我把 syslog 写在块里，注释说"留到锁外"，其实它仍在 mutex 内
++   *      （unlock 在 errout）—— 说到没做到，这次真正挪出去了。 */
++
++  {
++    static unsigned int s_priv_seq;
++
++    flags = spin_lock_irqsave(&upper->spinlock);
++    priv->flink = upper->head;
++    filep->f_priv = priv;
++    upper->head = priv;
++
++    /* ⚠️ 别图省事写成 `upper->head == NULL ? 0 : 1` —— 那恒为 1，是个假计数
++     * （2026-10-29 当场写错过一次）。要数就得真遍历，而且得在锁里。 */
++
++    {
++      FAR struct audio_openpriv_s *p;
++
++      for (p = upper->head; p != NULL; p = p->flink)
++        {
++          n++;
++        }
++    }
++
++    myid = ++s_priv_seq;
++    priv->id = myid;
++    spin_unlock_irqrestore(&upper->spinlock, flags);
++  }
++
+   ret = OK;
+ 
+ errout:
+@@ -208,6 +253,11 @@ errout:
+     {
+       kumm_free(priv);
+     }
++  else
++    {
++      /* mutex 已经放掉了，这里打日志才是安全的（见上面 ②） */
++      syslog(LOG_WARNING, "audio: open #%u（开完共 %d 个会话）\n", myid, n);
++    }
+ 
+   return ret;
+ }
+@@ -385,6 +435,61 @@ static inline int audio_getnstate(FAR struct audio_upperhalf_s *upper,
+   return nstate;
+ }
+ 
++/****************************************************************************
++ * Name: audio_forget_sessions
++ *
++ * Description:
++ *   把其它 fd 身上"我手里有活会话"的记账清回 OPEN，可选地打一行告警。
++ *
++ *   专供**半双工抢占**那条路用。抢占是直调 lower->ops->stop() 拆掉正在跑的
++ *   那个会话（见 audio_configure 里的说明），**绕过了 audio_stop()** —— 而
++ *   priv->state = OPEN 那句只写在 audio_stop() 里。于是被抢的那个 fd 从此
++ *   永久举着 RUNNING，而 audio_stop() 的放行判据恰好是
++ *   "audio_getnstate() <= PREPARED"（见下），它一个人就能把**所有** STOP
++ *   挡在门外：硬件停不下来、COMPLETE 永远不发、上层状态机顶在 RUNNING，
++ *   往后每一次 CONFIGURE/START 都被那道门静默吞掉却照样返回 OK。
++ *
++ *   真机指纹（2026-10-26）：串口 "AUDIO_IN: started" 打了 22 次、
++ *   "hw_start 真跑了" 一次都没有，armed=0 busy=0，监听守护每 5 秒
++ *   "判定僵尸会话" 重开一圈，麦克风永久失聪 —— 而触发点正是第一句回复
++ *   起播时 OUTPUT 抢 INPUT 那一下。
++ *
++ * Input Parameters:
++ *   upper  - 上半部
++ *   cur    - 本次调用者自己的会话（不清它：它马上要接着起，状态由它自己写）
++ *   why    - 触发原因，只用来打日志；NULL 表示静默
++ *
++ ****************************************************************************/
++
++static void audio_forget_sessions(FAR struct audio_upperhalf_s *upper,
++                                  FAR struct audio_openpriv_s *cur,
++                                  FAR const char *why)
++{
++  FAR struct audio_openpriv_s *priv;
++  int cleared = 0;
++  irqstate_t flags;
++
++  flags = spin_lock_irqsave(&upper->spinlock);
++  for (priv = upper->head; priv != NULL; priv = priv->flink)
++    {
++      if (priv != cur && priv->state > AUDIO_STATE_PREPARED)
++        {
++          priv->state = AUDIO_STATE_OPEN;
++          cleared++;
++        }
++    }
++
++  spin_unlock_irqrestore(&upper->spinlock, flags);
++
++  if (cleared > 0)
++    {
++      syslog(LOG_WARNING,
++             "audio: 清掉 %d 个陈旧的会话记账（%s）—— 不清的话它们会把所有 "
++             "STOP 永久挡在门外\n",
++             cleared, why != NULL ? why : "?");
++    }
++}
++
+ /****************************************************************************
+  * Name: audio_try_enqueue
+  *
+@@ -469,6 +574,7 @@ static int audio_configure(FAR struct file *filep,
+   FAR struct audio_lowerhalf_s *lower = upper->dev;
+   FAR const struct audio_caps_s *caps = &cap_desc->caps;
+   FAR struct audio_openpriv_s *priv = filep->f_priv;
++  bool preempted = false;
+   int ret = OK;
+ 
+   DEBUGASSERT(lower->ops->configure != NULL);
+@@ -476,7 +582,84 @@ static int audio_configure(FAR struct file *filep,
+   audinfo("configure: status=%d ac_type: %" PRIu8 " \n",
+     upper->status->state, caps->ac_type);
+ 
++  /* 半双工抢占（2026-10-11 真机定案）：本板音频是半双工，上层却是全局单
++   * 状态机 —— 常开麦把状态顶在 RUNNING 之后，其他 app 的 OUTPUT CONFIGURE
++   * 会被下面的门静默吞掉（返回 OK、驱动毫不知情），播放的 PCM 全写在录音
++   * 会话上，DAC/功放从未打开，每块都等 DMA 超时被丢 —— 现场全程无声
++   * （串口只有 "AUDIO: 等播放完成超时，本块丢弃"、从无 "hw_start 真跑了"）。
++   *
++   * 修法：OUTPUT 在 INPUT 会话运行时抢占 —— 直调下层 stop 拆掉录音会话
++   * （sf32lb52_audio_stop 会 hw_stop + 唤醒阻塞的 read + 发 COMPLETE 让
++   * 状态落回 OPEN），hello_app 的录音监听守护随后自动重开麦。反向（INPUT
++   * 抢 OUTPUT）故意不放行：麦不能杀死用户要听到的声音。
++   *
++   * 这正是 robot_ui.c 报警节注释里写的设计意图（「放音时驱动会停掉录音
++   * 通路并唤醒对方阻塞的 read，对方的监听守护会重开」），只是一直没落到
++   * 上层代码 —— 上层这道门让 START 根本到不了驱动，设计意图落空。 */
++
++  if (caps->ac_type == AUDIO_TYPE_OUTPUT &&
++      upper->status->state == AUDIO_STATE_RUNNING &&
++      (upper->info.type == AUDIO_TYPE_INPUT ||
++       priv->state == AUDIO_STATE_OPEN))
++    {
++      /* ★ 2026-10-26 放宽：原来还要求 `upper->info.type == AUDIO_TYPE_INPUT`
++       * （只认"OUTPUT 抢 INPUT"）。但 `info.type` **只在 CONFIGURE 真转发时才写**
++       * （见下面 612 行），而陈旧记账那种死锁里 CONFIGURE 早就全被吞了 ——
++       * 于是它保留的是**上一次成功配置**的类型，可能是 INPUT 也可能是 OUTPUT，
++       * 赌错一次整条自愈就打不响，用户又白烧一轮。
++       *
++       * 新增的这一支是"**全新 fd**（priv->state 还是 OPEN，从没配过）要 OUTPUT"：
++       * 那就是"有新客户端要这台半双工设备"，抢占是本板的设计意图
++       * （见上面 robot_ui.c 报警节那段）。它同时覆盖两种情形：
++       *   · 正常的半双工抢占（抢的是正在跑的 INPUT）—— 原行为；
++       *   · **陈旧记账**：某个 fd 的 priv->state 卡在 RUNNING 而设备上其实
++       *     一个会话都没有，此时新 fd 的 CONFIGURE 就是唯一能踩响
++       *     audio_forget_sessions() 的机会（内核自己判不出"这本账是假的"，
++       *     只有上层拿着 armed=0 busy=0 的证据才知道）。
++       * 代价：同一时刻的第二个播放客户端会顶掉第一个。本板录放本来就是
++       * 半双工单喇叭、ai_audio.c 也把播放串行化了（起播前先 audio_play_stop），
++       * 唯一的第三方是报警铃，而报警顶掉语音播报本来就是想要的行为。 */
++#ifdef CONFIG_AUDIO_MULTI_SESSION
++      lower->ops->stop(lower, cap_desc->session);
++#else
++      lower->ops->stop(lower);
++#endif
++
++      /* 下层 stop 的 COMPLETE 回调一般已把状态带回 OPEN；无论回调时序
++       * 如何，这里显式落到 PREPARED，让下面的门必定转发这次 CONFIGURE。 */
++
++      audio_setstate(upper, AUDIO_STATE_PREPARED);
++      preempted = true;
++
++      /* ★ 被抢的那个 fd 的 priv->state 还停在 RUNNING，必须一并作废
++       * （2026-10-26）。上面这句 lower->ops->stop() 绕过了 audio_stop()，
++       * 而 priv->state = OPEN 只写在 audio_stop() 里 —— 会话被拆了、记账
++       * 却没清，于是它永久举着"我有活会话"，之后**所有** audio_stop() 的
++       * 放行判据（audio_getnstate() <= PREPARED）恒假，硬件永远停不下来、
++       * 永远没人发 COMPLETE，状态机钉死，CONFIGURE/START 全被静默吞掉。
++       * 触发点恰好是第一句回复起播（OUTPUT 抢 INPUT），真机症状就是
++       * 「回了一句就再也不说话」。 */
++
++      audio_forget_sessions(upper, priv, "半双工抢占拆掉了别人的会话");
++    }
++
++  /* 转发门（2026-10-21 放宽到 PREPARED）：
++   *
++   * 原来只在 OPEN（或抢占后、或非 INPUT/OUTPUT 类型）转发，于是
++   * "CONFIGURE 过了、还没 START"的 PREPARED 态会把后续 CONFIGURE **静默吞掉**
++   * （返回 OK、驱动毫不知情）。半双工抢占之后这道门是致命的：抢占把状态显式
++   * 落到 PREPARED，接着录音侧重启的 CONFIGURE(INPUT) 正好撞上这道门被吞掉 ——
++   * 驱动看到的 pending_playback 还是那次抢占留下的 true，录音会话带着
++   * playback=1 的标签启动（串口铁证 "hw_start 真跑了：playback=1"），
++   * L5 恢复守卫看着"健康的播放"永久跳过、RX 冻死。
++   *
++   * PREPARED 的语义就是"配好了、还没起"——在这个状态重配一次是**合法**的
++   * （换方向、换采样率都要走这条路），转发它没有任何"改正在跑的会话"的风险：
++   * 真正在跑是 RUNNING/PAUSED，那两个仍然被这道门挡着。 */
++
+   if (upper->status->state == AUDIO_STATE_OPEN ||
++      upper->status->state == AUDIO_STATE_PREPARED ||
++      preempted ||
+       (caps->ac_type != AUDIO_TYPE_INPUT &&
+        caps->ac_type != AUDIO_TYPE_OUTPUT))
+     {
+@@ -501,9 +684,24 @@ static int audio_configure(FAR struct file *filep,
+       upper->info.samplerate =
+           caps->ac_controls.hw[0] | (caps->ac_controls.b[3] << 16);
+       memcpy(&upper->info.codec, &caps->ac_codec, sizeof(caps->ac_codec));
++
++      /* 只有**真的转发给了驱动**才配记账成本 fd "配好了、还没起"
++       * （2026-10-26）。原来这句挂在 if 外面，被门吞掉的 CONFIGURE 也会把
++       * priv->state 改掉：轻则把一个正在跑的 fd 从 RUNNING 降级成 PREPARED
++       * （别人的 STOP 看到 nstate <= PREPARED 就敢停它的硬件），重则让一个
++       * 根本没配过的 fd 冒充 PREPARED。priv->state 是 audio_stop() 放行判据
++       * 的唯一来源，这本账只能记实。 */
++
++      priv->state = AUDIO_STATE_PREPARED;
++    }
++  else
++    {
++      syslog(LOG_WARNING,
++             "audio: CONFIGURE 被吞（status=%d type=%d），驱动没收到，"
++             "不改本 fd 的会话记账（%d）\n",
++             upper->status->state, caps->ac_type, priv->state);
+     }
+ 
+-  priv->state = AUDIO_STATE_PREPARED;
+   return ret;
+ }
+ 
+@@ -546,9 +744,18 @@ static int audio_pause(FAR struct file *filep)
+         }
+ 
+       audio_setstate(upper, AUDIO_STATE_PAUSED);
++
++      /* 同 audio_start：被吞的请求不许记账（2026-10-26）。PAUSED > PREPARED，
++       * 乱记一笔就能把所有 STOP 挡在门外。 */
++
++      priv->state = AUDIO_STATE_PAUSED;
++      return OK;
+     }
+ 
+-  priv->state = AUDIO_STATE_PAUSED;
++  syslog(LOG_WARNING,
++         "audio: PAUSE 被吞（status=%d nstate=%d），驱动没收到，"
++         "不改本 fd 的会话记账（%d）\n",
++         upper->status->state, nstate, priv->state);
+   return OK;
+ }
+ 
+@@ -590,9 +797,19 @@ static int audio_resume(FAR struct file *filep)
+         }
+ 
+       audio_setstate(upper, AUDIO_STATE_RUNNING);
++
++      /* 同 audio_start：只有真的转发给了驱动才配记账成"我手里有活会话"
++       * （2026-10-26）。audio_start 在 PAUSED 态会直接绕进本函数，所以这里
++       * 漏一笔和 start 漏一笔是一样的后果 —— 一个没起来的会话永久举着
++       * RUNNING，把所有 STOP 挡在门外。 */
++
++      priv->state = AUDIO_STATE_RUNNING;
++      return OK;
+     }
+ 
+-  priv->state = AUDIO_STATE_RUNNING;
++  syslog(LOG_WARNING,
++         "audio: RESUME 被吞（status=%d），驱动没收到，不改本 fd 的会话记账"
++         "（%d）\n", upper->status->state, priv->state);
+   return OK;
+ }
+ 
+@@ -652,9 +869,26 @@ static int audio_start(FAR struct file *filep)
+         }
+ 
+       audio_setstate(upper, AUDIO_STATE_RUNNING);
++
++      /* ★ 只有**真的转发给了驱动**才配记账成本 fd "我手里有活会话"
++       * （2026-10-26）。原来这句挂在 if 外面，被门吞掉的 START 也会把
++       * priv->state 置成 RUNNING —— 等于让一个**根本没起来的会话**永久
++       * 举着"我在跑"，而 audio_stop() 的放行判据是
++       * audio_getnstate() <= PREPARED，它一个人就能把之后**所有** STOP
++       * 挡在门外：硬件停不下来、COMPLETE 永远不发、上层状态机顶在
++       * RUNNING，往后每一次 CONFIGURE/START 都被静默吞掉却照样返回 OK。
++       * 真机指纹：串口 "AUDIO_IN: started" 打了 22 次、"hw_start 真跑了"
++       * 一次都没有，armed=0 busy=0，监听守护每 5 秒"判定僵尸会话"重开
++       * 一圈，麦克风永久失聪。被吞时保持原值（CONFIGURE 留下的 PREPARED）
++       * 才是实话：配好了，但没起。 */
++
++      priv->state = AUDIO_STATE_RUNNING;
++      return OK;
+     }
+ 
+-  priv->state = AUDIO_STATE_RUNNING;
++  syslog(LOG_WARNING,
++         "audio: START 被吞（status=%d），驱动没收到，不改本 fd 的会话记账"
++         "（%d）\n", upper->status->state, priv->state);
+   return OK;
+ }
+ 
+@@ -682,10 +916,26 @@ static int audio_stop(FAR struct file *filep)
+ 
+   DEBUGASSERT(upper != NULL && lower->ops->stop != NULL);
+ 
++  /* 硬件 STOP 的放行条件（2026-10-21 放宽）：
++   *
++   * 原来要求 nstate == AUDIO_STATE_OPEN —— 也就是"别的 fd 一个都没配过"才允许
++   * 真的停硬件。可是只要有一个别的 fd 走过 CONFIGURE，它的 priv->state 就会被
++   * audio_configure 末尾那句无条件置成 PREPARED（哪怕这次 CONFIGURE 已经被
++   * 上面的门吞掉了、驱动根本没收到），于是它一个人就能把**所有** STOP 永久挡
++   * 在门外：状态机顶在 RUNNING，之后所有 CONFIGURE/START 被吞，串口表现是
++   * "AUDIO_IN: started" 打了却没有 "hw_start 真跑了"、read 每轮 -110、
++   * rxstuck 循环永不停止。robot_ui 的语音镜像面板常驻一个配过没起的 fd，
++   * 就是真机上把 hello_app 录音钉死的那一个（2026-10-21 现场）。
++   *
++   * PREPARED 的语义是"配好了、还没起"——它手里**没有**硬件会话，不该有资格
++   * 否决别人停硬件。真正需要让路的只有那些手里有活会话的：PAUSED / XRUN /
++   * DRAINING / RUNNING（见 audio_getnstate 的取值顺序，这四个都 > PREPARED）。
++   * 反过来，活跃播放（RUNNING）仍然挡得住录音侧的 STOP，半双工让路不变。 */
++
+   nstate = audio_getnstate(upper, priv);
+   if ((upper->status->state == AUDIO_STATE_RUNNING ||
+        upper->status->state == AUDIO_STATE_PAUSED) &&
+-      nstate == AUDIO_STATE_OPEN)
++      nstate <= AUDIO_STATE_PREPARED)
+     {
+       audinfo("stop: nstate=%d status=%d\n", nstate, upper->status->state);
+       tstate = upper->status->state;
+@@ -712,6 +962,45 @@ static int audio_stop(FAR struct file *filep)
+           return ret;
+         }
+     }
++  else if (upper->status->state == AUDIO_STATE_RUNNING ||
++           upper->status->state == AUDIO_STATE_PAUSED ||
++           upper->status->state == AUDIO_STATE_DRAINING)
++    {
++      /* 硬件明明还说自己在跑，这次 STOP 却**没停到硬件**就放行了。正常情况下
++       * 是"别人手里有活会话、我该让路"（半双工），但同一个形状也会是
++       * "陈旧记账在挡路"—— 后者就是麦克风永久失聪的开始。落一行实证，
++       * 下次一看 nstate 便知是谁在挡。 */
++
++      syslog(LOG_WARNING,
++             "audio: STOP 没停到硬件（status=%d nstate=%d，本 fd 记账 %d）"
++             "—— 若 nstate 是陈旧记账，接下来 CONFIGURE/START 会被静默吞掉\n",
++             upper->status->state, nstate, priv->state);
++
++      /* ★ 点名到底是谁在挡（2026-10-26）。原来只有 nstate 一个数，知道
++       * "有人举着 RUNNING"却不知道是谁 —— 这板子上 open /dev/audio/audio0
++       * 的有四路（hello_app 录/放、robot_ui 录/放、板级报警铃 sf32lb52_alarm、
++       * 状态探针 sf32lb52_status），一路一路猜要烧好几轮。
++       * 这里把每个会话的记账打出来：本 fd 前面标 "*"，其余就是嫌疑人。
++       * 纯日志，不改任何行为。 */
++      {
++        FAR struct audio_openpriv_s *p;
++        int idx = 0;
++
++        for (p = upper->head; p != NULL; p = p->flink)
++          {
++            syslog(LOG_WARNING,
++                   "audio:   会话[%d] #%u%s priv->state=%d%s\n",
++                   idx, p->id, (p == priv) ? " ←本次调用" : "", p->state,
++                   (p->state > AUDIO_STATE_PREPARED) ? "  ★就是它在挡" : "");
++            idx++;
++          }
++
++        if (idx == 0)
++          {
++            syslog(LOG_WARNING, "audio:   （会话链表为空——不该走到这）\n");
++          }
++      }
++    }
+ 
+   priv->state = AUDIO_STATE_OPEN;
+   return OK;
+diff --git a/cmake/nuttx_kconfig.cmake b/cmake/nuttx_kconfig.cmake
+index dedec049e3f..b7fd94af44b 100644
+--- a/cmake/nuttx_kconfig.cmake
++++ b/cmake/nuttx_kconfig.cmake
+@@ -44,11 +44,17 @@ function(nuttx_export_kconfig_by_value kconfigfile config)
+   foreach(NameAndValue ${ConfigContents})
+     decode_brackets(NameAndValue)
+     encode_semicolon(NameAndValue)
+-    string(REGEX REPLACE "^[ ]+" "" NameAndValue ${NameAndValue})
+-    string(REGEX MATCH "^CONFIG[^=]+" Name ${NameAndValue})
++    # ★ 这几处 ${NameAndValue} / ${Value} 必须加引号：空行（file(STRINGS) 会
++    #   给出空元素）展开成"参数缺失"，CMake 报
++    #   "string sub-command REGEX, mode MATCH needs at least 5 arguments"，
++    #   整个 configure 收尾时报 Configuring incomplete。
++    #   加引号后空串是合法的第 5 个参数，REGEX MATCH 不命中、Name 为空，
++    #   走原有 if(Name) 分支被跳过，行为不变。
++    string(REGEX REPLACE "^[ ]+" "" NameAndValue "${NameAndValue}")
++    string(REGEX MATCH "^CONFIG[^=]+" Name "${NameAndValue}")
+     if(Name STREQUAL ${config})
+-      string(REPLACE "${Name}=" "" Value ${NameAndValue})
+-      string(REPLACE "\"" "" Value ${Value})
++      string(REPLACE "${Name}=" "" Value "${NameAndValue}")
++      string(REPLACE "\"" "" Value "${Value}")
+       decode_semicolon(Value)
+       set(${Name}
+           ${Value}
+@@ -70,14 +76,15 @@ function(nuttx_export_kconfig kconfigfile)
+     decode_brackets(NameAndValue)
+     encode_semicolon(NameAndValue)
+     # Strip leading spaces
+-    string(REGEX REPLACE "^[ ]+" "" NameAndValue ${NameAndValue})
++    # （加引号理由同上：空行会把参数吃掉，见 nuttx_export_kconfig_by_value）
++    string(REGEX REPLACE "^[ ]+" "" NameAndValue "${NameAndValue}")
+ 
+     # Find variable name
+-    string(REGEX MATCH "^CONFIG[^=]+" Name ${NameAndValue})
++    string(REGEX MATCH "^CONFIG[^=]+" Name "${NameAndValue}")
+ 
+     if(Name)
+       # Find the value
+-      string(REPLACE "${Name}=" "" Value ${NameAndValue})
++      string(REPLACE "${Name}=" "" Value "${NameAndValue}")
+ 
+       # remove extra quotes
+       if(Value MATCHES "^\"(.*)\"$")
+diff --git a/drivers/usbdev/rndis.c b/drivers/usbdev/rndis.c
+index 867447942f6..152f0d42b11 100644
+--- a/drivers/usbdev/rndis.c
++++ b/drivers/usbdev/rndis.c
+@@ -31,6 +31,7 @@
+ 
+ #include <assert.h>
+ #include <debug.h>
++#include <syslog.h>
+ #include <errno.h>
+ #include <inttypes.h>
+ #include <string.h>
+@@ -45,6 +46,8 @@
+ #include <nuttx/net/netdev.h>
+ #include <nuttx/kmalloc.h>
+ #include <nuttx/arch.h>
++#include <nuttx/irq.h>
++#include <nuttx/spinlock.h>
+ #include <nuttx/usb/usb.h>
+ #include <nuttx/usb/cdc.h>
+ #include <nuttx/usb/usbdev.h>
+@@ -117,7 +120,7 @@ static_assert((CONFIG_NET_LL_GUARDSIZE % 4) == 2,
+ #define RNDIS_MXDESCLEN         (128)
+ #define RNDIS_MAXSTRLEN         (RNDIS_MXDESCLEN-2)
+ #define RNDIS_CTRLREQ_LEN       (256)
+-#define RNDIS_RESP_QUEUE_WORDS  (64)
++#define RNDIS_RESP_QUEUE_WORDS  (1024)
+ 
+ #define RNDIS_BUFFER_SIZE       CONFIG_NET_ETH_PKTSIZE
+ #define RNDIS_BUFFER_COUNT      4
+@@ -176,8 +179,19 @@ struct rndis_dev_s
+   uint32_t rndis_packet_filter;          /* RNDIS packet filter value */
+   uint32_t rndis_host_tx_count;          /* TX packet counter */
+   uint32_t rndis_host_rx_count;          /* RX packet counter */
++  uint32_t rx_dropped_nomem;             /* RX frames dropped for lack of a buffer */
+   uint8_t host_mac_address[6];           /* Host side MAC address */
+   mutex_t lock;                          /* Mutex to protect the driver state */
++  spinlock_t rdlock;                     /* Spinlock guarding rdreq_submitted/
++                                          * rx_blocked.  Taken with IRQs
++                                          * disabled: bulk OUT re-arm has two
++                                          * concurrent call sites (worker
++                                          * rxdispatch tail vs. wrcomplete's
++                                          * freewrreq in IRQ context on another
++                                          * CPU), and the check-then-act on
++                                          * rdreq_submitted must be atomic or
++                                          * the same request gets EP_SUBMITed
++                                          * twice and wedges the UDC queue. */
+ 
+   size_t response_queue_words;           /* Count of words waiting in response_queue. */
+   uint32_t response_queue[RNDIS_RESP_QUEUE_WORDS];
+@@ -274,9 +288,9 @@ static const struct usb_devdesc_s g_devdesc =
+   USB_SIZEOF_DEVDESC,                           /* len */
+   USB_DESC_TYPE_DEVICE,                         /* type */
+   {LSBYTE(0x0200), MSBYTE(0x0200)},             /* usb */
+-  0,                                            /* classid */
+-  0,                                            /* subclass */
+-  0,                                            /* protocol */
++  USB_CLASS_MISC,                               /* classid 0xef */
++  0x02,                                         /* subclass: IAD device */
++  0x01,                                         /* protocol */
+   CONFIG_RNDIS_EP0MAXPACKET,                    /* maxpacketsize */
+   { LSBYTE(CONFIG_RNDIS_VENDORID),              /* vendor */
+     MSBYTE(CONFIG_RNDIS_VENDORID) },
+@@ -324,6 +338,39 @@ static const struct usb_iaddesc_s g_rndis_assoc_desc =
+   .protocol     = 0x01,
+   .ifunction    = 0
+ };
++#endif
++
++#ifndef CONFIG_RNDIS_COMPOSITE
++  /* Interface Association Descriptor: binds the two interfaces (comm+data)
++   * into one RNDIS function.  0xef/0x04/0x01 is the class coding that
++   * Windows' inbox rndiscmp.inf matches (USB\Class_EF&SubClass_04&Prot_01),
++   * which is what makes Windows load the Remote NDIS driver instead of
++   * leaving the function with no driver at all.
++   */
++
++static const uint8_t g_rndis_iad_rndis[] =
++{
++  0x08,                                       /* bLength */
++  USB_DESC_TYPE_INTERFACEASSOCIATION,         /* bDescriptorType 0x0b */
++  0x00,                                       /* bFirstInterface */
++  RNDIS_NINTERFACES,                          /* bInterfaceCount */
++  USB_CLASS_MISC,                             /* bFunctionClass 0xef */
++  0x04,                                       /* bFunctionSubClass */
++  0x01,                                       /* bFunctionProtocol */
++  0x00                                        /* iFunction */
++};
++
++  /* CDC functional descriptors for the RNDIS communication interface:
++   * Header(1.10) + CallMgmt(data if 1) + ACM + Union(master 0, slave 1)
++   */
++
++static const uint8_t g_rndis_func_descs[] =
++{
++  0x05, 0x24, 0x00, 0x10, 0x01,               /* header, bcdCDC 0x0110 */
++  0x05, 0x24, 0x01, 0x00, 0x01,               /* call mgmt -> data if 1 */
++  0x04, 0x24, 0x02, 0x00,                     /* ACM */
++  0x05, 0x24, 0x06, 0x00, 0x01                /* union: master 0 slave 1 */
++};
+ #endif
+ 
+   /* Communication interface descriptor */
+@@ -478,6 +525,19 @@ static uint8_t g_rndis_default_mac_addr[6] =
+   0x02, 0x00, 0x00, 0x11, 0x22, 0x33
+ };
+ 
++/* MAC address of our (device) side of the interface.  The netdev must carry a
++ * real unicast address: with d_mac left at zero every frame the board sends
++ * (ARP requests, IP packets) has 00:00:00:00:00:00 as its source address,
++ * which is not a valid unicast address.  RNDIS is a point-to-point link, so
++ * this happens to work with Windows, but the frames are malformed and break
++ * as soon as they reach anything that actually checks them.
++ */
++
++static uint8_t g_rndis_device_mac_addr[6] =
++{
++  0x02, 0x00, 0x00, 0x11, 0x22, 0x34
++};
++
+ /* These lists give dummy responses to be returned to PC. The values are
+  * chosen so that Windows is happy - other operating systems don't really
+  * care much.
+@@ -588,21 +648,60 @@ static const struct rndis_oid_value_s g_rndis_oid_values[] =
+ 
+ static int rndis_submit_rdreq(FAR struct rndis_dev_s *priv)
+ {
++  irqstate_t flags;
+   int ret = OK;
+ 
++  /* 2026-10-12 真机定案（第二次）：本函数有两个并发调用点 ——
++   * rxdispatch 尾部（ETHWORK worker，CPU-B）和 freewrreq（bulk IN 写完成
++   * 回调，IRQ 上下文，CPU-A）。两边原来都是裸读 rdreq_submitted 做
++   * 检查-然后-动作，SMP 上会双双通过检查、把同一个 rdreq EP_SUBMIT 两次
++   * —— 厂商 UDC 的 bulk OUT 队列就此损坏：驱动以为请求还在途、endpoint
++   * 队列其实已空，RX 永久死亡（板子静默、主机 transmit queue watchdog）。
++   * 对话重流量（ASR 上传 + TTS 下载同时打满双向）时必现。
++   *
++   * 修法：标志检查+占位在 rdlock 里做（关中断自旋锁），EP_SUBMIT 放在
++   * 锁外 —— UDC 允许同步完成，嵌套的完成回调会再进 cancel/block 路径取
++   * 同一把锁，锁内调 EP_SUBMIT 会死锁。占位后只有本调用者会提交，
++   * 另一调用点看到 rdreq_submitted=true 直接返回。
++   */
++
++  flags = spin_lock_irqsave(&priv->rdlock);
+   if (!priv->rdreq_submitted && !priv->rx_blocked)
+     {
+-      priv->rdreq->len = priv->epbulkout->maxpacket;
++      /* Set the flag *before* handing the request to the UDC.  A UDC is
++       * allowed to complete a request synchronously from submit(): it may
++       * already have a packet parked in the endpoint FIFO, in which case
++       * EP_SUBMIT() reads it, runs the completion callback, and that
++       * callback calls rndis_submit_rdreq() again before EP_SUBMIT()
++       * returns.  Setting rdreq_submitted afterwards overwrote the "not
++       * submitted" state which the nested completion had just established,
++       * so the driver believed a request was outstanding while the endpoint
++       * queue was in fact empty.  Nothing ever re-armed the bulk OUT pipe
++       * again: no further read completion, no further RX, permanently.
++       */
++
++      priv->rdreq->len      = priv->epbulkout->maxpacket;
++      priv->rdreq_submitted = true;
++
++      spin_unlock_irqrestore(&priv->rdlock, flags);
++
+       ret = EP_SUBMIT(priv->epbulkout, priv->rdreq);
+       if (ret != OK)
+         {
++          /* EP_SUBMIT 失败时嵌套完成回调可能已经跑过并清过标志，
++           * 再清一次无害；反之若没跑过，这里必须清，否则 RX 断臂。 */
++
++          flags = spin_lock_irqsave(&priv->rdlock);
++          priv->rdreq_submitted = false;
++          spin_unlock_irqrestore(&priv->rdlock, flags);
++
+           usbtrace(TRACE_CLSERROR(USBSER_TRACEERR_RDSUBMIT),
+                    (uint16_t)-priv->rdreq->result);
+         }
+-      else
+-        {
+-          priv->rdreq_submitted = true;
+-        }
++    }
++  else
++    {
++      spin_unlock_irqrestore(&priv->rdlock, flags);
+     }
+ 
+   return ret;
+@@ -621,11 +720,22 @@ static int rndis_submit_rdreq(FAR struct rndis_dev_s *priv)
+ 
+ static void rndis_cancel_rdreq(FAR struct rndis_dev_s *priv)
+ {
++  irqstate_t flags = spin_lock_irqsave(&priv->rdlock);
++
+   if (priv->rdreq_submitted)
+     {
+-      EP_CANCEL(priv->epbulkout, priv->rdreq);
++      /* Clear the flag under the lock, then cancel outside it: EP_CANCEL
++       * on this vendor UDC may run a nested completion callback, which
++       * takes the same lock.  While rx_blocked is set (the only condition
++       * under which cancel is called) no other site can claim the flag. */
++
+       priv->rdreq_submitted = false;
++      spin_unlock_irqrestore(&priv->rdlock, flags);
++      EP_CANCEL(priv->epbulkout, priv->rdreq);
++      return;
+     }
++
++  spin_unlock_irqrestore(&priv->rdlock, flags);
+ }
+ 
+ /****************************************************************************
+@@ -641,7 +751,9 @@ static void rndis_cancel_rdreq(FAR struct rndis_dev_s *priv)
+ 
+ static void rndis_block_rx(FAR struct rndis_dev_s *priv)
+ {
++  irqstate_t flags = spin_lock_irqsave(&priv->rdlock);
+   priv->rx_blocked = true;
++  spin_unlock_irqrestore(&priv->rdlock, flags);
+   rndis_cancel_rdreq(priv);
+ }
+ 
+@@ -661,7 +773,9 @@ static void rndis_block_rx(FAR struct rndis_dev_s *priv)
+ 
+ static void rndis_unblock_rx(FAR struct rndis_dev_s *priv)
+ {
++  irqstate_t flags = spin_lock_irqsave(&priv->rdlock);
+   priv->rx_blocked = false;
++  spin_unlock_irqrestore(&priv->rdlock, flags);
+ }
+ 
+ /****************************************************************************
+@@ -1088,6 +1202,18 @@ static void rndis_rxdispatch(FAR void *arg)
+   priv->current_rx_datagram_size = 0;
+   rndis_unblock_rx(priv);
+ 
++  /* Re-arm the bulk OUT pipe unconditionally.
++   *
++   * Unblocking reception is only half the job: the endpoint also needs a
++   * read request queued again.  Until now that happened only as a side
++   * effect of rndis_freewrreq(), i.e. when a bulk IN write completed or a
++   * network request was released -- so a received frame that produced no
++   * reply (an ARP frame not addressed to us, a duplicate, a packet the
++   * stack silently dropped) left the pipe unarmed and RX stopped for good.
++   */
++
++  rndis_submit_rdreq(priv);
++
+   if (priv->net_req != NULL)
+     {
+       rndis_freenetreq(priv);
+@@ -1337,15 +1463,40 @@ static inline int rndis_recvpacket(FAR struct rndis_dev_s *priv,
+         {
+           int ret;
+ 
+-          DEBUGASSERT(work_available(&priv->rxwork));
+-          ret = work_queue(ETHWORK, &priv->rxwork, rndis_rxdispatch,
+-                           priv, 0);
+-          DEBUGASSERT(ret == 0);
+-          UNUSED(ret);
++          /* 2026-10-12 真机定案：重流量（TTS/LLM 的 HTTPS 经 RNDIS）时
++           * 前一包的 rxdispatch 还挂在 ETHWORK 上没跑完，又攒齐了一整包
++           * —— 原来这里两条 DEBUGASSERT 直接把整板 panic（老人对话念到
++           * 一半整机重启，host 侧随后报 NETDEV WATCHDOG）。ETHWORK 上
++           * 还压着 TX work 之类，rxdispatch 排队等一等是常态，不是病。
++           *
++           * 降级成丢包：挂起的 rxdispatch 跑完时会在尾部统一 unblock +
++           * 重臂 bulk OUT（那边本来就无条件重臂），RX 必然恢复；这一包
++           * 的字节已经进了 rx_req 的 iob，最坏是并进挂起那帧、校验失败
++           * 被协议栈丢掉，TCP 自己重传 —— 远好过整板 panic。
++           */
+ 
+-          rndis_block_rx(priv);
+-          priv->rndis_host_tx_count++;
+-          return -EBUSY;
++          if (!work_available(&priv->rxwork))
++            {
++              ret = -EALREADY;
++            }
++          else
++            {
++              ret = work_queue(ETHWORK, &priv->rxwork, rndis_rxdispatch,
++                               priv, 0);
++            }
++
++          if (ret == 0 || ret == -EALREADY)
++            {
++              rndis_block_rx(priv);
++              priv->rndis_host_tx_count++;
++              return -EBUSY;
++            }
++
++          uerr("ERROR: rxdispatch queue failed (%d), drop datagram\n",
++               ret);
++          NETDEV_RXERRORS(&priv->netdev);
++          priv->current_rx_datagram_size = 0;
++          return OK;
+         }
+     }
+ 
+@@ -1380,9 +1531,21 @@ rndis_prepare_response(FAR struct rndis_dev_s *priv, size_t size,
+ 
+   if (priv->response_queue_words + size_words > RNDIS_RESP_QUEUE_WORDS)
+     {
+-      uerr("RNDIS response queue full, dropping command %08x",
++      /* Stale responses were never fetched (host re-enumerated or EP0
++       * completed with error).  Dropping the command stalls the control
++       * pipe and the host bind fails with -32.  Discard leftovers and
++       * retry once so INIT/QUERY/SET can always be answered.
++       */
++      uerr("RNDIS response queue full (%u words, need %u) -- reset, cmd %08x",
++           (unsigned)priv->response_queue_words, (unsigned)size_words,
+            (unsigned int)request_hdr->msgtype);
+-      return NULL;
++      priv->response_queue_words = 0;
++      buf = priv->response_queue;
++      hdr = (FAR struct rndis_response_header *)buf;
++      if (size_words > RNDIS_RESP_QUEUE_WORDS)
++        {
++          return NULL;
++        }
+     }
+ 
+   hdr->msgtype = request_hdr->msgtype | RNDIS_MSG_COMPLETE;
+@@ -1430,8 +1593,27 @@ static int rndis_send_encapsulated_response(FAR struct rndis_dev_s *priv,
+   notif->reserved = 0;
+   priv->epintin_req->len = sizeof(struct rndis_notification);
+ 
+-  EP_CANCEL(priv->epintin, priv->epintin_req);
+-  EP_SUBMIT(priv->epintin, priv->epintin_req);
++  uinfo("rndis: notif=%08lx qwords=%d maxpkt=%d\n",
++        (unsigned long)((struct rndis_notification *)priv->epintin_req->buf)
++          ->notification,
++        priv->response_queue_words, priv->epintin->maxpacket);
++
++  /* Only cancel an outstanding notification; if the previous one already
++   * completed (the host read it), just re-arm the request.  Cancelling a
++   * completed request re-runs its callback and can make the host see the
++   * notification out of step with the response it belongs to.
++   */
++
++  if (priv->epintin_req->result == -EINPROGRESS)
++    {
++      uinfo("rndis: intin still pending, cancel first\n");
++      EP_CANCEL(priv->epintin, priv->epintin_req);
++    }
++
++  {
++    int nret = EP_SUBMIT(priv->epintin, priv->epintin_req);
++    uinfo("rndis: intin notify submit ret=%d\n", nret);
++  }
+ 
+   return OK;
+ }
+@@ -1454,8 +1636,45 @@ static int rndis_handle_control_message(FAR struct rndis_dev_s *priv,
+                                         FAR uint8_t *dataout,
+                                         uint16_t outlen)
+ {
+-  FAR struct rndis_command_header *cmd_hdr =
+-    (FAR struct rndis_command_header *)dataout;
++  FAR struct rndis_command_header *cmd_hdr;
++
++  /* The data stage of SEND_ENCAPSULATED_COMMAND must carry at least the
++   * message header; a NULL/short buffer used to be dereferenced blindly.
++   *
++   * Do NOT -EINVAL a short message: the UDC turns a negative setup
++   * return into a STALL, and one STALL kills the host's entire bind
++   * (-EPIPE, "RNDIS init failed, -32").  The host never legitimately
++   * sends less than the 12-byte header (even HALT); sub-12-byte
++   * arrivals are misrouted SETUP packets from the vendor UDC ep0
++   * parking bug (fixed via g_ep0superseded in sf32lb_usbdev.c).
++   * Handle what we can (HALT only needs msgtype), ignore the rest and
++   * complete the control transfer cleanly so the next INIT/QUERY —
++   * i.e. the bind itself — still has a working pipe.
++   */
++
++  if (dataout == NULL || outlen < sizeof(struct rndis_command_header))
++    {
++      if (dataout != NULL && outlen >= sizeof(uint32_t))
++        {
++          uint32_t msgtype = (uint32_t)dataout[0]       |
++                             (uint32_t)dataout[1] << 8  |
++                             (uint32_t)dataout[2] << 16 |
++                             (uint32_t)dataout[3] << 24;
++
++          if (msgtype == RNDIS_HALT_MSG)
++            {
++              priv->response_queue_words = 0;
++              priv->connected = false;
++              return OK;
++            }
++        }
++
++      uwarn("RNDIS short control message (%u bytes), ignored\n",
++            (unsigned)outlen);
++      return OK;
++    }
++
++  cmd_hdr = (FAR struct rndis_command_header *)dataout;
+ 
+   switch (cmd_hdr->msgtype)
+     {
+@@ -1464,6 +1683,17 @@ static int rndis_handle_control_message(FAR struct rndis_dev_s *priv,
+           FAR struct rndis_initialize_cmplt *resp;
+           size_t respsize = sizeof(struct rndis_initialize_cmplt);
+ 
++          /* 主机发起 INIT = 开启新会话，上一会话的残留状态作废。不清的话，
++           * 跨多次 USB 重连（板子不复位）后 response_queue 里未被取走的响应
++           * 会一直堆积，堆满后 prepare_response 返回 NULL → 上层 -ENOMEM →
++           * UDC stall → 主机 rndis_host 看到 -32，probe 失败。真机复现：
++           * 2026-10-11 同一开机周期内第三次重新枚举时 QUERY(MAC) 即 stall，
++           * 板子物理复位后立刻恢复。与 HALT/RESET 分支同样处理。
++           */
++
++          priv->response_queue_words = 0;
++          priv->connected = false;
++
+           resp = rndis_prepare_response(priv, respsize, cmd_hdr);
+           if (!resp)
+             {
+@@ -1498,6 +1728,27 @@ static int rndis_handle_control_message(FAR struct rndis_dev_s *priv,
+           FAR struct rndis_query_msg *req =
+             (FAR struct rndis_query_msg *)dataout;
+ 
++          /* The cast above reads objid/buflen past the 12-byte header;
++           * a truncated message must not stall the pipe -- answer
++           * NOT_SUPPORTED with a normal completion instead.
++           */
++
++          if (outlen < sizeof(struct rndis_query_msg))
++            {
++              FAR struct rndis_response_header *shortresp;
++              size_t shortsize = sizeof(struct rndis_response_header);
++
++              shortresp = rndis_prepare_response(priv, shortsize, cmd_hdr);
++              if (!shortresp)
++                {
++                  return -ENOMEM;
++                }
++
++              shortresp->status = RNDIS_STATUS_NOT_SUPPORTED;
++              rndis_send_encapsulated_response(priv, shortsize);
++              break;
++            }
++
+           resp = rndis_prepare_response(priv, max_reply_size, cmd_hdr);
+           if (!resp)
+             {
+@@ -1594,6 +1845,23 @@ static int rndis_handle_control_message(FAR struct rndis_dev_s *priv,
+           FAR struct rndis_response_header *resp;
+           size_t respsize = sizeof(struct rndis_response_header);
+ 
++          /* Same truncated-message rule as QUERY: reply, never stall. */
++
++          if (outlen < sizeof(struct rndis_set_msg))
++            {
++              FAR struct rndis_response_header *shortresp;
++
++              shortresp = rndis_prepare_response(priv, respsize, cmd_hdr);
++              if (!shortresp)
++                {
++                  return -ENOMEM;
++                }
++
++              shortresp->status = RNDIS_STATUS_NOT_SUPPORTED;
++              rndis_send_encapsulated_response(priv, respsize);
++              break;
++            }
++
+           resp = rndis_prepare_response(priv, respsize, cmd_hdr);
+           req  = (FAR struct rndis_set_msg *)dataout;
+ 
+@@ -1707,13 +1975,48 @@ static void rndis_rdcomplete(FAR struct usbdev_ep_s *ep,
+ 
+   ret = OK;
+ 
+-  priv->rdreq_submitted = false;
++  {
++    irqstate_t flags = spin_lock_irqsave(&priv->rdlock);
++    priv->rdreq_submitted = false;
++    spin_unlock_irqrestore(&priv->rdlock, flags);
++  }
+ 
+   switch (req->result)
+     {
+     case 0: /* Normal completion */
+       ret = rndis_recvpacket(priv, req->buf, req->xfrd);
+-      DEBUGASSERT(ret != -ENOMEM);
++      if (ret == -ENOMEM)
++        {
++          /* No RX buffer could be obtained: either the IOB pool was empty
++           * or the write-request free list had nothing left.  This is a
++           * transient, recoverable condition and must NOT be fatal: the
++           * original DEBUGASSERT() panicked here, which takes the whole USB
++           * device stack down with it (the host then reports "USB device not
++           * recognized" until the board is re-plugged or rebooted).
++           *
++           * Recover by dropping this frame and re-arming the bulk OUT pipe
++           * below.  rndis_recvpacket() can only fail this way at the start of
++           * a fresh datagram -- a continuation packet always finds rx_req
++           * already allocated -- so no reassembly state is left behind.  The
++           * dropped frame is an Ethernet frame: TCP retransmits it, ARP and
++           * ICMP simply try again, which is far cheaper than losing the
++           * device.
++           *
++           * The log is rate limited (first 3, then every 64th) because this
++           * runs in interrupt context and a buffer shortage arrives in
++           * bursts.
++           */
++
++          priv->rx_dropped_nomem++;
++          if (priv->rx_dropped_nomem <= 3 ||
++              (priv->rx_dropped_nomem & 0x3f) == 0)
++            {
++              uerr("ERROR: RX buffer unavailable, frame dropped "
++                   "(%" PRIu32 " total)\n", priv->rx_dropped_nomem);
++            }
++
++          ret = OK;
++        }
+       break;
+ 
+     case -ESHUTDOWN: /* Disconnection */
+@@ -1726,6 +2029,14 @@ static void rndis_rdcomplete(FAR struct usbdev_ep_s *ep,
+       break;
+     };
+ 
++  /* 重臂 bulk OUT 一律走 submit_rdreq：它在 rdlock 里原子地检查
++   * rdreq_submitted + rx_blocked，被 block 时安全空转（RX 由 rxdispatch
++   * 尾部统一恢复）；EP_CANCEL 在这颗厂商 UDC 上可能触发嵌套完成回调，
++   * 从 default 分支落到这里时同样经由该检查避免越权重臂。
++   * 这里不再手动读 rx_blocked —— 裸读和 submit 内的占位不是原子的，
++   * 两个调用点间的竞态正是 2026-10-12 第二次真机卡死的根因。
++   */
++
+   if (ret == OK)
+     {
+       rndis_submit_rdreq(priv);
+@@ -1845,6 +2156,9 @@ static void usbclass_ep0incomplete(FAR struct usbdev_ep_s *ep,
+ static void usbclass_epintin_complete(FAR struct usbdev_ep_s *ep,
+                                       FAR struct usbdev_req_s *req)
+ {
++  uinfo("rndis: intin complete result=%d xfrd=%d len=%d\n",
++        req->result, req->xfrd, req->len);
++
+   if (req->result || req->xfrd != req->len)
+     {
+       usbtrace(TRACE_CLSERROR(USBSER_TRACEERR_REQRESULT),
+@@ -1972,6 +2286,17 @@ static int16_t usbclass_mkcfgdesc(FAR uint8_t *buf,
+ 
+   totallen += sizeof(struct usb_cfgdesc_s);
+ 
++  /* Interface Association Descriptor (non-composite RNDIS needs it so that
++   * Windows sees one RNDIS function rather than a stray CDC-ACM port) */
++
++  if (buf != NULL)
++    {
++      memcpy(buf, g_rndis_iad_rndis, sizeof(g_rndis_iad_rndis));
++      buf += sizeof(g_rndis_iad_rndis);
++    }
++
++  totallen += sizeof(g_rndis_iad_rndis);
++
+ #elif defined(CONFIG_COMPOSITE_IAD)
+   /* Interface association descriptor */
+ 
+@@ -2001,6 +2326,18 @@ static int16_t usbclass_mkcfgdesc(FAR uint8_t *buf,
+ 
+   totallen += sizeof(struct usb_ifdesc_s);
+ 
++#ifndef CONFIG_RNDIS_COMPOSITE
++  /* CDC functional descriptors (header/call-mgmt/acm/union) */
++
++  if (buf != NULL)
++    {
++      memcpy(buf, g_rndis_func_descs, sizeof(g_rndis_func_descs));
++      buf += sizeof(g_rndis_func_descs);
++    }
++
++  totallen += sizeof(g_rndis_func_descs);
++#endif
++
+   epno = devinfo ? devinfo->epno[RNDIS_EP_INTIN_IDX] : 0;
+   ret = usbdev_copy_epdesc((struct usb_epdesc_s *)buf,
+                            epno,
+@@ -2502,8 +2839,22 @@ static int usbclass_setup(FAR struct usbdevclass_driver_s *driver,
+ #  endif /* CONFIG_USBDEV_DUALSPEED */
+                 case USB_DESC_TYPE_CONFIG:
+                   {
++                    int i;
+                     ret = usbclass_mkcfgdesc(ctrlreq->buf, &priv->devinfo,
+                                              dev->speed, ctrl->value[1]);
++                    for (i = 0; i + 16 <= ret; i += 16)
++                      {
++                        uinfo("cfg[%02d] %02x %02x %02x %02x %02x %02x %02x %02x"
++                              " %02x %02x %02x %02x %02x %02x %02x %02x\n",
++                              i, ctrlreq->buf[i], ctrlreq->buf[i + 1],
++                              ctrlreq->buf[i + 2], ctrlreq->buf[i + 3],
++                              ctrlreq->buf[i + 4], ctrlreq->buf[i + 5],
++                              ctrlreq->buf[i + 6], ctrlreq->buf[i + 7],
++                              ctrlreq->buf[i + 8], ctrlreq->buf[i + 9],
++                              ctrlreq->buf[i + 10], ctrlreq->buf[i + 11],
++                              ctrlreq->buf[i + 12], ctrlreq->buf[i + 13],
++                              ctrlreq->buf[i + 14], ctrlreq->buf[i + 15]);
++                      }
+                   }
+                   break;
+ #endif
+@@ -2567,12 +2918,26 @@ static int usbclass_setup(FAR struct usbdevclass_driver_s *driver,
+ 
+     case USB_REQ_TYPE_CLASS:
+       {
++        /* 诊断（2026-10-29）：主机 rndis_host 每次都 RNDIS init failed, -32
++         * (-EPIPE)，即**这里返回了负值、上层把控制传输 STALL 掉**。
++         * 类请求只在绑定/设包过滤时才来，几行日志不会刷屏，所以用 uerr 常开。
++         * 光看 -32 分不出是「请求压根没到类驱动」还是「到了但返回负值」——
++         * 这一行就是用来分这两件事的。
++         */
++
++        uerr("rndis: cls setup type=%02x req=%02x value=%04x len=%04x "
++             "outlen=%u dataout=%p\n",
++             ctrl->type, ctrl->req, value, len,
++             (unsigned)outlen, dataout);
++
+         if ((ctrl->type & USB_REQ_RECIPIENT_MASK) ==
+             USB_REQ_RECIPIENT_INTERFACE)
+           {
+             if (ctrl->req == RNDIS_SEND_ENCAPSULATED_COMMAND)
+               {
+                 ret = rndis_handle_control_message(priv, dataout, outlen);
++                uerr("rndis: handle_control_message ret=%d qwords=%u\n",
++                     ret, (unsigned)priv->response_queue_words);
+               }
+             else if (ctrl->req == RNDIS_GET_ENCAPSULATED_RESPONSE)
+               {
+@@ -2630,11 +2995,23 @@ static int usbclass_setup(FAR struct usbdevclass_driver_s *driver,
+ #endif
+       if (ret < 0)
+         {
++          /* ★ 这一支也是「返回负值 → 上层 STALL → 主机 -32」的来源之一：
++           * ctrlreq 是**一个共享的 EP0 请求**，上一次还没完成就再 submit
++           * 会拿到 -EBUSY。日志把 errno 一起打出来，一眼分辨。 */
++
++          uerr("rndis: ep0 submit 失败 %d -> 上层 STALL "
++               "(type=%02x req=%02x len=%u)\n",
++               ret, ctrl->type, ctrl->req, len);
+           usbtrace(TRACE_CLSERROR(USBSER_TRACEERR_EPRESPQ), (uint16_t)-ret);
+           ctrlreq->result = OK;
+           usbclass_ep0incomplete(dev->ep0, ctrlreq);
+         }
+     }
++  else
++    {
++      uerr("rndis: setup 返回 %d -> 上层 STALL (type=%02x req=%02x len=%u)\n",
++           ret, ctrl->type, ctrl->req, len);
++    }
+ 
+   return ret;
+ }
+@@ -2751,11 +3128,52 @@ static int usbclass_setconfig(FAR struct rndis_dev_s *priv, uint8_t config)
+     }
+ #endif
+ 
++  /* A new configuration means a new RNDIS session: drop any responses
++   * left over from the previous one.  Without this the response queue
++   * fills up across re-enumerations and every INITIALIZE_MSG is dropped
++   * ("RNDIS response queue full"), because the host never got a chance to
++   * read them.  usbclass_resetconfig() used to do this from the
++   * disconnect path, which we had to remove (it takes a mutex and runs in
++   * interrupt context).
++   */
++
++  priv->response_queue_words = 0;
++  priv->connected            = false;
++
+   if (config == priv->config)
+     {
+-      /* Already configured -- Do nothing */
++      /* Already configured -- Do nothing except re-arm the bulk OUT read.
++       *
++       * A bus reset cancels every queued request (the UDC's reset branch
++       * calls cancelrequests() on all endpoints) but leaves priv->config
++       * set, so on re-enumeration the host's SET_CONFIGURATION lands here.
++       * Returning without re-submitting leaves the bulk OUT pipe with no
++       * read request for the rest of the session: the controller then NAKs
++       * every packet and not a single frame is received again.  That is
++       * exactly what happened after a port swap.
++       */
+ 
+       usbtrace(TRACE_CLSERROR(USBSER_TRACEERR_ALREADYCONFIGURED), 0);
++
++      if (priv->epbulkout != NULL && priv->rdreq != NULL)
++        {
++          irqstate_t flags = enter_critical_section();
++          irqstate_t rdflags;
++
++          /* Flag resets go through rdlock so they exclude the completion
++           * and worker paths, which run on other CPUs. */
++
++          rdflags = spin_lock_irqsave(&priv->rdlock);
++          priv->rdreq->callback = rndis_rdcomplete;
++          priv->rx_blocked      = false;
++          priv->rdreq_submitted = false;
++          spin_unlock_irqrestore(&priv->rdlock, rdflags);
++
++          (void)rndis_submit_rdreq(priv);
++
++          leave_critical_section(flags);
++        }
++
+       return 0;
+     }
+ 
+@@ -2824,12 +3242,20 @@ static int usbclass_setconfig(FAR struct rndis_dev_s *priv, uint8_t config)
+ 
+   priv->epbulkout->priv = priv;
+ 
+-  /* Queue read requests in the bulk OUT endpoint */
++  /* Queue read requests in the bulk OUT endpoint.
++   *
++   * usbclass_setconfig() runs in interrupt context (EP0 SET_CONFIGURATION),
++   * so nxmutex_lock() must not be used here: when the mutex happens to be
++   * held it calls nxmutex_wait(), whose DEBUGASSERT(!up_interrupt_context())
++   * panics the board.  That is exactly what killed the board once the RNDIS
++   * session started and the network side began taking priv->lock.  A
++   * critical section is enough on this single-core target.
++   */
+ 
+-  while (nxmutex_lock(&priv->lock) < 0);
++  irqstate_t flags = enter_critical_section();
+   priv->rdreq->callback = rndis_rdcomplete;
+   ret = rndis_submit_rdreq(priv);
+-  nxmutex_unlock(&priv->lock);
++  leave_critical_section(flags);
+   if (ret != OK)
+     {
+       usbtrace(TRACE_CLSERROR(USBSER_TRACEERR_RDSUBMIT), (uint16_t)-ret);
+@@ -2889,6 +3315,7 @@ static int usbclass_classobject(int minor,
+   *classdev = &drvr->drvr;
+ 
+   nxmutex_init(&priv->lock);
++  spin_lock_init(&priv->rdlock);
+ 
+   /* Get device info */
+ 
+@@ -2898,6 +3325,8 @@ static int usbclass_classobject(int minor,
+ 
+   sq_init(&priv->reqlist);
+   memcpy(priv->host_mac_address, g_rndis_default_mac_addr, 6);
++  memcpy(priv->netdev.d_mac.ether.ether_addr_octet,
++         g_rndis_device_mac_addr, 6);
+   priv->netdev.d_private = priv;
+   priv->netdev.d_ifup = &rndis_ifup;
+   priv->netdev.d_ifdown = &rndis_ifdown;
+@@ -2925,7 +3354,7 @@ static int usbclass_classobject(int minor,
+   ret = netdev_register(&priv->netdev, NET_LL_ETHERNET);
+   if (ret)
+     {
+-      uerr("Failed to register net device");
++      syslog(LOG_ERR, "[rndis] netdev_register failed: %d\n", ret);
+     }
+ 
+   return ret;
+@@ -2980,7 +3409,7 @@ int usbdev_rndis_initialize(FAR const uint8_t *mac_address)
+   ret = usbclass_classobject(0, &devinfo, &classdev);
+   if (ret)
+     {
+-      nerr("usbclass_classobject failed: %d\n", ret);
++      syslog(LOG_ERR, "[rndis] classobject failed: %d\n", ret);
+       return ret;
+     }
+ 
+@@ -2994,7 +3423,7 @@ int usbdev_rndis_initialize(FAR const uint8_t *mac_address)
+   ret = usbdev_register(&drvr->drvr);
+   if (ret)
+     {
+-      nerr("usbdev_register failed: %d\n", ret);
++      syslog(LOG_ERR, "[rndis] usbdev_register failed: %d\n", ret);
+       usbtrace(TRACE_CLSERROR(USBSER_TRACEERR_DEVREGISTER), (uint16_t)-ret);
+       usbclass_uninitialize(classdev);
+       return ret;
+diff --git a/include/nuttx/net/tcp.h b/include/nuttx/net/tcp.h
+index 5cebec18b7f..dc0fb31876b 100644
+--- a/include/nuttx/net/tcp.h
++++ b/include/nuttx/net/tcp.h
+@@ -209,5 +209,40 @@ struct tcp_stats_s
+  * Public Function Prototypes
+  ****************************************************************************/
+ 
++/* ── 连接池只读快照（纯仪表，2026-10-24）────────────────────────────
++ *
++ * 背景：真机出现过"跑几轮对话之后 socket() 必然 ENOMEM"，根因是
++ * net/tcp/tcp_conn.c 的 g_tcp_connections 这个 mempool 打满
++ * （mempool_allocate 在 nalloc >= maxalloc 时先于空闲队列就直接返回 NULL）。
++ * 但**谁占着不放**当时只能猜。这个快照就是给"猜"画上句号的：
++ * 应用侧的状态信标每 10 秒打一行，把"池子用了多少 / 活动连接各处于什么
++ * TCP 状态 / 对端是哪个端口"摆到串口上，一眼看出占着的是 TIME_WAIT
++ * （收尾没跑完）还是 ESTABLISHED（真泄漏），对端是 443（HTTPS）还是
++ * 1883（MQTT）还是别的。
++ *
++ * 代价：加一把 nxrmutex_trylock（拿不到就跳过这一拍明细），只读不写。
++ */
++
++#define TCP_CONN_PROBE_NSTATE   11   /* TCP_CLOSED .. TCP_LAST_ACK */
++#define TCP_CONN_PROBE_NPEER    8    /* 最多列 8 个不同的对端端口 */
++
++struct tcp_conn_probe_peer_s
++{
++  uint16_t rport;   /* network byte order */
++  uint16_t count;
++};
++
++struct tcp_conn_probe_s
++{
++  int      used;                              /* g_tcp_connections.nalloc */
++  int      cap;                               /* maxalloc（0 = 不限） */
++  int      nactive;                           /* g_active_tcp_connections 长度，-1 = 这拍没拿到锁 */
++  int      nstate[TCP_CONN_PROBE_NSTATE];     /* 按 TCP_STATE_MASK 计数 */
++  int      npeer;
++  struct tcp_conn_probe_peer_s peer[TCP_CONN_PROBE_NPEER];
++};
++
++void tcp_conn_probe(FAR struct tcp_conn_probe_s *out);
++
+ #endif /* CONFIG_NET_TCP */
+ #endif /* __INCLUDE_NUTTX_NET_TCP_H */
+diff --git a/net/tcp/tcp_conn.c b/net/tcp/tcp_conn.c
+index 685cf266791..bbb0469ad27 100644
+--- a/net/tcp/tcp_conn.c
++++ b/net/tcp/tcp_conn.c
+@@ -597,6 +597,88 @@ int tcp_selectport(uint8_t domain,
+   return portno;
+ }
+ 
++/****************************************************************************
++ * Name: tcp_conn_probe
++ *
++ * Description:
++ *   只读快照：连接池用了多少、活动连接各处于什么 TCP 状态、对端端口分布。
++ *   纯仪表，不改任何状态；给应用侧的状态信标用（见
++ *   app/hello_app/ai_companion_main.c 的 state_beacon_task）。
++ *
++ *   为什么要它：g_tcp_connections 是个 mempool，mempool_allocate() 在
++ *   nalloc >= maxalloc 时**先于空闲队列**就返回 NULL，于是 socket() 直接
++ *   ENOMEM。到那一步时"哪条连接没被还回来"完全看不出来，只能猜。这一行
++ *   把它变成一条判据：
++ *     - nstate 里 TIME_WAIT 占绝大多数  => 是收尾没跑完（close 后 FIN/TIME_WAIT
++ *       把 tcp_conn_s 又占了 CONFIG_NET_TCP_WAIT_TIMEOUT 秒），不是泄漏；
++ *     - ESTABLISHED / SYN_SENT 占着且长期不掉 => 是真泄漏，看 peer 表里对端
++ *       端口就知道是哪条链路（443=HTTPS、1883=MQTT、5600=LCDMIRROR、…）。
++ *
++ *   用 nxrmutex_trylock 而不是 tcp_conn_list_lock()：信标的铁律是"绝不阻塞"，
++ *   拿不到锁就把明细跳过（nactive = -1），池子计数仍然照报（无锁读两个
++ *   size_t，仪表精度足够）。
++ *
++ ****************************************************************************/
++
++void tcp_conn_probe(FAR struct tcp_conn_probe_s *out)
++{
++  FAR struct tcp_conn_s *tmp;
++
++  if (out == NULL)
++    {
++      return;
++    }
++
++  memset(out, 0, sizeof(*out));
++
++  /* 这两个是 mempool 里的计数器，加减都在锁内完成；无锁读对仪表来说够了。 */
++
++  out->used = (int)g_tcp_connections.nalloc;
++  out->cap  = (int)g_tcp_connections.maxalloc;
++
++  if (nxrmutex_trylock(&g_tcp_connections_lock) != OK)
++    {
++      out->nactive = -1;
++      return;
++    }
++
++  for (tmp = (FAR struct tcp_conn_s *)g_active_tcp_connections.head;
++       tmp != NULL;
++       tmp = (FAR struct tcp_conn_s *)tmp->sconn.s_node.flink)
++    {
++      int st = tmp->tcpstateflags & TCP_STATE_MASK;
++      int i;
++
++      out->nactive++;
++
++      if (st >= 0 && st < TCP_CONN_PROBE_NSTATE)
++        {
++          out->nstate[st]++;
++        }
++
++      /* 对端端口归并计数：443=HTTPS、1883=MQTT、5600=LCDMIRROR……
++       * 比逐条列连接紧凑得多，一行就能看出"是谁在刷连接"。 */
++
++      for (i = 0; i < out->npeer; i++)
++        {
++          if (out->peer[i].rport == tmp->rport)
++            {
++              out->peer[i].count++;
++              break;
++            }
++        }
++
++      if (i == out->npeer && out->npeer < TCP_CONN_PROBE_NPEER)
++        {
++          out->peer[out->npeer].rport = tmp->rport;
++          out->peer[out->npeer].count = 1;
++          out->npeer++;
++        }
++    }
++
++  nxrmutex_unlock(&g_tcp_connections_lock);
++}
++
+ /****************************************************************************
+  * Name: tcp_alloc
+  *

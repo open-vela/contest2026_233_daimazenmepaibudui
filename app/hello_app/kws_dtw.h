@@ -321,7 +321,15 @@
 /* ---- 模板 ---- */
 
 #define KWS_MAX_TEMPLATES   4                   /* 模板槽个数（每条 2600 字节 RAM） */
-#define KWS_DATA_DIR        "/data/kws"
+
+/* 落盘目录。**给 #ifndef 是为了 PC 侧工具**（tools/kws_tpl_gen）：它把
+ * kws_dtw.c 原样编到 x86 上跑 kws_enroll() 出厂模板，PC 上没有 /data/kws、
+ * 也不该为了这个去 sudo 建，于是 -DKWS_DATA_DIR 覆盖成自己的输出目录。
+ * 板上什么都不带、展开结果和改动前逐字一样。 */
+
+#ifndef KWS_DATA_DIR
+#  define KWS_DATA_DIR      "/data/kws"
+#endif
 
 /* ---- 阈值与返回码 ---- */
 

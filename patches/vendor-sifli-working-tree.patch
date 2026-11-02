@@ -1,0 +1,2004 @@
+diff --git a/boards/sf32lb52/drivers/lcd/Kconfig b/boards/sf32lb52/drivers/lcd/Kconfig
+index 9984767..4f9acad 100644
+--- a/boards/sf32lb52/drivers/lcd/Kconfig
++++ b/boards/sf32lb52/drivers/lcd/Kconfig
+@@ -88,7 +88,7 @@ if SIFLI_LCD
+         default 368 if LCD_USING_ED_LB55BILI8688E
+         default 390 if LCD_USING_CO5300
+ 
+-        
++
+     config LCD_VER_RES_MAX
+         int
+         default 448 if LCD_USING_ED_LB55BILI8688E
+diff --git a/boards/sf32lb52/drivers/lcd/co5300.c b/boards/sf32lb52/drivers/lcd/co5300.c
+index 0443fef..93aec76 100644
+--- a/boards/sf32lb52/drivers/lcd/co5300.c
++++ b/boards/sf32lb52/drivers/lcd/co5300.c
+@@ -80,6 +80,16 @@
+ #define REG_ORIENTATION_LANDSCAPE        (0x01) /* Landscape orientation choice of LCD screen */
+ #define REG_ORIENTATION_LANDSCAPE_ROT180 (0x02) /* Landscape rotated 180 orientation choice of LCD screen */
+ 
++/* ⚠️ 2026-10-24 试过用 MADCTL(0x36) 的 MV 位把 GRAM 行/列轴互换来出横屏
++ * （配合 CONFIG_LCD_HOR_RES_MAX/VER_RES_MAX 换成 450/390），**真机上是乱码**。
++ * 这颗 CO5300 是带密码解锁(0xF4/0xF5)和切命令页(0xFE)的 QSPI AMOLED，命令集
++ * 不是标准 MIPI DCS —— MADCTL 当普通寄存器写了没起作用，设窗照样按竖屏轴走，
++ * 像素写到错的地址上就成了一片噪声。
++ * 所以：**不要只改这两个 Kconfig 就以为能横屏**。真要横屏得换一条路
++ * （LVGL 侧把逻辑分辨率设成 450×390、在 flush 里转置像素，或找厂商要这颗
++ * 面板真正的方向寄存器），而且必须有能看的屏幕才能验收。
++ * 上面那三个 REG_ORIENTATION_* 是原厂留的死宏，从来没被用过，别被它们骗了。 */
++
+ /**
+   * @brief  CO5300 Registers
+   */
+@@ -123,11 +133,43 @@
+ 
+ #define QAD_SPI_ITF LCDC_INTF_SPI_DCX_4DATA
+ 
++/* ==================== 面板 QSPI 写时钟（降频 / 一键回退） ====================
++ * 这个 freq 不是面板自己的刷新率（CO5300 带 GRAM，自刷新由它内部振荡器驱动），
++ * 而是 SoC 往面板推像素的那条 QSPI 总线的时钟。它是全驱动里唯一的来源：
++ * HAL_LCDC_Init() → SetFreq() 拿它算分频写进 SPI_IF_CONF.CLK_DIV，读寄存器时
++ * 的降速/恢复（LCD_ReadMode）用的也是同一个值。
++ *
++ *     CLK_DIV = ceil(HCLK / freq)   （HAL 里那个除法向上取整，硬件最小分频 2）
++ *     面板时钟 = HCLK / CLK_DIV
++ *
++ * 本板 HCLK = 240MHz（bsp_init.c 的 HAL_RCC_HCPU_EnableDLL1(240000000)）：
++ *     50000000（CO5300 手册上限，改前）→ CLK_DIV = 5  → 面板时钟 48MHz
++ *     24000000（现在）               → CLK_DIV = 10 → 面板时钟 24MHz
++ *
++ * 为什么降：本板 USB 直供（不带电池），厂商提交 0a3cd0a 自己写着 "some panels
++ * do not respond reliably to ID queries on USB-only power where read timing is
++ * marginal" —— 48MHz 下这条总线在 USB 供电时处于边缘时序，症状是间歇性丢像素
++ * （大块背景丢、只剩细笔画，偶尔整屏黑），而应用/LCDC 侧一切正常。
++ *
++ * 代价：推送带宽减半（4 数据线 24MHz ≈ 12MB/s，全屏 390×450×2B ≈ 29ms/帧）；
++ * 面板自刷新不受影响，只有"往面板推画面"变慢。
++ *
++ * SF32LB_LCD_QSPI_CLK_SLOW 置 0 ⇒ 走下面 #else 分支，逐字回到改前的字面值
++ * 50000000（= 48MHz）。
++ */
++#define SF32LB_LCD_QSPI_CLK_SLOW 1
++
++#if SF32LB_LCD_QSPI_CLK_SLOW
++#define SF32LB_LCD_QSPI_CLK_HZ   24000000
++#endif
++
+ static LCDC_InitTypeDef lcdc_int_cfg_qadspi =
+ {
+     .lcd_itf = QAD_SPI_ITF, // LCDC_INTF_SPI_NODCX_1DATA
+ #if defined(LCD_MAX_CLK_FREQ)
+     .freq = LCD_MAX_CLK_FREQ,        //CO5300 RGB565 only support 50000000,  RGB888 support 60000000
++#elif SF32LB_LCD_QSPI_CLK_SLOW
++    .freq = SF32LB_LCD_QSPI_CLK_HZ,  //24000000 -> CLK_DIV 10 -> 24MHz @HCLK 240MHz
+ #else
+     .freq = 50000000, //CO5300 RGB565 only support 50000000,  RGB888 support 60000000
+ #endif
+diff --git a/boards/sf32lb52/drivers/lcd/sf32lb_lcd.c b/boards/sf32lb52/drivers/lcd/sf32lb_lcd.c
+index 66fcfc6..742bb7d 100644
+--- a/boards/sf32lb52/drivers/lcd/sf32lb_lcd.c
++++ b/boards/sf32lb52/drivers/lcd/sf32lb_lcd.c
+@@ -73,6 +73,56 @@ const void *_lcd_drv_ref_ili8688e
+  ****************************************************************************/
+ #define lcd_debug_print lcdinfo
+ 
++/* LCDDEVIO_SETCONTRAST / GETCONTRAST 在本驱动里按“亮度百分比 0..100”解释，
++ * **不跟 CONFIG_LCD_MAXCONTRAST 走**（本板它是 63，会把 100% 挡在外面）。
++ * 面板侧对应 CO5300 的 0x51 WBRIGHT，见 co5300.c 的 LCD_SetBrightness()。 */
++
++#define SF32LB_LCD_BRIGHTNESS_MAX 100
++
++/* ==================== 面板重新初始化（黑屏救回）总开关 ====================
++ * 1 = 编出 sf32lb_lcd_panel_reinit()（带逐步诊断日志），并把 panel_lock 打开：
++ *       - hw_test lcdreinit 用它把"面板丢了配置"造成的整屏黑救回来；
++ *       - 开机路径 lcd_hw_setup_thread_entry 的第三次面板复位拿同一把锁，
++ *         挡掉"面板正在被复位、外面却在写 0x29/0x28"这个竞态
++ *         （"重插有概率黑屏起不来"，理由写在该函数里）；
++ *       - sf32lb_lcd_setpower() 也拿它（外部来的 DisplayOn/Off 不能再插队）。
++ * 0 = 退回没加这个功能之前：sf32lb_lcd_panel_reinit() 直接回 -ENOSYS，
++ *     panel_lock 的三个宏变成空操作，刷新路径和开机路径一行不多。
++ *
++ * 为什么需要它 / 上板怎么用：docs/display_touch_gpio_usage.md 第 3.4 节。
++ */
++
++#define SF32LB_LCD_PANEL_REINIT 1
++
++/* 重初始化时把面板 RESET 脚拉低多久（ms）。开机路径只拉低 10ms（co5300.c 的
++ * LCD_Drv_Init），这里给 3 倍余量：面板"丢了配置"最常见的形状是复位不彻底/
++ * 电源塌陷，低电平时间给足才谈得上真的复位了一次。 */
++#define SF32LB_LCD_RESET_LOW_MS   30
++#define SF32LB_LCD_RESET_HIGH_MS  120
++
++/* 等 panel_lock 的上限（ms）。一次面板复位要 ~0.4s，等 1s 够用；
++ * 超时只打一行 WARN 然后照原样放行 —— 宁可少一层保护，也不能把调用方
++ * （NSH 命令、LVGL 那条路）永久挡住。 */
++#define SF32LB_LCD_PANEL_LOCK_WAIT_MS 1000
++
++/* ==================== 重初始化的逐步日志 ====================
++ * ⚠ 本驱动里原有的 lcdinfo / lcdwarn / lcderr 在**本板固件里全被编掉了**：
++ *   CONFIG_DEBUG_LCD 没开 ⇒ nuttx/include/debug.h:517-532 把它们展开成 _none，
++ *   驱动里那些现成的打点一行都不会出现在串口里。所以"每一步都看得见"只能走
++ *   syslog —— 本板 CONFIG_SYSLOG_DEFAULT_MASK=0xff，LOG_INFO/WARNING/ERR
++ *   三级都出得来。前缀统一成 [lcdreinit]，串口日志里直接 grep 它。
++ * ⚠ CONFIG_SYSLOG_BUFSIZE=196，一行别写太长（一个汉字 3 字节）。 */
++#define LCD_REINIT_TAG "[lcdreinit]"
++
++#define LCD_REINIT_STEP(fmt, ...) \
++  syslog(LOG_INFO, LCD_REINIT_TAG " " fmt "\n", ##__VA_ARGS__)
++#define LCD_REINIT_PASS(fmt, ...) \
++  syslog(LOG_INFO, LCD_REINIT_TAG " PASS " fmt "\n", ##__VA_ARGS__)
++#define LCD_REINIT_WARN(fmt, ...) \
++  syslog(LOG_WARNING, LCD_REINIT_TAG " WARN " fmt "\n", ##__VA_ARGS__)
++#define LCD_REINIT_FAIL(fmt, ...) \
++  syslog(LOG_ERR, LCD_REINIT_TAG " FAIL " fmt "\n", ##__VA_ARGS__)
++
+ struct sf32lb_lcd_dev_s
+ {
+     struct lcd_dev_s dev;
+@@ -84,10 +134,29 @@ struct sf32lb_lcd_dev_s
+     FAR sem_t init_sem;
+     FAR sem_t draw_sem;
+ 
++    /* "面板访问"互斥：putrun / putarea 推像素、sf32lb_lcd_panel_reinit()
++     * 重发面板配置、lcd_hw_setup_thread_entry 那次面板复位、以及外部进来的
++     * setpower（DisplayOn/Off）都要拿它。LVGL 线程一直在刷（真机 20~30 帧/s），
++     * 而 hw_test lcdreinit 是从 NSH 任务里调的 —— 不隔开的话，QSPI 上会
++     * 一边推像素一边插寄存器写，谁都不该指望结果。关掉 SF32LB_LCD_PANEL_REINIT
++     * 时这三个宏是空操作，热路径和改动前完全一样。 */
++    FAR sem_t panel_lock;
++
+     int power;
++    int contrast;               /* 亮度百分比 0..100，见 setcontrast/getcontrast */
+     uint8_t bpp;
+ };
+ 
++#if SF32LB_LCD_PANEL_REINIT
++#define SF32LB_LCD_PANEL_LOCK()   (void)sem_wait(&s_drv_lcd.panel_lock)
++#define SF32LB_LCD_PANEL_UNLOCK() (void)sem_post(&s_drv_lcd.panel_lock)
++#define SF32LB_LCD_PANEL_LOCK_WAIT(ms) sf32lb_lcd_panel_lock_timeout(ms)
++#else
++#define SF32LB_LCD_PANEL_LOCK()   do { } while (0)
++#define SF32LB_LCD_PANEL_UNLOCK() do { } while (0)
++#define SF32LB_LCD_PANEL_LOCK_WAIT(ms) (0)
++#endif
++
+ /* Configuration ************************************************************/
+ 
+ /****************************************************************************
+@@ -97,6 +166,58 @@ static struct sf32lb_lcd_dev_s s_drv_lcd;
+ static volatile bool s_fb_registering;
+ static volatile bool s_lcd_hw_ready;
+ 
++/* "GRAM 内容跟 LVGL 以为的不一样"这个记账（契约见板级头文件
++ * sf32lb52_devkit_lcd.h 的 take_content_lost）：
++ *   ① 面板就绪前 putrun/putarea 被静默丢弃 —— 计数 + 置位；
++ *   ② 面板被 (重) 初始化过（SWRESET 清 GRAM）—— 置位。
++ * 上层（robot_ui_bridge_lcd_check）每帧轮询 take，取走即清零，看到 true
++ * 就把整屏判脏重画。Cortex-M 上 32 位对齐读写是原子的，丢一两个中断
++ * 之间的计数对诊断无害，不加锁。
++ */
++static volatile uint32_t s_drop_count;
++static volatile bool s_content_lost;
++
++#if SF32LB_LCD_PANEL_REINIT
++static int sf32lb_lcd_panel_lock_timeout(uint32_t ms);
++
++/****************************************************************************
++ * Name:  sf32lb_lcd_panel_lock_timeout
++ *
++ * Description:
++ *   带超时地拿 panel_lock。返回 0 拿到、-1 超时（调用方自己决定：
++ *   重初始化是"从坏状态里往外捞"，超时也要继续；setpower 超时则照原样下发）。
++ *
++ *   为什么要带超时：一次面板复位会把锁按住 ~0.4 秒，而调用方可能是
++ *   "用户刚点了什么就要立刻生效"的路径。sem_wait 万一遇到没人释放的锁
++ *   就是永久卡死一块板子，这里给上界。
++ *
++ ****************************************************************************/
++
++static int sf32lb_lcd_panel_lock_timeout(uint32_t ms)
++{
++  struct timespec ts;
++
++  clock_gettime(CLOCK_REALTIME, &ts);
++  ts.tv_sec  += (time_t)(ms / 1000u);
++  ts.tv_nsec += (long)(ms % 1000u) * 1000000L;
++  if (ts.tv_nsec >= 1000000000L)
++    {
++      ts.tv_sec  += 1;
++      ts.tv_nsec -= 1000000000L;
++    }
++
++  while (sem_timedwait(&s_drv_lcd.panel_lock, &ts) < 0)
++    {
++      if (errno != EINTR)
++        {
++          return -1;
++        }
++    }
++
++  return 0;
++}
++#endif /* SF32LB_LCD_PANEL_REINIT */
++
+ static void sf32lb_lcd_ensure_display_on(FAR struct sf32lb_lcd_dev_s *dev)
+ {
+   if (dev == NULL || dev->p_drv_ops == NULL || dev->p_drv_ops->p_ops == NULL)
+@@ -331,12 +452,17 @@ static int sf32lb_lcd_putrun(FAR struct lcd_dev_s *dev,
+ 
+   if (s_fb_registering || !s_lcd_hw_ready)
+     {
++      /* 静默丢帧：LVGL 以为画上去了。记账，让上层有机会整屏判脏重画。 */
++      s_drop_count++;
++      s_content_lost = true;
+       return OK;
+     }
+ 
+   lcd_debug_print("row: %d col: %d npixels: %d\n", row, col, npixels);
+   DEBUGASSERT(buffer && ((uintptr_t)buffer & 1) == 0);
+ 
++  SF32LB_LCD_PANEL_LOCK();
++
+   if (priv->bpp == 8)
+     {
+       FAR uint16_t *conv;
+@@ -345,6 +471,7 @@ static int sf32lb_lcd_putrun(FAR struct lcd_dev_s *dev,
+       conv = kmm_malloc(npixels * sizeof(uint16_t));
+       if (conv == NULL)
+         {
++          SF32LB_LCD_PANEL_UNLOCK();
+           return -ENOMEM;
+         }
+ 
+@@ -365,6 +492,7 @@ static int sf32lb_lcd_putrun(FAR struct lcd_dev_s *dev,
+                        col, row, col + npixels - 1, row);
+       sf32lb_lcd_ensure_display_on(priv);
+       kmm_free(conv);
++      SF32LB_LCD_PANEL_UNLOCK();
+       return OK;
+     }
+ 
+@@ -372,6 +500,8 @@ static int sf32lb_lcd_putrun(FAR struct lcd_dev_s *dev,
+   sf32lb_lcd_wrram(priv, buffer, col, row, col + npixels - 1, row);
+   sf32lb_lcd_ensure_display_on(priv);
+ 
++  SF32LB_LCD_PANEL_UNLOCK();
++
+   return OK;
+ }
+ 
+@@ -406,6 +536,9 @@ static int sf32lb_lcd_putarea(FAR struct lcd_dev_s *dev,
+ 
+   if (s_fb_registering || !s_lcd_hw_ready)
+     {
++      /* 静默丢帧：LVGL 以为画上去了。记账，让上层有机会整屏判脏重画。 */
++      s_drop_count++;
++      s_content_lost = true;
+       return OK;
+     }
+ 
+@@ -417,6 +550,8 @@ static int sf32lb_lcd_putarea(FAR struct lcd_dev_s *dev,
+ 
+   DEBUGASSERT(buffer && ((uintptr_t)buffer & 1) == 0);
+ 
++  SF32LB_LCD_PANEL_LOCK();
++
+   if (priv->bpp == 8)
+     {
+       fb_coord_t y;
+@@ -425,6 +560,7 @@ static int sf32lb_lcd_putarea(FAR struct lcd_dev_s *dev,
+ 
+       if (conv == NULL)
+         {
++          SF32LB_LCD_PANEL_UNLOCK();
+           return -ENOMEM;
+         }
+ 
+@@ -452,6 +588,7 @@ static int sf32lb_lcd_putarea(FAR struct lcd_dev_s *dev,
+ 
+       sf32lb_lcd_ensure_display_on(priv);
+       kmm_free(conv);
++      SF32LB_LCD_PANEL_UNLOCK();
+       return OK;
+     }
+ 
+@@ -495,6 +632,8 @@ static int sf32lb_lcd_putarea(FAR struct lcd_dev_s *dev,
+ 
+   sf32lb_lcd_ensure_display_on(priv);
+ 
++  SF32LB_LCD_PANEL_UNLOCK();
++
+   return OK;
+ }
+ 
+@@ -524,8 +663,13 @@ static int sf32lb_lcd_getrun(FAR struct lcd_dev_s *dev,
+   lcdinfo("row: %d col: %d npixels: %d\n", row, col, npixels);
+   DEBUGASSERT(buffer && ((uintptr_t)buffer & 1) == 0);
+ 
++  SF32LB_LCD_PANEL_LOCK();
++
+   sf32lb_lcd_setarea(priv, col, row, col + npixels - 1, row);
+   //sf32lb_lcd_rdram(priv, dest, npixels);
++
++  SF32LB_LCD_PANEL_UNLOCK();
++
+   DEBUGASSERT(0);
+   return OK;
+ }
+@@ -629,6 +773,20 @@ static int sf32lb_lcd_getpower(FAR struct lcd_dev_s *dev)
+ 
+ /****************************************************************************
+  * Name:  sf32lb_lcd_setpower
++ *
++ * Description:
++ *   开/关面板显示（**不是亮度**，亮度走 SETCONTRAST）。
++ *
++ *   为什么这里也要拿 panel_lock：开机路径会把面板复位三次
++ *   （find_right_driver → lcd_init_thread_entry → lcd_hw_setup_thread_entry），
++ *   而 /dev/lcd0 在第二次之后就已经存在、/dev/fb0 在第三次之前就注册好了，
++ *   上层随时可能进来调 SETPOWER。如果这时面板正被复位、寄存器序列写到一半，
++ *   插进去的 0x29/0x28 会让面板停在一个半配置状态 —— 之后一直黑，直到真断电。
++ *   拿同一把锁就把这个插队挡掉了。
++ *
++ *   注意 putrun/putarea 里调的 sf32lb_lcd_ensure_display_on() 是**直接**调
++ *   DisplayOn 回调、不走这里，所以不会自己锁自己。
++ *
+  ****************************************************************************/
+ 
+ static int sf32lb_lcd_setpower(FAR struct lcd_dev_s *dev, int power)
+@@ -638,6 +796,14 @@ static int sf32lb_lcd_setpower(FAR struct lcd_dev_s *dev, int power)
+   lcdinfo("power: %d\n", power);
+   DEBUGASSERT((unsigned)power <= CONFIG_LCD_MAXPOWER);
+ 
++#if SF32LB_LCD_PANEL_REINIT
++  if (SF32LB_LCD_PANEL_LOCK_WAIT(SF32LB_LCD_PANEL_LOCK_WAIT_MS) < 0)
++    {
++      LCD_REINIT_WARN("setpower(%d): 等面板空闲超时 %dms，照原样下发",
++                      power, SF32LB_LCD_PANEL_LOCK_WAIT_MS);
++    }
++#endif
++
+   /* Set new power level */
+ 
+   if (power > 0)
+@@ -669,6 +835,10 @@ static int sf32lb_lcd_setpower(FAR struct lcd_dev_s *dev, int power)
+       priv->power = 0;
+     }
+ 
++#if SF32LB_LCD_PANEL_REINIT
++  SF32LB_LCD_PANEL_UNLOCK();
++#endif
++
+   return OK;
+ }
+ 
+@@ -676,29 +846,56 @@ static int sf32lb_lcd_setpower(FAR struct lcd_dev_s *dev, int power)
+  * Name:  sf32lb_lcd_getcontrast
+  *
+  * Description:
+- *   Get the current contrast setting (0-CONFIG_LCD_MAXCONTRAST).
++ *   回当前亮度百分比（0..100）。面板只有 0x51 WBRIGHT 这个写口、没有回读
++ *   通路（CO5300 的 0x52 RBRIGHT 在本驱动里没有读函数），所以这里回的是
++ *   “最近一次下发的值”；屏幕关着的时候按 0 报，免得调用方以为亮度还在。
+  *
+  ****************************************************************************/
+ 
+ static int sf32lb_lcd_getcontrast(FAR struct lcd_dev_s *dev)
+ {
+-  lcdinfo("Not implemented\n");
+-  return -ENOSYS;
++  FAR struct sf32lb_lcd_dev_s *priv = (FAR struct sf32lb_lcd_dev_s *)dev;
++
++  return priv->power > 0 ? priv->contrast : 0;
+ }
+ 
+ /****************************************************************************
+  * Name:  sf32lb_lcd_setcontrast
+  *
+  * Description:
+- *   Set LCD panel contrast (0-CONFIG_LCD_MAXCONTRAST).
++ *   设亮度百分比（0..100），转发给面板驱动的 SetBrightness 回调 —— CO5300 的
++ *   LCD_SetBrightness() 把百分比换算成 0..255 写 0x51 WBRIGHT。
++ *
++ *   别的屏可能没实现这个可选回调，那时如实回 -ENOSYS，不空指针调用。
+  *
+  ****************************************************************************/
+ 
+ static int sf32lb_lcd_setcontrast(FAR struct lcd_dev_s *dev,
+                               unsigned int contrast)
+ {
+-  lcdinfo("contrast: %d\n", contrast);
+-  return -ENOSYS;
++  FAR struct sf32lb_lcd_dev_s *priv = (FAR struct sf32lb_lcd_dev_s *)dev;
++
++  lcdinfo("contrast(brightness): %u\n", contrast);
++
++  if (contrast > SF32LB_LCD_BRIGHTNESS_MAX)
++    {
++      lcderr("contrast %u out of range 0..%d\n",
++             contrast, SF32LB_LCD_BRIGHTNESS_MAX);
++      return -EINVAL;
++    }
++
++  if (priv->p_drv_ops == NULL || priv->p_drv_ops->p_ops == NULL ||
++      priv->p_drv_ops->p_ops->SetBrightness == NULL)
++    {
++      lcdinfo("SetBrightness() not implemented by this panel\n");
++      return -ENOSYS;
++    }
++
++  priv->p_drv_ops->p_ops->SetBrightness(&priv->hlcdc, (uint8_t)contrast);
++
++  priv->contrast = (int)contrast;
++
++  return OK;
+ }
+ 
+                               
+@@ -725,6 +922,29 @@ static int lcdc1_isr(int irq, void *context, void *arg)
+     return OK;
+ }
+ 
++/****************************************************************************
++ * Name:  sf32lb_lcd_lcdc_setup
++ *
++ * Description:
++ *   LCDC 侧那几步"面板初始化之后必须跟着做"的设置：背景色清零、默认层复位、
++ *   默认层像素格式设成 RGB565。开机路径（lcd_hw_setup_thread_entry）和
++ *   sf32lb_lcd_panel_reinit() 都调这一个函数 —— 抽出来就是为了不出现两份。
++ *
++ *   两个调用点都在 panel_lock 里。
++ *
++ *   不含 irq_attach/up_enable_irq：这两步只在开机时做一次就够，reinit 里
++ *   另外单独补（见 sf32lb_lcd_panel_reinit 的 STEP8）。
++ *
++ ****************************************************************************/
++
++static void sf32lb_lcd_lcdc_setup(void)
++{
++    HAL_LCDC_SetBgColor(&s_drv_lcd.hlcdc, 0, 0, 0);
++    HAL_LCDC_LayerReset(&s_drv_lcd.hlcdc, HAL_LCDC_LAYER_DEFAULT);
++    HAL_LCDC_LayerSetFormat(&s_drv_lcd.hlcdc, HAL_LCDC_LAYER_DEFAULT,
++                            LCDC_PIXEL_FORMAT_RGB565);
++}
++
+ static int lcd_hw_setup_thread_entry(int argc, FAR char *argv[])
+ {
+     lcd_drv_desc_t *p_drv_ops = s_drv_lcd.p_drv_ops;
+@@ -755,6 +975,20 @@ static int lcd_hw_setup_thread_entry(int argc, FAR char *argv[])
+       }
+ #endif
+ 
++    /* /dev/fb0 上面的 fb_register 已经跑完，/dev/lcd0 在 lcd_init_thread_entry
++     * 里也早就注册好了 —— 也就是说**从这一刻起，上层随时可能碰面板**。
++     * 而下面这一步会把面板整个复位 + 重发一遍寄存器（~0.4s）。这就是
++     * "重插有概率黑屏起不来"的窗口：
++     *   - putrun/putarea 有 s_lcd_hw_ready 挡着（此刻还是 false），丢帧无害；
++     *   - 但 sf32lb_lcd_setpower()（LCDDEVIO_SETPOWER）过去是不挡的：它会在
++     *     "面板 RESET 脚正被拉低、寄存器序列写到一半"的时候插一个 0x29/0x28
++     *     进去，面板就停在一个半配置状态 —— 之后整屏黑，直到真断电才好。
++     * 所以这里和 setpower 拿同一把 panel_lock，把这段复位变成"独占面板"。
++     * s_lcd_hw_ready 也在锁里才置位：保证第一个推像素的人一定看到复位后的面板。
++     * 关掉 SF32LB_LCD_PANEL_REINIT 时这两个宏是空操作，开机语义和以前一模一样。 */
++
++    SF32LB_LCD_PANEL_LOCK();
++
+     if (p_drv_ops && p_drv_ops->p_ops && p_drv_ops->p_ops->Init)
+     {
+         p_drv_ops->p_ops->Init(&s_drv_lcd.hlcdc);
+@@ -765,13 +999,12 @@ static int lcd_hw_setup_thread_entry(int argc, FAR char *argv[])
+     up_enable_irq(NX_IRQ(LCDC1_IRQn));
+ #endif /* SOC_BF0_HCPU */
+ 
+-    HAL_LCDC_SetBgColor(&s_drv_lcd.hlcdc, 0, 0, 0);
+-    HAL_LCDC_LayerReset(&s_drv_lcd.hlcdc, HAL_LCDC_LAYER_DEFAULT);
+-    HAL_LCDC_LayerSetFormat(&s_drv_lcd.hlcdc, HAL_LCDC_LAYER_DEFAULT,
+-                            LCDC_PIXEL_FORMAT_RGB565);
++    sf32lb_lcd_lcdc_setup();
+ 
+     s_lcd_hw_ready = true;
+ 
++    SF32LB_LCD_PANEL_UNLOCK();
++
+     return OK;
+ }
+ 
+@@ -836,6 +1069,8 @@ static int lcd_init_thread_entry(int argc, FAR char *argv[])
+ 	 */
+ 	if (p_drv_ops && p_drv_ops->p_ops && p_drv_ops->p_ops->Init)
+ 	{
++		/* SWRESET 会清 GRAM —— 从这一刻起 GRAM 内容不再等于 LVGL 以为的画面。 */
++		s_content_lost = true;
+ 		p_drv_ops->p_ops->Init(&s_drv_lcd.hlcdc);
+ 	}
+ 
+@@ -922,6 +1157,11 @@ int board_lcd_initialize(void)
+     
+     memset(&s_drv_lcd, 0, sizeof(s_drv_lcd));
+ 
++    /* 面板上电默认 WBRIGHT 就是满值，让 GETCONTRAST 在第一次设置前也报 100；
++     * 真正“亮不亮”仍然看 priv->power（开机时是 0，第一次刷像素才 DisplayOn）。 */
++
++    s_drv_lcd.contrast = SF32LB_LCD_BRIGHTNESS_MAX;
++
+     s_drv_lcd.hlcdc.Instance = LCDC1;
+ 
+     s_drv_lcd.select_layer = HAL_LCDC_LAYER_DEFAULT;
+@@ -929,6 +1169,9 @@ int board_lcd_initialize(void)
+ 
+     sem_init(&(s_drv_lcd.init_sem), 0, 0);
+     sem_init(&(s_drv_lcd.draw_sem), 0, 0);
++    /* 计数 1 = 二值信号量当互斥用。关掉 SF32LB_LCD_PANEL_REINIT 时它没人用，
++     * 初始化这一步本身无害，就不加 #if 了。 */
++    sem_init(&(s_drv_lcd.panel_lock), 0, 1);
+ 
+     /* Keep bringup non-blocking; init/register devices in a worker task. */
+ 
+@@ -947,6 +1190,352 @@ int board_lcd_initialize(void)
+     return OK;
+ }
+ 
++/****************************************************************************
++ * Name:  sf32lb_lcd_panel_reinit
++ *
++ * Description:
++ *   面板重新初始化 —— 把"面板丢了配置"造成的整屏黑救回来的入口
++ *   （复位不生效、只有真断电才好的那种黑，见 docs/display_touch_gpio_usage.md
++ *   第 3.4 节）。
++ *
++ *   做的事，就是开机那条路重走一遍（顺序也一样），但**每一步都打一行日志**：
++ *     STEP1  拿 panel_lock（挡住 putrun / putarea / setpower）
++ *     STEP2  进来时的状态快照：LCDC 的 State/Lock/ErrorCode/收发计数、四个关键
++ *            寄存器、显示时钟（HCLK + SPI_IF_CONF.CLK_DIV ⇒ 面板时钟）
++ *     STEP3  **动手之前先读一次面板 ID**（全流程最有判别力的一步，见下）
++ *     STEP4  坏状态归零：Lock→UNLOCKED、State→READY、ErrorCode→NONE
++ *     STEP5  BSP_LCD_PowerUp()：VADD_EN(PA37) 拉高 + LCD 那几根脚重新 pinmux
++ *     STEP6  自己拉一轮 RESET 脚，低电平比开机长（30ms vs 10ms）
++ *     STEP7  p_ops->Init()：**内含 HAL_LCDC_Init()** —— RCC_MOD_LCDC1 整模块
++ *            复位 → 接口选择/时钟分频/输出格式/TE/接口使能/释放 RSTB，随后拉
++ *            RESET 脚 + 重发整串面板寄存器（0xFE 页切换、密码锁、SPI 模式、0x3A
++ *            像素格式、0x2A/0x2B 窗口、0x11 出睡眠、0x29 DisplayOn）
++ *     STEP8  补开机那一步中断接线：irq_attach + up_enable_irq(LCDC1)（幂等）
++ *     STEP9  sf32lb_lcd_lcdc_setup()：LCDC 侧背景色/层复位/层像素格式；再按当前
++ *            bpp 显式设一次像素格式（SetColorMode）
++ *     STEP10 亮度按驱动里记着的值重下发（面板复位后 WBRIGHT 会回默认值），
++ *            再清 power 后 DisplayOn 一次，让 priv->power 和面板对齐
++ *     STEP11 收工后再读一次面板 ID
++ *     STEP12 结论 + 耗时/持锁时间（直接回答"挡了刷屏多久"）
++ *
++ *   === 怎么用日志判断卡在哪一层（STEP3 / STEP11 的 ReadID）===
++ *   面板 ID 是"QSPI 链路 + LCDC 出位 + 面板本身"同时活着的最好证据：
++ *     - 读回 == p_drv_ops->id（本板 0x331100）⇒ 送得出去也读得回来，问题不在
++ *       面板通路；去看 LCDC 出帧那一侧（层/格式/背景色）、面板自己的显示开关
++ *       （0x29/0x28）、亮度（0x51）、或者背光 PWM。
++ *     - 读不回（0 / 0xFFFFFF）⇒ QSPI 或面板那侧：LCDC 的 SPI 时钟分频/模块复位
++ *       没起来、State 卡在 BUSY（HAL_LCDC_ReadDatas 会直接返回 HAL_BUSY）、
++ *       RESET 脚没释放、VADD_EN(PA37) 没供上。
++ *   再配上 STEP2 的 State/Lock/寄存器快照，"哪一层卡住"就钉死了。
++ *
++ *   === 为什么不再单独调 HAL_LCDC_Reset() ===
++ *   读实现（bf0_hal_lcdc.c:2373）可以确认 HAL_LCDC_Reset() 就是
++ *   `LCDC_HW_Init(lcdc)` + `State = READY`，和 HAL_LCDC_Init() 的唯一区别是后者
++ *   还顺手置了一下 Layer[].disable；而 **LCDC_HW_Init() 每次都会
++ *   `HAL_RCC_EnableModule + HAL_RCC_ResetModule(RCC_MOD_LCDC1)`** —— 那一步就是
++ *   LCDC 整个模块的硬复位，正是"显示通路重来一遍"要的东西。两条都能重入也不是
++ *   靠猜：开机路径已经把 p_ops->Init()（= 内含 HAL_LCDC_Init）整整调了三次
++ *   （find_right_driver、lcd_init_thread_entry、lcd_hw_setup_thread_entry）。
++ *   既然 Init() 已经做了同样的模块复位，再插一次 HAL_LCDC_Reset() 只是多一次
++ *   全模块复位、多一个 ROM 函数的重入面，什么也不多给 —— 所以不加。
++ *   （要确认它真做了，看 STEP2 与 STEP7 之后那几行寄存器/时钟日志。）
++ *
++ *   === 显示时钟 / PMU 电源域 ===
++ *   LCDC1 的模块时钟来自 HCLK（本板 240MHz、由 bsp_init.c 的 DLL1 提供），分频写
++ *   进 SPI_IF_CONF.CLK_DIV，**没有独立的显示 PLL，也没有 PMU 里的显示电源域**要
++ *   开。面板的 VADD_EN 是板级 GPIO PA37，由 BSP_LCD_PowerUp() 拉（STEP5）。
++ *   所以 STEP2/STEP7 把 HCLK 和 CLK_DIV 都打出来，一眼看出时钟对不对。
++ *   （LCDC 那个 SPI/四线接口就是面板总线，**不是** flash 的 SFC 控制器，别去动 SFC。）
++ *
++ *   === 和"正在刷屏的 LVGL 线程"共存 ===
++ *   整个 STEP2~STEP11 都拿 s_drv_lcd.panel_lock，而 putrun/putarea 推像素、
++ *   setpower、以及开机那次面板复位拿的是同一把锁 —— 所以"重发配置"和"推一帧像素"
++ *   不会同时在 QSPI 上跑。代价是这段时间刷新会卡住（面板本来就在复位，卡住是应该
++ *   的）；STEP12 会把实际持锁时长打出来。更彻底的做法是"先让 LVGL 停刷再重初始
++ *   化"（LVGL 的刷新由它自己的定时器驱动，本项目没有现成的暂停接口），本轮没做，
++ *   影响见文档 3.4 节。
++ *
++ *   **只动面板和 LCDC，不碰 LVGL**：屏幕重绘由调用方负责
++ *   （robot_ui 的 robot_ui_bridge_panel_reinit() 会往 LVGL 线程投一次全屏失效）。
++ *
++ *   Returned Value:
++ *     OK       重新初始化下发完成
++ *     -ENODEV  面板驱动还没绑上（开机 lcd_init 线程还没跑到）
++ *     -EINVAL  在中断上下文里调的
++ *     -ENOSYS  编译期关掉了（SF32LB_LCD_PANEL_REINIT = 0）
++ *
++ ****************************************************************************/
++
++/****************************************************************************
++ * 重初始化用的两个小工具
++ ****************************************************************************/
++
++#if SF32LB_LCD_PANEL_REINIT
++
++/* 单调毫秒计时。用它量"持锁多久"，直接把"挡了刷屏多长时间"变成日志上的一行。 */
++static uint32_t sf32lb_lcd_now_ms(void)
++{
++  struct timespec ts;
++
++  clock_gettime(CLOCK_MONOTONIC, &ts);
++  return (uint32_t)((uint64_t)ts.tv_sec * 1000u
++                    + (uint64_t)ts.tv_nsec / 1000000u);
++}
++
++/* 读面板 ID（走面板驱动的 ReadID 回调，本板 = CO5300 的 0x04 寄存器）。
++ * 没实现 ReadID 时回 0xffffffff，调用方按"读不到"处理。 */
++static uint32_t sf32lb_lcd_read_panel_id(FAR lcd_drv_desc_t *p_drv_ops)
++{
++  if (p_drv_ops == NULL || p_drv_ops->p_ops == NULL ||
++      p_drv_ops->p_ops->ReadID == NULL)
++    {
++      return 0xffffffffu;
++    }
++
++  return p_drv_ops->p_ops->ReadID(&s_drv_lcd.hlcdc);
++}
++
++#endif /* SF32LB_LCD_PANEL_REINIT */
++
++int sf32lb_lcd_panel_reinit(void)
++{
++#if !SF32LB_LCD_PANEL_REINIT
++  LCD_REINIT_WARN("sf32lb_lcd_panel_reinit: 编译期已关闭（SF32LB_LCD_PANEL_REINIT=0）");
++  return -ENOSYS;
++#else
++  lcd_drv_desc_t *p_drv_ops = s_drv_lcd.p_drv_ops;
++  LCDC_HandleTypeDef *hlcdc = &s_drv_lcd.hlcdc;
++  LCD_IF_TypeDef *regs;
++  uint32_t id_before;
++  uint32_t id_after;
++  uint32_t hclk_mhz;
++  uint32_t clk_div;
++  uint32_t t_enter;
++  uint32_t t_locked;
++  uint32_t t_done;
++
++  if (p_drv_ops == NULL || p_drv_ops->p_ops == NULL ||
++      p_drv_ops->p_ops->Init == NULL)
++    {
++      LCD_REINIT_FAIL("面板驱动还没绑上，先等开机 lcd_init 线程跑完");
++      return -ENODEV;
++    }
++
++  if (up_interrupt_context())
++    {
++      LCD_REINIT_FAIL("不能在中断上下文里调");
++      return -EINVAL;
++    }
++
++  t_enter = sf32lb_lcd_now_ms();
++
++  LCD_REINIT_STEP("===== 开始 (面板 %s bpp %d power %d 亮度 %d%%) =====",
++                  p_drv_ops->name, s_drv_lcd.bpp, s_drv_lcd.power,
++                  s_drv_lcd.contrast);
++
++  /* STEP1：等"面板空闲"。LVGL 20~30 帧/s 地推像素，这里可能真要等一会儿。 */
++  if (SF32LB_LCD_PANEL_LOCK_WAIT(SF32LB_LCD_PANEL_LOCK_WAIT_MS) < 0)
++    {
++      LCD_REINIT_WARN("STEP1 等 panel_lock 超时 %dms（推屏太密？）——继续",
++                      SF32LB_LCD_PANEL_LOCK_WAIT_MS);
++    }
++
++  t_locked = sf32lb_lcd_now_ms();
++  LCD_REINIT_STEP("STEP1 拿到面板锁（等了 %u ms），之后刷屏会被挡住",
++                  (unsigned)(t_locked - t_enter));
++
++  regs = hlcdc->Instance;
++
++  /* STEP2：状态快照 —— "动手之前长什么样"的唯一记录。 */
++  LCD_REINIT_STEP("STEP2 LCDC: State=%d Lock=%d ErrorCode=0x%08x 起帧=%u 完帧=%u",
++                  (int)hlcdc->State, (int)hlcdc->Lock,
++                  (unsigned)hlcdc->ErrorCode,
++                  (unsigned)hlcdc->debug_cnt0, (unsigned)hlcdc->debug_cnt2);
++  LCD_REINIT_STEP("STEP2 寄存器: LCD_CONF=0x%08x SPI_IF_CONF=0x%08x LCD_IF_CONF=0x%08x",
++                  (unsigned)regs->LCD_CONF, (unsigned)regs->SPI_IF_CONF,
++                  (unsigned)regs->LCD_IF_CONF);
++  LCD_REINIT_STEP("STEP2 寄存器: TE_CONF=0x%08x STATUS=0x%08x LCD_SINGLE=0x%08x",
++                  (unsigned)regs->TE_CONF, (unsigned)regs->STATUS,
++                  (unsigned)regs->LCD_SINGLE);
++
++  hclk_mhz = HAL_RCC_GetHCLKFreq(CORE_ID_HCPU) / 1000000u;
++  clk_div  = (regs->SPI_IF_CONF & LCD_IF_SPI_IF_CONF_CLK_DIV_Msk)
++             >> LCD_IF_SPI_IF_CONF_CLK_DIV_Pos;
++  LCD_REINIT_STEP("STEP2 显示时钟: HCLK=%uMHz CLK_DIV=%u ⇒ 面板时钟≈%uMHz",
++                  (unsigned)hclk_mhz, (unsigned)clk_div,
++                  (unsigned)(clk_div != 0u ? hclk_mhz / clk_div : 0u));
++
++  /* STEP3：**动手之前**读一次面板 ID —— 全流程最有判别力的一条。 */
++  id_before = sf32lb_lcd_read_panel_id(p_drv_ops);
++  if (id_before == p_drv_ops->id)
++    {
++      LCD_REINIT_PASS("STEP3 读回面板 ID=0x%08x (期望 0x%08x) ⇒ QSPI 链路和面板都活着",
++                      (unsigned)id_before, (unsigned)p_drv_ops->id);
++    }
++  else
++    {
++      LCD_REINIT_WARN("STEP3 读回面板 ID=0x%08x (期望 0x%08x) ⇒ QSPI/面板那侧有问题",
++                      (unsigned)id_before, (unsigned)p_drv_ops->id);
++      if (hlcdc->State != HAL_LCDC_STATE_READY || hlcdc->Lock != HAL_UNLOCKED)
++        {
++          LCD_REINIT_WARN("STEP3 注意 State=%d Lock=%d：读寄存器走 HAL_LCDC_ReadDatas，"
++                          "State!=READY 时它直接回 HAL_BUSY，读失败未必是 QSPI 坏",
++                          (int)hlcdc->State, (int)hlcdc->Lock);
++        }
++    }
++
++  /* STEP4：把上一次留下的坏状态归零。 */
++  if (hlcdc->Lock != HAL_UNLOCKED)
++    {
++      LCD_REINIT_WARN("STEP4 Lock 残留=%d ⇒ 强置 UNLOCKED（否则 WriteDatas 里会死等）",
++                      (int)hlcdc->Lock);
++      hlcdc->Lock = HAL_UNLOCKED;
++    }
++  else
++    {
++      LCD_REINIT_PASS("STEP4 Lock 干净 (HAL_UNLOCKED)");
++    }
++
++  if (hlcdc->State != HAL_LCDC_STATE_READY)
++    {
++      /* HAL_LCDC_ReadDatas / WriteDatas / SendLayerData2Reg_IT 开头都会判
++       * `HAL_LCDC_STATE_READY != lcdc->State` 然后直接返回 HAL_BUSY —— State
++       * 卡在 BUSY 时**每一次寄存器写都静默失败**，正好是整屏黑的形状。
++       * State 只是软件标志，强置 READY 没有硬件副作用（Init 自己也会置回 READY）。 */
++      LCD_REINIT_WARN("STEP4 State=%d 不是 READY ⇒ 强置 READY（否则寄存器读写全 HAL_BUSY）",
++                      (int)hlcdc->State);
++      hlcdc->State = HAL_LCDC_STATE_READY;
++    }
++  else
++    {
++      LCD_REINIT_PASS("STEP4 State=READY");
++    }
++
++  if (hlcdc->ErrorCode != HAL_LCDC_ERROR_NONE)
++    {
++      LCD_REINIT_WARN("STEP4 ErrorCode=0x%08x 清零", (unsigned)hlcdc->ErrorCode);
++      hlcdc->ErrorCode = HAL_LCDC_ERROR_NONE;
++    }
++
++  /* STEP5：板级上电（幂等）：等 500us → LCD/QSPI 那几根脚重新 pinmux →
++   * PA10(LCD 供电使能)=1、PA37(VADD_EN)=1。PA00 是面板 RESET，STEP6 自己拉。 */
++  BSP_LCD_PowerUp();
++  LCD_REINIT_PASS("STEP5 BSP_LCD_PowerUp 完成（PA10 供电、PA37 VADD_EN=1、QSPI 脚 pinmux）");
++
++  /* STEP6：RESET 脚时序。开机只拉低 10ms（co5300.c 的 LCD_Drv_Init），这里给 30ms：
++   * 面板"丢配置"最常见的形状就是复位不彻底。之后 Init() 自己还会按 10ms 再拉
++   * 一轮，无害。 */
++  BSP_LCD_Reset(1);
++  up_mdelay(10);
++  BSP_LCD_Reset(0);
++  up_mdelay(SF32LB_LCD_RESET_LOW_MS);
++  BSP_LCD_Reset(1);
++  up_mdelay(SF32LB_LCD_RESET_HIGH_MS);
++  LCD_REINIT_PASS("STEP6 RESET 脚: 1→10ms→0→%dms→1→%dms（开机只拉低 10ms）",
++                  SF32LB_LCD_RESET_LOW_MS, SF32LB_LCD_RESET_HIGH_MS);
++
++  /* STEP7：面板 Init —— 内部第一步就是 HAL_LCDC_Init() → LCDC_HW_Init()：
++   * RCC_MOD_LCDC1 使能 + 硬复位 → SelectIntf → SetFreq（写 SPI_IF_CONF.CLK_DIV）
++   * → SetOutFormat → SetupTE → EnableInf → 释放 RSTB。这就是"显示通路重初始化"
++   * 的 SoC 侧那一步，之后才是面板那一串寄存器。 */
++  s_content_lost = true;   /* SWRESET 清 GRAM：通知上层整屏判脏（take_content_lost） */
++  p_drv_ops->p_ops->Init(hlcdc);
++  LCD_REINIT_STEP("STEP7 面板 Init 完成（含 HAL_LCDC_Init: RCC_MOD_LCDC1 复位→接口/分频/格式/TE）");
++
++  clk_div = (regs->SPI_IF_CONF & LCD_IF_SPI_IF_CONF_CLK_DIV_Msk)
++            >> LCD_IF_SPI_IF_CONF_CLK_DIV_Pos;
++  if (clk_div == 0u)
++    {
++      LCD_REINIT_WARN("STEP7 SPI_IF_CONF.CLK_DIV=0（硬件不支持分频 1）⇒ 时钟没配好");
++    }
++  else
++    {
++      LCD_REINIT_PASS("STEP7 SPI_IF_CONF.CLK_DIV=%u ⇒ 面板时钟≈%uMHz",
++                      (unsigned)clk_div, (unsigned)(hclk_mhz / clk_div));
++    }
++
++  if ((regs->LCD_IF_CONF & LCD_IF_LCD_IF_CONF_LCD_RSTB) == 0u)
++    {
++      LCD_REINIT_WARN("STEP7 LCDC 的 LCD_RSTB 位没起来（LCD_IF_CONF=0x%08x）",
++                      (unsigned)regs->LCD_IF_CONF);
++    }
++
++  /* STEP8：补开机那一步中断接线（幂等）。LCDC1 的中断没接/没使能时，
++   * HAL_LCDC_SendLayerData2Reg_IT 永远等不到完成，State 会卡在 BUSY。 */
++#ifdef SOC_BF0_HCPU     /* gpio1 only work on hcpu */
++  irq_attach(NX_IRQ(LCDC1_IRQn), lcdc1_isr, (void *)hlcdc);
++  up_enable_irq(NX_IRQ(LCDC1_IRQn));
++  LCD_REINIT_PASS("STEP8 irq_attach + up_enable_irq(LCDC1_IRQn=%d)", NX_IRQ(LCDC1_IRQn));
++#else
++  LCD_REINIT_WARN("STEP8 本核不接 LCDC1 中断（非 HCPU），跳过");
++#endif /* SOC_BF0_HCPU */
++
++  /* STEP9：LCDC 侧层配置 + 按当前 bpp 重设像素格式。 */
++  sf32lb_lcd_lcdc_setup();
++  if (p_drv_ops->p_ops->SetColorMode != NULL)
++    {
++      p_drv_ops->p_ops->SetColorMode(hlcdc,
++                                     s_drv_lcd.bpp == 24
++                                         ? LCDC_PIXEL_FORMAT_RGB888
++                                         : LCDC_PIXEL_FORMAT_RGB565);
++      LCD_REINIT_PASS("STEP9 层复位/背景色清零 + SetColorMode(%s)",
++                      s_drv_lcd.bpp == 24 ? "RGB888" : "RGB565");
++    }
++  else
++    {
++      LCD_REINIT_WARN("STEP9 该面板没有 SetColorMode 回调，只做了层复位/背景色");
++    }
++
++  /* STEP10：亮度 + DisplayOn。面板被复位过，WBRIGHT 会回到上电默认值，
++   * 所以按驱动里记着的百分比重下发一次。 */
++  if (p_drv_ops->p_ops->SetBrightness != NULL)
++    {
++      p_drv_ops->p_ops->SetBrightness(hlcdc, (uint8_t)s_drv_lcd.contrast);
++      LCD_REINIT_PASS("STEP10 亮度重下发 %d%%", s_drv_lcd.contrast);
++    }
++  else
++    {
++      LCD_REINIT_WARN("STEP10 该面板没有 SetBrightness 回调，亮度没重下发");
++    }
++
++  s_drv_lcd.power = 0;
++  sf32lb_lcd_ensure_display_on(&s_drv_lcd);
++  LCD_REINIT_PASS("STEP10 DisplayOn 已下发 (0x29)，power=%d", s_drv_lcd.power);
++
++  /* STEP11：收工后再读一次 ID —— 和 STEP3 配对，就是"这次救没救回来"的答案。 */
++  id_after = sf32lb_lcd_read_panel_id(p_drv_ops);
++  if (id_after == p_drv_ops->id)
++    {
++      LCD_REINIT_PASS("STEP11 重发配置后读回面板 ID=0x%08x", (unsigned)id_after);
++      if (id_before == p_drv_ops->id)
++        {
++          LCD_REINIT_STEP("STEP12 结论: 动手前/后 ID 都读得回 ⇒ 面板通路本来就是通的，"
++                          "黑屏不在这层；接着看背光/亮度、LCDC 层格式或面板显示开关");
++        }
++      else
++        {
++          LCD_REINIT_STEP("STEP12 结论: 动手前读不回、动手后读回 ⇒ 原本是 QSPI/面板侧的"
++                          "问题，这次重初始化把它救回来了");
++        }
++    }
++  else
++    {
++      LCD_REINIT_WARN("STEP11 重发配置后仍读不回面板 ID=0x%08x", (unsigned)id_after);
++      LCD_REINIT_WARN("STEP12 结论: 不是面板丢配置这么简单 —— LCDC 时钟/复位、"
++                      "VADD_EN(PA37) 供电、或 RESET 脚(PA00) 那侧还没起来。"
++                      "断电可恢复说明面板本身没坏");
++    }
++
++  SF32LB_LCD_PANEL_UNLOCK();
++
++  t_done = sf32lb_lcd_now_ms();
++  LCD_REINIT_STEP("===== 结束: 总耗时 %u ms，其中持锁 %u ms（这段时间刷屏被挡） =====",
++                  (unsigned)(t_done - t_enter), (unsigned)(t_done - t_locked));
++
++  return OK;
++#endif /* !SF32LB_LCD_PANEL_REINIT */
++}
++
+ /****************************************************************************
+  * Name:  board_lcd_getdev
+  *
+@@ -1004,3 +1593,26 @@ void board_lcd_uninitialize(void)
+ 
+ }
+ 
++/****************************************************************************
++ * Name:  sf32lb_lcd_take_content_lost / sf32lb_lcd_drop_count
++ *
++ * Description:
++ *   板级（robot_ui_bridge_lcd_check）轮询的两个观测入口，契约见板级头文件
++ *   sf32lb52_devkit_lcd.h：
++ *     take  —— 返回"这段时间里 GRAM 是否跟 LVGL 以为的不一样"，取走即清零；
++ *     count —— 面板就绪前被静默丢弃的像素写入总次数（开机日志判据）。
++ ****************************************************************************/
++
++bool sf32lb_lcd_take_content_lost(void)
++{
++  bool lost = s_content_lost;
++
++  s_content_lost = false;
++  return lost;
++}
++
++uint32_t sf32lb_lcd_drop_count(void)
++{
++  return s_drop_count;
++}
++
+diff --git a/chips/sf32lb52/Make.defs b/chips/sf32lb52/Make.defs
+index c4b6652..c77e828 100644
+--- a/chips/sf32lb52/Make.defs
++++ b/chips/sf32lb52/Make.defs
+@@ -34,7 +34,14 @@ include armv7-m/Make.defs
+ 
+ CHIP_CSRCS += sifli_start.c sifli_irq.c sifli_uart.c
+ CHIP_CSRCS += sifli_oneshot.c sifli_allocateheap.c
+-CHIP_CSRCS += sifli_spi.c
++CHIP_CSRCS += sifli_spi.c sifli_lowput.c sifli_gpio.c sifli_i2c.c
++
++# HAL source files from SiFli SDK (excluding files not applicable to SF32LB52X)
++CHIP_CSRCS += $(filter-out %/bf0_hal_audcodec.c %/bf0_hal_qspi.c %/bf0_hal_qspi_ex.c, \
++              $(wildcard chip/../drivers/hal/*.c))
++
++# System initialization files (symlinked to chip directory)
++CHIP_CSRCS += system_bf0_ap.c bf0_pin_const.c lcpu_config_type.c
+ 
+ ifeq ($(CONFIG_ADC),y)
+ CHIP_CSRCS += sf32lb_adc.c
+@@ -74,7 +81,3 @@ CHIP_CSRCS += ../drivers/cmsis/sf32lb52x/bt_rf_fulcal.c
+ endif
+ 
+ include ./ipc_queue/Make.defs
+-
+-ifeq ($(CONFIG_SF32LB52_USBDEV),y)
+-CHIP_CSRCS += sf32lb_usbdev.c
+-endif
+diff --git a/chips/sf32lb52/sf32lb_flash.c b/chips/sf32lb52/sf32lb_flash.c
+index a1f17e9..c51c5fe 100644
+--- a/chips/sf32lb52/sf32lb_flash.c
++++ b/chips/sf32lb52/sf32lb_flash.c
+@@ -474,7 +474,7 @@ static void sf32lb_flash_restore_ahb_read(FAR FLASH_HandleTypeDef *hflash)
+   qmode = hflash->Mode != 0;
+   if (hflash->size > NOR_FLASH_MAX_3B_SIZE)
+     {
+-      HAL_FLASH_CONFIG_FULL_AHB_READ(hflash, qmode);
++      HAL_FLASH_CONFIG_AHB_READ(hflash, qmode);
+     }
+   else
+     {
+diff --git a/chips/sf32lb52/sf32lb_rtc.c b/chips/sf32lb52/sf32lb_rtc.c
+index 5b237ec..f1630f4 100644
+--- a/chips/sf32lb52/sf32lb_rtc.c
++++ b/chips/sf32lb52/sf32lb_rtc.c
+@@ -195,7 +195,23 @@ static int sf32lb_rdtime(FAR struct rtc_lowerhalf_s *lower,
+   rtctime->tm_mday = rtc_date.Date;
+   rtctime->tm_mon = rtc_date.Month - 1;
+   rtctime->tm_wday = rtc_date.WeekDay - 1;
+-  rtctime->tm_year = rtc_date.Year;
++
++  /* Date_2_reg() 把 2000~2099 的年份写成两位 + CB=0，1900~1999 写成
++   * 两位 + CB=1；HAL_RTC_GetDate() 只对 19xx 打上 RTC_CENTURY_BIT。
++   * 这里必须还原成"自 1900 起的年数"，否则 2026 会被读成 1926，
++   * 而 RTC_SET_RELATIVE 拿这个年份去喂 mktime()/localtime()（本固件
++   * localtime 就是 gmtime，日历换算只支持 1970 以后）会算出越界的
++   * 时/分/秒，写进 ALRMTR/ALRMDR 的比较值永远匹配不上 → alarm 不触发。
++   * 逻辑与 SDK 参考驱动 drv_rtc.c 的读回处理一致。 */
++
++  if (rtc_date.Year & RTC_CENTURY_BIT)
++    {
++      rtctime->tm_year = rtc_date.Year & ~RTC_CENTURY_BIT;
++    }
++  else
++    {
++      rtctime->tm_year = rtc_date.Year + 100;
++    }
+ 
+ #if defined(CONFIG_RTC_HIRES) || defined(CONFIG_ARCH_HAVE_RTC_SUBSECONDS)
+   rtctime->tm_nsec = rtc_time.SubSeconds * 1000000 / 256 * 1000;
+@@ -281,8 +297,12 @@ static int sf32lb_setalarm(FAR struct rtc_lowerhalf_s *lower,
+   alarm.AlarmDate.Year = alarminfo->time.tm_year;
+   alarm.AlarmDate.WeekDay = alarminfo->time.tm_wday + 1;
+ 
+-  /* Use high precision on subsecond match to avoid repetitive IRQ trigger. */
+-  alarm.AlarmMask = (10 << RTC_ALRMDR_MSKSS_Pos);
++  /* 亚秒只比高位（避免同一次 alarm 反复触发），另外必须屏蔽"星期"：
++   * ALRMDR 的 MSKWD/MSKD/MSKM 为 0 时硬件要求这些字段精确匹配，而星期
++   * 字段来自 libc 重算（add_timeout 里的 localtime），和硬件 DR.WD 不同源，
++   * 编码也差一位 → 不屏蔽就会永远匹配不上。日期已唯一确定星期，屏蔽不丢信息。
++   * 厂商 SDK 参考驱动同样是屏蔽 MSKD|MSKM|MSKWD 的。 */
++  alarm.AlarmMask = RTC_ALRMDR_MSKWD | (10 << RTC_ALRMDR_MSKSS_Pos);
+ 
+   if (HAL_RTC_SetAlarm(&lh->rtc_handler, &alarm, RTC_FORMAT_BIN) != HAL_OK)
+     {
+@@ -344,7 +364,7 @@ static int sf32lb_setrelative(FAR struct rtc_lowerhalf_s *lower,
+   alarm.AlarmDate.Month = alarm_tm.tm_mon + 1;
+   alarm.AlarmDate.Year = alarm_tm.tm_year;
+   alarm.AlarmDate.WeekDay = alarm_tm.tm_wday + 1;
+-  alarm.AlarmMask = (10 << RTC_ALRMDR_MSKSS_Pos);
++  alarm.AlarmMask = RTC_ALRMDR_MSKWD | (10 << RTC_ALRMDR_MSKSS_Pos);
+ 
+   if (HAL_RTC_SetAlarm(&lh->rtc_handler, &alarm, RTC_FORMAT_BIN) != HAL_OK)
+     {
+@@ -382,7 +402,17 @@ static int sf32lb_rdalarm(FAR struct rtc_lowerhalf_s *lower,
+   alarminfo->time->tm_mday = alarm.AlarmDate.Date;
+   alarminfo->time->tm_mon = alarm.AlarmDate.Month - 1;
+   alarminfo->time->tm_wday = alarm.AlarmDate.WeekDay - 1;
+-  alarminfo->time->tm_year = alarm.AlarmDate.Year;
++
++  /* 与 sf32lb_rdtime() 同样要还原世纪位，否则读回来的 alarm 年份会差 100 */
++
++  if (alarm.AlarmDate.Year & RTC_CENTURY_BIT)
++    {
++      alarminfo->time->tm_year = alarm.AlarmDate.Year & ~RTC_CENTURY_BIT;
++    }
++  else
++    {
++      alarminfo->time->tm_year = alarm.AlarmDate.Year + 100;
++    }
+ 
+   return OK;
+ }
+diff --git a/chips/sf32lb52/sf32lb_usbdev.c b/chips/sf32lb52/sf32lb_usbdev.c
+index a1cf6fc..380b9e2 100644
+--- a/chips/sf32lb52/sf32lb_usbdev.c
++++ b/chips/sf32lb52/sf32lb_usbdev.c
+@@ -67,14 +67,20 @@
+ #define SF32LB52_EP0MAXPACKET       64          /* EP0 max packet size */
+ #define SF32LB52_BULKMAXPACKET      64          /* Bulk endpoint max packet */
+ #define SF32LB52_INTRMAXPACKET      64          /* Interrupt endpoint max packet */
+-#define SF32LB52_NENDPOINTS         4           /* EP0 + 3 IN + .. we use 4 */
++#define SF32LB52_NENDPOINTS         6           /* EP0..EP5 (EP3/EP4 unusable) */
+ 
+-/* Endpoint numbers */
++/* Endpoint numbers.
++ *
++ * NOTE: endpoint index 3 (and 4) cannot be configured on this part -- a
++ * non-zero TXMAXP write simply does not stick, while indices 1, 5, 6 and 7
++ * accept it.  So the interrupt IN endpoint lives on EP5, and EP3/EP4 are
++ * left as placeholders to keep the eplist indexed by endpoint number.
++ */
+ 
+ #define SF32LB52_EP0                0           /* Control endpoint */
+ #define SF32LB52_EPBULKIN           1           /* Bulk EP for send to host */
+ #define SF32LB52_EPBULKOUT          2           /* Bulk EP for recv from host */
+-#define SF32LB52_EPINTRIN           3           /* Intr EP for host poll */
++#define SF32LB52_EPINTRIN           5           /* Intr EP for host poll */
+ 
+ /* FIFO size encoding: log2(size) - 3
+  * 8=0, 16=1, 32=2, 64=3, 128=4, 256=5, 512=6, 1024=7
+@@ -226,9 +232,10 @@ static void sf32lb52_rqenqueue(struct sf32lb52_ep_s *privep,
+ /* Low level data transfers and request operations */
+ 
+ static int  sf32lb52_ep0write(struct sf32lb52_usbdev_s *priv,
+-                              uint8_t *buf, uint16_t nbytes);
++                              uint8_t *buf, uint16_t nbytes, bool last);
+ static int  sf32lb52_epwrite(struct sf32lb52_usbdev_s *priv,
+-                             uint8_t epphy, uint8_t *buf, uint16_t nbytes);
++                             uint8_t epphy, uint8_t *buf, uint16_t nbytes,
++                             bool last);
+ static int  sf32lb52_epread(struct sf32lb52_usbdev_s *priv,
+                             uint8_t epphy, uint8_t *buf, uint16_t nbytes);
+ static inline void sf32lb52_abortrequest(struct sf32lb52_ep_s *privep,
+@@ -341,6 +348,16 @@ static const struct sf32lb52_epinfo_s g_epinfo[SF32LB52_NENDPOINTS] =
+     .attr      = USB_EP_ATTR_XFER_BULK,
+     .maxpacket = SF32LB52_BULKMAXPACKET,
+   },
++  {
++    .addr      = 3,                             /* EP3: unusable on this part */
++    .attr      = USB_EP_ATTR_XFER_BULK,
++    .maxpacket = SF32LB52_BULKMAXPACKET,
++  },
++  {
++    .addr      = 4,                             /* EP4: unusable on this part */
++    .attr      = USB_EP_ATTR_XFER_BULK,
++    .maxpacket = SF32LB52_BULKMAXPACKET,
++  },
+   {
+     .addr      = SF32LB52_EPINTRIN | USB_DIR_IN,
+     .attr      = USB_EP_ATTR_XFER_INT,
+@@ -404,7 +421,7 @@ static void sf32lb52_rqenqueue(struct sf32lb52_ep_s *privep,
+  ****************************************************************************/
+ 
+ static int sf32lb52_ep0write(struct sf32lb52_usbdev_s *priv,
+-                             uint8_t *buf, uint16_t nbytes)
++                             uint8_t *buf, uint16_t nbytes, bool last)
+ {
+   volatile USBC_X_Typedef *hw = priv->hw;
+   uint16_t bytesleft;
+@@ -416,14 +433,18 @@ static int sf32lb52_ep0write(struct sf32lb52_usbdev_s *priv,
+   if (nbytes <= SF32LB52_EP0MAXPACKET)
+     {
+       bytesleft = nbytes;
+-      csr0 = USB_CSR0_TXPKTRDY | USB_CSR0_P_DATAEND;
+     }
+   else
+     {
+       bytesleft = SF32LB52_EP0MAXPACKET;
+-      csr0 = USB_CSR0_TXPKTRDY;
+     }
+ 
++  /* DATAEND 只在控制 IN 数据阶段的**最后一包**置位。
++   * 否则传输会在首包（≤64B）后结束：75B 配置描述符只回 64B，
++   * Windows 报 "Configuration Descriptor Request Failed"。 */
++
++  csr0 = USB_CSR0_TXPKTRDY | (last ? USB_CSR0_P_DATAEND : 0);
++
+   nwritten = bytesleft;
+ 
+   /* Write data to FIFO using 32-bit access when possible */
+@@ -460,10 +481,12 @@ static int sf32lb52_ep0write(struct sf32lb52_usbdev_s *priv,
+  ****************************************************************************/
+ 
+ static int sf32lb52_epwrite(struct sf32lb52_usbdev_s *priv,
+-                            uint8_t epphy, uint8_t *buf, uint16_t nbytes)
++                            uint8_t epphy, uint8_t *buf, uint16_t nbytes,
++                            bool last)
+ {
+   volatile USBC_X_Typedef *hw = priv->hw;
+   uint16_t bytesleft;
++  uint16_t csr;
+   int ret;
+ 
+   if (epphy >= SF32LB52_NENDPOINTS)
+@@ -475,7 +498,7 @@ static int sf32lb52_epwrite(struct sf32lb52_usbdev_s *priv,
+ 
+   if (epphy == 0)
+     {
+-      return sf32lb52_ep0write(priv, buf, nbytes);
++      return sf32lb52_ep0write(priv, buf, nbytes, last);
+     }
+ 
+   bytesleft = SF32LB52_BULKMAXPACKET;
+@@ -516,8 +539,10 @@ static int sf32lb52_epwrite(struct sf32lb52_usbdev_s *priv,
+ 
+   /* Set TXPKTRDY to start transmission */
+ 
+-  hw->csr0_txcsr = (hw->csr0_txcsr & ~USB_TXCSR_P_WZC_BITS)
+-                    | USB_TXCSR_TXPKTRDY;
++  csr = hw->csr0_txcsr;
++
++  hw->csr0_txcsr = (csr & ~USB_TXCSR_P_WZC_BITS) | USB_TXCSR_TXPKTRDY;
++
+   return ret;
+ }
+ 
+@@ -657,6 +682,7 @@ static int sf32lb52_wrrequest(struct sf32lb52_ep_s *privep)
+   int nbytes;
+   int bytesleft;
+   int nbyteswritten;
++  bool last = false;
+ 
+   privreq = sf32lb52_rqpeek(privep);
+   if (!privreq)
+@@ -665,48 +691,93 @@ static int sf32lb52_wrrequest(struct sf32lb52_ep_s *privep)
+       return OK;
+     }
+ 
+-  for (; ; )
+-    {
+-      bytesleft = privreq->req.len - privreq->req.xfrd;
++  /* 上一包还挂在 FIFO 里等主机取（TXPKTRDY 未清）时，一个字节都不许
++   * 碰 FIFO，原样返回等 TX-complete 中断再来叫醒。
++   *
++   * 本函数有两个调用点：TX-complete 中断（正确时机，FIFO 已被主机取空）
++   * 和 sf32lb52_epsubmit —— 后者每次有新 IN 请求入队都会立刻调下来。
++   * 持续大流量（语音 TTS 下行、ASR 上行时的 TCP ACK 回程）时栈会连着
++   * 发包，第二个请求到达时第一包大概率还没被主机取走；旧代码在这条
++   * 路径上直接写 epwrite，而 epwrite 见 FIFONOTEMPTY 会先 FLUSHFIFO ——
++   * 一 flush 就把在途包冲掉（主机收半截包/错包），更糟的是这颗 MUSB
++   * 类内核在 TXPKTRDY 置位期间被 flush 后 TX 状态机可能彻底卡死：
++   * TX-complete 中断永不再来，队列请求全部滞留，wrreq 池耗尽
++   * （hasfreereqs 恒 false），连 RX 的 rx_req 都分配不出来 ——
++   * 整条数据通道死掉而 EP0 控制还活着，主机侧现象就是 ARP FAILED +
++   * NETDEV WATCHDOG transmit queue timed out（2026-10-14 晚上语音
++   * 一上流量两分钟内必现的那次卡死）。
++   *
++   * 排队的请求不会丢：主机取空 FIFO 后 TX-complete 中断照常来，
++   * 到时队头 TXPKTRDY 已清，正常续写。
++   */
++
++  {
++    volatile USBC_X_Typedef *hw = privep->dev->hw;
++    uint16_t txpkr = (privep->epphy == 0) ? USB_CSR0_TXPKTRDY
++                                          : USB_TXCSR_TXPKTRDY;
++    hw->index = privep->epphy;
++    if (hw->csr0_txcsr & txpkr)
++      {
++        usbtrace(TRACE_WRITE(privep->epphy), privreq->req.xfrd);
++        return OK;
++      }
++  }
++
++  bytesleft = privreq->req.len - privreq->req.xfrd;
++
++  usbtrace(TRACE_WRITE(privep->epphy), privreq->req.xfrd);
++
++  /* Transmit at most ONE packet per call.  The MUSB controller requires
++   * the host to drain the FIFO (TXPKTRDY auto-clears -> TX-complete
++   * interrupt) before the next packet may be written.  Chaining packets
++   * here overwrites the FIFO and corrupts multi-packet transfers, e.g.
++   * the 75-byte configuration descriptor on EP0.
++   */
+ 
+-      usbtrace(TRACE_WRITE(privep->epphy), privreq->req.xfrd);
+-      if (bytesleft > 0 || privep->txnullpkt)
++  if (bytesleft > 0 || privep->txnullpkt)
++    {
++      privep->txnullpkt = 0;
++      if (bytesleft > privep->ep.maxpacket)
+         {
+-          privep->txnullpkt = 0;
+-          if (bytesleft > privep->ep.maxpacket)
+-            {
+-              nbytes = privep->ep.maxpacket;
+-            }
+-          else
++          nbytes = privep->ep.maxpacket;
++        }
++      else
++        {
++          nbytes = bytesleft;
++          if ((privreq->req.flags & USBDEV_REQFLAGS_NULLPKT) != 0)
+             {
+-              nbytes = bytesleft;
+-              if ((privreq->req.flags & USBDEV_REQFLAGS_NULLPKT) != 0)
+-                {
+-                  privep->txnullpkt =
+-                    (bytesleft == privep->ep.maxpacket);
+-                }
++              privep->txnullpkt = (bytesleft == privep->ep.maxpacket);
+             }
++        }
+ 
+-          buf = privreq->req.buf + privreq->req.xfrd;
+-          nbyteswritten = sf32lb52_epwrite(privep->dev, privep->epphy,
+-                                           buf, nbytes);
+-          if (nbyteswritten < 0 || nbyteswritten != nbytes)
+-            {
+-              usbtrace(TRACE_DEVERROR(SF32LB52_TRACEERR_EWRITE),
+-                       nbyteswritten);
+-              return ERROR;
+-            }
++      buf = privreq->req.buf + privreq->req.xfrd;
+ 
+-          privreq->req.xfrd += nbytes;
+-        }
++      /* 末包判定：本包发完即发完整个请求，且不欠 ZLP 时才是末包 */
++      last = ((privreq->req.xfrd + nbytes) >= privreq->req.len) &&
++             !privep->txnullpkt;
+ 
+-      if (privreq->req.xfrd >= privreq->req.len && !privep->txnullpkt)
++      nbyteswritten = sf32lb52_epwrite(privep->dev, privep->epphy,
++                                       buf, nbytes, last);
++      if (nbyteswritten < 0 || nbyteswritten != nbytes)
+         {
+-          usbtrace(TRACE_COMPLETE(privep->epphy), privreq->req.xfrd);
+-          privep->txnullpkt = 0;
+-          sf32lb52_reqcomplete(privep, OK);
+-          return OK;
++          usbtrace(TRACE_DEVERROR(SF32LB52_TRACEERR_EWRITE),
++                   nbyteswritten);
++          return ERROR;
+         }
++
++      privreq->req.xfrd += nbytes;
++    }
++
++  /* Transfer is complete only when the whole request fit in this packet
++   * and no zero-length packet is still owed.  Otherwise the TX-complete
++   * interrupt calls us again to send the next packet.
++   */
++
++  if (privreq->req.xfrd >= privreq->req.len && !privep->txnullpkt)
++    {
++      usbtrace(TRACE_COMPLETE(privep->epphy), privreq->req.xfrd);
++      privep->txnullpkt = 0;
++      sf32lb52_reqcomplete(privep, OK);
+     }
+ 
+   return OK;
+@@ -723,6 +794,7 @@ static int sf32lb52_wrrequest(struct sf32lb52_ep_s *privep)
+ static int sf32lb52_rdrequest(struct sf32lb52_ep_s *privep)
+ {
+   struct sf32lb52_req_s *privreq;
++  volatile USBC_X_Typedef *hw = privep->dev->hw;
+   uint8_t *buf;
+   int nbytesread;
+ 
+@@ -733,6 +805,23 @@ static int sf32lb52_rdrequest(struct sf32lb52_ep_s *privep)
+       return OK;
+     }
+ 
++  /* RXCOUNT is only valid while RXPKTRDY is set.  The controller keeps the
++   * FIFO contents and the count after the packet has been read, so reading
++   * again without a fresh packet re-delivers the previous payload: the
++   * request then completes twice and the class driver's reassembly state
++   * (RNDIS current_rx_received/msglen) is corrupted for good.  NAK instead
++   * and let the RX interrupt pick the request up when data really arrives.
++   */
++
++  if (privep->epphy != 0)
++    {
++      hw->index = privep->epphy;
++      if ((hw->rxcsr & USB_RXCSR_RXPKTRDY) == 0)
++        {
++          return OK;
++        }
++    }
++
+   usbtrace(TRACE_READ(privep->epphy), privreq->req.xfrd);
+ 
+   buf = privreq->req.buf + privreq->req.xfrd;
+@@ -801,15 +890,41 @@ static struct sf32lb52_ep_s *sf32lb52_epfindbyaddr(
+  * Name: sf32lb52_dispatchrequest
+  ****************************************************************************/
+ 
++/* Control transfer bookkeeping for the EP0 OUT data stage.
++ *
++ * A USB control transfer with an OUT data stage sends the SETUP packet and
++ * the data in two separate packets.  When the SETUP interrupt fires the data
++ * has not arrived yet (rxcount == 0), so the request must be parked here and
++ * finished by the interrupt that delivers the data.
++ */
++
++static struct usb_ctrlreq_s g_ep0pending_ctrl;
++static bool                 g_ep0pending;
++static bool                 g_ep0superseded;
++
++static uint8_t g_ep0outbuf[SF32LB52_EP0MAXPACKET];
++static size_t  g_ep0outlen;
++static bool    g_ep0outdataend;
++
+ static void sf32lb52_dispatchrequest(struct sf32lb52_usbdev_s *priv,
+                                      const struct usb_ctrlreq_s *ctrl)
+ {
++  uint8_t *dataout = NULL;
++  size_t outlen = 0;
+   int ret;
+ 
+   usbtrace(TRACE_INTDECODE(SF32LB52_TRACEINTID_DISPATCH), 0);
++
++  if (g_ep0outlen > 0)
++    {
++      dataout = g_ep0outbuf;
++      outlen  = g_ep0outlen;
++      g_ep0outlen = 0;
++    }
++
+   if (priv && priv->driver)
+     {
+-      ret = CLASS_SETUP(priv->driver, &priv->usbdev, ctrl, NULL, 0);
++      ret = CLASS_SETUP(priv->driver, &priv->usbdev, ctrl, dataout, outlen);
+       if (ret < 0)
+         {
+           usbtrace(TRACE_DEVERROR(SF32LB52_TRACEERR_STALLEDISPATCH),
+@@ -873,6 +988,17 @@ static void sf32lb52_ep0setup(struct sf32lb52_usbdev_s *priv)
+   if (csr0 & USB_CSR0_P_SETUPEND)
+     {
+       hw->csr0_txcsr = USB_CSR0_P_SVDSETUPEND;
++
++      /* A new SETUP superseded whatever control transfer was in flight.
++       * If a class/vendor OUT request was parked waiting for its data
++       * stage, that data will never arrive -- the bytes now in the FIFO
++       * are the new SETUP packet itself.  Flag it so the pending branch
++       * below abandons the stale request instead of consuming the SETUP
++       * as "data" (which produced 8-byte RNDIS messages, a driver
++       * -EINVAL, an ep0 STALL and host-side "RNDIS init failed, -32").
++       */
++
++      g_ep0superseded = true;
+     }
+ 
+   /* Distinguish 8-byte setup packets from EP0 OUT data stage payload.
+@@ -881,6 +1007,85 @@ static void sf32lb52_ep0setup(struct sf32lb52_usbdev_s *priv)
+    */
+ 
+   count0 = hw->rxcount & 0x7f;
++
++  if (g_ep0pending && g_ep0superseded)
++    {
++      /* SETUPEND said a new SETUP replaced the parked request.  Abandon
++       * the parked one and process the bytes below as the new SETUP
++       * packet.  Never hand them to the class driver as the parked
++       * request's data stage -- that is what turned a fresh INIT/QUERY
++       * SETUP into an 8-byte "message" and killed the host's bind with
++       * a -32 STALL.
++       */
++
++      g_ep0pending    = false;
++      g_ep0outlen     = 0;
++      g_ep0outdataend = false;
++    }
++
++  g_ep0superseded = false;
++
++  if (g_ep0pending)
++    {
++      /* This is the OUT data stage of the class/vendor request whose SETUP
++       * packet we already parsed.  Read the payload and hand it, together
++       * with the saved request, to the class driver.
++       */
++
++      uint16_t got = 0;
++      bool     shortpkt = (count0 < SF32LB52_EP0MAXPACKET);
++
++      if (count0 == 0)
++        {
++          /* No packet is actually waiting (rxcount==0): this call is a
++           * duplicate service of the SETUP interrupt -- INTRTX CONTROL
++           * and INTRRX EP0 both route to here, and the first call has
++           * already cleared RXPKTRDY.  Dispatching the parked request
++           * with an empty data stage made the class driver reject it
++           * (-EINVAL → ep0 STALL → host "RNDIS init failed, -32" on
++           * cold boot).  Keep the request parked; the real data-stage
++           * interrupt will deliver it.
++           */
++
++          return;
++        }
++
++      if (count0 > 0)
++        {
++          if (count0 > sizeof(g_ep0outbuf))
++            {
++              count0 = sizeof(g_ep0outbuf);
++            }
++
++          got = (uint16_t)sf32lb52_epread(priv, 0, g_ep0outbuf, count0);
++        }
++
++      /* The final (short) OUT packet of a control write must be acknowledged
++       * with DATAEND as well.  Without it the core never considers the data
++       * stage finished: the next SETUP then raises SETUPEND, and because the
++       * SETUPEND branch below used to win the else-if chain, that SETUP was
++       * cleared and dropped -- which is exactly how the RNDIS
++       * GET_ENCAPSULATED_RESPONSE got lost.  Same rule as the vendor HAL,
++       * see bf0_hal_pcd.c:663-669.
++       */
++
++      hw->index = 0;
++      csr0 = USB_CSR0_P_SVDRXPKTRDY;
++      if (shortpkt)
++        {
++          csr0 |= USB_CSR0_P_DATAEND;
++          g_ep0outdataend = true;
++        }
++
++      hw->csr0_txcsr = csr0;
++
++      g_ep0pending = false;
++      g_ep0outlen  = (size_t)got;
++
++      sf32lb52_dispatchrequest(priv, &g_ep0pending_ctrl);
++      return;
++    }
++
+   if (count0 != USB_SIZEOF_CTRLREQ)
+     {
+       if (count0 > 0)
+@@ -910,25 +1115,52 @@ static void sf32lb52_ep0setup(struct sf32lb52_usbdev_s *priv)
+       return;
+     }
+ 
++  /* A real SETUP supersedes any parked class request: the previous data
++   * stage never arrived (host aborted), otherwise this packet would have
++   * been treated as that data stage and the SETUP would be lost.
++   */
++
++  g_ep0pending    = false;
++  g_ep0outdataend = false;
++
+   index = GETUINT16(ctrl.index);
+   value = GETUINT16(ctrl.value);
+   len   = GETUINT16(ctrl.len);
+ 
+-  uinfo("type=%02x req=%02x value=%04x index=%04x len=%04x\n",
+-        ctrl.type, ctrl.req, value, index, len);
++  /* Do not add syslog() here: this runs in interrupt context on the EP0
++   * SETUP path, and writing to the console can block long enough that the
++   * host times out the control request.  Keep this path free of console
++   * output.
++   */
+ 
+   /* Dispatch non-standard requests */
+ 
+-  ep0->in = (ctrl.type & USB_DIR_IN) != 0;
++  ep0->in = (ctrl.type & USB_REQ_DIR_IN) != 0;
+   if ((ctrl.type & USB_REQ_TYPE_MASK) != USB_REQ_TYPE_STANDARD)
+     {
+-      /* For class/vendor requests, only clear RXPKTRDY and let CLASS_SETUP
+-       * submit the proper EP0 response/status stage.
++      /* Class/vendor requests may carry an OUT data stage -- RNDIS sends
++       * its control messages that way (SEND_ENCAPSULATED_COMMAND).
++       *
++       * That data arrives in a LATER packet than this SETUP, so rxcount is
++       * still 0 here.  Park the request and let the data-stage interrupt
++       * finish it; reading now would hand the class driver NULL/garbage
++       * (which is exactly what made RNDIS report "Unsupported control
++       * message" for the very first INITIALIZE_MSG).
+        */
+ 
+       hw->index = 0;
+       hw->csr0_txcsr = USB_CSR0_P_SVDRXPKTRDY;
+ 
++      if (!ep0->in && len > 0)
++        {
++          g_ep0pending_ctrl = ctrl;
++          g_ep0pending      = true;
++          return;
++        }
++
++      /* No data stage -- handle it now. */
++
++      g_ep0outlen = 0;
+       sf32lb52_dispatchrequest(priv, &ctrl);
+       return;
+     }
+@@ -1009,8 +1241,32 @@ static void sf32lb52_ep0setup(struct sf32lb52_usbdev_s *priv)
+           {
+             hw->index = 0;
+             hw->csr0_txcsr = USB_CSR0_P_SVDRXPKTRDY | USB_CSR0_P_DATAEND;
++
+             privep->halted = 0;
+-            sf32lb52_wrrequest(privep);
++
++            if (privep->epphy != 0)
++              {
++                /* CLEAR_FEATURE(ENDPOINT_HALT) must also drop the hardware
++                 * stall and reset the data toggle.  Not done for EP0: the
++                 * resume path rewrites CSR0 from a read-back value, and
++                 * writing DATAEND back can restart the status stage.
++                 */
++
++                sf32lb52_epstall(&privep->ep, true);
++              }
++
++            /* Only re-drive a write request on an IN endpoint.  An OUT
++             * endpoint's queued request is a *read* request; passing it to
++             * wrrequest() transmitted the receive buffer on a receive
++             * endpoint and left req.xfrd at a bogus value, which corrupted
++             * the first incoming bulk packet.  The read request is already
++             * armed, the RX interrupt picks it up.
++             */
++
++            if (privep->epphy == 0 || privep->in)
++              {
++                sf32lb52_wrrequest(privep);
++              }
+           }
+         else
+           {
+@@ -1183,7 +1439,7 @@ static int sf32lb52_interrupt(int irq, void *context, void *arg)
+       /* Re-enable EP0 and USB core interrupts after reset */
+ 
+       hw->intrtxe  = USBC_EP0_INTR_MASK;
+-      hw->intrrxe  = 0;
++      hw->intrrxe  = USBC_EP0_INTR_MASK;
+       hw->intrusbe = USB_INTR_RESET | USB_INTR_RESUME |
+                      USB_INTR_SUSPEND;
+ 
+@@ -1195,12 +1451,23 @@ static int sf32lb52_interrupt(int irq, void *context, void *arg)
+           sf32lb52_epreset(priv, i);
+         }
+ 
+-      /* Notify class driver of reset */
++      /* Any parked EP0 OUT request died with the reset: its data stage
++       * will never come.  Clear the parking state so the first SETUP of
++       * re-enumeration is not consumed as that request's data.
++       */
+ 
+-      if (priv->driver)
+-        {
+-          CLASS_DISCONNECT(priv->driver, &priv->usbdev);
+-        }
++      g_ep0pending    = false;
++      g_ep0superseded = false;
++      g_ep0outlen     = 0;
++      g_ep0outdataend = false;
++
++      /* NOTE: do NOT call CLASS_DISCONNECT here.  A USB bus reset is
++       * not a device detach; class drivers (e.g. rndis) take mutexes
++       * in their disconnect path, which is illegal from interrupt
++       * context and would assert.  Hosts issue a bus reset before
++       * (re-)enumeration; the class driver is re-driven through the
++       * SETUP packets that follow.
++       */
+     }
+ 
+   if (intrusb & USB_INTR_RESUME)
+@@ -1229,10 +1496,17 @@ static int sf32lb52_interrupt(int irq, void *context, void *arg)
+   if (intrusb & USB_INTR_DISCONNECT)
+     {
+       usbtrace(TRACE_INTENTRY(SF32LB52_TRACEINTID_DISCONNECT), 0);
+-      if (priv->driver)
+-        {
+-          CLASS_DISCONNECT(priv->driver, &priv->usbdev);
+-        }
++
++      /* Do NOT call CLASS_DISCONNECT here.  This runs in interrupt
++       * context, and the RNDIS class driver's disconnect path does
++       * `while (nxmutex_lock(&priv->lock) < 0);` and calls
++       * netdev d_ifdown(); mutexes cannot be taken from an interrupt, so
++       * that either asserts or spins forever and wedges the USB
++       * interrupt -- after which the host talks to a controller that
++       * never answers ("device descriptor request failed").  The class
++       * driver is re-driven by the SETUP packets that follow
++       * re-enumeration.  Same reasoning as the reset branch above.
++       */
+     }
+ 
+   /* Handle EP0 (control) interrupt */
+@@ -1252,42 +1526,83 @@ static int sf32lb52_interrupt(int irq, void *context, void *arg)
+ 
+           hw->csr0_txcsr = csr0 & ~USB_CSR0_P_SENTSTALL;
+         }
+-      else if (csr0 & USB_CSR0_P_SETUPEND)
++      else
+         {
+-          usbtrace(TRACE_INTENTRY(SF32LB52_TRACEINTID_TXFIFOSETEND),
+-                   csr0);
++          /* SETUPEND and RXPKTRDY can be set together: the host aborted
++           * (or ended early) the previous control transfer and the next
++           * SETUP is already waiting.  Servicing SETUPEND alone used to win
++           * the else-if chain and swallow that SETUP -- the RNDIS
++           * GET_ENCAPSULATED_RESPONSE was lost exactly this way.  Clear
++           * SETUPEND, then keep servicing whatever is still pending.
++           */
+ 
+-          /* Clear SetupEnd */
++          if (csr0 & USB_CSR0_P_SETUPEND)
++            {
++              int guard;
+ 
+-          hw->csr0_txcsr = USB_CSR0_P_SVDSETUPEND;
+-        }
+-      else if (csr0 & USB_CSR0_RXPKTRDY)
+-        {
+-          usbtrace(TRACE_INTENTRY(SF32LB52_TRACEINTID_RXPKTRDY), csr0);
+-          sf32lb52_ep0setup(priv);
+-        }
+-      else if ((csr0 & USB_CSR0_TXPKTRDY) == 0)
+-        {
+-          /* TXPKTRDY is clear -- either a previous IN transfer completed
+-           * or we're idle after status phase.
+-           */
++              usbtrace(TRACE_INTENTRY(SF32LB52_TRACEINTID_TXFIFOSETEND),
++                       csr0);
++
++              /* The new SETUP in the FIFO superseded any parked request;
++               * ep0setup() consumes this flag so it will not treat the
++               * SETUP packet as that request's data stage.
++               */
++
++              g_ep0superseded = true;
++
++              hw->csr0_txcsr = USB_CSR0_P_SVDSETUPEND;
++
++              csr0 = hw->csr0_txcsr;
++
++              /* The core clears SETUPEND asynchronously (see the vendor HAL,
++               * bf0_hal_pcd.c:1307-1309, which polls it as well).
++               */
+ 
+-          /* Set address after status stage completes */
++              for (guard = 0;
++                   guard < 1000 &&
++                   (csr0 & USB_CSR0_P_SETUPEND) != 0;
++                   guard++)
++                {
++                  csr0 = hw->csr0_txcsr;
++                }
++            }
+ 
+-          if (!priv->paddrset && priv->paddr != 0)
++          if (csr0 & USB_CSR0_RXPKTRDY)
+             {
+-              hw->faddr = priv->paddr;
+-              priv->paddrset = 1;
++              /* Service the packet here as well as from the INTRRX EP0 path.
++               * SETUP can be reported through either route; dropping this one
++               * loses control transfers outright (the host then reports
++               * "device descriptor request failed").  Handling a packet that
++               * the other path already serviced is harmless: RXPKTRDY is
++               * cleared by then, so ep0setup() takes its RXCOUNT==0 exit.
++               */
++
++              usbtrace(TRACE_INTENTRY(SF32LB52_TRACEINTID_RXPKTRDY), csr0);
++              sf32lb52_ep0setup(priv);
+             }
++          else if ((csr0 & USB_CSR0_TXPKTRDY) == 0)
++            {
++              /* TXPKTRDY is clear -- either a previous IN transfer completed
++               * or we're idle after status phase.
++               */
+ 
+-          /* Continue any pending EP0 IN transfer */
++              /* Set address after status stage completes */
+ 
+-          privep = &priv->eplist[SF32LB52_EP0];
+-          if (!sf32lb52_rqempty(privep))
+-            {
+-              usbtrace(TRACE_INTENTRY(SF32LB52_TRACEINTID_TXPKTRDY),
+-                       csr0);
+-              sf32lb52_wrrequest(privep);
++              if (!priv->paddrset && priv->paddr != 0)
++                {
++                  hw->faddr = priv->paddr;
++                  priv->paddrset = 1;
++                }
++
++              /* Continue any pending EP0 IN transfer */
++
++              privep = &priv->eplist[SF32LB52_EP0];
++              if (!sf32lb52_rqempty(privep))
++                {
++                  usbtrace(TRACE_INTENTRY(SF32LB52_TRACEINTID_TXPKTRDY),
++                           csr0);
++                  sf32lb52_wrrequest(privep);
++                }
+             }
+         }
+     }
+@@ -1326,9 +1641,16 @@ static int sf32lb52_interrupt(int irq, void *context, void *arg)
+         }
+     }
+ 
+-  /* Handle RX (OUT) endpoint interrupts (EP2) */
++  /* Handle RX (OUT) endpoint interrupts (EP0 SETUP/OUT, EP2 bulk) */
+ 
+-  if (intrrx)
++  if (intrrx & USBC_EP0_INTR_MASK)
++    {
++      usbtrace(TRACE_INTENTRY(SF32LB52_TRACEINTID_RXFIFO), 0);
++      hw->index = 0;
++      sf32lb52_ep0setup(priv);
++    }
++
++  if (intrrx & ~USBC_EP0_INTR_MASK)
+     {
+       int i;
+       for (i = 1; i < SF32LB52_NENDPOINTS; i++)
+@@ -1341,6 +1663,7 @@ static int sf32lb52_interrupt(int irq, void *context, void *arg)
+               if (!sf32lb52_rqempty(privep))
+                 {
+                   sf32lb52_rdrequest(privep);
++                  priv->rxpending = 0;
+                 }
+               else
+                 {
+@@ -1415,7 +1738,7 @@ static void sf32lb52_epinitialize(struct sf32lb52_usbdev_s *priv)
+     {
+       hw->index = g_epinfo[i].addr & 0x0f;
+ 
+-      if (USB_EPIN(g_epinfo[i].addr))
++      if (USB_ISEPIN(g_epinfo[i].addr))
+         {
+           /* Configure TX (IN) endpoint */
+ 
+@@ -1519,9 +1842,12 @@ static void sf32lb52_ctrlinitialize(struct sf32lb52_usbdev_s *priv)
+ 
+   hw->intrtxe = USBC_EP0_INTR_MASK;
+ 
+-  /* Enable RX interrupts for OUT endpoints */
++  /* Enable RX interrupts: EP0 bit is required or SETUP packets
++   * (which arrive as EP0 RX events) are silently dropped and the
++   * host never gets a device descriptor.  Other OUT endpoints get
++   * their bits set when configured by the class driver.  */
+ 
+-  hw->intrrxe = 0;
++  hw->intrrxe = USBC_EP0_INTR_MASK;
+ 
+   /* Initialize endpoints */
+ 
+@@ -1719,8 +2045,24 @@ static int sf32lb52_epsubmit(struct usbdev_ep_s *ep,
+       /* EP0 zero-length status stage */
+ 
+       usbtrace(TRACE_COMPLETE(privep->epphy), privreq->req.xfrd);
+-      priv->hw->index = 0;
+-      priv->hw->csr0_txcsr = USB_CSR0_TXPKTRDY | USB_CSR0_P_DATAEND;
++
++      if (g_ep0outdataend)
++        {
++          /* The class OUT data stage already ended with DATAEND, so the core
++           * completes the status stage itself (vendor HAL switches to
++           * HAL_PCD_EP0_STATUSIN and never writes TXPKTRDY again,
++           * bf0_hal_pcd.c:663-669 / :1283-1290).  Writing another packet here
++           * would put a spurious DATAEND packet on the bus.
++           */
++
++          g_ep0outdataend = false;
++        }
++      else
++        {
++          priv->hw->index = 0;
++          priv->hw->csr0_txcsr = USB_CSR0_TXPKTRDY | USB_CSR0_P_DATAEND;
++        }
++
+       sf32lb52_abortrequest(privep, privreq, OK);
+     }
+   else if (req->len == 0 && (privep->in || privep->epphy == SF32LB52_EPINTRIN))
+@@ -1750,10 +2092,39 @@ static int sf32lb52_epsubmit(struct usbdev_ep_s *ep,
+       sf32lb52_rqenqueue(privep, privreq);
+       usbtrace(TRACE_OUTREQQUEUED(privep->epphy), privreq->req.len);
+ 
+-      if (priv->rxpending)
++      /* Only the data (non-control) OUT endpoints use the receive path.
++       * EP0 is driven entirely from sf32lb52_ep0setup(): rxpending is a
++       * single global flag that EP2 sets, so letting it trigger a read here
++       * made EP0 swallow a control packet and the host then reported
++       * "device descriptor request failed".
++       */
++
++      if (privep->epphy != 0)
+         {
+-          ret = sf32lb52_rdrequest(privep);
+-          priv->rxpending = 0;
++          if (priv->rxpending)
++            {
++              ret = sf32lb52_rdrequest(privep);
++              priv->rxpending = 0;
++            }
++          else
++            {
++              /* The rxpending flag can also be out of step with the
++               * controller: when that happens the packet sits in the FIFO
++               * forever, because the core raises no further RX interrupt
++               * while RXPKTRDY is still set, and the bulk OUT pipe stops for
++               * good.  Ask the hardware instead.
++               */
++
++              uint8_t saved = priv->hw->index;
++
++              priv->hw->index = privep->epphy;
++              if ((priv->hw->rxcsr & USB_RXCSR_RXPKTRDY) != 0)
++                {
++                  ret = sf32lb52_rdrequest(privep);
++                }
++
++              priv->hw->index = saved;
++            }
+         }
+     }
+ 
+@@ -1882,14 +2253,14 @@ static struct usbdev_ep_s *sf32lb52_allocep(struct usbdev_s *dev,
+ 
+       if (in)
+         {
+-          if (!USB_EPIN(g_epinfo[ndx].addr))
++          if (!USB_ISEPIN(g_epinfo[ndx].addr))
+             {
+               continue;
+             }
+         }
+       else
+         {
+-          if (!USB_EPOUT(g_epinfo[ndx].addr))
++          if (!USB_ISEPOUT(g_epinfo[ndx].addr))
+             {
+               continue;
+             }
+@@ -2048,7 +2419,7 @@ void arm_usbinitialize(void)
+       privep->ep.eplog = g_epinfo[i].addr;
+       privep->ep.maxpacket = g_epinfo[i].maxpacket;
+ 
+-      if (USB_EPIN(g_epinfo[i].addr))
++      if (USB_ISEPIN(g_epinfo[i].addr))
+         {
+           privep->in = 1;
+         }
+@@ -2161,6 +2532,7 @@ int usbdev_register(struct usbdevclass_driver_s *driver)
+ 
+   sf32lb52_epreset(&g_usbdev, 0);
+   g_usbdev.hw->intrtxe |= USBC_EP0_INTR_MASK;
++  g_usbdev.hw->intrrxe |= USBC_EP0_INTR_MASK;
+ 
+   /* Enable USB core interrupts */
+ 
+diff --git a/chips/sf32lb52/sifli_irq.c b/chips/sf32lb52/sifli_irq.c
+index 99b0d00..23c7877 100644
+--- a/chips/sf32lb52/sifli_irq.c
++++ b/chips/sf32lb52/sifli_irq.c
+@@ -39,6 +39,9 @@
+ 
+ #include "bf0_hal.h"
+ 
++/* arm_lowprintf is implemented in sifli_start.c */
++extern int arm_lowprintf(const char *fmt, ...);
++
+ /* Get a 32-bit version of the default priority */    
+ #define DEFPRIORITY32 \
+       (NVIC_SYSH_PRIORITY_DEFAULT << 24 | \
+diff --git a/chips/sf32lb52/sifli_uart.c b/chips/sf32lb52/sifli_uart.c
+index 12e09d2..3881e44 100644
+--- a/chips/sf32lb52/sifli_uart.c
++++ b/chips/sf32lb52/sifli_uart.c
+@@ -473,6 +473,90 @@ static int sifli_dma_receive(struct uart_dev_s *dev)
+ }
+ 
+ 
++/****************************************************************************
++ * Name: sifli_uart_reinit_rx_dma
++ *
++ * Description:
++ *   非 static 的"把这一路 UART 的 RX DMA 重新装回去"入口（板级用）。
++ *
++ *   为什么需要它（2026-09-17 真机踩到）：本驱动**只在"上一次 DMA 传输完成"的
++ *   中断回调里**才会重新武装 RX（sifli_dma_receive）。而 DMAC1 上同时挂着本串口
++ *   （UART1 控制台 = DMA1_Channel6/7）和音频的 AUDPRC RX0 —— 板级音频恢复里那记
++ *   "复位整块 DMAC1"（RSTR1 的 DMAC1 位）会把这一路的通道配置一并抹掉，之后
++ *   DMA 永远不会完成 → receive() 永远不会再被调用 → **串口 RX 永久聋**（现象是
++ *   nsh 收不到任何命令，板子看起来"死了"，其实还在打日志）。
++ *
++ *   所以板级在复位完 DMAC1 之后必须调用本函数，把每一路 UART 的 RX DMA 重新
++ *   配置 + 重新启动接收。idx 用 sifli_uart.c 里的 UARTx_INDEX 枚举（0 起，
++ *   UART1 是 0）。
++ *
++ *   Returned Value:
++ *     0       装回去了
++ *     -EINVAL idx 越界或该路没配 RX DMA
++ *     -ENODEV 这一路还没 attach（priv 为空），不用管
++ ****************************************************************************/
++
++int sifli_uart_reinit_rx_dma(int idx)
++{
++    struct sifli_uart *uart;
++    int ret;
++
++    if (idx < 0 || idx >= UART_MAX)
++    {
++        return -EINVAL;
++    }
++
++    uart = &uart_obj[idx];
++
++    if (uart->serial.priv == NULL)
++    {
++        return -ENODEV;
++    }
++
++    /* ★ 先把"残影"清干净 —— 这一步不做，等于把复位前的旧输入重放一遍：
++     *   - RX 的 DMA 直接写进 NuttX 的 recv.buffer，里面还留着复位前收到的旧字节；
++     *     重新武装之后驱动把这些字节当成"刚收到的新数据"上报，nsh 于是**反复重放
++     *     一条几分钟前的命令**（2026-09-17 真机踩到：控制台刷 125 KB 的同一条命令）。
++     *   - 环形的 head/tail 也必须一起归零：复位后 head 被 DMA 位置重新写成一个小值，
++     *     而 tail 还停在旧位置 → 上层认为"有一大段数据可读"，读到的全是垃圾。
++     *   顺序：先清缓冲 + 指针，再武装（sifli_dma_receive 内部会把 last_index 归零）。 */
++
++    memset(uart->serial.recv.buffer, 0, uart->serial.recv.size);
++    uart->serial.recv.head = 0;
++    uart->serial.recv.tail = 0;
++
++    /* ★★ 这一行才是"重新武装"能生效的关键（2026-09-17 用仪表定案）：
++     *
++     *   HAL_UART_Receive_DMA() 的守门条件是 `if (huart->RxState == HAL_UART_STATE_READY)`；
++     *   而串口开机 attach 之后 RxState 一直是 HAL_UART_STATE_BUSY_RX（UART 外设并没有被
++     *   DMAC1 的模块级复位动过，这个**软件状态**自然也不会回到 READY）—— 于是"重新武装"
++     *   会被静默跳过、返回 HAL_OK 却什么都不做：仪表实测这一路 CCR.EN=0、CNDTR=0、
++     *   CPAR/CM0AR=0，即传输根本没被启动。
++     *   （本驱动自己在 sifli_dma_receive 之前不做这一步，是因为 attach 时它本来就是 READY。）
++     *
++     *   顺序：先摆状态 → 再清缓冲/指针 → 最后武装。 */
++
++    uart->handle.RxState = HAL_UART_STATE_READY;
++
++    /* 关键的一步：先把这条通道**还回通道池**再重新分配。
++     *
++     * 本构建开了动态通道分配（DMA_SUPPORT_DYN_CHANNEL_ALLOC），HAL_DMA_Init() 内部
++     * 会先 DMA_AllocChannel()；如果池里还记着"这条通道被占着"，它直接返回 HAL_BUSY、
++     * **一个寄存器都不写**（HAL_DMA_Init 的返回值还经常被调用方丢掉）—— 表现就是
++     * "调了重新武装，但串口 RX 依然收不到任何东西"（2026-09-17 真机踩到）。
++     * HAL_DMA_DeInit() 会 CCR=0 + 清该通道标志 + 清 CSELR 映射 + 回收通道池
++     * （bf0_hal_dma.c:618-687），正是"还回去"的那一下。 */
++
++    if (uart->handle.hdmarx != NULL &&
++        uart->handle.hdmarx->State != HAL_DMA_STATE_READY)
++    {
++        HAL_DMA_DeInit(uart->handle.hdmarx);
++    }
++
++    return ret;
++}
++
++
+ /****************************************************************************
+  * Name: nrf53_rxavailable
+  *
+@@ -1006,7 +1090,6 @@ void up_putc(int ch)
+ 
+   arm_lowputc(ch);
+ #endif
+-  return ch;
+ }
+ 
+ #endif /* USE_SERIALDRIVER */

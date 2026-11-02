@@ -20,6 +20,12 @@
 #include <errno.h>
 #include <syslog.h>
 
+/* enter_critical_section()/leave_critical_section() —— 门控环形缓冲的互斥
+ * 从 2026-10-30 起用关中断临界区实现，不用 pthread_mutex（理由见
+ * sound_detect_pcm_tap 的文件内注释）。 */
+#include <nuttx/config.h>
+#include <nuttx/spinlock.h>
+
 /****************************************************************************
  * Pre-processor Definitions
  ****************************************************************************/
@@ -1215,6 +1221,16 @@ void sound_detect_init_default_classes(sound_detect_context_t *ctx)
 /* 门限：全部按 sensitivity 缩放（sens 越大越敏感 = 门限越低）*/
 #define SOUND_GATE_SILENCE_RMS       0.004f  /* 静音底噪（-48dBFS 量级）*/
 #define SOUND_GATE_ANOMALY_RMS       0.020f  /* 喂本地模型的最小能量（-34dBFS）*/
+#define SOUND_GATE_ANOMALY_PEAK      0.150f  /* 喂本地模型的另一条路：峰值（-16dBFS）。
+                                              * ★ 2026-10-31 加。摔倒/砸物是**短促冲击**，
+                                              *   0.1~0.2 秒的峰值摊进 0.64 秒窗算 RMS
+                                              *   会被稀释到 0.4~0.5 倍，本来刚过线的
+                                              *   一声闷响就掉到线下、整个窗没喂进模型，
+                                              *   3/4 投票永远凑不齐 —— 这是"摔倒没反应"
+                                              *   最像的一条来路。峰值不稀释，拿它补一条
+                                              *   路：**只多喂，不少喂**，喂不喂得准由
+                                              *   本地小模型的 0.60/0.70 阈值 + 3/4 投票
+                                              *   + 8 秒不应期把关。 */
 #define SOUND_GATE_VOICED_ZCR_MAX    0.35f   /* 浊音帧过零率上限 */
 #define SOUND_GATE_VOICED_AC_MIN     0.30f   /* 单帧"浊音样"的自相关峰下限 */
 #define SOUND_GATE_VOICED_AC_STRONG  0.60f   /* 整窗强周期性判据 */
@@ -1223,6 +1239,11 @@ void sound_detect_init_default_classes(sound_detect_context_t *ctx)
 #define SOUND_GATE_LAG_MIN           40      /* 16k/400Hz：人声基频上界 */
 #define SOUND_GATE_LAG_MAX           200     /* 16k/80Hz：人声基频下界 */
 #define SOUND_GATE_LAG_STEP          2
+#define SOUND_GATE_FEED_LINGER       4      /* 喂模型的"松手拖尾"：能量门关掉之后
+                                            * 再喂 4 跳（800ms）。一次撞击往往只有
+                                            * 0.2~0.4 秒，只喂那一两跳的话小模型
+                                            * 连第一个 0.64 秒窗都攒不满，一次推理
+                                            * 都不会有，3/4 投票更是永远凑不齐。 */
 #define SOUND_GATE_SENS_MIN          0.3f
 #define SOUND_GATE_SENS_MAX          3.0f
 
@@ -1230,8 +1251,7 @@ void sound_detect_init_default_classes(sound_detect_context_t *ctx)
 static int16_t        *g_gate_ring;
 static size_t          g_gate_ring_head;
 static size_t          g_gate_ring_count;
-static pthread_mutex_t g_gate_lock;
-static bool            g_gate_lock_valid;
+static bool            g_gate_ready;
 static pthread_t       g_gate_thread;
 static bool            g_gate_thread_valid;
 static volatile bool   g_gate_stop;
@@ -1255,6 +1275,115 @@ static void                   *g_gate_busy_arg;
 static sound_detect_voice_cb_t g_gate_voice_cb;
 static void                   *g_gate_voice_arg;
 static sound_gate_stats_t      g_gate_stats;
+
+/* ★ 2026-11-01：人声"余温"截止时刻。
+ *
+ *   真机误报的 fall/knock 总是**紧跟在一串人声窗之后**：一声喊叫/说话的
+ *   尾几跳 rms 还在门槛上，但"浊音"判据差一点没过，门控按非人声把它喂进
+ *   模型，模型就判成 knock/fall（实测 fall 0.57、knock 0.71）。只在
+ *   verdict>0 的那一跳做 scream-only 拦不住这些尾巴。
+ *
+ *   所以门控判成人声后 2.5 秒内的所有喂入都按人声处理（只允许 scream 投票）。
+ *   真正的撞击/倒地声是宽带的、ac 低，不会紧贴着一段人声还过能量门槛 ——
+ *   用 2.5 秒换掉"说句话就报警"是值得的。 */
+static uint32_t                g_gate_voice_until_ms;
+
+/* ★ 2026-11-01：连续"尖锐声窗"计数。
+ *
+ *   "声音还在持续（未回落）就不报 fall/knock"那一条原本是**逐窗**判的：
+ *   敲桌子时当前 0.64 秒窗本来就还在响，于是每一发 hit 都被当成"持续声"
+ *   挡掉 —— 真机 v20 测试 `★命中` 计数为 0，用户连敲完全没反应。
+ *
+ *   改成**连续多久**才算持续：> 6 秒（30 个 0.2 秒跳）才抑制。短敲
+ *   （几窗）不受影响，风扇/摩擦这种连续几十秒的噪声才被挡。
+ *   真正的单发误报由上层"两次确认"兜（单次 0.55~0.80 不报）。 */
+static uint32_t                g_gate_loud_run;
+#define SOUND_GATE_SUSTAINED_WINDOWS 30
+
+/* ★ 门控逐窗可观测（2026-10-31）。
+ *
+ * 排查"摔倒异常声音检测一点反应都没有"时踩到的硬伤：门控线程**除了
+ * verdict>0 之外一个字都不打**，统计又只在 bypass_stop 那一刻打印一次。
+ * 于是一次测试跑完，串口里既看不到"喂了几个窗给模型"，也看不到"是不是
+ * 全被判成人声送去云端了"，五个候选原因一个都排除不掉。
+ *
+ * 这里加的是**限速**日志（同一 250ms 桶只出一行，攒着的算在下一行里报），
+ * 别把串口灌满；真正喂进模型的窗不受限速，必须每一扇都看得见。 */
+
+static uint32_t g_gate_dbg_last_ms;
+static uint32_t g_gate_dbg_suppressed;
+static uint32_t g_gate_dbg_summary_ms;
+
+/* ★ 喂模型必须是**连续、不重复**的音频流（2026-10-31 修）。
+ *
+ * sound_event_feed 是流式前端（sound_event.h:42-45 写着"允许任意长度、
+ * 任意切分地连续调用"），它自己攒 0.64 秒窗、每 200ms 出一次推理。
+ * 门控这边的 win 是**滑动窗**：每步只前进 HOP=3200 样本、重叠 7040 样本。
+ * 原来把整窗 10240 一股脑喂进去 = 同一段音频被喂 3.2 遍，而且是
+ * "前进 3200 / 倒退 7040"的锯齿 —— 模型听到的是世界上根本不存在的声音，
+ * mel 历史整个是花的，3/4 投票永远凑不齐。
+ *
+ *   （旁证：模型每 20 帧出一次推理，20 帧 = 20*160 = 3200 样本 = 正好一跳。
+ *    也就是说"一跳喂一推理"才是设计好的节奏，整窗喂是 3 次推理还都带重复。）
+ *
+ * 所以改成：只喂**新**的那一跳（win + skip，长度 W - skip）；能量门刚打开
+ * 时（primed=false）补喂整窗好让首窗攒得够；断流之后重新补。 */
+
+static bool     g_gate_primed;      /* 小模型手里已经有连续音频了吗 */
+static size_t   g_gate_feed_skip;   /* win 开头有多少样本上一跳已经喂过 */
+static int      g_gate_feed_linger; /* 松手拖尾还剩几跳 */
+
+#define SOUND_GATE_DBG_INTERVAL_MS   250   /* 逐窗日志的限速桶 */
+#define SOUND_GATE_DBG_SUMMARY_MS   15000  /* 周期性汇总 */
+
+/* 逐窗一行。who 说清这一窗走了哪条路。 */
+static void gate_dbg_window(uint32_t now, const char *who,
+                            const sound_gate_features_t *f, float sens)
+{
+  if ((now - g_gate_dbg_last_ms) >= SOUND_GATE_DBG_INTERVAL_MS)
+    {
+      printf("[门控] %s rms=%.4f peak=%.4f zcr=%.2f ac=%.2f 浊音=%.2f"
+             "（喂模型门槛 rms>=%.4f 或 peak>=%.4f，静音门 %.4f）"
+             "%s\n",
+             who, f->rms, f->peak, f->zcr, f->ac_peak, f->voiced_ratio,
+             SOUND_GATE_ANOMALY_RMS / sens,
+             SOUND_GATE_ANOMALY_PEAK / sens,
+             SOUND_GATE_SILENCE_RMS / sens,
+             g_gate_dbg_suppressed > 0 ? "（前面攒了几窗没打，省串口）" : "");
+      g_gate_dbg_suppressed = 0;
+      g_gate_dbg_last_ms    = now;
+    }
+  else
+    {
+      g_gate_dbg_suppressed++;
+    }
+}
+
+/* 每 15 秒一行汇总。**哪怕一扇窗都没有也打** —— "0 窗"和"有窗但没喂"
+ * 是两个完全不同的病因（录音链死了 vs 判据把窗挡了），必须分得开。 */
+static void gate_dbg_summary(uint32_t now)
+{
+  if ((now - g_gate_dbg_summary_ms) < SOUND_GATE_DBG_SUMMARY_MS)
+    {
+      return;
+    }
+
+  g_gate_dbg_summary_ms = now;
+
+  printf("[门控] 汇总：判过 %lu 窗 = 人声 %lu + 非人声喂模型 %lu"
+         "（其中靠峰值 %lu）；播放态跳过 %lu；"
+         "⚠判成人声但峰值很高 %lu；有声没喂 %lu；"
+         "最近一窗 rms=%.4f peak=%.4f 浊音=%.2f\n",
+         (unsigned long)g_gate_stats.windows,
+         (unsigned long)g_gate_stats.voice_windows,
+         (unsigned long)g_gate_stats.anomaly_windows,
+         (unsigned long)g_gate_stats.peak_feed_windows,
+         (unsigned long)g_gate_stats.mute_windows,
+         (unsigned long)g_gate_stats.voice_peak_windows,
+         (unsigned long)g_gate_stats.nearmiss_windows,
+         g_gate_stats.last.rms, g_gate_stats.last.peak,
+         g_gate_stats.last.voiced_ratio);
+}
 
 /* 任务三 / robot_ui 的弱实现兜底：对方落地后强符号覆盖（见 ai_sound_detect.h）。
  *
@@ -1400,6 +1529,7 @@ int sound_detect_voice_gate_ex(const int16_t *pcm, size_t n,
   sound_gate_features_t f;
   uint64_t acc = 0;
   size_t crossings = 0;
+  int32_t peak = 0;
   int frames = 0;
   int voiced_frames = 0;
   float ac_peak = 0.0f;
@@ -1420,6 +1550,16 @@ int sound_detect_voice_gate_ex(const int16_t *pcm, size_t n,
       int32_t s = pcm[i];
       acc += (uint64_t)((int64_t)s * s);
 
+      if (s < 0)
+        {
+          s = -s;      /* s 从 int16_t 提上来的，-32768 也取得到 */
+        }
+
+      if (s > peak)
+        {
+          peak = s;
+        }
+
       if (i > 0 && ((pcm[i - 1] < 0 && s >= 0) ||
                     (pcm[i - 1] >= 0 && s < 0)))
         {
@@ -1430,6 +1570,7 @@ int sound_detect_voice_gate_ex(const int16_t *pcm, size_t n,
   mean_sq = (float)((double)acc / (double)n);
   f.energy = mean_sq;
   f.rms = sqrtf(mean_sq) / 32768.0f;
+  f.peak = (float)peak / 32768.0f;
   f.zcr = (n > 1) ? (float)crossings / (float)(n - 1) : 0.0f;
 
   /* 逐 32ms 帧算自相关峰值比（浊音性）和帧过零率。
@@ -1546,7 +1687,7 @@ int sound_detect_pcm_tap(const int16_t *pcm, size_t n)
       return -EINVAL;
     }
 
-  if (!g_gate_enabled || g_gate_ring == NULL || !g_gate_lock_valid)
+  if (!g_gate_enabled || g_gate_ring == NULL || !g_gate_ready)
     {
       return 0;    /* 门控没开：静默丢掉，不影响主链路 */
     }
@@ -1559,23 +1700,42 @@ int sound_detect_pcm_tap(const int16_t *pcm, size_t n)
 
   g_gate_taps_inflight++;
 
-  if (!g_gate_enabled || g_gate_ring == NULL || !g_gate_lock_valid)
+  if (!g_gate_enabled || g_gate_ring == NULL || !g_gate_ready)
     {
       g_gate_taps_inflight--;
       return 0;
     }
 
-  /* 只**试**锁：录音线程在这里等门控线程 = 丢麦克风数据，绝不允许。
-   * 抢不到就当下这一小块不要了（下一帧 20ms 后还有）。 */
+  /* ★ 2026-10-30：这里（以及门控线程、start 里）的互斥换成**关中断临界区**。
+   *
+   * 2026-10-25 那次"不再销毁锁"的修复**没能止住崩溃** —— 10-30 真机又崩在
+   * 同一个位置（见 bypass_stop 注释里的 backtrace）。而且源码里三处加/解锁
+   * 全是**线性的**（拿一次放一次，没有第二条路径去放），所以"重复解锁"从源
+   * 码上讲不出来。那就只剩两种可能：
+   *
+   *   (a) pthread_mutex 的**持有者跟踪**本身出错（NuttX 的 sem_post.c:63
+   *       断言正是拿持有者做判据的，held 标记丢了/被别的线程抢改了都会打）；
+   *   (b) g_gate_lock 这 28 字节被别处写坏了（这个断言对锁内容极其敏感）。
+   *
+   * 两种都**没法从源码证明**是哪一种，但两种都被下面这个改法一次性消掉：
+   * 关中断临界区没有"持有者"可言，`pthread_mutex_give` → `sem_post` 这条路
+   * 就不存在了，断言无从触发。同时 (b) 也落空 —— 没有锁对象可被写坏。
+   *
+   * 顺带把"抢不到锁就丢掉这一帧"一起去掉了：单核临界区不可能抢不到，
+   * 送进环的数据只会更多不会更少（摔倒检测那边只会更灵敏）。
+   *
+   * 代价是临界区里有一次 memcpy：tap 这边一个录音块（1 KB 上下），
+   * 门控线程那边一个窗（20 KB）。SF32LB52 上最多几十 µs，而音频 DMA 一档
+   * 20 ms、RNDIS 也没这么紧 —— 余量两个数量级，不会顶到实时性。
+   *
+   * ⚠ 摔倒/异常声音检测的**算法、判定、上报一行没改**，只换了锁的实现。 */
 
-  if (pthread_mutex_trylock(&g_gate_lock) != 0)
-    {
-      g_gate_taps_inflight--;
-      return 0;
-    }
+  {
+    irqstate_t flags = enter_critical_section();
+    gate_ring_push(pcm, n);
+    leave_critical_section(flags);
+  }
 
-  gate_ring_push(pcm, n);
-  pthread_mutex_unlock(&g_gate_lock);
   g_gate_taps_inflight--;
   return 0;
 }
@@ -1605,8 +1765,14 @@ static void *sound_detect_gate_thread(void *arg)
       int verdict;
       float sens;
 
-      if (g_gate_lock_valid && pthread_mutex_trylock(&g_gate_lock) == 0)
+      /* 临界区只包住"看一眼够不够一窗 + 取一窗 + 丢一跳"这几步索引运算和
+       * memcpy（理由见 sound_detect_pcm_tap 里的长注释：2026-10-30 起不用
+       * pthread_mutex，改关中断临界区，让 sem_post.c:63 那类断言无从触发）。 */
+
+      if (g_gate_ready)
         {
+          irqstate_t flags = enter_critical_section();
+
           if (g_gate_ring_count >= SOUND_GATE_WINDOW_SAMPLES)
             {
               gate_ring_peek(win, SOUND_GATE_WINDOW_SAMPLES);
@@ -1614,11 +1780,22 @@ static void *sound_detect_gate_thread(void *arg)
               have = true;
             }
 
-          pthread_mutex_unlock(&g_gate_lock);
+          leave_critical_section(flags);
         }
 
       if (!have)
         {
+          /* 环里不够一整窗 = 断流（录音停了 / 起步没攒够）。
+           * 小模型那边的连续性到此为止，下次有窗要重新补满一整窗；
+           * 同时也不能让它在断流时一声不吭 —— "一扇窗都没有"和"有窗但没喂"
+           * 是两个完全不同的病因。 */
+
+          g_gate_primed    = false;
+          g_gate_feed_skip = 0;
+          g_gate_feed_linger = 0;
+
+          gate_dbg_summary(sound_detect_get_tick_ms());
+
           usleep(20000);    /* 20ms：攒够一个窗口再判 */
           continue;
         }
@@ -1629,6 +1806,10 @@ static void *sound_detect_gate_thread(void *arg)
       if (g_gate_busy_cb != NULL && g_gate_busy_cb(g_gate_busy_arg))
         {
           g_gate_stats.mute_windows++;
+          g_gate_primed    = false;   /* 自己在放音：模型那边断流，回来重新补 */
+          g_gate_feed_skip = 0;
+          g_gate_feed_linger = 0;
+          gate_dbg_summary(sound_detect_get_tick_ms());
           continue;
         }
 
@@ -1639,40 +1820,190 @@ static void *sound_detect_gate_thread(void *arg)
         }
 
       now = sound_detect_get_tick_ms();
+      if (verdict > 0)
+        {
+          g_gate_voice_until_ms = now + 2500;
+        }
+
       g_gate_stats.windows++;
       g_gate_stats.last = f;
+      sens = sound_detect_gate_sensitivity();
+
+      /* 更新"连续尖锐窗"计数：这一窗还过能量门槛就 ++，否则归零。
+       * 只在 > SOUND_GATE_SUSTAINED_WINDOWS 时才把 loud_hint 传给模型。 */
+
+      {
+        bool loud_win = f.active &&
+            (f.rms >= SOUND_GATE_ANOMALY_RMS / sens ||
+             f.peak >= SOUND_GATE_ANOMALY_PEAK / sens);
+
+        if (loud_win)
+          {
+            if (g_gate_loud_run < 1000000u)
+              {
+                g_gate_loud_run++;
+              }
+          }
+        else
+          {
+            g_gate_loud_run = 0;
+          }
+      }
+
+      /* ★★ 2026-10-31：喂不喂本地小模型只看**能量**，与"是不是人声"正交。
+       *
+       *   原来人声窗直接 `continue`、一个样本都不喂小模型，于是尖叫（SCREAM 类）
+       *   **结构上永远不可能**触发 —— 尖叫是浊音、必然被判成人声走云端，而人声
+       *   分支压根不喂模型。真机 `top1=scream` 全程 0、用户大声叫喊被判成 knock、
+       *   「大声叫喊板子没报警」就是这么来的。一声脆响（撞击）被"浊音"判据吃掉
+       *   也一样，只多记一个计数就过去了。
+       *
+       *   本地小模型的职责是"这是什么声"（OTHER/FALL/KNOCK/SCREAM）；
+       *   门控的职责是"要不要顺手送云端做语音"。这两件事原来被做成互斥的，
+       *   现在分开：能量够就喂模型，判成人声的**另外**再送云端。
+       *   CPU 代价：真机 315 秒 / 1061 窗里多喂约 137 窗 ≈ 0.4 次/秒，可忽略。
+       *
+       * 两条能量路（取**或**，只多喂不少喂，判得准不准由小模型那边的
+       * 0.60/0.70 阈值 + 3/4 投票 + 8 秒不应期把关）：
+       *   ① 整窗 RMS 过门槛（持续性噪声/长响）；
+       *   ② 峰值过门槛（**短促撞击**：0.64 秒窗会把 0.15 秒的响摊薄到
+       *      0.48 倍 RMS，本来刚过线的一声闷响就掉到线下，整窗白扔）。 */
 
       if (verdict > 0)
         {
-          /* 人声：交给云端语音链路（回调里只许置标志）*/
+          /* 人声：顺手送云端语音链路（回调里只许置标志）。
+           * ★ 不再 continue —— 下面喂小模型那一步照样要做。 */
 
           g_gate_stats.voice_windows++;
           g_gate_stats.last_voice_ms = now;
+
+          /* ★ 人声窗里峰值还很高 = 一声脆响/尖叫被"浊音"判据吃掉了。
+           *   这个计数一涨就说明"撞击/喊叫被当成说话送去云端"，是门控判据
+           *   的问题，不是小模型的问题。 */
+
+          if (f.peak >= SOUND_GATE_ANOMALY_PEAK / sens)
+            {
+              g_gate_stats.voice_peak_windows++;
+              gate_dbg_window(now, "判成人声且峰值高 -> 送云端 + 也喂小模型"
+                                   "（尖叫/撞击最可能落在这里）",
+                              &f, sens);
+            }
+          else
+            {
+              gate_dbg_window(now, "判成人声 -> 云端语音链路", &f, sens);
+            }
 
           if (g_gate_voice_cb != NULL)
             {
               g_gate_voice_cb(&f, g_gate_voice_arg);
             }
-
-          continue;
         }
 
-      /* 非人声 + 能量超阈：喂本地小模型（任务三的 sound_event）。
-       * 每 200ms 一个窗地喂（重叠窗），投票/不应期由那边做。 */
+      {
+        bool feed_now = false;
 
-      sens = sound_detect_gate_sensitivity();
-      if (f.active && f.rms >= SOUND_GATE_ANOMALY_RMS / sens)
-        {
-          g_gate_stats.anomaly_windows++;
-          g_gate_stats.last_anomaly_ms = now;
+        if (f.active)
+          {
+            if (f.rms >= SOUND_GATE_ANOMALY_RMS / sens)
+              {
+                feed_now = true;
+              }
+            else if (f.peak >= SOUND_GATE_ANOMALY_PEAK / sens)
+              {
+                g_gate_stats.peak_feed_windows++;
+                feed_now = true;
+              }
+            else
+              {
+                g_gate_stats.nearmiss_windows++;
+              }
+          }
 
-          if (sound_event_feed(win, SOUND_GATE_WINDOW_SAMPLES) < 0 &&
-              g_gate_stats.anomaly_windows == 1)
+        if (feed_now)
+          {
+            g_gate_stats.anomaly_windows++;
+            g_gate_stats.last_anomaly_ms = now;
+            g_gate_feed_linger = SOUND_GATE_FEED_LINGER;
+          }
+        else if (g_gate_feed_linger > 0)
+          {
+            /* 松手再拖几跳，好让小模型凑得满一个窗（见 SOUND_GATE_FEED_LINGER）。 */
+
+            g_gate_feed_linger--;
+            feed_now = true;
+          }
+
+        if (feed_now)
+          {
+            const int16_t *feed_p;
+            size_t         feed_n;
+            int            wins;
+
+            if (!g_gate_primed)
+              {
+                /* 断流之后头一喂：整窗补上，首窗（10480 样本）才攒得够。 */
+
+                feed_p = win;
+                feed_n = SOUND_GATE_WINDOW_SAMPLES;
+              }
+            else
+              {
+                /* 只喂上一跳没喂过的那一截 —— 见上面那段长注释。 */
+
+                feed_p = win + g_gate_feed_skip;
+                feed_n = SOUND_GATE_WINDOW_SAMPLES - g_gate_feed_skip;
+              }
+
+            /* 人声或"人声余温"（见 g_gate_voice_until_ms）：只让 SCREAM
+             * 类投票（见 sound_event_feed_ex 的注释）。fall/knock 只从
+             * 真正非人声的窗触发，这样"说话/喊叫"（包括它的尾音）不会再
+             * 被当成敲击/跌倒去报警。 */
             {
-              printf("[门控] 本地小模型还没落地（sound_event_feed 返回 -ENOSYS），"
-                     "异常窗暂时只记账\n");
+              int voice_ctx = (verdict > 0) ||
+                  ((int32_t)(now - g_gate_voice_until_ms) < 0);
+
+              /* 连续 >6 秒都过能量门槛才算"持续声"，才抑制 fall/knock。
+               * 短敲（几窗）不再被误伤 —— v20 真机就是逐窗判导致真敲
+               * 一发 `★命中` 都没有（全被"声音还在持续"挡住）。 */
+              int loud_now = (g_gate_loud_run > SOUND_GATE_SUSTAINED_WINDOWS);
+
+              wins = sound_event_feed_ex(feed_p, feed_n, voice_ctx, loud_now);
             }
-        }
+
+            g_gate_primed    = true;
+            g_gate_feed_skip = SOUND_GATE_WINDOW_SAMPLES -
+                               SOUND_GATE_HOP_SAMPLES;
+
+            if (wins < 0 && g_gate_stats.anomaly_windows == 1)
+              {
+                printf("[门控] 本地小模型还没落地（sound_event_feed 返回 -ENOSYS），"
+                       "异常窗暂时只记账\n");
+              }
+            else if (wins > 0)
+              {
+                printf("[门控] 喂模型 %lu 样本 -> %d 次推理\n",
+                       (unsigned long)feed_n, wins);
+              }
+
+            gate_dbg_window(now, (feed_n == SOUND_GATE_WINDOW_SAMPLES)
+                                 ? "喂本地小模型（补喂整窗）"
+                                 : "喂本地小模型（只喂新的一跳）",
+                            &f, sens);
+          }
+        else
+          {
+            /* 这一跳不喂：小模型那边就断流了，下次得重新补满一整窗。 */
+
+            g_gate_primed    = false;
+            g_gate_feed_skip = 0;
+
+            gate_dbg_window(now, (verdict > 0)
+                                 ? "人声但没喂模型（能量/峰值都不够）"
+                                 : "非人声但没喂（能量/峰值都不够）", &f, sens);
+          }
+      }
+
+      gate_dbg_summary(now);
     }
 
   free(win);
@@ -1704,24 +2035,20 @@ int sound_detect_bypass_start(void)
         }
     }
 
-  if (!g_gate_lock_valid)
-    {
-      ret = pthread_mutex_init(&g_gate_lock, NULL);
-      if (ret != 0)
-        {
-          free(g_gate_ring);
-          g_gate_ring = NULL;
-          return -ret;
-        }
+  /* 环形缓冲/统计区一旦用上就永远算就绪 —— 它们永不销毁（理由见
+   * bypass_stop）。2026-10-30 起互斥是关中断临界区，不再有"锁初始化"这回事，
+   * 也就没有 init 失败这条路（原来那条路会 free 环、把 g_gate_lock_valid
+   * 留在 false，是另一种"半初始化"状态，现在不存在了）。 */
 
-      g_gate_lock_valid = true;
-    }
+  g_gate_ready = true;
 
-  pthread_mutex_lock(&g_gate_lock);
-  g_gate_ring_head = 0;
-  g_gate_ring_count = 0;
-  memset(&g_gate_stats, 0, sizeof(g_gate_stats));
-  pthread_mutex_unlock(&g_gate_lock);
+  {
+    irqstate_t flags = enter_critical_section();
+    g_gate_ring_head = 0;
+    g_gate_ring_count = 0;
+    memset(&g_gate_stats, 0, sizeof(g_gate_stats));
+    leave_critical_section(flags);
+  }
 
   g_gate_stop = false;
 
@@ -1752,8 +2079,12 @@ int sound_detect_bypass_start(void)
   g_gate_thread_valid = true;
   g_gate_enabled = true;
 
-  printf("[门控] 旁路门控已启动: 窗口 %.2fs / 步长 %.2fs / 环形 %d 样本 / "
-         "优先级 %d\n",
+  /* ★ "关中断临界区"这几个字是**新旧固件的分水岭**：串口开机看到它 =
+   *   2026-10-30 那版（sem_post 崩溃已修）落地了；看不到就是还跑着旧的。
+   *   前面连续两次烧录失败都是靠行为反推出来的，以后直接看这一行。 */
+
+  printf("[门控] 旁路门控已启动（关中断临界区）: 窗口 %.2fs / 步长 %.2fs / "
+         "环形 %d 样本 / 优先级 %d\n",
          (double)SOUND_GATE_WINDOW_SAMPLES / 16000.0,
          (double)SOUND_GATE_HOP_SAMPLES / 16000.0,
          (int)SOUND_GATE_RING_SAMPLES,
@@ -1774,29 +2105,31 @@ void sound_detect_bypass_stop(void)
   /* 顺序：先关闸（新 tap 从此在第一道检查就被拦下），再等在途的 tap
    * 归零，然后 join 门控线程。
    *
-   * ★★★ 2026-10-25：这里**不再销毁锁、也不再释放环形缓冲**。
+   * ★★★ 这里的崩溃史（三步，别再倒回去）：
    *
-   * 原来的写法是"等在途归零 → pthread_mutex_destroy + free(环)"，并且等在途
-   * 只等 200 ms，超时就照旧销毁。注释自己写着这样会重现 2026-10-20 那次崩溃：
-   * tap 卡在"检查通过之后、unlock 之前"时销毁锁，那次 unlock 就打在已销毁的
-   * 互斥量上，触发 sem_post.c:63 的持有者断言、hello_app 当场崩。**2026-10-25
-   * 真机又崩了一次，就是这个逃生口**（日志：
-   *   Assertion failed at /sched/semaphore/sem_post.c:63 task: hello_app
-   *   backtrace: nxsem_post_slow ← pthread_mutex_give ← sound_detect_pcm_tap
-   *   ← audio_record_thread
-   * ）。另一个洞是 sound_detect_gate_set_enabled(true) 能在 teardown 途中把
-   * g_gate_enabled 重新打开，绕过"不许新 tap"这道门。
+   *   1. 早先：stop 会 pthread_mutex_destroy + free(环)，tap 在"检查通过
+   *      之后、unlock 之前"撞上销毁，unlock 打在已销毁的互斥量上 ——
+   *      sem_post.c:63 的持有者断言，hello_app 当场崩（2026-10-20）。
    *
-   * 与其把时序窗口一个个堵上，不如让这类竞争**根本不可能有后果**：
-   *   - g_gate_lock 是**静态全局**，不是堆上的 —— 销毁它没有任何收益，
-   *     只换来"use-after-destroy"这一整类崩溃。留着，下次 start 直接复用。
-   *   - 环形缓冲是**固定大小一次性分配**，也不必释放。留着，下次 start 复用。
-   *   于是 tap 就算在 stop 之后才跑到 unlock，也只是解锁一把仍然有效的锁；
-   *   就算 set_enabled(true) 在 teardown 途中把闸重新打开，tap 也只是往一个
-   *   没人读的环里写几帧。两个洞同时闭死，而且**与在途计数的时序无关**。
+   *   2. 2026-10-25 修复：不销毁锁、不释放环，只留 g_gate_enabled=false
+   *      + 等在途。**没止住** —— 2026-10-30 真机又崩在同一个 backtrace：
+   *        Assertion failed at /sched/semaphore/sem_post.c:63 task: hello_app
+   *        backtrace: nxsem_post_slow ← pthread_mutex_give
+   *                   ← sound_detect_pcm_tap ← audio_record_thread
+   *      而源码里三处加/解锁全是线性的、不存在重复解锁，所以第 1 条那类
+   *      "use-after-destroy"解释不了这次 —— 只能是 pthread 的持有者跟踪出错，
+   *      或者锁内存被别处写坏（两种都无法从源码证明是哪一种）。
    *
-   * g_gate_enabled=false + 等在途仍保留（收尾更干净、日志更好读），
-   * 但它不再是安全性的承重墙。 */
+   *   3. 2026-10-30 现在：**这个模块不再持有任何 pthread_mutex**。
+   *      g_gate_ring 的互斥改成 enter_critical_section()（关中断 + 关抢占，
+   *      详细理由见 sound_detect_pcm_tap）。没有锁对象就没有持有者，
+   *      `pthread_mutex_give → sem_post` 这条路根本不存在，断言无从触发；
+   *      同时"锁内存被写坏"也落空 —— 没有锁可写。
+   *      ⇒ 第 1、2 条那两类崩溃同时消失，而且**与在途计数的时序无关**。
+   *
+   * 环形缓冲仍然**固定大小一次性分配、永不释放**（复用），这条不变。
+   * g_gate_enabled=false + 等在途也保留（收尾更干净、日志更好读），
+   * 但它早已不是安全性的承重墙。 */
 
   g_gate_enabled = false;
   for (i = 0; i < 200 && g_gate_taps_inflight > 0; i++)
@@ -1817,8 +2150,8 @@ void sound_detect_bypass_stop(void)
   pthread_join(g_gate_thread, NULL);
   g_gate_thread_valid = false;
 
-  /* ⚠ 不 free(g_gate_ring)、不 pthread_mutex_destroy(&g_gate_lock)、
-   * 不把 g_gate_lock_valid 置回 false —— 理由见上。下次 start 会复用它们。 */
+  /* ⚠ 不 free(g_gate_ring)、不把 g_gate_ready 置回 false —— 理由见上。
+   * （这里已经没有 pthread_mutex 可销毁了。）下次 start 会复用它们。 */
 
   g_gate_ring_head = 0;
   g_gate_ring_count = 0;

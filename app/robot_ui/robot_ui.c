@@ -15,6 +15,8 @@
 #include <stdint.h>           /* intptr_t：按钮 user_data 里塞"确认/不用" */
 #include <unistd.h>           /* usleep()：等 hello_app 交出麦克风时的轮询/续租间隔 */
 #include <pthread.h>          /* 报警出声线程（报警声不能做在 LVGL 线程里，见下面那节） */
+#include <semaphore.h>        /* sem_t / SEM_INITIALIZER */
+#include <nuttx/semaphore.h>  /* nxsem_wait_uninterruptible / nxsem_post */
 
 /* 跨线程投递口（ui_async.c）：询问页按钮的回答也走它 —— 理由见下面询问页那一节
  * （在对象自己的事件回调里删自己，LVGL 的事件链表正在遍历的节点就没了）。 */
@@ -32,6 +34,7 @@
  * INCLUDE_DIRECTORIES `../hello_app` 提供，无需改构建脚本。
  * ★ 2026-09-21：原来的「让路 / 收回」整套删掉了，详见下面报警那一节。 */
 #include "ai_companion_req.h"
+#include "voice_emerg.h"
 
 /* 状态栏时钟：定义在本文件后面（ui_clock_refresh / ui_clock_timer_cb），
  * 状态栏创建时立刻刷新一次，并挂一个定时器周期刷新。 */
@@ -59,7 +62,7 @@ static lv_obj_t *scr_alarm = NULL;     // 报警屏幕
 /* lbl_status：**不再是状态栏上那个"[在线]"**（状态栏那三样 2026-09-14 已被用户
  * 要求删掉，见 create_status_bar() 的注释），2026-09-16 挪到主界面「AI 回复区」
  * 里当"语音状态小字"：用户原话「既然我们做了常态语音，不如在主页那个对话框加上
- * 状态」。所以它现在**是会显示的**，由 create_ai_reply_area() 建出来、
+ * 状态」。所以它现在**是会显示的**，由 create_reply_caption() 建出来、
  * robot_ui_set_status() 写文字和颜色。
  *
  * lbl_net：仍然不在任何地方创建，恒为 NULL（robot_ui_set_net_status() 内部判 NULL
@@ -73,26 +76,61 @@ static lv_obj_t *lbl_status = NULL;    // 语音状态小标签（建在 AI 回�
 #define UI_CLOCK_MAX 6
 static lv_obj_t *clock_slots[UI_CLOCK_MAX] = {NULL};
 static lv_obj_t *lbl_net = NULL;       // 网络状态标签（已不再创建）
-static lv_obj_t *lbl_face = NULL;      // 表情标签
-static lv_obj_t *lbl_ai_reply = NULL;  // AI回复标签
-static lv_obj_t *lbl_reminder = NULL;  // 提醒标签
+static lv_obj_t *lbl_ai_reply = NULL;  // AI 回复小字（对话框去掉后剩下的那行字幕）
 
 /* 按钮 */
-static lv_obj_t *btn_remind = NULL;    // 提醒按钮
-static lv_obj_t *btn_menu = NULL;      // 菜单按钮（底部排，2026-10-14 顶替设置位）
-static lv_obj_t *btn_alarm = NULL;     // 报警按钮
+static lv_obj_t *btn_menu = NULL;      // 菜单按钮（小方形，2026-10-29 起）
+static lv_obj_t *btn_alarm = NULL;     // 报警按钮（大圆形，红）
 
 /* 报警页的 "!!!" 图标：闪烁只动它一个（原来动的是整屏，见 alarm_blink_timer_cb） */
 static lv_obj_t *lbl_alarm_icon = NULL;
 
-/* 动画 */
-static lv_anim_t anim_face = {0};      // 表情动画
+/* 报警页那句详情（"检测到异常/已通知家人"）。必须是文件级 static：
+ * 文案在 robot_ui_show_alarm() 里按「手机推送到底能不能发出去」改写
+ * （push_is_enabled()），原来它是 build 页面时写死的局部变量，事后改不了 ——
+ * 于是推送密钥没配上时屏幕照样写着"已通知家人"，老人以为家人知道了。 */
+static lv_obj_t *lbl_alarm_detail = NULL;
+
+/* ==================== 会呼吸的笑脸（LVGL 画的，2026-10-29） ====================
+ * 用户：「把主页面的对话框框去掉，换成大版的动画图案，ai说话的时候它也在动」
+ * + 拍板「LVGL 画的会呼吸的笑脸」。所以脸不是图片素材（本工程一张图都没有），
+ * 是几个 lv_obj 拼出来的圆 + 圆角条，尺寸/颜色全在这里改。
+ *
+ * 结构（从后往前画）：
+ *   face_ring2 / face_ring1   两圈描边圆 —— 说话时当"声波涟漪"用（闪）
+ *   face_core                 脸本体容器，整体上下浮动 = 呼吸
+ *     face_disc               黄色圆脸盘（不透明，脸的底色）
+ *     eye_l / eye_r           眼睛（圆角条）
+ *     mouth                   嘴（圆角条，说话时一开一合）
+ *
+ * ★ 动画用 lv_timer 逐步改，**不用 lv_anim**：这里每帧要同时改好几件东西
+ *   （嘴高、环的透明度、整脸的 y），lv_anim 一个动画只能驱动一个量，得开
+ *   三四条并行动画互相抢；timer 一次 tick 全改完，也好按「说话/不说话」
+ *   随时换节奏。代价是要自己维护相位 face_tick。
+ * ★ 全屏二级页面盖上来时必须整个停（robot_ui_set_face_anim_paused）：那块
+ *   重绘是白做的，而面板本来就慢 —— 这是老账（见那个函数的注释）。 */
+static lv_obj_t *face_ring2 = NULL;    /* 最外圈（涟漪外圈） */
+static lv_obj_t *face_ring1 = NULL;    /* 内圈（涟漪内圈） */
+static lv_obj_t *face_core = NULL;     /* 脸本体容器（呼吸时整体上下挪） */
+static lv_obj_t *face_disc = NULL;     /* 黄色圆脸盘 */
+static lv_obj_t *eye_l = NULL;
+static lv_obj_t *eye_r = NULL;
+static lv_obj_t *mouth = NULL;
+static lv_timer_t *face_timer = NULL;  /* 动画主定时器，100ms 一跳 */
+static uint32_t face_tick = 0;         /* 相位（自由跑，取模用） */
+static bool face_paused = false;       /* 被全屏页面盖住了 = 停 */
+static int32_t face_core_base_y = 0;   /* 脸的中位 y，呼吸在这上下各 5px */
+static bool face_was_speaking = false; /* 上一跳还在说？收尾时要归位嘴和涟漪 */
+
+/* 嘴的"这个表情该有的样子"：robot_ui_set_face() 换表情时改这四个，
+ * face_mouth_rest() 照着摆。说话动画期间嘴是被 timer 抢走的。 */
+static int32_t face_mouth_w = 60;
+static int32_t face_mouth_h = 14;
+static int32_t face_mouth_r = 7;
+static int32_t face_mouth_dy = 20;
 
 /* 报警闪烁：低频定时器，创建后先暂停，报警时 resume（见 robot_ui_show_alarm） */
 static lv_timer_t *alarm_blink_timer = NULL;
-
-/* 表情浮动动画是否在跑（全屏页面打开时暂停，见 robot_ui_set_face_anim_paused） */
-static bool face_anim_running = false;
 
 /* 询问页（「检测到异常声响，要报警吗？」）的那两个量。
  * 定义放在这里、而不是跟下面那一节的其它量放在一起：robot_ui_show_alarm() 要
@@ -110,18 +148,6 @@ static lv_style_t style_bg;           // 背景样式
 static lv_style_t style_btn;          // 按钮样式
 static lv_style_t style_btn_alarm;    // 报警按钮样式
 static lv_style_t style_text;         // 文字样式
-static lv_style_t style_face;         // 表情样式
-
-/* ==================== 表情数据 ==================== */
-/* ASCII 表情 */
-static const char *face_array[] = {
-    "(^_^)",     // 开心
-    "(=_=)",     // 思考
-    "(~_~)zZZ", // 困倦
-    "(O_O)",     // 惊讶
-    "(>_<)",     // 担心
-    "(! ! !)",   // 报警
-};
 
 /* ==================== 内部函数声明 ==================== */
 static void init_styles(void);
@@ -129,7 +155,7 @@ static void create_main_screen(void);
 static void create_alarm_screen(void);
 static void create_status_bar(lv_obj_t *parent);
 static void create_face_area(lv_obj_t *parent);
-static void create_ai_reply_area(lv_obj_t *parent);
+static void create_reply_caption(lv_obj_t *parent);
 static void create_bottom_buttons(lv_obj_t *parent);
 static void btn_event_handler(lv_event_t *e);
 static void alarm_blink_timer_cb(lv_timer_t *t);
@@ -164,11 +190,6 @@ static void init_styles(void)
     lv_style_init(&style_text);
     lv_style_set_text_color(&style_text, THEME_TEXT_PRIMARY);
     lv_style_set_text_font(&style_text, &lv_font_ui_16);
-
-    /* 表情样式 - 大号字体（浅底用深绿，黄色看不清） */
-    lv_style_init(&style_face);
-    lv_style_set_text_color(&style_face, THEME_FACE_HAPPY);
-    lv_style_set_text_font(&style_face, &lv_font_ui_24);
 }
 
 /* ==================== 创建主屏幕 ==================== */
@@ -181,13 +202,13 @@ static void create_main_screen(void)
     /* 创建状态栏 */
     create_status_bar(scr_main);
 
-    /* 创建表情区域 */
+    /* 创建会呼吸的笑脸（主页面主角） */
     create_face_area(scr_main);
 
-    /* 创建 AI 回复区域 */
-    create_ai_reply_area(scr_main);
+    /* 创建 AI 回复字幕（对话框框 2026-10-29 去掉，只剩这一行字） */
+    create_reply_caption(scr_main);
 
-    /* 创建底部按钮 */
+    /* 创建底部按钮（小方形菜单 + 大圆形紧急呼叫） */
     create_bottom_buttons(scr_main);
 
     /* 加载主屏幕 */
@@ -372,8 +393,8 @@ static void create_status_bar(lv_obj_t *parent)
      * 注意：`robot_ui_set_status()` / `robot_ui_set_net_status()` 两个 setter
      * 都**保留**了（内部都有 NULL 检查），main.c 里那十几处调用点一行都不用改：
      *   - set_net_status()：对应标签仍然不创建，恒为 NULL，没有任何显示效果；
-     *   - set_status()：写的是主界面「AI 回复区」里那一行语音状态小字
-     *     （见 create_ai_reply_area() 和 robot_ui_set_status()），与顶栏无关。 */
+     *   - set_status()：写的是主界面字幕正下方那一行语音状态小字
+     *     （见 create_reply_caption() 和 robot_ui_set_status()），与顶栏无关。 */
     lv_obj_t *bar = lv_obj_create(parent);
     /* 高度 40 → **64**：菜单按钮要做到 52 高才够好点（40 的栏里塞不下），
      * 顺便让整块状态栏不那么挤。 */
@@ -437,74 +458,208 @@ void robot_ui_set_net_status(const char *text)
                                 0);
 }
 
-/* ==================== 创建表情区域 ==================== */
-static void create_face_area(lv_obj_t *parent)
+/* ==================== 创建表情区域（会呼吸的笑脸） ==================== */
+
+/* 呼吸相位表：24 跳 × 100ms = 2.4 秒一次呼吸，整张脸上下共 10px。
+ * 查表不用三角函数 —— 板上没必要为这点动画引浮点。 */
+static const int8_t s_breath_y[24] = {
+     0,  1,  2,  3,  4,  5,  5,  5,  4,  3,  2,  1,
+     0, -1, -2, -3, -4, -5, -5, -5, -4, -3, -2, -1,
+};
+
+/* 说话时嘴的开合高度：8 跳 × 100ms = 0.8 秒一张一合。
+ * 最大 42 是按脸盘 152 算的 —— 再大嘴就顶到下巴了。 */
+static const int8_t s_mouth_h[8] = { 14, 24, 34, 42, 38, 28, 20, 14 };
+
+/* 说话时两圈涟漪的透明度，两圈错开 4 跳 = 看着像波从里往外推。 */
+static const uint8_t s_ripple_opa[8] = { 255, 200, 150, 110, 90, 110, 150, 200 };
+
+/* 把嘴摆回"这个表情该有的样子"（robot_ui_set_face 换表情后调一次，
+ * 说话动画收尾也调一次 —— 否则嘴会停在张开的那一格）。 */
+static void face_mouth_rest(void)
 {
-    /* 表情容器 */
-    lv_obj_t *container = lv_obj_create(parent);
-    lv_obj_set_size(container, LV_PCT(100), LV_SIZE_CONTENT);
-    lv_obj_align(container, LV_ALIGN_TOP_MID, 0, 60);
-    lv_obj_set_style_bg_opa(container, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(container, 0, 0);
-    lv_obj_set_flex_flow(container, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(container, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-
-    /* 表情标签 */
-    lbl_face = lv_label_create(container);
-    lv_label_set_text(lbl_face, face_array[ROBOT_FACE_HAPPY]);
-    lv_obj_add_style(lbl_face, &style_face, 0);
-    lv_obj_set_style_text_font(lbl_face, &lv_font_ui_24, 0);
-
-    /* 状态文字 */
-    lbl_reminder = lv_label_create(container);
-    lv_label_set_text(lbl_reminder, "你好，我是智爱");
-    lv_obj_set_style_text_color(lbl_reminder, THEME_TEXT_SECONDARY, 0);
-    lv_obj_set_style_text_font(lbl_reminder, &lv_font_ui_24, 0);
-    lv_obj_set_style_pad_top(lbl_reminder, 10, 0);
-
-    /* 启动表情动画 - 上下浮动 */
-    lv_anim_init(&anim_face);
-    lv_anim_set_var(&anim_face, lbl_face);
-    lv_anim_set_values(&anim_face, -10, 10);
-    lv_anim_set_time(&anim_face, 1000);
-    lv_anim_set_playback_time(&anim_face, 1000);
-    lv_anim_set_repeat_count(&anim_face, LV_ANIM_REPEAT_INFINITE);
-    lv_anim_set_exec_cb(&anim_face, (lv_anim_exec_xcb_t)lv_obj_set_y);
-    lv_anim_start(&anim_face);
-    face_anim_running = true;
+    if (mouth == NULL) {
+        return;
+    }
+    lv_obj_set_size(mouth, face_mouth_w, face_mouth_h);
+    lv_obj_set_style_radius(mouth, face_mouth_r, 0);
+    lv_obj_align(mouth, LV_ALIGN_CENTER, 0, face_mouth_dy);
 }
 
-/* 全屏二级页面打开/关闭时暂停/恢复表情浮动动画。
- *
- * 为什么必须暂停：这个动画每帧（16~33ms）都把表情标签那块区域标脏等重绘。
- * 页面全屏盖住主屏之后，那块重绘完全是白做的，而滚动页面时 LVGL 要把
- * 滚动的大块重绘和这块"冤枉"重绘拼在一起送显 —— 面板接口本来就慢，
- * 叠加出来就是用户看到的"上下滑动卡顿"。
- * 只能在 LVGL 线程里调（touch_ui 的面板开关路径都在 LVGL 线程）。 */
-void robot_ui_set_face_anim_paused(bool paused)
+/* 动画主定时器。100ms 一跳，一次跳把该变的都变了（见文件头部那段说明）。 */
+static void face_timer_cb(lv_timer_t *t)
 {
-    if (lbl_face == NULL) {
+    (void)t;
+    if (face_paused || face_core == NULL) {
         return;
     }
 
-    if (paused && face_anim_running) {
-        lv_anim_del(lbl_face, (lv_anim_exec_xcb_t)lv_obj_set_y);
-        lv_obj_set_y(lbl_face, 0);   /* 停在中间，别停在半空 */
-        face_anim_running = false;
-    } else if (!paused && !face_anim_running) {
-        lv_anim_init(&anim_face);
-        lv_anim_set_var(&anim_face, lbl_face);
-        lv_anim_set_values(&anim_face, -10, 10);
-        lv_anim_set_time(&anim_face, 1000);
-        lv_anim_set_playback_time(&anim_face, 1000);
-        lv_anim_set_repeat_count(&anim_face, LV_ANIM_REPEAT_INFINITE);
-        lv_anim_set_exec_cb(&anim_face, (lv_anim_exec_xcb_t)lv_obj_set_y);
-        lv_anim_start(&anim_face);
-        face_anim_running = true;
+    face_tick++;
+
+    if (current_status == ROBOT_STATUS_SPEAKING) {
+        uint32_t s = face_tick % 8;
+        int32_t h = s_mouth_h[s];
+
+        /* 嘴一张一合：高变了就跟着把圆角改成 h/2，一直保持椭圆/胶囊形 */
+        if (mouth != NULL && lv_obj_get_height(mouth) != h) {
+            lv_obj_set_height(mouth, h);
+            lv_obj_set_style_radius(mouth, h / 2, 0);
+            lv_obj_align(mouth, LV_ALIGN_CENTER, 0, face_mouth_dy);
+        }
+
+        if (face_ring1 != NULL) {
+            lv_obj_set_style_border_opa(face_ring1, s_ripple_opa[s], 0);
+        }
+        if (face_ring2 != NULL) {
+            lv_obj_set_style_border_opa(face_ring2, s_ripple_opa[(s + 4) % 8], 0);
+        }
+
+        /* 说话时**不**上下飘：嘴已经在动，再飘会晃眼。
+         * 停在呼吸的中位（base_y），别停在半空。 */
+        if (lv_obj_get_y(face_core) != face_core_base_y) {
+            lv_obj_set_y(face_core, face_core_base_y);
+        }
+        face_was_speaking = true;
+        return;
+    }
+
+    /* 不说话：整张脸慢慢呼吸（上下 10px / 2.4 秒） */
+    int32_t y = face_core_base_y + s_breath_y[face_tick % 24];
+    if (lv_obj_get_y(face_core) != y) {
+        lv_obj_set_y(face_core, y);
+    }
+
+    /* 刚从"在说"退回来：把嘴和涟漪一次性归位，之后就不再碰它们
+     * （每跳都写同一次值会让 LVGL 白白标脏重绘） */
+    if (face_was_speaking) {
+        face_mouth_rest();
+        if (face_ring1 != NULL) {
+            lv_obj_set_style_border_opa(face_ring1, 150, 0);
+        }
+        if (face_ring2 != NULL) {
+            lv_obj_set_style_border_opa(face_ring2, 210, 0);
+        }
+        face_was_speaking = false;
     }
 }
 
-/* ==================== 创建 AI 回复区域 ==================== */
+static void create_face_area(lv_obj_t *parent)
+{
+    /* 脸区：390×206，贴着状态栏下面。
+     * ⚠️ 状态栏是 **64px** 高（create_status_bar 里写死的），不是更早那版注释
+     * 说的 42 —— 竖向预算按 64 重排过：状态栏 64 + 脸 206 + 字幕两行 52 +
+     * 状态小字 22 + 按钮排 96 ≈ 450，一屏刚好塞下，谁也不挤谁。 */
+    lv_obj_t *area = lv_obj_create(parent);
+    lv_obj_set_size(area, LV_PCT(100), 206);
+    lv_obj_align(area, LV_ALIGN_TOP_MID, 0, 66);
+    lv_obj_set_style_bg_opa(area, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(area, 0, 0);
+    lv_obj_set_style_pad_all(area, 0, 0);
+    lv_obj_remove_flag(area, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* 两圈涟漪（说话时闪，平时当脸的光晕） */
+    face_ring2 = lv_obj_create(area);
+    lv_obj_set_size(face_ring2, 200, 200);
+    lv_obj_align(face_ring2, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_opa(face_ring2, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_radius(face_ring2, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_border_width(face_ring2, 3, 0);
+    lv_obj_set_style_border_color(face_ring2, THEME_GREEN_BORDER, 0);
+    lv_obj_set_style_border_opa(face_ring2, 210, 0);
+    lv_obj_remove_flag(face_ring2, LV_OBJ_FLAG_SCROLLABLE);
+
+    face_ring1 = lv_obj_create(area);
+    lv_obj_set_size(face_ring1, 178, 178);
+    lv_obj_align(face_ring1, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_opa(face_ring1, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_radius(face_ring1, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_border_width(face_ring1, 3, 0);
+    lv_obj_set_style_border_color(face_ring1, THEME_GREEN, 0);
+    lv_obj_set_style_border_opa(face_ring1, 150, 0);
+    lv_obj_remove_flag(face_ring1, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* 脸本体容器：眼睛/嘴是它的孩子，整体上下飘 = 呼吸 */
+    face_core = lv_obj_create(area);
+    lv_obj_set_size(face_core, 152, 152);
+    lv_obj_align(face_core, LV_ALIGN_CENTER, 0, 0);
+    face_core_base_y = lv_obj_get_y(face_core);   /* 记下中位，动画在这上下各 5px */
+    lv_obj_set_style_bg_opa(face_core, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(face_core, 0, 0);
+    lv_obj_set_style_pad_all(face_core, 0, 0);
+    lv_obj_remove_flag(face_core, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* 黄色圆脸盘（不透明，压在眼睛/嘴下面） */
+    face_disc = lv_obj_create(face_core);
+    lv_obj_set_size(face_disc, 152, 152);
+    lv_obj_set_pos(face_disc, 0, 0);
+    lv_obj_set_style_bg_color(face_disc, THEME_GREEN, 0);
+    lv_obj_set_style_bg_opa(face_disc, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(face_disc, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_border_width(face_disc, 0, 0);
+    lv_obj_remove_flag(face_disc, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* 眼睛：两根圆角条。先建的 disc 在下面，后建的眼睛在上面。 */
+    eye_l = lv_obj_create(face_core);
+    lv_obj_set_size(eye_l, 22, 28);
+    lv_obj_align(eye_l, LV_ALIGN_CENTER, -26, -22);
+    lv_obj_set_style_bg_color(eye_l, THEME_TEXT_PRIMARY, 0);
+    lv_obj_set_style_bg_opa(eye_l, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(eye_l, 11, 0);
+    lv_obj_set_style_border_width(eye_l, 0, 0);
+    lv_obj_remove_flag(eye_l, LV_OBJ_FLAG_SCROLLABLE);
+
+    eye_r = lv_obj_create(face_core);
+    lv_obj_set_size(eye_r, 22, 28);
+    lv_obj_align(eye_r, LV_ALIGN_CENTER, 26, -22);
+    lv_obj_set_style_bg_color(eye_r, THEME_TEXT_PRIMARY, 0);
+    lv_obj_set_style_bg_opa(eye_r, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(eye_r, 11, 0);
+    lv_obj_set_style_border_width(eye_r, 0, 0);
+    lv_obj_remove_flag(eye_r, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* 嘴：圆角条，宽高和圆角由表情/说话动画改 */
+    mouth = lv_obj_create(face_core);
+    lv_obj_set_size(mouth, face_mouth_w, face_mouth_h);
+    lv_obj_align(mouth, LV_ALIGN_CENTER, 0, face_mouth_dy);
+    lv_obj_set_style_bg_color(mouth, THEME_TEXT_PRIMARY, 0);
+    lv_obj_set_style_bg_opa(mouth, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(mouth, face_mouth_r, 0);
+    lv_obj_set_style_border_width(mouth, 0, 0);
+    lv_obj_remove_flag(mouth, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* 开机动画：100ms 一跳。全屏页面盖上来时由
+     * robot_ui_set_face_anim_paused() 整个停掉。 */
+    face_timer = lv_timer_create(face_timer_cb, 100, NULL);
+    face_paused = false;
+}
+
+/* 全屏二级页面打开/关闭时暂停/恢复笑脸动画。
+ *
+ * 为什么必须暂停：这个动画每 100ms 都把脸那块区域标脏等重绘。页面全屏盖住
+ * 主屏之后，那块重绘完全是白做的，而滚动页面时 LVGL 要把滚动的大块重绘和
+ * 这块"冤枉"重绘拼在一起送显 —— 面板接口本来就慢，叠加出来就是用户看到的
+ * "上下滑动卡顿"。现在是 lv_timer，直接 lv_timer_pause/resume，比当年删建
+ * lv_anim 干净得多。
+ * 只能在 LVGL 线程里调（touch_ui 的面板开关路径都在 LVGL 线程）。 */
+void robot_ui_set_face_anim_paused(bool paused)
+{
+    face_paused = paused;
+
+    if (face_timer != NULL) {
+        if (paused) {
+            lv_timer_pause(face_timer);
+        } else {
+            lv_timer_resume(face_timer);
+        }
+    }
+
+    /* 停在中位，别停在呼吸的半空 */
+    if (paused && face_core != NULL) {
+        lv_obj_set_y(face_core, face_core_base_y);
+    }
+}
+
+/* ==================== AI 回复字幕 + 语音状态小字 ==================== */
 
 /* 语音状态小标签（lbl_status）的四档配色：听=蓝、想=橙、说=绿、空闲=灰。
  *
@@ -519,46 +674,32 @@ void robot_ui_set_face_anim_paused(bool paused)
 #define UI_STATUS_COLOR_THINKING  THEME_ST_THINKING    /* 橙：在想 */
 #define UI_STATUS_COLOR_SPEAKING  THEME_ST_SPEAKING    /* 绿：在说 */
 
-static void create_ai_reply_area(lv_obj_t *parent)
+static void create_reply_caption(lv_obj_t *parent)
 {
-    /* AI 回复容器。
+    /* ★ 2026-10-29 用户点名「把主页面的对话框框去掉」—— 那张白色圆角卡连同
+     * 里面的「智爱」署名一起拆了，主页面主角换成上面那个大笑脸。
      *
-     * 高度 120 -> **150**（2026-09-16）：下面那一行语音状态小字（20 号字 21px
-     * + 6px 上边距 ≈ 27px）要有地方放，不然它会反过来把上面两行（[AI] 图标 +
-     * 回复正文）往上挤 —— 要求就是"别挤掉现有内容"。
-     * 容器本身仍然是"居中 + 向下 20"，所以这 30px 是上下各长 15px：
-     * 上沿离表情区还有 40 多像素、下沿离底部按钮栏还有 50 像素，都不碰。 */
-    lv_obj_t *container = lv_obj_create(parent);
-    lv_obj_set_size(container, LV_PCT(90), 150);
-    lv_obj_align(container, LV_ALIGN_CENTER, 0, 20);
-    lv_obj_set_style_bg_color(container, THEME_BG_CARD, 0);
-    lv_obj_set_style_radius(container, 20, 0);
-    lv_obj_set_style_border_width(container, 2, 0);
-    lv_obj_set_style_border_color(container, THEME_GREEN_BORDER, 0);
-    lv_obj_set_flex_flow(container, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(container, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_all(container, 15, 0);
+     * 但 AI 说的那句话不能凭空消失：老人要看它在说啥，家属调试也要看。
+     * 所以留成**脸下面的一行字幕**，不带框、不带底色，靠页面奶油底衬着。
+     * 这是本工程有意为之的一处偏差（用户原话只说换掉框，没说把字也删掉），
+     * 不想要这一行随时可以再拆，删掉本函数体即可，别处不受影响。 */
 
-    /* 发送者名（原来是 "[AI]" 字样，方括号看着乱，换成聊天软件式的署名） */
-    lv_obj_t *lbl_icon = lv_label_create(container);
-    lv_label_set_text(lbl_icon, "智爱");
-    lv_obj_set_style_text_color(lbl_icon, THEME_GREEN_DARK, 0);
-    lv_obj_set_style_text_font(lbl_icon, &lv_font_ui_20, 0);
-
-    /* AI 回复内容 */
-    lbl_ai_reply = lv_label_create(container);
-    lv_label_set_text(lbl_ai_reply, "你好！\n有什么可以帮你的吗？");
+    /* AI 回复字幕：最多两行，超出截断（LV_LABEL_LONG_DOT）——
+     * 这一屏的主角是脸，长篇大论不该压在它下面挤掉按钮。 */
+    lbl_ai_reply = lv_label_create(parent);
+    lv_label_set_text(lbl_ai_reply, "你好！我是智爱\n有什么可以帮你的吗？");
     lv_obj_set_style_text_color(lbl_ai_reply, THEME_TEXT_PRIMARY, 0);
     lv_obj_set_style_text_font(lbl_ai_reply, &lv_font_ui_24, 0);
-    lv_label_set_long_mode(lbl_ai_reply, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(lbl_ai_reply, LV_PCT(100));
+    lv_label_set_long_mode(lbl_ai_reply, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(lbl_ai_reply, 350);
+    lv_obj_align(lbl_ai_reply, LV_ALIGN_TOP_MID, 0, 276);
     lv_obj_set_style_text_align(lbl_ai_reply, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_pad_top(lbl_ai_reply, 5, 0);
 
     /* 语音状态小标签：主界面上「空闲 / 在听… / 在想… / 在说…」那一行。
      *
      * 用户原话：「既然我们做了常态语音，不如在主页那个对话框加上状态」——
-     * 不弹开语音面板，扫一眼主界面就知道它现在在干什么。
+     * 不弹开语音面板，扫一眼主界面就知道它现在在干什么。对话框没了，
+     * 这一行挪到字幕正下方，位置还在"主页面正中偏下"，老人照旧一眼看到。
      *
      * 谁写它：只有 robot_ui_set_status()（四档的文字和颜色都在那边）。
      * 这里只把控件建出来挂到 lbl_status 上，**不另开一条状态来源** ——
@@ -566,71 +707,67 @@ static void create_ai_reply_area(lv_obj_t *parent)
      * robot_ui_bridge_voice_state() / MQTT 的 voice_state 分支 → ui_post()
      * （内部 lv_async_call）投到 LVGL 线程，最后落到那一个 setter 上。
      *
-     * 字号取 20（比上面两行的 24 小一档）：它是状态提示，不该跟 AI 的正文抢
+     * 字号取 20（比字幕的 24 小一档）：它是状态提示，不该跟 AI 的正文抢
      * 注意力；又没有小到看不清 —— 这一屏是给老人用的，16 那一档本工程只用在
      * 辅助信息上。颜色由 setter 按状态给，初始是"空闲"的灰。 */
-    lbl_status = lv_label_create(container);
+    lbl_status = lv_label_create(parent);
     lv_label_set_text(lbl_status, "空闲");
     lv_obj_set_style_text_color(lbl_status, UI_STATUS_COLOR_IDLE, 0);
     lv_obj_set_style_text_font(lbl_status, &lv_font_ui_20, 0);
-    lv_obj_set_style_pad_top(lbl_status, 6, 0);
+    lv_obj_align(lbl_status, LV_ALIGN_TOP_MID, 0, 332);
 }
 
 /* ==================== 创建底部按钮 ==================== */
 static void create_bottom_buttons(lv_obj_t *parent)
 {
-    /* 按钮容器 */
-    /* ⚠️ 这块屏是圆角屏（390×450）：容器铺满 100% 宽的话，最左/最右那个按钮
-     * 会压在**左下/右下圆角**上 —— 视觉被切一块，触摸也可能点不到。
-     * 所以左右各内缩 28px，三个按钮整体往里收（用户反馈"不好点"）。 */
+    /* 按钮容器。
+     * ⚠️ 这块屏是圆角屏（390×450）：容器铺满 100% 宽的话，按钮会压在
+     * **左下/右下圆角**上 —— 视觉被切一块，触摸也可能点不到。
+     * 所以左右各内缩 40px，两颗按钮整体往里收。 */
     lv_obj_t *container = lv_obj_create(parent);
-    lv_obj_set_size(container, LV_PCT(100), 88);
+    lv_obj_set_size(container, LV_PCT(100), 96);
     lv_obj_align(container, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_opa(container, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(container, 0, 0);
-    lv_obj_set_style_pad_left(container, 28, 0);
-    lv_obj_set_style_pad_right(container, 28, 0);
-    /* 底部内缩 12（原 6）：给屏幕下圆角让出余量，三颗按钮整体不再贴边 */
-    lv_obj_set_style_pad_bottom(container, 12, 0);
+    lv_obj_set_style_pad_left(container, 40, 0);
+    lv_obj_set_style_pad_right(container, 40, 0);
+    /* 底部内缩 8：给屏幕下圆角让出余量，按钮不再贴边。
+     * 内容区 88 高，正好放下那颗 86 的圆。 */
+    lv_obj_set_style_pad_bottom(container, 8, 0);
+    lv_obj_remove_flag(container, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_flex_flow(container, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(container, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
-    /* 提醒按钮 */
-    btn_remind = lv_btn_create(container);
-    lv_obj_set_size(btn_remind, 94, 56);
-    lv_obj_add_style(btn_remind, &style_btn, 0);
-    lv_obj_add_event_cb(btn_remind, btn_event_handler, LV_EVENT_CLICKED, (void *)UI_VIEW_REMIND);
-    lv_obj_t *lbl_btn1 = lv_label_create(btn_remind);
-    /* 中文标签（字库已经是 GB2312 全集，"提醒"两个字有字形）——
-     * 原来写的 "Remind"，主屏其它按钮（报警）都是中文，统一一下更认得出。 */
-    lv_label_set_text(lbl_btn1, "提醒");
-    lv_obj_set_style_text_font(lbl_btn1, &lv_font_ui_24, 0);
-    lv_obj_center(lbl_btn1);
-
-    /* 菜单按钮：2026-10-14 用户拍板，这颗位置原来是「设置」，换成「菜单」
-     * （顶栏那颗同名按钮同时删除，顶部只留时间）。设置页仍可从主菜单进，
-     * 功能一个不丢；菜单反而升格成常驻底排，老人不用手势也能随时进主菜单。 */
+    /* 菜单按钮：**小方形**（72×72，圆角 16 = 一眼看得出是"方"，但不硌手）。
+     * 2026-10-29 用户拍板「大动画下面改成方形小的方形菜单和大的圆形紧急呼叫」。
+     * 它只是个入口，不是安全功能，所以刻意比报警小一圈 —— 别跟报警抢眼睛。
+     * 设置页/提醒页/语音聊天都在它开出的主菜单四宫格里，功能一个没丢。 */
     btn_menu = lv_btn_create(container);
-    lv_obj_set_size(btn_menu, 94, 56);
+    lv_obj_set_size(btn_menu, 72, 72);
     lv_obj_add_style(btn_menu, &style_btn, 0);
+    lv_obj_set_style_radius(btn_menu, 16, 0);
     lv_obj_add_event_cb(btn_menu, menu_button_event_handler, LV_EVENT_CLICKED, NULL);
     lv_obj_t *lbl_btn2 = lv_label_create(btn_menu);
     lv_label_set_text(lbl_btn2, "菜单");
     lv_obj_set_style_text_font(lbl_btn2, &lv_font_ui_24, 0);
+    /* 黄底上**不能用白字**（对比度不够，老人更看不清）—— 用深棕，
+     * 和 ui_theme.h 里 THEME_TEXT_ON_GREEN 是同一套道理。 */
+    lv_obj_set_style_text_color(lbl_btn2, THEME_TEXT_ON_GREEN, 0);
     lv_obj_center(lbl_btn2);
 
-    /* 报警按钮：全屏最大的控件（110×64，比旁边两个明显大一圈）——
+    /* 紧急呼叫按钮：**大圆形**（86×86），红 —— 全屏最大的控件。
      * 用户要求"报警按钮要清晰"，老人紧急时一眼找到、一按就中。
-     * 左侧再让开 14px：SPACE_EVENLY 下三颗按钮间距本来就均等，报警
-     * 更大更红，和"设置"贴太近容易误触 —— 加一道明显的空隙。 */
+     * 红色是约定不是配色（ui_theme.h 里那段注释），换色调时**没动**。
+     * 文案分两行（紧急 / 呼叫）：四个字一行在 86 的圆里放不下，硬塞会顶到圆边。 */
     btn_alarm = lv_btn_create(container);
-    lv_obj_set_size(btn_alarm, 110, 64);
+    lv_obj_set_size(btn_alarm, 86, 86);
     lv_obj_add_style(btn_alarm, &style_btn_alarm, 0);
-    lv_obj_set_style_margin_left(btn_alarm, 14, 0);
+    lv_obj_set_style_radius(btn_alarm, LV_RADIUS_CIRCLE, 0);
     lv_obj_add_event_cb(btn_alarm, btn_event_handler, LV_EVENT_CLICKED, (void *)UI_VIEW_ALARM);
     lv_obj_t *lbl_btn3 = lv_label_create(btn_alarm);
-    lv_label_set_text(lbl_btn3, "报警");
+    lv_label_set_text(lbl_btn3, "紧急\n呼叫");
     lv_obj_set_style_text_font(lbl_btn3, &lv_font_ui_24, 0);
+    lv_obj_set_style_text_align(lbl_btn3, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_center(lbl_btn3);
 }
 
@@ -656,7 +793,11 @@ static void btn_event_handler(lv_event_t *e)
                 robot_ui_show_alarm("Abnormal detected!\nPlease confirm if help is needed.");
                 break;
             case UI_VIEW_MAIN:
-                /* 报警界面 Back 按钮:关闭报警，返回主界面 */
+                /* 报警界面 Back 按钮:关闭报警，返回主界面。
+                 * ★ 2026-11-01：还要停 voice_emerg 的铃（原来只调
+                 *   robot_ui_close_alarm 停板级警音，voice_emerg 的
+                 *   响-停-听循环还在跑，铃声不断、页面却没了）。 */
+                voice_emerg_cancel("手动停止");
                 robot_ui_close_alarm();
                 break;
             default:
@@ -711,12 +852,12 @@ static void create_alarm_screen(void)
     lv_obj_set_style_text_font(text, &lv_font_ui_24, 0);
     lv_obj_align(text, LV_ALIGN_CENTER, 0, 0);
 
-    /* 报警详情 */
-    lv_obj_t *detail = lv_label_create(scr_alarm);
-    lv_label_set_text(detail, "检测到异常\n已通知家人");
-    lv_obj_set_style_text_color(detail, THEME_TEXT_ON_GREEN, 0);
-    lv_obj_set_style_text_font(detail, &lv_font_ui_24, 0);
-    lv_obj_align(detail, LV_ALIGN_CENTER, 0, 40);
+    /* 报警详情（文案由 robot_ui_show_alarm() 按推送能不能发出去改写） */
+    lbl_alarm_detail = lv_label_create(scr_alarm);
+    lv_label_set_text(lbl_alarm_detail, "检测到异常\n已通知家人");
+    lv_obj_set_style_text_color(lbl_alarm_detail, THEME_TEXT_ON_GREEN, 0);
+    lv_obj_set_style_text_font(lbl_alarm_detail, &lv_font_ui_24, 0);
+    lv_obj_align(lbl_alarm_detail, LV_ALIGN_CENTER, 0, 40);
 
     /* 返回按钮：加大到 180×64（用户要求报警相关按钮清晰好点） */
     lv_obj_t *btn_back = lv_btn_create(scr_alarm);
@@ -753,34 +894,99 @@ void robot_ui_init(void)
 }
 
 /* ==================== 设置表情 ==================== */
+/* 表情不再是那行 ASCII 字，是**画出来的脸**：换表情 = 换脸盘颜色 + 眼睛形状
+ * + 嘴形。嘴的"这个表情该有的样子"存在 face_mouth_w/h/r/dy 里，
+ * face_mouth_rest() 照着摆；正在说话时嘴被动画抢走（face_timer_cb），
+ * 说完那一跳会自动归位，不会停在张开的那一格。 */
 void robot_ui_set_face(robot_face_t face)
 {
     if (face >= ROBOT_FACE_MAX) return;
 
     current_face = face;
+    if (face_disc == NULL) return;
 
-    if (lbl_face) {
-        lv_label_set_text(lbl_face, face_array[face]);
+    lv_color_t disc = THEME_GREEN;   /* 脸盘底色，默认就是那张黄脸 */
+    int32_t eye_w = 22, eye_h = 28, eye_dx = 26, eye_dy = -22, eye_rad = 11;
 
-        /* 根据表情改变颜色 */
-        switch (face) {
-            case ROBOT_FACE_HAPPY:
-                lv_obj_set_style_text_color(lbl_face, THEME_FACE_HAPPY, 0); // 深绿
-                break;
-            case ROBOT_FACE_THINKING:
-                lv_obj_set_style_text_color(lbl_face, THEME_FACE_THINKING, 0); // 蓝
-                break;
-            case ROBOT_FACE_SLEEPY:
-                lv_obj_set_style_text_color(lbl_face, THEME_FACE_SLEEPY, 0); // 灰
-                break;
-            case ROBOT_FACE_ALARM:
-                lv_obj_set_style_text_color(lbl_face, THEME_FACE_ALARM, 0); // 红
-                break;
-            default:
-                lv_obj_set_style_text_color(lbl_face, THEME_FACE_HAPPY, 0);
-                break;
-        }
+    face_mouth_w = 60;
+    face_mouth_h = 14;
+    face_mouth_r = 7;
+    face_mouth_dy = 20;
+
+    switch (face) {
+        case ROBOT_FACE_HAPPY:
+            break;                                  /* 默认就是笑脸 */
+
+        case ROBOT_FACE_THINKING:
+            /* 眼睛往上看 + 嘴抿成一小团 */
+            eye_dy = -28;
+            face_mouth_w = 26;
+            face_mouth_h = 26;
+            face_mouth_r = 13;
+            face_mouth_dy = 22;
+            break;
+
+        case ROBOT_FACE_SLEEPY:
+            /* 眼睛眯成两条缝 + 嘴小小的 */
+            disc = THEME_FACE_SLEEPY;
+            eye_w = 26;
+            eye_h = 7;
+            eye_rad = 3;
+            face_mouth_w = 30;
+            face_mouth_h = 10;
+            face_mouth_r = 5;
+            break;
+
+        case ROBOT_FACE_SURPRISED:
+            /* 眼睛瞪圆 + 嘴张成椭圆 */
+            eye_w = 26;
+            eye_h = 32;
+            eye_rad = 13;
+            face_mouth_w = 30;
+            face_mouth_h = 36;
+            face_mouth_r = 15;
+            face_mouth_dy = 24;
+            break;
+
+        case ROBOT_FACE_WORRIED:
+            disc = THEME_ORANGE;
+            eye_w = 22;
+            eye_h = 22;
+            eye_rad = 11;
+            face_mouth_w = 40;
+            face_mouth_h = 10;
+            face_mouth_r = 5;
+            face_mouth_dy = 24;
+            break;
+
+        case ROBOT_FACE_ALARM:
+            /* 红脸 + 张大嘴。报警页整体也是红的，两边一致 ——
+             * 红是"出事了"的约定，换色调时一个字节都没动。 */
+            disc = THEME_FACE_ALARM;
+            eye_w = 24;
+            eye_h = 9;
+            eye_rad = 4;
+            face_mouth_w = 36;
+            face_mouth_h = 32;
+            face_mouth_r = 16;
+            face_mouth_dy = 22;
+            break;
+
+        default:
+            break;
     }
+
+    lv_obj_set_style_bg_color(face_disc, disc, 0);
+
+    lv_obj_set_size(eye_l, eye_w, eye_h);
+    lv_obj_set_style_radius(eye_l, eye_rad, 0);
+    lv_obj_align(eye_l, LV_ALIGN_CENTER, -eye_dx, eye_dy);
+
+    lv_obj_set_size(eye_r, eye_w, eye_h);
+    lv_obj_set_style_radius(eye_r, eye_rad, 0);
+    lv_obj_align(eye_r, LV_ALIGN_CENTER, eye_dx, eye_dy);
+
+    face_mouth_rest();
 }
 
 /* ==================== 设置 AI 回复 ==================== */
@@ -792,7 +998,7 @@ void robot_ui_set_ai_reply(const char *text)
 }
 
 /* ==================== 设置状态 ==================== */
-/* 写的是主界面「AI 回复区」里那一行语音状态小字（create_ai_reply_area() 建的
+/* 写的是主界面字幕正下方那一行语音状态小字（create_reply_caption() 建的
  * lbl_status）。**状态栏上没有它** —— 状态栏那三样 2026-09-14 已被用户删掉。
  *
  * 四档和语音链路的四档一一对应（hello_app 的 voice_state_probe()）：
@@ -801,8 +1007,8 @@ void robot_ui_set_ai_reply(const char *text)
  *   在想 THINKING   「在想…」 橙   识别 / 等大模型这一段
  *   在说 SPEAKING   「在说…」 绿
  * 文案比语音镜像面板（touch_ui.c 的 voice_state_text：「检测到声音」「正在想…」
- * 「正在说话…」）**更短**：面板里那行是大字、有整行的地方，主界面这一行是夹在
- * 对话框里的小字，短一点才不会撑宽。颜色两边是同一套（见文件上面那几个
+ * 「正在说话…」）**更短**：面板里那行是大字、有整行的地方，主界面这一行是字幕
+ * 下面的小字，短一点才不会撑宽。颜色两边是同一套（见文件上面那几个
  * UI_STATUS_COLOR_*），老人换个屏幕不用重新学。
  *
  * 提醒中 / 报警两档沿用原来的措辞（它们是别的流程在借这一行，不是语音状态），
@@ -1005,7 +1211,12 @@ void robot_ui_show_error(const char *title, const char *content)
  *   alarm_sound_active  —— 报警还没结束（出声线程据此决定继续还是收摊）
  *   alarm_sound_pending —— 有一次"出声 + 上报"还没做（show_alarm 每次调用置位）
  *   alarm_worker_up     —— 出声线程活着（活着就不再起第二条） */
-static pthread_mutex_t alarm_audio_lock = PTHREAD_MUTEX_INITIALIZER;
+/* ★ 2026-11-01：**不用 mutex，用二值信号量**（同 g_audio_in_lock 的教训）。
+ *   这颗内核的 mutex 持有者跟踪不可靠：sem_post.c:63 断言（"解锁线程不是
+ *   持锁者"）在门控锁、录音锁上都栽过。alarm_audio_lock 保护的只是几个标志
+ *   的短临界区，不需要优先级继承；信号量没有持有者概念，post 永远不走断言。
+ *   判据：报警页不再"弹出就卡"。 */
+static sem_t alarm_audio_lock = SEM_INITIALIZER(1);
 static bool alarm_sound_active  = false;
 static bool alarm_sound_pending = false;
 static bool alarm_worker_up     = false;
@@ -1026,6 +1237,16 @@ static void alarm_sound_do(void)
                         "报警已触发，请尽快确认");
     if (ret != OK) {
         printf("robot_ui: alarm_trigger failed: %d\n", ret);
+    } else {
+        /* ★ 语音急救模块挂上来（2026-10-31）：补上"10 秒内说「没事」就能
+         *   停铃"这件事。铃和推送上面这条路都已经做了，voice_emerg 探到
+         *   板级报警在响会自己转**辅助模式**：不重复响铃、不重复推送，
+         *   只盯「没事」好把铃掐掉 —— 老人误触这个大红按钮的退路，
+         *   今天没有（铃会一直响到 60 秒自停）。
+         *
+         *   顺序是钉死的：**必须在 alarm_trigger 之后**，因为辅助模式的
+         *   判据就是"触发这一刻板级报警在不在响"。 */
+        voice_emerg_trigger("sos_button", "用户按下报警按钮");
     }
 
     /* 上报：MQTT 发到 zhi_ai/<client_id>/alarm（+ 手机推送）。
@@ -1056,7 +1277,7 @@ static void *alarm_sound_worker(void *arg)
     for (;;) {
         bool pending;
 
-        pthread_mutex_lock(&alarm_audio_lock);
+        nxsem_wait_uninterruptible(&alarm_audio_lock);
 
         /* 出声 + 上报。show_alarm 每调用一次置一次 pending，这里认领；
          * 报警页还开着时又来新的触发（声音检测 / MQTT 反复调 show_alarm）
@@ -1075,11 +1296,11 @@ static void *alarm_sound_worker(void *arg)
              * 置回去，本线程下面那一圈照常出声），要么看到 worker_up 已经是假
              * （那它自己会起一条新线程）。 */
             alarm_worker_up = false;
-            pthread_mutex_unlock(&alarm_audio_lock);
+            nxsem_post(&alarm_audio_lock);
             return NULL;
         }
 
-        pthread_mutex_unlock(&alarm_audio_lock);
+        nxsem_post(&alarm_audio_lock);
 
         if (pending) {
             alarm_sound_do();
@@ -1107,7 +1328,7 @@ static void alarm_sound_begin(void)
     pthread_t      tid;
     bool           need_start = false;
 
-    pthread_mutex_lock(&alarm_audio_lock);
+    nxsem_wait_uninterruptible(&alarm_audio_lock);
 
     alarm_sound_active  = true;
     alarm_sound_pending = true;
@@ -1117,7 +1338,7 @@ static void alarm_sound_begin(void)
         need_start = true;
     }
 
-    pthread_mutex_unlock(&alarm_audio_lock);
+    nxsem_post(&alarm_audio_lock);
 
     if (!need_start) {
         return;
@@ -1134,10 +1355,10 @@ static void alarm_sound_begin(void)
          * （页面、上报都在，只是这一串动作压了一小下 LVGL 线程）。 */
         printf("[Alarm] 出声线程起不来（栈/资源不足），就地出声 + 上报\n");
 
-        pthread_mutex_lock(&alarm_audio_lock);
+        nxsem_wait_uninterruptible(&alarm_audio_lock);
         alarm_worker_up     = false;
         alarm_sound_pending = false;
-        pthread_mutex_unlock(&alarm_audio_lock);
+        nxsem_post(&alarm_audio_lock);
 
         alarm_sound_do();
         return;
@@ -1155,15 +1376,19 @@ static void alarm_sound_begin(void)
  */
 static void alarm_sound_end(void)
 {
-    pthread_mutex_lock(&alarm_audio_lock);
+    /* ★ 2026-11-01：不持锁直接写标志 —— 单核上写 bool 是原子的，
+     *   而这里从 LVGL 线程调（按钮回调），拿锁可能被工作线程短暂阻塞。
+     *   worker 每 1 秒检查 alarm_sound_active，最多晚 1 秒收摊。 */
     alarm_sound_active  = false;      /* 出声线程据此收摊 */
     alarm_sound_pending = false;
-    pthread_mutex_unlock(&alarm_audio_lock);
 }
 
 /* ==================== 显示报警 ==================== */
 void robot_ui_show_alarm(const char *content)
 {
+    /* ★ 2026-11-01：入口无条件打一行 —— 原来本函数只在 ask_panel 存在时才打日志，
+     *   报警页弹出后 UI 卡死时串口里看不到任何触发记录，排查无从下手。 */
+    printf("[robot_ui] show_alarm: %s\n", content != NULL ? content : "(null)");
     /* ⓪' 报警一旦真的走起来，**另一条确认路**（hello_app 的语音追问：大字
      *     「检测到声音」那一套）就该停下：它是同一件事的另一半，两边都在问的时候
      *     报警声和它的 TTS 会抢同一台半双工音频设备，追问问完还会再问第二轮，
@@ -1198,6 +1423,18 @@ void robot_ui_show_alarm(const char *content)
     /* 设置报警表情 */
     robot_ui_set_face(ROBOT_FACE_ALARM);
     robot_ui_set_status(ROBOT_STATUS_ALARM);
+
+    /* 报警详情那句按「手机推送到底发不发得出去」改写。
+     * push_is_enabled() = push_init() 真拿到了 key（/etc/assets/push_key.txt
+     * 在 ROMFS 里）—— 没拿到时整条 Bark 推送是**必然发不出去**的
+     * （push_send_notification 会直接返回 -1），这时候还写"已通知家人"
+     * 等于让老人以为家人已经在路上，是最坏的一种失败。 */
+    if (lbl_alarm_detail != NULL)
+    {
+        lv_label_set_text(lbl_alarm_detail,
+                          push_is_enabled() ? "检测到异常\n已通知家人"
+                                            : "检测到异常\n请直接联系家人");
+    }
 
     /* 启动报警闪烁：先复位成满不透明，再让 2Hz 定时器跑起来 */
     if (lbl_alarm_icon != NULL)
@@ -1306,6 +1543,22 @@ void robot_ui_close_alarm(void)
 static robot_ask_result_cb_t ask_result_cb = NULL;       /* 回答往哪送（main.c 登记） */
 static void     *ask_result_arg = NULL;
 
+/* ★ 统一报警路径（2026-10-31）：提示行要跟着状态改口
+ *   「10 秒内说"没事"或点下面按钮取消」 -> 「已通知家人，30 秒后重发」。
+ *   建页面时是局部量，改成文件级量才能事后改（页面活着期间它一直有效）。 */
+static lv_obj_t *ask_panel_hint = NULL;
+
+/* 改提示行（**只在 LVGL 线程里**调；别的线程走 main.c 的 ui_post_ask_hint） */
+void robot_ui_ask_hint(const char *hint)
+{
+    if (ask_panel == NULL || ask_panel_hint == NULL || hint == NULL) {
+        return;
+    }
+
+    lv_label_set_text(ask_panel_hint, hint);
+    printf("[Ask] 提示行改为：%s\n", hint);
+}
+
 bool robot_ui_ask_alarm_active(void)
 {
     return (ask_panel != NULL);
@@ -1324,7 +1577,7 @@ static const char *ask_answer_name(int confirmed)
         return "是的，报警";
     }
     if (confirmed == 0) {
-        return "不用了";
+        return "我没事，取消";
     }
     return "作废（报警页让位）";
 }
@@ -1338,6 +1591,7 @@ void robot_ui_close_ask_alarm(void)
 
     lv_obj_del(ask_panel);
     ask_panel = NULL;
+    ask_panel_hint = NULL;          /* 控件已经删了，别留野指针 */
     ask_panel_reason[0] = '\0';
 
     printf("[Ask] 询问页已撤下\n");
@@ -1377,7 +1631,11 @@ static void ask_btn_handler(lv_event_t *e)
     m->confirmed = (int)(intptr_t)lv_event_get_user_data(e);
 
     touch_ui_play_sound("click");
-    printf("[Ask] 屏幕按钮：%s\n", m->confirmed ? "是的，报警" : "不用了");
+    /* ★ 2026-10-31：原来这里自己拼了一句「不用了」，而页面上那个按钮早就改叫
+     * 「我没事，取消」了 —— 日志和屏幕对不上，排查时看着像点了别的东西。
+     * 改成直接问 ask_answer_name()（唯一出处），按钮文案再改也不会漏。 */
+
+    printf("[Ask] 屏幕按钮：%s\n", ask_answer_name(m->confirmed));
 
     if (ui_async_call(ask_btn_apply, m) != LV_RESULT_OK) {
         free(m);
@@ -1469,9 +1727,10 @@ void robot_ui_show_ask_alarm(const char *reason)
     lv_obj_add_flag(lbl_time_ask, LV_OBJ_FLAG_FLOATING);
     lv_obj_align(lbl_time_ask, LV_ALIGN_TOP_MID, 0, 12);
 
-    /* 大字标题 */
+    /* 大字标题 ★ 2026-10-31 统一报警路径：这一页不再是"要不要报警"的询问，
+     * 而是**报警正在进行**的确认页 —— 铃已经在响了，标题就得说实话。 */
     title = lv_label_create(ask_panel);
-    lv_label_set_text(title, "检测到异常声响");
+    lv_label_set_text(title, "正在报警");
     lv_obj_set_style_text_font(title, &lv_font_ui_24, 0);
     lv_obj_set_style_text_color(title, THEME_TEXT_ON_GREEN, 0);
     lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
@@ -1485,15 +1744,23 @@ void robot_ui_show_ask_alarm(const char *reason)
     lv_obj_set_width(detail, LV_PCT(90));
     lv_label_set_long_mode(detail, LV_LABEL_LONG_WRAP);
 
-    /* 时限说明：把 20 秒明写在屏幕上（数的来源是 robot_ui.h 的宏，改一处就够），
-     * 顺带告诉现场"手机上也能确认"——屏幕可能已经坏了，这句话得让评审看见。 */
-    snprintf(hint, sizeof(hint), "%u 秒内请回答，否则按「不用了」处理\n手机上也可以确认",
+    /* ★ 时限说明（2026-10-31 换口径）：原来是"20 秒内请回答，否则按「不用了」
+     * 处理" —— 那等于"没人答就算了、不通知家人"，和用户要的正好相反。
+     * 现在明写：**10 秒内说「没事」或点下面按钮取消，否则通知家人**。
+     * 10 这个数取自 robot_ui.h 的 ROBOT_ASK_ALARM_TIMEOUT_MS，和 voice_emerg
+     * 真正发 Bark 的时刻是同一个数（改一处就够）。 */
+    snprintf(hint, sizeof(hint),
+             "%u 秒内说「没事」或点下面按钮取消\n"
+             "否则通知家人",
              (unsigned)(ROBOT_ASK_ALARM_TIMEOUT_MS / 1000));
     hint_lbl = lv_label_create(ask_panel);
     lv_label_set_text(hint_lbl, hint);
     lv_obj_set_style_text_font(hint_lbl, &lv_font_ui_16, 0);
     lv_obj_set_style_text_color(hint_lbl, THEME_RED_BG, 0);
     lv_obj_set_style_text_align(hint_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(hint_lbl, LV_PCT(90));
+    lv_label_set_long_mode(hint_lbl, LV_LABEL_LONG_WRAP);
+    ask_panel_hint = hint_lbl;   /* 提示行要跟着状态改口（robot_ui_ask_hint） */
 
     /* 两个大按钮：左右并排，横着一排 150×64（老人好点；圆角屏左右各内缩 28，
      * 和主屏那排按钮同一个理由） */
@@ -1532,13 +1799,13 @@ void robot_ui_show_ask_alarm(const char *reason)
     lv_obj_set_style_radius(btn_no, 32, 0);
     lv_obj_add_event_cb(btn_no, ask_btn_handler, LV_EVENT_CLICKED, (void *)(intptr_t)0);
     lbl = lv_label_create(btn_no);
-    lv_label_set_text(lbl, "不用了");
+    lv_label_set_text(lbl, "我没事，取消");
     lv_obj_set_style_text_font(lbl, &lv_font_ui_24, 0);
     lv_obj_set_style_text_color(lbl, THEME_TEXT_ON_GREEN, 0);
     lv_obj_center(lbl);
 
-    printf("[Ask] 询问页已弹出：原因=%s（%u 秒无人应答按「不用了」处理；"
-           "MQTT 也可回答）\n",
+    printf("[Ask] 报警确认页已弹出：原因=%s（%u 秒内说「没事」/点「我没事，取消」"
+           "可停；到点就通知家人，铃不许断）\n",
            ask_panel_reason, (unsigned)(ROBOT_ASK_ALARM_TIMEOUT_MS / 1000));
 }
 

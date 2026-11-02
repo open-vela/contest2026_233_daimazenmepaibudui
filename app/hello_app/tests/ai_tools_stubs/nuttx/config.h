@@ -3,8 +3,8 @@
  *
  * 谁在用：tests/run_host_tests_ai_tools.sh 编的 TU 里，ai_tools_provider.c 和
  * tests/test_ai_tools_provider.c 都 `#include <nuttx/config.h>`；PC 上没有真机那
- * 一份，所以这里补一份最小的。（stub_framework.c 只读 tools/tool_registry.h，
- * 不经过这里。）
+ * 一份，所以这里补一份最小的。（stub_framework.c 也要它 —— 只为 OK / ERROR
+ * 两个名字，tool_guard_set_enabled() 的假实现照真身返回 ERROR。）
  *
  * 真身在哪：
  *   - 开关：构建时生成的 nuttx/config.h。本板卡那份在 openvela/cmake_out/

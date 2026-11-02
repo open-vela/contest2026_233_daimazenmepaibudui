@@ -48,8 +48,9 @@
 #include <errno.h>
 #include <syslog.h>
 
+#include <semaphore.h>          /* sem_t / SEM_INITIALIZER */
 #include <nuttx/audio/audio.h>
-#include <nuttx/mutex.h>
+#include <nuttx/semaphore.h>    /* nxsem_wait_uninterruptible / nxsem_post */
 #include <nuttx/sched.h>
 #include <nuttx/clock.h>          /* clock_systime_ticks()/MSEC2TICK()：空转日志限频 */
 
@@ -111,7 +112,20 @@ static pid_t g_audio_in_owner_group = (pid_t)-1;
 
 /* fd 与状态的保护锁。只保护 start/stop 的临界区，不覆盖阻塞的 read。 */
 
-static mutex_t g_audio_in_lock = NXMUTEX_INITIALIZER;
+/* ★ 2026-11-01：**不用 mutex，用二值信号量**。
+ *
+ *   真机 v22 测试：AI 回了一句后 hello_app 被打死，
+ *     Assertion failed at /sched/semaphore/sem_post.c:63
+ *     nxsem_post_slow ← audio_in_read ← audio_record_thread
+ *   这条断言判的是"解锁的线程是不是持锁者"。录音线程每读一帧都
+ *   lock/unlock 这把锁，而在这颗内核上 mutex 的持有者跟踪不可靠（门控锁
+ *   10-31 已经栽过同一条，当时改成关中断临界区）。
+ *   二值信号量没有"持有者"这个概念，post 永远不会走那条断言；锁保护的只是
+ *   fd/状态的短临界区，不需要优先级继承。
+ *
+ *   判据：再出现 sem_post.c:63 时任务栈里不应再有 audio_in_read。 */
+
+static sem_t g_audio_in_lock = SEM_INITIALIZER(1);
 
 /* "有线程正在收这一次会话"。收尾在锁外做（ioctl/close 都不能持锁），所以用一个
  * 标志防并发：两个线程同时看到同一个 fd 各自 close 一次，第二次关掉的可能是刚被
@@ -202,7 +216,7 @@ int audio_in_start(int sample_rate, int channels, int bits)
       return -EINVAL;
     }
 
-  if (nxmutex_lock(&g_audio_in_lock) < 0)
+  if (nxsem_wait_uninterruptible(&g_audio_in_lock) < 0)
     {
       return -EINVAL;                 /* 锁坏掉了，属于不可能的状态 */
     }
@@ -233,7 +247,7 @@ int audio_in_start(int sample_rate, int channels, int bits)
     {
       if (g_audio_in_owner == self)
         {
-          nxmutex_unlock(&g_audio_in_lock);
+          nxsem_post(&g_audio_in_lock);
           syslog(LOG_WARNING,
                  "AUDIO_IN: 本线程 %d 已在录音，拒绝重入（-EBUSY）\n",
                  (int)self);
@@ -247,7 +261,7 @@ int audio_in_start(int sample_rate, int channels, int bits)
           /* nxsched_get_tcb() 会加 TCB 引用计数，必须配对释放 */
 
           nxsched_put_tcb(owner_tcb);
-          nxmutex_unlock(&g_audio_in_lock);
+          nxsem_post(&g_audio_in_lock);
           syslog(LOG_WARNING,
                  "AUDIO_IN: 录音设备仍被线程 %d 占用（-EBUSY）\n",
                  (int)g_audio_in_owner);
@@ -273,7 +287,7 @@ int audio_in_start(int sample_rate, int channels, int bits)
           if (owner_group_tcb != NULL)
             {
               nxsched_put_tcb(owner_group_tcb);
-              nxmutex_unlock(&g_audio_in_lock);
+              nxsem_post(&g_audio_in_lock);
               syslog(LOG_WARNING,
                      "AUDIO_IN: 持有线程 %d 已消失，但它的任务组 %d 还活着且不是"
                      "本组（group %d）—— 这是那个 app 自己把会话留在了原地，"
@@ -343,7 +357,7 @@ int audio_in_start(int sample_rate, int channels, int bits)
     {
       int errcode = errno;
 
-      nxmutex_unlock(&g_audio_in_lock);
+      nxsem_post(&g_audio_in_lock);
       syslog(LOG_ERR, "AUDIO_IN: open %s failed: %d\n",
              AUDIO_IN_DEV, errcode);
       return -errcode;
@@ -361,7 +375,7 @@ int audio_in_start(int sample_rate, int channels, int bits)
       int errcode = errno;
 
       close(fd);
-      nxmutex_unlock(&g_audio_in_lock);
+      nxsem_post(&g_audio_in_lock);
       syslog(LOG_ERR, "AUDIO_IN: AUDIOIOC_CONFIGURE failed: %d\n", errcode);
       return -errcode;
     }
@@ -418,7 +432,7 @@ int audio_in_start(int sample_rate, int channels, int bits)
       if (!started)
         {
           close(fd);
-          nxmutex_unlock(&g_audio_in_lock);
+          nxsem_post(&g_audio_in_lock);
           return -errcode;
         }
     }
@@ -431,7 +445,7 @@ int audio_in_start(int sample_rate, int channels, int bits)
   g_audio_in_owner       = self;
   g_audio_in_owner_group = getpid();
 
-  nxmutex_unlock(&g_audio_in_lock);
+  nxsem_post(&g_audio_in_lock);
 
   syslog(LOG_INFO, "AUDIO_IN: started (%d Hz, %d ch, %d bit)\n",
          sample_rate, channels, bits);
@@ -455,14 +469,14 @@ ssize_t audio_in_read(FAR void *buf, size_t len)
   /* 只拿一个 fd 快照，**不持锁**做阻塞读：否则别的任务没法调
    * audio_in_stop() 来发 STOP 唤醒这里的 read()。 */
 
-  if (nxmutex_lock(&g_audio_in_lock) < 0)
+  if (nxsem_wait_uninterruptible(&g_audio_in_lock) < 0)
     {
       return -EINVAL;
     }
 
   fd = g_audio_in_fd;
 
-  nxmutex_unlock(&g_audio_in_lock);
+  nxsem_post(&g_audio_in_lock);
 
   if (fd < 0)
     {
@@ -507,7 +521,7 @@ int audio_in_stop(void)
   int fd;
   int errcode;
 
-  if (nxmutex_lock(&g_audio_in_lock) < 0)
+  if (nxsem_wait_uninterruptible(&g_audio_in_lock) < 0)
     {
       return -EINVAL;
     }
@@ -516,7 +530,7 @@ int audio_in_stop(void)
 
   if (fd < 0)
     {
-      nxmutex_unlock(&g_audio_in_lock);
+      nxsem_post(&g_audio_in_lock);
       return OK;                      /* 没在录音，安全空操作 */
     }
 
@@ -537,7 +551,7 @@ int audio_in_stop(void)
       if (stopper != NULL)
         {
           nxsched_put_tcb(stopper);
-          nxmutex_unlock(&g_audio_in_lock);
+          nxsem_post(&g_audio_in_lock);
           now = clock_systime_ticks();
 
           /* 空转返回 OK 这件事，调用方**看不出来**（返回值与"真停掉了"完全一样），
@@ -572,7 +586,7 @@ int audio_in_stop(void)
   g_audio_in_stop_pending = true;
   g_audio_in_stop_owner   = nxsched_gettid();
 
-  nxmutex_unlock(&g_audio_in_lock);
+  nxsem_post(&g_audio_in_lock);
 
   /* 跨组调用要先确认这个 fd 到底通到哪个设备，再决定动不动它。
    *
@@ -599,11 +613,11 @@ int audio_in_stop(void)
              fd, (int)owner_group, (int)owner, (int)getpid(),
              (int)nxsched_gettid());
 
-      if (nxmutex_lock(&g_audio_in_lock) == 0)
+      if (nxsem_wait_uninterruptible(&g_audio_in_lock) == 0)
         {
           g_audio_in_stop_pending = false;
           g_audio_in_stop_owner   = (pid_t)-1;
-          nxmutex_unlock(&g_audio_in_lock);
+          nxsem_post(&g_audio_in_lock);
         }
 
       return -EPERM;
@@ -643,11 +657,11 @@ int audio_in_stop(void)
                "也等不到唤醒。" :
                "—— 音频设备在，但这次 STOP 被拒了。");
 
-      if (nxmutex_lock(&g_audio_in_lock) == 0)
+      if (nxsem_wait_uninterruptible(&g_audio_in_lock) == 0)
         {
           g_audio_in_stop_pending = false;
           g_audio_in_stop_owner   = (pid_t)-1;
-          nxmutex_unlock(&g_audio_in_lock);
+          nxsem_post(&g_audio_in_lock);
         }
 
       return -errcode;
@@ -658,7 +672,7 @@ int audio_in_stop(void)
    * 这时候才清全局、才 close —— 而且只在"会话还是刚才那一个"时清，
    * 免得把期间新开的一次会话顶掉。 */
 
-  if (nxmutex_lock(&g_audio_in_lock) == 0)
+  if (nxsem_wait_uninterruptible(&g_audio_in_lock) == 0)
     {
       if (g_audio_in_fd == fd)
         {
@@ -669,7 +683,7 @@ int audio_in_stop(void)
 
       g_audio_in_stop_pending = false;
       g_audio_in_stop_owner   = (pid_t)-1;
-      nxmutex_unlock(&g_audio_in_lock);
+      nxsem_post(&g_audio_in_lock);
     }
 
   close(fd);
@@ -715,7 +729,7 @@ int audio_in_abandon(void)
   pid_t owner_group;
   int fd;
 
-  if (nxmutex_lock(&g_audio_in_lock) < 0)
+  if (nxsem_wait_uninterruptible(&g_audio_in_lock) < 0)
     {
       return -EINVAL;                 /* 锁坏掉了，属于不可能的状态 */
     }
@@ -724,7 +738,7 @@ int audio_in_abandon(void)
 
   if (fd < 0)
     {
-      nxmutex_unlock(&g_audio_in_lock);
+      nxsem_post(&g_audio_in_lock);
 
       /* 本来就没有会话。幂等：重复调、没 start 就调，都是这个返回值，
        * 不动任何东西（这正是调用方想要的"已经干净了"）。 */
@@ -743,7 +757,7 @@ int audio_in_abandon(void)
       if (stopper != NULL)
         {
           nxsched_put_tcb(stopper);
-          nxmutex_unlock(&g_audio_in_lock);
+          nxsem_post(&g_audio_in_lock);
           syslog(LOG_INFO,
                  "AUDIO_IN: abandon 时线程 %d 正在收这一次会话，本次不重复关 fd\n",
                  (int)g_audio_in_stop_owner);
@@ -761,7 +775,7 @@ int audio_in_abandon(void)
   g_audio_in_stop_pending = true;
   g_audio_in_stop_owner   = nxsched_gettid();
 
-  nxmutex_unlock(&g_audio_in_lock);
+  nxsem_post(&g_audio_in_lock);
 
   /* 跨组调用要先确认这个 fd 到底通到哪个设备，否则 close() 关掉的是别人组里的
    * 另一个 file 对象（fd 号只在开它的那个 task group 里保证有意义）。判据与
@@ -781,11 +795,11 @@ int audio_in_abandon(void)
              fd, (int)owner_group, (int)owner, (int)getpid(),
              (int)nxsched_gettid());
 
-      if (nxmutex_lock(&g_audio_in_lock) == 0)
+      if (nxsem_wait_uninterruptible(&g_audio_in_lock) == 0)
         {
           g_audio_in_stop_pending = false;
           g_audio_in_stop_owner   = (pid_t)-1;
-          nxmutex_unlock(&g_audio_in_lock);
+          nxsem_post(&g_audio_in_lock);
         }
 
       return -EPERM;
@@ -797,7 +811,7 @@ int audio_in_abandon(void)
    * 而它新开的 fd 号不可能是我们手里这个（这个槽位还被我们占着，open 会拿别的
    * 号），所以下面的 close 关掉的一定是我们自己那一次会话的 fd。 */
 
-  if (nxmutex_lock(&g_audio_in_lock) == 0)
+  if (nxsem_wait_uninterruptible(&g_audio_in_lock) == 0)
     {
       if (g_audio_in_fd == fd)
         {
@@ -808,7 +822,7 @@ int audio_in_abandon(void)
 
       g_audio_in_stop_pending = false;
       g_audio_in_stop_owner   = (pid_t)-1;
-      nxmutex_unlock(&g_audio_in_lock);
+      nxsem_post(&g_audio_in_lock);
     }
 
   /* 只关自己的 fd，不发 AUDIOIOC_STOP：这是本函数存在的全部意义。

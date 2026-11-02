@@ -1,5 +1,65 @@
 # 补丁总览（openvela 工作区的三棵上游树）
 
+> ## ⚠ 先看这里（2026-10-30 复核，和本文下面的历史描述不一致）
+>
+> **打补丁请只打这三份**，它们是从当前工作树 `git diff` 直接生成的、覆盖各自
+> 树**全部**补丁范围内的改动：
+>
+> | 权威补丁 | `cd` 到 | 覆盖 |
+> |---|---|---|
+> | `nuttx-working-tree.patch` | `nuttx` | 全部 6 个改动文件 |
+> | `vendor-sifli-working-tree.patch` | `vendor/sifli` | `chips/sf32lb52/**` + `boards/sf32lb52/drivers/lcd/**` |
+> | `apps-ai-agent-working-tree.patch` | `packages/ai_agent` | 全部 41 个改动文件（去掉 `.built`/`.depend`） |
+>
+> **不要**把下面表格里那些 per-fix 补丁和这三份叠加着打（会冲突）。
+>
+> ### 为什么要这一层（两个坑，都是 2026-10-30 实测出来的）
+>
+> 1. **补丁失修没人报警。** 本文档原本写着「补丁都能 `git apply --check --reverse`
+>    通过」，实测：`nuttx` 4 个补丁里 **3 个过期**（`nuttx-audio-drain-fix` /
+>    `nuttx-usbdev-rndis` / `nuttx-usbdev-rndis-nomem`），`vendor/sifli` 7 个里
+>    **3 个过期**（`vendor_sifli-lcd-brightness` / `vendor_sifli-usb-rndis` /
+>    `vendor_sifli-uart-rx-dma-reinit`——最后这个其实是**补丁路径写错**
+>    （`b/vendor/sifli/chips/...` 多了一层目录），连 apply 都 apply 不进去）。
+>    更要命的是 `nuttx` 还有 **3 个改动文件压根没有任何补丁**：
+>    `cmake/nuttx_kconfig.cmake`（不修 CMake configure 直接崩）、
+>    `include/nuttx/net/tcp.h` + `net/tcp/tcp_conn.c`（tcp 连接池只读快照）。
+>    也就是说那句「补丁能对上」早就不是真的了，而**上传 contest 仓库**和
+>    **板子上跑的固件**就在这个过程里悄悄脱钩了。
+> 2. **「补丁能反打」不等于「没漏文件」。** 第一版核对脚本只跑
+>    `git apply --check --reverse` 就宣布全绿 —— 那条只证明「补丁和它碰的
+>    那几个文件对得上」。实测 `packages/ai_agent` 有 41 个文件改动，而 per-fix
+>    补丁只覆盖 3 个，38 个文件（含 `include/agent_config.h`、
+>    `src/voice/volc_asr.c`、`src/voice/voice_asr.c`）会丢，脚本照样打绿。
+>    所以 `verify_upstream_trees.sh` 多加了**完备性**这一条判据。
+>
+> ### 一键核对（改完上游树、上传之前跑一遍）
+>
+> ```bash
+> bash patches/verify_upstream_trees.sh
+> ```
+>
+> 三条判据，全绿才能上传：① 补丁与工作树逐字对应 ② 范围内每个改动文件都在
+> 补丁里 ③ 补丁新增行里没有凭据形状（这些补丁是要传 GitHub 的）。
+> 脚本只读，不改任何文件。**这条判据做过负向测试**（故意从补丁里删掉一个文件，
+> 它会报 ✗ 并点名那个文件）。
+>
+> ### 重新生成某一份补丁
+>
+> ```bash
+> cd /home/xiaoyingyu/openvela/nuttx
+> git diff > /home/xiaoyingyu/openvela/contest2026_233_daimazenmepaibudui/patches/nuttx-working-tree.patch
+> ```
+> 生成后先跑 `verify_upstream_trees.sh`（含凭据扫描）确认干净，再提交。
+>
+> ### 下面表格里的 per-fix 补丁是什么
+>
+> **历史存档 + 逐条修复的说明文档**，`README.md` 后面每一大节解释的是它们。
+> 用途是「想知道当年为什么这么改」以及「上游 sync 后只想重打某一个修复」。
+> 2026-10-30 复核状态：`packages/ai_agent` 那 6 份**仍然全部对得上**；
+> `nuttx`/`vendor/sifli` 的 6 份已过期（列表见上），不要拿来打补丁。
+
+
 本目录的补丁 apply 到 **openvela 工作区的三个不同仓库**（`git apply` 的 `cd` 目标
 在每节里写明），先总览一遍：
 

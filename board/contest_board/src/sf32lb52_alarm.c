@@ -85,6 +85,27 @@
 #define ALARM_EMERG_LOW_FREQ      700
 #define ALARM_EMERG_INTERVAL_MS   5000
 
+/* EMERGENCY_CONFIRM：语音急救词走的「响-停-听」档位。
+ *
+ * 响 1.2 秒 / 停 0.6 秒，循环。停的那 0.6 秒（= interval − round）音频 fd
+ * 是关着的，而板子硬件半双工、喇叭响时麦克风是聋的 —— 那 0.6 秒就是唯一
+ * 能听见老人说「没事」的窗口。
+ *
+ * 音色**沿用 EMERGENCY 的 1200/700 Hz 高低交替**（老人听熟的那一种），
+ * 只是节奏更快（200ms 单声 / 400ms 一轮）——既更急，也让 1.2 秒正好是
+ * **3 整轮**，收尾不会停在半声上（ALARM_EMERG_MS 那套是 500ms 一轮，
+ * 1.2 秒会切成 2.4 轮，尾巴掐在半声里）。
+ *
+ * ⚠ 这些是**新增**，ALARM_EMERG_* 那组一个字都没动 —— 摔倒/异常声音检测
+ *   那条路走的是 ALARM_LEVEL_EMERGENCY，用户要求不许受影响。 */
+
+#define ALARM_EMERG_CONFIRM_TONE_MS     200
+#define ALARM_EMERG_CONFIRM_CYCLE_MS    (2 * ALARM_EMERG_CONFIRM_TONE_MS)
+#define ALARM_EMERG_CONFIRM_CYCLES      3
+#define ALARM_EMERG_CONFIRM_MS          (ALARM_EMERG_CONFIRM_CYCLE_MS * \
+                                         ALARM_EMERG_CONFIRM_CYCLES)
+#define ALARM_EMERG_CONFIRM_INTERVAL_MS 1800   /* 轮间空 600ms = 偷听窗 */
+
 /* 工作线程。
  *
  * 优先级 115 是刻意选的：NuttX 里**数值越小优先级越高**，所以它低于
@@ -175,6 +196,9 @@ static uint32_t alarm_round_ms(enum alarm_level_e level)
       case ALARM_LEVEL_WARNING:
         return ALARM_WARNING_MS;
 
+      case ALARM_LEVEL_EMERGENCY_CONFIRM:
+        return ALARM_EMERG_CONFIRM_MS;
+
       case ALARM_LEVEL_EMERGENCY:
         return ALARM_EMERG_MS;
 
@@ -189,6 +213,9 @@ static uint32_t alarm_round_interval_ms(enum alarm_level_e level)
     {
       case ALARM_LEVEL_WARNING:
         return ALARM_WARNING_INTERVAL_MS;
+
+      case ALARM_LEVEL_EMERGENCY_CONFIRM:
+        return ALARM_EMERG_CONFIRM_INTERVAL_MS;
 
       case ALARM_LEVEL_EMERGENCY:
         return ALARM_EMERG_INTERVAL_MS;
@@ -227,6 +254,13 @@ static int alarm_tone_freq(enum alarm_level_e level, int offset)
         pos   = offset % cycle;
         return (pos < ALARM_WARNING_BEEP_MS * ALARM_SAMPLES_PER_MS) ?
                ALARM_WARNING_FREQ : 0;
+
+      case ALARM_LEVEL_EMERGENCY_CONFIRM:
+        /* 同一对高低音，只是更快；1.2 秒 = 3 整轮，收尾干净 */
+        cycle = ALARM_EMERG_CONFIRM_CYCLE_MS * ALARM_SAMPLES_PER_MS;
+        pos   = offset % cycle;
+        return (pos < ALARM_EMERG_CONFIRM_TONE_MS * ALARM_SAMPLES_PER_MS) ?
+               ALARM_EMERG_HIGH_FREQ : ALARM_EMERG_LOW_FREQ;
 
       case ALARM_LEVEL_EMERGENCY:
         cycle = ALARM_EMERG_CYCLE_MS * ALARM_SAMPLES_PER_MS;

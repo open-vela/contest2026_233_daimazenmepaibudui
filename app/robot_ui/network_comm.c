@@ -62,6 +62,7 @@
  * 依赖 Kconfig：CONFIG_NETUTILS_WEBCLIENT + CONFIG_CRYPTO_MBEDTLS（本工程已开）。 */
 #include <netutils/webclient.h>
 #include <semaphore.h>
+#include <nuttx/semaphore.h>  /* nxsem_wait_uninterruptible / nxsem_post */
 #include <pthread.h>
 #ifdef CONFIG_CRYPTO_MBEDTLS
 #include <mbedtls/ssl.h>
@@ -239,6 +240,7 @@ static void mqtt_load_broker_config(void)
 static int create_tcp_socket(const char *host, uint16_t port);
 static int mqtt_send_connect(void);
 static int mqtt_send_subscribe(const char *topic, int qos);
+static int mqtt_send_unsubscribe(const char *topic);
 static int mqtt_send_publish(const char *topic, const char *payload, int qos, bool retain);
 static int mqtt_send_puback(uint16_t packet_id);
 static int mqtt_send_pingreq(void);
@@ -571,13 +573,12 @@ int mqtt_subscribe(const char *topic, int qos)
 /* ==================== MQTT 取消订阅 ==================== */
 int mqtt_unsubscribe(const char *topic)
 {
-    if (!mqtt_config.connected) {
+    if (!mqtt_config.connected || topic == NULL || topic[0] == '\0') {
         return -1;
     }
 
     printf("Unsubscribe: %s\n", topic);
-    // TODO: 实现 UNSUBSCRIBE
-    return 0;
+    return mqtt_send_unsubscribe(topic);
 }
 
 /* ==================== MQTT 发布 ==================== */
@@ -675,7 +676,8 @@ static int g_mqtt_queue_count = 0;
  * 静态初始化过的 pthread_mutex 在 NuttX task 和 pthread 之间都能用，
  * 而本文件那个推送队列早就被 net_task 和 LVGL 线程同时锁过了（真机跑通的）。
  * 出过事的是"忘了初始化、.bss 全 0 就当互斥量用"，那才会撞 NXSEM_IS_MUTEX 断言。 */
-static pthread_mutex_t g_mqtt_queue_lock = PTHREAD_MUTEX_INITIALIZER;
+/* ★ 2026-11-01：不用 mutex（同 alarm_audio_lock / g_audio_in_lock 教训）。 */
+static sem_t g_mqtt_queue_lock = SEM_INITIALIZER(1);
 
 /* 生产者 -> network_task 的唤醒信号。
  * 只是"有货了"的提示：network_task 的分片睡眠里 trywait 到就提前结束这一觉，
@@ -711,9 +713,9 @@ static int mqtt_queue_count_read(void)
 {
     int n;
 
-    pthread_mutex_lock(&g_mqtt_queue_lock);
+    nxsem_wait_uninterruptible(&g_mqtt_queue_lock);
     n = g_mqtt_queue_count;
-    pthread_mutex_unlock(&g_mqtt_queue_lock);
+    nxsem_post(&g_mqtt_queue_lock);
 
     return n;
 }
@@ -760,7 +762,7 @@ int mqtt_publish_queued(const char *topic, const char *payload, int qos, bool re
         return -EMSGSIZE;    /* 未持锁 */
     }
 
-    pthread_mutex_lock(&g_mqtt_queue_lock);
+    nxsem_wait_uninterruptible(&g_mqtt_queue_lock);
     mqtt_queue_sem_ensure();
 
     if (g_mqtt_queue_count >= MQTT_QUEUE_SLOTS) {
@@ -796,7 +798,7 @@ int mqtt_publish_queued(const char *topic, const char *payload, int qos, bool re
     }
 
 out:
-    pthread_mutex_unlock(&g_mqtt_queue_lock);
+    nxsem_post(&g_mqtt_queue_lock);
 
     if (ret == OK) {
         /* 出锁之后再唤醒：signalling 跟队列本身没有关系，也没必要占着锁。 */
@@ -812,7 +814,7 @@ static int mqtt_queue_pop(mqtt_queue_item_t *out)
 {
     int ret = -1;
 
-    pthread_mutex_lock(&g_mqtt_queue_lock);
+    nxsem_wait_uninterruptible(&g_mqtt_queue_lock);
 
     if (g_mqtt_queue_count > 0) {
         *out = g_mqtt_queue[g_mqtt_queue_head];
@@ -821,7 +823,7 @@ static int mqtt_queue_pop(mqtt_queue_item_t *out)
         ret = 0;
     }
 
-    pthread_mutex_unlock(&g_mqtt_queue_lock);
+    nxsem_post(&g_mqtt_queue_lock);
 
     return ret;
 }
@@ -922,8 +924,13 @@ static int alarm_publish(const char *alarm_type, const char *details, bool queue
         alarm_callback(alarm_type, details);
     }
 
-    /* 发送手机推送通知 */
-    push_send_alarm(alarm_type, details);
+    /* 发送手机推送通知。返回值原来被直接丢掉，于是"密钥没配上 / 推送没发出去"
+     * 在串口上只剩 push_send_notification 里那一行不起眼的 "push not enabled"，
+     * 而界面上还照样写着"已通知家人"。这里把结果摊开到报警这一行旁边，
+     * 免得还得去翻 push 那一节才知道家人到底收没收到。 */
+    if (push_send_alarm(alarm_type, details) < 0) {
+        printf("[ALARM] 手机推送没发出去（家人手机不会收到这条）\n");
+    }
 
     return ret;
 }
@@ -1474,10 +1481,16 @@ static int push_tls_connect(void *ctx, const char *hostname, const char *port,
     }
 
     printf("[PUSH] TLS handshake complete\n");
+
+    /* ★ 2026-11-01 诊断：Bark 推送自己的 TLS 连接也不在 vela_tls 池里，
+     *   补上 open/close，和 TTS/ASR 一起对齐定位 D 池泄漏。 */
+    printf("[TLS-FD] push open fd=%d %s:%s\n", conn->fd, hostname, port);
+
     *connp = (struct webclient_tls_connection *)conn;
     return 0;
 
 err:
+    printf("[TLS-FD] push close(fail) fd=%d\n", conn->fd);
     mbedtls_ssl_free(&conn->ssl);
     close(conn->fd);
     free(conn);
@@ -1521,7 +1534,7 @@ static int push_tls_close(void *ctx, struct webclient_tls_connection *base)
     struct push_tls_conn_s *conn = (struct push_tls_conn_s *)base;
 
     (void)ctx;
-    mbedtls_ssl_close_notify(&conn->ssl);
+    printf("[TLS-FD] push close fd=%d\n", conn->fd);
     mbedtls_ssl_free(&conn->ssl);
     close(conn->fd);
     free(conn);
@@ -1721,7 +1734,11 @@ struct push_job_s
 };
 
 static struct push_job_s g_push_job;
-static pthread_mutex_t g_push_job_lock = PTHREAD_MUTEX_INITIALIZER;
+/* ★ 2026-11-01：不用 mutex。**这把锁是报警页卡死的根因**：
+ *   alarm_escalate（LVGL 线程）→ report_alarm_queued → alarm_publish
+ *   → push_send_alarm → push_send_notification → nxsem_wait_uninterruptible(&g_push_job_lock)
+ *   —— LVGL 线程在这里死锁，UI 冻结。 */
+static sem_t g_push_job_lock = SEM_INITIALIZER(1);
 static sem_t g_push_job_sem;
 static pthread_t g_push_task_id;
 static bool g_push_task_started = false;
@@ -1738,7 +1755,7 @@ static void *push_task(void *arg)
 
         sem_wait(&g_push_job_sem);
 
-        pthread_mutex_lock(&g_push_job_lock);
+        nxsem_wait_uninterruptible(&g_push_job_lock);
         if (g_push_job.pending) {
             strncpy(url, g_push_job.url, sizeof(url) - 1);
             url[sizeof(url) - 1] = '\0';
@@ -1747,7 +1764,7 @@ static void *push_task(void *arg)
             g_push_job.pending = false;
             have = true;
         }
-        pthread_mutex_unlock(&g_push_job_lock);
+        nxsem_post(&g_push_job_lock);
 
         if (!have) {
             continue;
@@ -1903,13 +1920,13 @@ int push_send_notification(const char *title, const char *content, const char *g
 
     /* 异步投递：交给推送任务去发，这里立刻返回，UI 不被 TLS 往返阻塞。
      * 真正的成功判据（HTTP 200/201）和状态码日志在 push_task() 里。 */
-    pthread_mutex_lock(&g_push_job_lock);
+    nxsem_wait_uninterruptible(&g_push_job_lock);
     strncpy(g_push_job.url, url, sizeof(g_push_job.url) - 1);
     g_push_job.url[sizeof(g_push_job.url) - 1] = '\0';
     strncpy(g_push_job.body, json_body, sizeof(g_push_job.body) - 1);
     g_push_job.body[sizeof(g_push_job.body) - 1] = '\0';
     g_push_job.pending = true;
-    pthread_mutex_unlock(&g_push_job_lock);
+    nxsem_post(&g_push_job_lock);
 
     sem_post(&g_push_job_sem);
     free(json_body);
@@ -2301,6 +2318,38 @@ static int mqtt_send_subscribe(const char *topic, int qos)
 
     /* QoS */
     packet[pos++] = qos;
+
+    return send(mqtt_socket, packet, pos, 0);
+}
+
+/* 发送 MQTT UNSUBSCRIBE 包 */
+static int mqtt_send_unsubscribe(const char *topic)
+{
+    uint8_t packet[256];
+    int pos = 0;
+    int topic_len = strlen(topic);
+    int remaining = 2 + 2 + topic_len;
+
+    if (topic_len <= 0 || topic_len >= (int)sizeof(packet) - 4) {
+        printf("[MQTT] UNSUBSCRIBE 拒绝：topic 非法 topic_len=%d\n", topic_len);
+        return -1;
+    }
+
+    /* 固定头: UNSUBSCRIBE = 0xA2 */
+    packet[pos++] = 0xA2;
+    pos += mqtt_encode_remaining_length(&packet[pos], remaining);
+
+    /* 包 ID */
+    static uint16_t unsubscribe_id = 0;
+    unsubscribe_id++;
+    packet[pos++] = (unsubscribe_id >> 8) & 0xFF;
+    packet[pos++] = unsubscribe_id & 0xFF;
+
+    /* 主题过滤器 */
+    packet[pos++] = (topic_len >> 8) & 0xFF;
+    packet[pos++] = topic_len & 0xFF;
+    memcpy(&packet[pos], topic, topic_len);
+    pos += topic_len;
 
     return send(mqtt_socket, packet, pos, 0);
 }
@@ -2855,8 +2904,15 @@ void network_task(void *arg)
     while (1) {
         /* 检查 WiFi 状态 */
         if (!wifi_config.connected) {
-            /* 尝试重连 */
-            // TODO: 实现重连逻辑
+            /* WiFi 掉线后要自己把上次配置的 SSID/PASS 带回去重连，而不是把
+             * MQTT 误标成“在线”。只要之前配过，就按同一套参数重试；没配过则
+             * 直接保持断开，避免把“无配置”的状态伪装成“已连”。 */
+            if (wifi_config.ssid[0] != '\0') {
+                printf("[WIFI] WiFi 断开，尝试重连 SSID=%s\n", wifi_config.ssid);
+                if (wifi_connect(wifi_config.ssid, wifi_config.password) < 0) {
+                    printf("[WIFI] WiFi 重连失败，继续等待下一轮\n");
+                }
+            }
         }
 
         /* 上一轮 publish 失败时只把 connected 置了 false（别的任务不敢碰

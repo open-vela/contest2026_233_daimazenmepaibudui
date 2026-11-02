@@ -45,32 +45,62 @@
  * Public Function Prototypes
  ****************************************************************************/
 
-/* 两种语气，两句话、两段提示音。
+/* 三种语气，三句话、三段提示音。
  *
  * ACK  「嗯，我在」—— 说完之后那一声，答"我听见了，正在想"。
  * MISS 「我刚才没听清楚，您再说一遍好吗？」—— ASR 空 / 纯标点 / 识别失败
  *       时说的一声。2026-10-25 之前这条路只把文字推上屏、喇叭一声不吭；
  *       加了 ACK 提示音之后，用户听到的会变成"叮一声然后死寂"——比原来
  *       更像坏了，所以必须补上这一声。
+ * FAIL 「我这边有点问题，等一下再说好吗？」—— **我方**掉了（LLM 请求失败 /
+ *       TTS 合成失败 / 缓冲没了）。2026-10-26 补：这几条原来也只上屏不出声，
+ *       屏幕上字都出来了、喇叭一声不吭 —— 用户原话「明明屏幕上有字了，但是
+ *       没有开口说话」。而老人根本看不到屏（玻璃是坏的，只有 lcd_mirror 能看），
+ *       所以那几条对他就是彻底的"不回复"。
  *
- * 两句话都写死在这里当**查表 key**：PC 上跑一次 gen_tts_cache.py 把它们
+ *       为什么 FAIL 要和 MISS 分开：说"没听清"会让老人把同一句再问一遍，
+ *       撞上同一个故障还是没答；说"我这边有点问题"才叫他等等再来。
+ *
+ * 三句话都写死在这里当**查表 key**：PC 上跑一次 gen_tts_cache.py 把它们
  * 合成进 ROMFS，就自动从提示音升级成说人话，代码一个字不用改。 */
 
 typedef enum
 {
   PROMPT_ACK_KIND_ACK  = 0,
   PROMPT_ACK_KIND_MISS = 1,
+  PROMPT_ACK_KIND_FAIL = 2,
+  PROMPT_ACK_KIND_GREET = 3,   /* ★ 唤醒词命中后的问候（2026-10-31，用户指定措辞） */
 } prompt_ack_kind_t;
 
-/* 可以直接拿去上屏 / 丢给 gen_tts_cache.py 的那两句话 */
+/* 可以直接拿去上屏 / 丢给 gen_tts_cache.py 的那几句话
+ * （字形已对 app/robot_ui/lv_font_ui_24.c 的 cmap 验过，全在） */
 #define PROMPT_ACK_TEXT        "嗯，我在"
 #define PROMPT_MISS_TEXT       "我刚才没听清楚，您再说一遍好吗？"
+#define PROMPT_FAIL_TEXT       "我这边有点问题，等一下再说好吗？"
+
+/* ★ 2026-10-31 用户指定的唤醒应答，**一字不改**：
+ *   「我说唤醒词之后，板子要回应：你好！有什么需要帮助的吗？」
+ *   原来唤醒后只有那声 0.43 秒的「嗯，我在」/「嘟」，用户点名要换成这句。 */
+#define PROMPT_GREET_TEXT      "你好！有什么需要帮助的吗？"
+
+/****************************************************************************
+ * Name: prompt_ack_text
+ *
+ * Description:
+ *   某个语气对应的文案（查表 key）。prompt_ack_play_kind() 和
+ *   ai_companion_main.c 的 miss_speak_worker() 都用它 —— 同一句话只许有一处
+ *   写死，否则改一处漏一处（这一条以前栽过：三选一写成二选一，FAIL 落到
+ *   "嗯，我在"上）。
+ *
+ ****************************************************************************/
+
+const char *prompt_ack_text(prompt_ack_kind_t kind);
 
 /****************************************************************************
  * Name: prompt_ack_play_kind
  *
  * Description:
- *   起播一声"我听见了"或"没听清"。非阻塞：起播成功就立刻返回 0，真正
+ *   起播一声"我听见了"/"没听清"/"我这边出问题了"。非阻塞：起播成功就立刻返回 0，真正
  *   出声在播放线程上（audio_play_start 只做 memcpy + 起线程）。
  *
  *   只能在**非录音线程**上调（ai_audio 的半双工切割 audio_prepare_output
@@ -82,7 +112,7 @@ typedef enum
  *
  * Input Parameters:
  *   ctx  - 音频上下文（hello_app / robot_ui 各自己的那个）
- *   kind - PROMPT_ACK_KIND_ACK 或 PROMPT_ACK_KIND_MISS
+ *   kind - PROMPT_ACK_KIND_ACK / _MISS / _FAIL
  *
  * Returned Value:
  *   0 = 已起播（或本来就在响）；负 errno，其中 -EBUSY 说明设备正被别的

@@ -53,6 +53,25 @@ settings_t* touch_ui_get_settings(void);
 void touch_ui_save_settings(void);
 void touch_ui_show_setting_detail(const char *title, const char *content);
 
+/* 设置现在存在哪：true = TF 卡（掉电保留），false = /data 内存盘（重启会丢）。
+ * 设置页拿它决定要不要挂「没插 TF 卡，重启会丢」那句。判据是真写探针，
+ * 不是 stat —— /data/tf 目录没插卡也在。 */
+bool touch_ui_settings_persistent(void);
+
+/* 语音说「声音小一点」「把亮度调到最亮」时的落地入口（AI 工具 adjust_setting）。
+ * item / action / value 的取值见 app/hello_app/mimo_voice.h 的 MIMO_SET_*（那头
+ * 是跨 app 的协议，这里不重复定义一份）。
+ *
+ * 走的是和设置页滑块**同一条路**：改 user_settings + 真下发硬件（音量回调 /
+ * backlight_set）+ 存盘 —— 所以语音调完再打开设置页，滑块就停在新值上。
+ *
+ * **不碰 LVGL**（设置页的滑块是下次打开页面时按 user_settings 重建的，所以
+ * 这里不用去挪它），因此任何线程都能调；真回调跑在语音工作线程里。
+ *
+ * 返回 >=0 已生效的新值（0..100，到顶/到底也如实回当前值）；<0 负 errno
+ * （-EINVAL 参数不对 / 背光驱动不认的错误码原样透传）。 */
+int touch_ui_settings_apply(int item, int action, int value);
+
 /* ==================== 提醒操作 ==================== */
 void touch_ui_add_reminder(const char *title, const char *time);
 void touch_ui_show_reminder_list(void);

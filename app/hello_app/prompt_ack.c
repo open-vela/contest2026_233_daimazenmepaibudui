@@ -46,15 +46,40 @@
 #define PROMPT_MISS_N2_HZ      330   /* E4 */
 #define PROMPT_MISS_N2_MS      190
 
+/* 语气 C「我这边有点问题」：**三声**降调，一路走低。
+ * 分辨靠"几声"这个最粗的特征，不靠音高 —— 老人高频听力先退化，细辨
+ * 音高不可靠；两声 vs 三声哪怕在听不清的时候也不会混。走低是"不成、
+ * 而且不是你的问题"的听感，和 B（没听清，叫你再说一遍）能分开。
+ * 三声总长 320 ms，仍短于语气 A 的 430 ms，所以 PROMPT_MAX_SAMPLES
+ * 不用改（临时堆是按 A 开的）。 */
+#define PROMPT_FAIL_N1_HZ      392   /* G4 */
+#define PROMPT_FAIL_N2_HZ      330   /* E4 */
+#define PROMPT_FAIL_N3_HZ      262   /* C4 */
+#define PROMPT_FAIL_NOTE_MS    90
+#define PROMPT_FAIL_GAP_MS     25
+
 #define PROMPT_MS_TO_N(m)      (PROMPT_RATE_HZ * (m) / 1000)
 
 /* 峰值 7200 ≈ 满量程的 22%。够响又不刺耳，也不会把麦克风旁边的人吓一跳。 */
 #define PROMPT_PEAK            7200
 
-/* 两种语气里更长的那一种（语气 A），临时堆按它开 */
+/* 三种语气里更长的那一种（语气 A），临时堆按它开 */
 #define PROMPT_MAX_SAMPLES     (PROMPT_MS_TO_N(PROMPT_ACK_N1_MS) + \
                                 PROMPT_MS_TO_N(PROMPT_ACK_GAP_MS) + \
                                 PROMPT_MS_TO_N(PROMPT_ACK_N2_MS))
+
+/* 语气 C 的总样本数，编译期核对别溢出上面那个堆（见 tone_build 里的检查） */
+#define PROMPT_FAIL_SAMPLES    (PROMPT_MS_TO_N(PROMPT_FAIL_NOTE_MS) * 3 + \
+                                PROMPT_MS_TO_N(PROMPT_FAIL_GAP_MS) * 2)
+
+/* 任何一种语气都必须装得进 PROMPT_MAX_SAMPLES 那块栈上缓冲。
+ * 这条是**编译期**的：加了更长的语气就得同步抬高 PROMPT_MAX_SAMPLES，
+ * 否则直接编不过，不会拖到真机上写穿栈。 */
+_Static_assert(PROMPT_FAIL_SAMPLES <= PROMPT_MAX_SAMPLES,
+               "语气 C 装不进 PROMPT_MAX_SAMPLES，抬高它或缩短语气 C");
+_Static_assert((PROMPT_MS_TO_N(PROMPT_MISS_N1_MS) + PROMPT_MS_TO_N(PROMPT_MISS_GAP_MS) +
+                PROMPT_MS_TO_N(PROMPT_MISS_N2_MS)) <= PROMPT_MAX_SAMPLES,
+               "语气 B 装不进 PROMPT_MAX_SAMPLES");
 
 /* 起振 6 ms / 收尾 8 ms，都是防"咔哒"的（波形从非零值突变到 0 就是咔哒）。 */
 #define PROMPT_ATTACK_SAMPLES  (PROMPT_RATE_HZ * 6 / 1000)
@@ -183,34 +208,55 @@ static void tone_note(int16_t *out, size_t samples, uint32_t hz)
 
 static size_t tone_build(int16_t *out, prompt_ack_kind_t kind)
 {
-  uint32_t n1_hz;
-  uint32_t n2_hz;
-  size_t   n1;
+  /* 音符表最大 3 个（语气 C）。统一成表 + 循环比三套 if/else 好读，
+   * 也省得以后加第四种语气时又抄一遍时序。 */
+  uint32_t hz[3];
+  size_t   n[3];
   size_t   gap;
-  size_t   n2;
+  int      cnt;
+  size_t   total = 0;
+  int      i;
 
   if (kind == PROMPT_ACK_KIND_MISS)
     {
-      n1_hz = PROMPT_MISS_N1_HZ;
-      n2_hz = PROMPT_MISS_N2_HZ;
-      n1    = PROMPT_MS_TO_N(PROMPT_MISS_N1_MS);
+      hz[0] = PROMPT_MISS_N1_HZ;  n[0] = PROMPT_MS_TO_N(PROMPT_MISS_N1_MS);
+      hz[1] = PROMPT_MISS_N2_HZ;  n[1] = PROMPT_MS_TO_N(PROMPT_MISS_N2_MS);
       gap   = PROMPT_MS_TO_N(PROMPT_MISS_GAP_MS);
-      n2    = PROMPT_MS_TO_N(PROMPT_MISS_N2_MS);
+      cnt   = 2;
+    }
+  else if (kind == PROMPT_ACK_KIND_FAIL)
+    {
+      hz[0] = PROMPT_FAIL_N1_HZ;  n[0] = PROMPT_MS_TO_N(PROMPT_FAIL_NOTE_MS);
+      hz[1] = PROMPT_FAIL_N2_HZ;  n[1] = PROMPT_MS_TO_N(PROMPT_FAIL_NOTE_MS);
+      hz[2] = PROMPT_FAIL_N3_HZ;  n[2] = PROMPT_MS_TO_N(PROMPT_FAIL_NOTE_MS);
+      gap   = PROMPT_MS_TO_N(PROMPT_FAIL_GAP_MS);
+      cnt   = 3;
     }
   else
     {
-      n1_hz = PROMPT_ACK_N1_HZ;
-      n2_hz = PROMPT_ACK_N2_HZ;
-      n1    = PROMPT_MS_TO_N(PROMPT_ACK_N1_MS);
+      hz[0] = PROMPT_ACK_N1_HZ;   n[0] = PROMPT_MS_TO_N(PROMPT_ACK_N1_MS);
+      hz[1] = PROMPT_ACK_N2_HZ;   n[1] = PROMPT_MS_TO_N(PROMPT_ACK_N2_MS);
       gap   = PROMPT_MS_TO_N(PROMPT_ACK_GAP_MS);
-      n2    = PROMPT_MS_TO_N(PROMPT_ACK_N2_MS);
+      cnt   = 2;
     }
 
-  tone_note(&out[0], n1, n1_hz);
-  memset(&out[n1], 0, gap * sizeof(int16_t));
-  tone_note(&out[n1 + gap], n2, n2_hz);
+  /* 音符与静音交替排进堆里。**绝对不能越过 PROMPT_MAX_SAMPLES** —— 这块
+   * 是调用方的栈上缓冲，写穿了比听不见严重得多。上面 PROMPT_FAIL_SAMPLES
+   * 的编译期断言已经核对过语气 C 不会超；万一以后有人加了更长的语气，
+   * 那条断言会先在编译期炸，不会拖到真机。 */
+  for (i = 0; i < cnt; i++)
+    {
+      if (i > 0)
+        {
+          memset(&out[total], 0, gap * sizeof(int16_t));
+          total += gap;
+        }
 
-  return n1 + gap + n2;
+      tone_note(&out[total], n[i], hz[i]);
+      total += n[i];
+    }
+
+  return total;
 }
 
 /**
@@ -233,11 +279,48 @@ static void prompt_ack_done(void *user_data)
  * Public Functions
  ****************************************************************************/
 
+/* 某个语气对应的文案（查表 key）。**全工程唯一一处写死**：
+ * ai_companion_main.c 的 miss_speak_worker() 也来这儿取，免得改一处漏一处。 */
+
+const char *prompt_ack_text(prompt_ack_kind_t kind)
+{
+  switch (kind)
+    {
+      case PROMPT_ACK_KIND_MISS:
+        return PROMPT_MISS_TEXT;
+      case PROMPT_ACK_KIND_FAIL:
+        return PROMPT_FAIL_TEXT;
+      case PROMPT_ACK_KIND_GREET:
+        return PROMPT_GREET_TEXT;
+      default:
+        return PROMPT_ACK_TEXT;
+    }
+}
+
 int prompt_ack_play_kind(audio_context_t *ctx, prompt_ack_kind_t kind)
 {
-  const char    *text = (kind == PROMPT_ACK_KIND_MISS) ? PROMPT_MISS_TEXT
-                                                       : PROMPT_ACK_TEXT;
-  const char    *what = (kind == PROMPT_ACK_KIND_MISS) ? "没听清" : "我听见了";
+  /* 【2026-10-29 修】原来写的是 `(kind == MISS) ? PROMPT_MISS_TEXT : PROMPT_ACK_TEXT`
+   * —— 三选一只答了是/否，PROMPT_ACK_KIND_FAIL 就落到 "嗯，我在" 上了：
+   * 我方失败时说"嗯，我在"，比不说还糟。四种语气各配各的文案。 */
+
+  const char    *text = prompt_ack_text(kind);
+  const char    *what;
+
+  switch (kind)
+    {
+      case PROMPT_ACK_KIND_MISS:
+        what = "没听清";
+        break;
+      case PROMPT_ACK_KIND_FAIL:
+        what = "我这边有点问题";
+        break;
+      case PROMPT_ACK_KIND_GREET:
+        what = "唤醒应答";
+        break;
+      default:
+        what = "我听见了";
+        break;
+    }
   unsigned char *cached = NULL;
   size_t         cached_len = 0;
   int16_t       *tone;

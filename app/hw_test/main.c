@@ -3184,6 +3184,7 @@ static FAR const char *alarm_level_name(enum alarm_level_e level)
     {
       case ALARM_LEVEL_NOTICE:    return "NOTICE";
       case ALARM_LEVEL_WARNING:   return "WARNING";
+      case ALARM_LEVEL_EMERGENCY_CONFIRM: return "EMERG_CONFIRM";
       case ALARM_LEVEL_EMERGENCY: return "EMERGENCY";
       default:                    return "NONE";
     }

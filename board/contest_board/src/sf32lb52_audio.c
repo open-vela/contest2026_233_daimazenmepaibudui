@@ -353,6 +353,15 @@ extern int sifli_uart_reinit_rx_dma(int idx);
  * rx_sem 并作废会话代号，正常的 stop 收尾是立刻被唤醒的。 */
 #define SF32LB52_AUDIO_RX_READ_TIMEOUT_MS   5000
 
+/* 单读者守卫里"占着 rx_busy 多久算它已经死了、可以抢占"的门槛（毫秒）。
+ * 取 2 倍的一次读等待上界：真读者最坏也要在这之内把 rx_busy 交回来
+ * （超时走 -ETIMEDOUT，被打断走 0），占满两倍还不出去的只有"卡死在厂商
+ * HAL 无界自旋里"那一种 —— 那时候留着它已经没有任何意义了。 */
+/* ★ 2026-11-01：从 2×（10s）降到 读上界 + 1.5s（6.5s）。
+ *   5 秒等待 + 收尾/抢占调度，6.5 秒对活读者仍有 1.5 秒余量；而真卡死的读者
+ *   原来要哑 10 秒才被抢占，现在 6.5 秒就能被新一代接管。 */
+#define SF32LB52_AUDIO_RX_BUSY_STEAL_MS     (SF32LB52_AUDIO_RX_READ_TIMEOUT_MS + 1500)
+
 /****************************************************************************
  * Private Types
  ****************************************************************************/
@@ -447,6 +456,11 @@ struct sf32lb52_audio_s
   bool                    wr_busy;      /* write() DMA 进行中 */
   sem_t                   rx_sem;       /* read() 同步信号量 */
   bool                    rx_busy;      /* read() DMA 进行中 */
+  clock_t                 rx_busy_at;   /* rx_busy 置真的时刻（单读者守卫算占用时长用） */
+  /* ★ 2026-11-01：这一代 rx_busy 的**所有者**（read 进门时取的 session_gen）。
+   *   只有 rx_owner_gen == 自己那一代时，退出才允许清 rx_busy；被抢占/换代
+   *   的旧读者醒来后看到自己的代号对不上，就不去拆新一代的账。 */
+  uint32_t                rx_owner_gen;
   bool                    rx_aborted;   /* stop() 打断了正在等待的 read() */
 
   /* write() 那次等待（采样时长 + 500ms）的"到点了"由这记**本驱动私有**的看门狗
@@ -2364,6 +2378,16 @@ static int sf32lb52_audio_hw_stop(FAR struct sf32lb52_audio_s *priv)
 
   priv->session_gen++;      /* 会话作废：read 即使没被这次 post 唤醒，醒来也会自己退出 */
 
+  /* ★ 2026-10-31：连发 3 次而不是 1 次。理由是同一条 priv 上**可能不止一个
+   *   等待者**（单读者守卫落地前的历史僵尸线程，或抢占路径里的残影）——
+   *   计数信号量的 post 只够叫醒一个，剩下那些就只能干等到自己那记心跳；
+   *   而它们的心跳可能已经被别人的 wd_cancel 取消掉了（见 read() 那段注释），
+   *   于是永远叫不醒、一直持着 file 引用，「开完共 X 个」只涨不跌。
+   *   多 post 的代价是零：read() 进门的 nxsem_reset(&priv->rx_sem, 0) 会把
+   *   多余计数一次性收掉，不会串到下一帧当"采集完成"。 */
+
+  nxsem_post(&priv->rx_sem);
+  nxsem_post(&priv->rx_sem);
   nxsem_post(&priv->rx_sem);
 
   /* 把还挂着的 buffer 归还给上层。
@@ -3802,6 +3826,77 @@ static ssize_t sf32lb52_audio_read(FAR struct audio_lowerhalf_s *dev,
       return 0;
     }
 
+  /* ★ 单读者守卫（2026-10-31）=================================================
+   *
+   * 半双工单客户端：同一条 priv 上**不该同时有两个读者**。真机上真出现过，
+   * 代价极大 —— 第二个读者进门做的头三件事是
+   *
+   *     nxsem_reset(&priv->rx_sem, 0)、wd_cancel(&priv->rx_wait_wdog)、
+   *     wd_start(&priv->rx_wait_wdog, …)，
+   *
+   * 也就是**把第一个读者那记 5 秒心跳整个换掉**。第一个读者这一次等待从此
+   * 没有上界，正是串口里「录音线程卡在设备读里 8039 ms」「放弃 join」的来路
+   * （8039 那个数不是超时值，是上层 8 秒停滞告警的首拍；本该出现的
+   * 「RX 等待由心跳收口」一次都没打 = 心跳被别人取消了）。放弃 join 会把线程
+   * detach 掉、它又持着 file 引用不清账，「开完共 X 个」就一路涨（实测 1→7）。
+   *
+   * 所以这里让第二个读者**立刻走人**（-EBUSY）。上层（app/hello_app/ai_audio.c
+   * 的 record 线程）把非超时负值当"这一代会话死了"，置 record_died → 100 ms
+   * 后重开 —— 正是想要的：宁可丢一帧，也不要两个读者互相拆台。
+   * 这里放在 last_read 更新**之前**：被拒的那条根本没碰设备，不该把 owner 的
+   * 账（user_tid / last_read）顶掉。
+   *
+   * ★ 但**不能永久拒**：万一上一个读者真卡死在厂商 HAL 的无界自旋里
+   *   （bf0_hal_audprc.c / bf0_hal_dma.c 里那种对 post 和看门狗都无感的死循环），
+   *   rx_busy 会永远为真，无条件拒 = 麦克风永久哑掉，比今天还糟。所以留一条
+   *   **抢占**出口：持满 SF32LB52_AUDIO_RX_BUSY_STEAL_MS 就当它已经死了，连
+   *   账带等待一起接管（顺手踢它一脚，让它早点退出）。抢占最坏也只是退化成
+   *   今天的行为，任何情况下都不会比现状更差。
+   *   接管时 bump session_gen —— 和 hw_stop() 同一个用法：让上一个读者醒来后
+   *   一看代号变了就不碰 rx_busy / rx_arm_gen 这些账，不会把新一代的闸门拆掉。
+   *
+   * ★ 2026-11-01：判据从 `rx_busy && !rx_aborted` 改成**只看 rx_busy**，
+   *   并用 rx_owner_gen 区分"谁才是这一笔账的主人"。旧判据留了一个洞：
+   *
+   *     hw_stop()/hw_shutdown() 置 rx_aborted=true，但**不清 rx_busy**（清账在
+   *     读者自己的收尾里做）。于是 stop 之后下一条 read 会**放行**，进门就
+   *     `nxsem_reset(&rx_sem); wd_cancel(&rx_wait_wdog); wd_start(...)` ——
+   *     把上一个还卡在等待里的读者的 5 秒心跳**整个换掉**，那个读者从此没有
+   *     上界。串口里「录音线程卡在设备读里 8019 ms」「放弃 join」以及
+   *     「开完共 X 个会话」只涨不跌，都是这一个洞的产物。
+   *
+   *   现在：读者武装前登记 rx_owner_gen = 自己这一代；退出时只有
+   *   `rx_owner_gen == 自己` 才允许清 rx_busy。新读者看到 rx_busy 一律让路
+   *   （-EBUSY，上层 100ms 后重开），超过 SF32LB52_AUDIO_RX_BUSY_STEAL_MS
+   *   才抢占并把 owner 作废。stop 之后旧读者醒来会正常清掉 rx_busy（它还是
+   *   owner），所以不会出现"每次 stop 都哑 10 秒"。
+   */
+
+  if (priv->rx_busy)
+    {
+      uint32_t held_ms =
+        (uint32_t)TICK2MSEC(clock_systime_ticks() - priv->rx_busy_at);
+
+      if (held_ms < SF32LB52_AUDIO_RX_BUSY_STEAL_MS)
+        {
+          syslog(LOG_WARNING,
+                 "AUDIO: read 撞上另一个读者（rx_busy 已持有 %lu ms < %d ms），"
+                 "本条让路返回 -EBUSY，请上层按会话死了收\n",
+                 (unsigned long)held_ms, SF32LB52_AUDIO_RX_BUSY_STEAL_MS);
+          return -EBUSY;
+        }
+
+      syslog(LOG_WARNING,
+             "AUDIO: 上一个读者占着 rx_busy 已 %lu ms（≥ %d ms），"
+             "判它已死，抢占并把它踢醒\n",
+             (unsigned long)held_ms, SF32LB52_AUDIO_RX_BUSY_STEAL_MS);
+
+      priv->rx_owner_gen = 0;         /* 旧读者失去账本，醒了也不许清新一代的账 */
+      (void)wd_cancel(&priv->rx_wait_wdog);
+      nxsem_post(&priv->rx_sem);      /* 踢醒僵尸等待者（多余的计数由下面 reset 收掉） */
+      priv->session_gen++;            /* 上一代的账从此作废 */
+    }
+
   /* last_read 只在这一处更新（**失败的 read 也记** —— 卡死的读循环正是靠
    * 这条在 L5 守卫里压过 last_write、戳穿"标签是播、身体是录"的假播放）。 */
 
@@ -3816,6 +3911,7 @@ static ssize_t sf32lb52_audio_read(FAR struct audio_lowerhalf_s *dev,
   nxsem_reset(&priv->rx_sem, 0);
 
   priv->rx_busy    = true;
+  priv->rx_busy_at = clock_systime_ticks();
   priv->rx_aborted = false;
   priv->rx_dma_err = false;
 
@@ -3823,6 +3919,10 @@ static ssize_t sf32lb52_audio_read(FAR struct audio_lowerhalf_s *dev,
    * hw_start() 都会让它变号，只要变了就说明这次等待已经没有意义。 */
 
   gen = priv->session_gen;
+
+  /* 这一笔 rx_busy 从现在起归我：退出时只有 rx_owner_gen 还等于 gen，
+   * 才允许把 rx_busy 交回去（见守卫那段）。 */
+  priv->rx_owner_gen = gen;
 
   hdma_rx = priv->aprc.hdma[SF32LB52_AUDIO_PRC_RX_CH];
 
@@ -3867,7 +3967,8 @@ static ssize_t sf32lb52_audio_read(FAR struct audio_lowerhalf_s *dev,
 
   if (res != HAL_OK)
     {
-      priv->rx_busy = false;
+      priv->rx_busy      = false;
+      priv->rx_owner_gen = 0;
       priv->rx_dma_busy_fail++;
 
       syslog(LOG_ERR,
@@ -3889,7 +3990,8 @@ static ssize_t sf32lb52_audio_read(FAR struct audio_lowerhalf_s *dev,
 
   if (hdma_rx == NULL || hdma_rx->State != HAL_DMA_STATE_BUSY)
     {
-      priv->rx_busy = false;
+      priv->rx_busy      = false;
+      priv->rx_owner_gen = 0;
       priv->rx_dma_not_armed++;
       priv->aprc.State[SF32LB52_AUDIO_PRC_RX_CH] = HAL_AUDPRC_STATE_READY;
 
@@ -3934,14 +4036,20 @@ static ssize_t sf32lb52_audio_read(FAR struct audio_lowerhalf_s *dev,
   ret = sf32lb52_audio_rx_wait_slice(priv, SF32LB52_AUDIO_RX_READ_TIMEOUT_MS);
 
   /* 风险 A：**只动属于自己这一代的账**。
-   * 一个上一代的残影在这里把 rx_busy 清成 false，会让新一代那条 read 从此收不到
+   * 一个被抢占的残影在这里把 rx_busy 清成 false，会让新一代那条 read 从此收不到
    * ISR 的 post（ISR 只在 rx_busy 为真时才 post），只能等它自己那 5 秒超时 ——
-   * 整条录音慢一拍。代号对不上就一律不碰：新一代那条 read 自己的收尾会把这笔账
-   * 收干净。 */
+   * 整条录音慢一拍。判据用 rx_owner_gen（被抢占时会被清 0），而不是
+   * session_gen（stop 自己也会 bump 它）—— 见下面那段。 */
 
-  if (gen == priv->session_gen)
+  /* ★ 2026-11-01：用 owner 而不是 session_gen 判"这笔账还是不是我的"。
+   *   session_gen 会被 stop 自己 bump 掉，按它判会导致 stop 之后旧读者
+   *   **永远不清 rx_busy** —— 下一条 read 要么被守卫挡 10 秒，要么（旧写法）
+   *   被放行后把旧读者的心跳拆掉。owner 只在**被抢占**时才作废。 */
+
+  if (priv->rx_owner_gen == gen)
     {
-      priv->rx_busy = false;
+      priv->rx_busy      = false;
+      priv->rx_owner_gen = 0;
     }
 
   /* 被 stop() / close / 新会话打断（或设备已经不在跑了）：按 EOF 返回 0。

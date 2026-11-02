@@ -9,3 +9,16 @@ __pycache__/
 
 # SDK board copy kept for reference (content identical to SiFli-SDK customer/boards)
 board/sf32lb52-lcd_n16r8/
+
+# ── 本机密钥（绝不入库）────────────────────────────────────────────
+# 开机由板级代码拷到 /data/ai_agent/config/config.json
+board/contest_board/src/etc/assets/agent_config.json
+# Bark/PushPlus 推送 key
+board/contest_board/src/etc/assets/push_key.txt
+
+# ── 构建产物（工作区外的东西不要混进仓库）────────────────────────
+cmake_out/
+build/
+*.o
+*.a
+*.d

@@ -22,8 +22,13 @@ BUILD_DIR=${TMPDIR:-/tmp}/hello_app_ai_tools_tests
 mkdir -p "$BUILD_DIR"
 
 CC=${CC:-cc}
-# -I$STUBS 必须在最前面：它提供假的 <nuttx/config.h> 和 tools/tool_registry.h
-CFLAGS="-std=gnu11 -Wall -Wextra -Werror -I$STUBS -I$APP_DIR"
+# -I$STUBS 必须在最前面：它提供假的 <nuttx/config.h> 和 tools/tool_registry.h，
+# 排在真源码目录前面才能盖住真的 tools/tool_registry.h。
+# AI_AGENT_SRC 放在最后，只为 tools/tool_guard.h —— 那个头自给自足
+# （只吃 stdbool/stddef），可以直接用真的；它不提供 tool_registry.h，
+# 所以不会和上面的假头打架。缺了它 ai_tools_provider.c:52 直接编不过。
+AI_AGENT_SRC="$APP_DIR/../../../packages/ai_agent/src"
+CFLAGS="-std=gnu11 -Wall -Wextra -Werror -I$STUBS -I$APP_DIR -I$AI_AGENT_SRC"
 
 echo "== 编译（对面已落地：ui_post_ask_alarm 有强符号） =="
 $CC $CFLAGS \

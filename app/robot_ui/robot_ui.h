@@ -135,8 +135,14 @@ void robot_ui_switch_view(ui_view_t view);
  */
 
 /* 无人应答时自动按「不用了」处理的时限（毫秒）。定义在这里而不是 main.c 私有，
- * 是因为对话框上要如实写给用户看（"20 秒内请回答"），两处必须是同一个数。 */
-#define ROBOT_ASK_ALARM_TIMEOUT_MS   20000
+ * 是因为对话框上要如实写给用户看，两处必须是同一个数。
+ *
+ * ★ 2026-10-31 从 20000 改到 10000 —— 统一报警路径的确认窗就是 **10 秒**
+ *   （用户拍板："10s 内老人说没事，ai 会停掉报警响铃，否则就直接通过 bark
+ *   联系家人"），voice_emerg 的 VOICE_EMERG_CONFIRM_MS 也是 10000。屏幕上
+ *   写的、和真正发 Bark 的时刻必须是同一个数，否则老人以为还有 20 秒、
+ *   10 秒时手机已经响了。 */
+#define ROBOT_ASK_ALARM_TIMEOUT_MS   10000
 
 /* 用户否认后，同一类原因的静默期（毫秒）：这期间不再重复询问。
  * "同一类"= 把 reason 尾部的置信度数字摘掉之后相等（见 main.c 的 ask_reason_key()），
@@ -170,6 +176,12 @@ int robot_ui_ask_alarm_answer(int confirmed);
 
 /* 询问页现在开着没有（跨线程只读一个指针） */
 bool robot_ui_ask_alarm_active(void);
+
+/* ★ 改询问页上那行小字（2026-10-31 统一报警路径）：
+ *   确认期写「10 秒内说「没事」或点下面按钮取消」，
+ *   Bark 发出去之后改成「已通知家人，30 秒后重发」。
+ *   只能在 LVGL 线程里调；别的线程走 ui_post_ask_hint()。页面没开着就是空操作。 */
+void robot_ui_ask_hint(const char *hint);
 
 /* ★ 跨线程入口：任何线程（声音检测线程 / MQTT 线程 / hello_app）都能调它来
  * "检测到异常，先问用户一句"。实现在 app/robot_ui/main.c，内部：
