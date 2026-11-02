@@ -8079,6 +8079,52 @@ static bool realtime_try(const char *text, sm_context_t *ctx)
 }
 
 /**
+ * @brief  这句话是否必须走带工具链的 velaclaw（而不是直连 MiMo）
+ *
+ * 简单问答直连 MiMo 可以把 LLM 一段从 5~11 秒压下来；但下面这些意图
+ * 依赖 ai_agent 的工具，必须保持原路，否则功能会退化：
+ *   提醒（建/删/查）、音量/亮度/设置、天气、搜索/实时、家居/媒体。
+ *
+ * 关键词宁可多列：多走一次 velaclaw 只是慢一点；漏判会直接影响功能。
+ */
+
+static bool intent_needs_tools(const char *text)
+{
+  static const char *const kw[] =
+  {
+    /* 提醒 */
+    "提醒", "闹钟", "叫我", "记得", "定时", "日程", "备忘",
+    /* 音量 / 亮度 / 设置 */
+    "音量", "声音", "大声", "小声", "调高", "调低", "亮度", "屏幕", "设置",
+    /* 天气 */
+    "天气", "气温", "下雨", "温度", "刮风",
+    /* 搜索 / 实时 */
+    "新闻", "搜索", "搜一下", "查一下", "查询", "最新", "实时",
+    "热点", "头条", "消息", "百科",
+    /* 家居 / 媒体 */
+    "开灯", "关灯", "灯", "打电话", "发消息", "播放", "放首", "音乐", "歌",
+  };
+
+  size_t i;
+
+  if (text == NULL || text[0] == '\0')
+    {
+      return true;   /* 空话别直连，按原路处理 */
+    }
+
+  for (i = 0; i < sizeof(kw) / sizeof(kw[0]); i++)
+    {
+      if (strstr(text, kw[i]) != NULL)
+        {
+          printf("[LLM] 命中工具意图「%s」-> 走 velaclaw\n", kw[i]);
+          return true;
+        }
+    }
+
+  return false;
+}
+
+/**
  * @brief  本地时间/日期快路（不经过云端）
  *
  * 真机：问「现在几点了」原来要 ASR(~6s) + velaclaw LLM(~11s) + TTS(~2s)，
@@ -8699,6 +8745,40 @@ static void process_ai_dialogue(sm_context_t *ctx)
   if (weather_fast_try(text_buf, ctx))
     {
       goto dlg_done;
+    }
+
+  /* ★ 2026-11-03：**简单问答直连 MiMo，跳过 velaclaw**。
+   *   真机 velaclaw 一段就要 5~11.5 秒；直连 mimo_chat 走同一条 HTTPS，
+   *   省掉 ReAct 决策/工具调度的开销。
+   *   带工具意图（提醒、音量/亮度、天气、搜索、家居/媒体）一律仍走
+   *   velaclaw —— 见 intent_needs_tools()，宁可慢也不让功能退化。
+   *   注意：直连这条路不带多轮上下文（mimo_chat 每次只发当前这句话），
+   *   简单问答够用；需要上下文的工具型会话仍由 velaclaw 承担。 */
+  if (g_net_started && !intent_needs_tools(text_buf))
+    {
+      int fb;
+
+      round_phase_set(ROUND_PHASE_LLM);
+
+      ai_network_send_face(&g_net_ctx, AI_CMD_FACE_THINKING);
+
+      strncpy(g_llm_sent_text, text_buf, sizeof(g_llm_sent_text) - 1);
+      g_llm_sent_text[sizeof(g_llm_sent_text) - 1] = '\0';
+
+      printf("[LLM] 简单问答直连 MiMo（跳过 velaclaw）：%s\n", text_buf);
+
+      fb = mimo_chat(text_buf, g_llm_fallback_reply,
+                     sizeof(g_llm_fallback_reply));
+
+      if (fb > 0 && g_llm_fallback_reply[0] != '\0')
+        {
+          printf("[LLM] 直连 MiMo 成功（%d 字节），进入 TTS\n",
+                 fb);
+          llm_complete_callback(g_llm_fallback_reply, 0, ctx);
+          goto dlg_done;
+        }
+
+      printf("[LLM] 直连 MiMo 失败（%d），回落 velaclaw\n", fb);
     }
 
   round_phase_set(ROUND_PHASE_LLM);
