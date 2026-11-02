@@ -2885,7 +2885,7 @@ index 1acc875..d1dd8f2 100644
      /* Normalise: remove trailing slash (except root "/") so path check works */
      strncpy(dir_buf, dir, sizeof(dir_buf) - 1);
 diff --git a/src/tools/tool_web_search.c b/src/tools/tool_web_search.c
-index 7499684..335a91d 100644
+index 7499684..99cc512 100644
 --- a/src/tools/tool_web_search.c
 +++ b/src/tools/tool_web_search.c
 @@ -26,10 +26,15 @@
@@ -2904,19 +2904,27 @@ index 7499684..335a91d 100644
  #include "cJSON.h"
  
  static const char *TAG = "web_search";
-@@ -38,6 +43,11 @@ static char s_serp_key[128]   = {0};
+@@ -38,8 +43,17 @@ static char s_serp_key[128]   = {0};
  static char s_exa_key[128]    = {0};
  static char s_news_key[128]   = {0};
  static char s_tavily_key[128] = {0};
+-
+-#define SEARCH_BUF_SIZE     (16 * 1024)
 +/* 和风天气：host + API KEY（见 AGENT_CFG_KEY_QWEATHER_* 那段）。两个都在
 + * 配置里才走和风，缺任一个 tool_get_weather_execute 自动退回 Open-Meteo。
 + * ★ 这两行是**凭据**，日志里一个字节都不打（只打"配了/没配"）。 */
 +static char s_qweather_host[128] = {0};
 +static char s_qweather_key[128]  = {0};
- 
- #define SEARCH_BUF_SIZE     (16 * 1024)
++
++/* ★ 2026-11-02：16 KB → **64 KB**。
++ *   Tavily 一次新闻搜索（topic=news, max_results=10）的真实响应实测 23 KB，
++ *   16 KB 缓冲会把 JSON 截断 → cJSON_Parse 失败 → 静默退回新浪（只给财经）。
++ *   这正是真机「问娱乐新闻却播财经」的根因。64 KB 留 2.5 倍余量。 */
++#define SEARCH_BUF_SIZE     (64 * 1024)
  #define SEARCH_RESULT_COUNT 5
-@@ -83,6 +93,115 @@ static int https_post_json(const char *host, const char *path,
+ 
+ /* ──────────────────────────────────────────────────────────────
+@@ -83,6 +97,115 @@ static int https_post_json(const char *host, const char *path,
                                hdrs, body, body ? strlen(body) : 0, buf, buf_cap, NULL);
  }
  
@@ -3032,7 +3040,7 @@ index 7499684..335a91d 100644
  /* ──────────────────────────────────────────────────────────────
   * Init
   * ──────────────────────────────────────────────────────────────*/
-@@ -108,6 +227,12 @@ int tool_web_search_init(void)
+@@ -108,6 +231,12 @@ int tool_web_search_init(void)
      memset(tmp, 0, sizeof(tmp));
      if (claw_config_get(AGENT_CFG_KEY_NEWS_KEY, tmp, sizeof(tmp)) == OK && tmp[0])
          strncpy(s_news_key, tmp, sizeof(s_news_key) - 1);
@@ -3045,7 +3053,7 @@ index 7499684..335a91d 100644
  
      if (s_tavily_key[0]) syslog(LOG_INFO, "[%s] Tavily key configured\n", TAG);
      if (s_serp_key[0])   syslog(LOG_INFO, "[%s] SerpAPI key configured\n", TAG);
-@@ -116,6 +241,17 @@ int tool_web_search_init(void)
+@@ -116,6 +245,17 @@ int tool_web_search_init(void)
      if (!s_tavily_key[0] && !s_serp_key[0])
          syslog(LOG_WARNING, "[%s] No search key. Use: set_tavily_key / set_search_key\n", TAG);
  
@@ -3063,7 +3071,7 @@ index 7499684..335a91d 100644
      return OK;
  }
  
-@@ -126,12 +262,26 @@ int tool_web_search_init(void)
+@@ -126,12 +266,26 @@ int tool_web_search_init(void)
   *   Response: { "results": [{ "title","url","content" }] }
   * ──────────────────────────────────────────────────────────────*/
  
@@ -3091,7 +3099,28 @@ index 7499684..335a91d 100644
      char *body_str = cJSON_PrintUnformatted(body_obj);
      cJSON_Delete(body_obj);
      if (!body_str) return ERROR;
-@@ -360,7 +510,7 @@ int tool_web_search_execute(const char *input_json, char *output, size_t output_
+@@ -153,9 +307,19 @@ static int tavily_search(const char *query, char *output, size_t output_size)
+         return ERROR;
+     }
+ 
++    /* ★ 2026-11-02：解析失败必须**说出来**。原来这里静默 return ERROR，
++     *   上层只打一行 "Tavily news failed"，看不出是截断、是网络、还是空结果。 */
++    size_t resp_len = strlen(buf);
+     cJSON *root = cJSON_Parse(buf);
++    if (!root)
++      {
++        syslog(LOG_ERR,
++               "[%s] Tavily JSON 解析失败（响应 %zu 字节 / 缓冲 %d，截断？）: %.160s\n",
++               TAG, resp_len, SEARCH_BUF_SIZE, buf);
++        free(buf);
++        return ERROR;
++      }
+     free(buf);
+-    if (!root) return ERROR;
+ 
+     cJSON *results = cJSON_GetObjectItem(root, "results");
+     if (!results || !cJSON_IsArray(results) || cJSON_GetArraySize(results) == 0) {
+@@ -360,7 +524,7 @@ int tool_web_search_execute(const char *input_json, char *output, size_t output_
      syslog(LOG_INFO, "[%s] Web search: %s\n", TAG, query);
  
      if (s_tavily_key[0]) {
@@ -3100,7 +3129,7 @@ index 7499684..335a91d 100644
          if (err == OK && output[0] && strncmp(output, "Error:", 6) != 0) {
              syslog(LOG_INFO, "[%s] Tavily OK: %d bytes\n", TAG, (int)strlen(output));
              return OK;
-@@ -390,6 +540,292 @@ int tool_web_search_execute(const char *input_json, char *output, size_t output_
+@@ -390,6 +554,292 @@ int tool_web_search_execute(const char *input_json, char *output, size_t output_
      return ERROR;
  }
  
@@ -3393,7 +3422,7 @@ index 7499684..335a91d 100644
  /* ──────────────────────────────────────────────────────────────
   * Backend 4: NewsAPI
   *   GET https://newsapi.org/v2/everything?q=...&pageSize=5&apiKey=...
-@@ -417,16 +853,31 @@ int tool_news_search_execute(const char *input_json, char *output, size_t output
+@@ -417,16 +867,31 @@ int tool_news_search_execute(const char *input_json, char *output, size_t output
  
      syslog(LOG_INFO, "[%s] News search: %s\n", TAG, query);
  
@@ -3428,7 +3457,7 @@ index 7499684..335a91d 100644
      /* Fallback: NewsAPI (may have routing issues on some networks) */
      if (s_news_key[0] == '\0') {
          snprintf(output, output_size,
-@@ -542,10 +993,1085 @@ int tool_web_search_set_news_key(const char *key)
+@@ -542,10 +1007,1085 @@ int tool_web_search_set_news_key(const char *key)
      return OK;
  }
  
@@ -4516,7 +4545,7 @@ index 7499684..335a91d 100644
   * ──────────────────────────────────────────────────────────────*/
  
  int tool_get_weather_execute(const char *input_json, char *output, size_t output_size)
-@@ -565,15 +2091,66 @@ int tool_get_weather_execute(const char *input_json, char *output, size_t output
+@@ -565,15 +2105,66 @@ int tool_get_weather_execute(const char *input_json, char *output, size_t output
  
      char location[256];
      strncpy(location, loc_item->valuestring, sizeof(location) - 1);
@@ -4585,7 +4614,7 @@ index 7499684..335a91d 100644
          if (err == OK && output[0] && strncmp(output, "Error:", 6) != 0) {
              syslog(LOG_INFO, "[%s] Weather via Tavily OK\n", TAG);
              return OK;
-@@ -589,8 +2166,12 @@ int tool_get_weather_execute(const char *input_json, char *output, size_t output
+@@ -589,8 +2180,12 @@ int tool_get_weather_execute(const char *input_json, char *output, size_t output
          }
      }
  

@@ -7,9 +7,9 @@
 >
 > | 权威补丁 | `cd` 到 | 覆盖 |
 > |---|---|---|
-> | `nuttx-working-tree.patch` | `nuttx` | 全部 6 个改动文件 |
+> | `nuttx-working-tree.patch` | `nuttx` | 全部 7 个改动文件（2026-11-02 增加 net/tcp/tcp_timer.c） |
 > | `vendor-sifli-working-tree.patch` | `vendor/sifli` | `chips/sf32lb52/**` + `boards/sf32lb52/drivers/lcd/**` |
-> | `apps-ai-agent-working-tree.patch` | `packages/ai_agent` | 全部 41 个改动文件（去掉 `.built`/`.depend`） |
+> | `apps-ai-agent-working-tree.patch` | `packages/ai_agent` | 全部 42 个改动文件（去掉 `.built`/`.depend`） |
 >
 > **不要**把下面表格里那些 per-fix 补丁和这三份叠加着打（会冲突）。
 >

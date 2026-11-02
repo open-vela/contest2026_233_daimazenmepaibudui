@@ -801,6 +801,13 @@ static void alarm_unify_hook(enum voice_emerg_phase_e phase,
 
         case VOICE_EMERG_CANCELLED:
         case VOICE_EMERG_EXPIRED:
+            /* ★ 2026-11-02：**必须把 ask_pending 一起作废**。
+             *   只关页面不清状态的话，10 秒超时线程仍按旧 gen 触发
+             *   ask_finish(0,"超时")，而那时 voice_emerg 已经收摊，
+             *   于是走「统一报警模块没在跑，兜底直接报警」→ 报警页重新
+             *   弹出并响铃（真机现象：说「没事」停铃后十秒报警页又弹回来）。
+             *   standdown 走 ask_finish(-1)：撤页、清 pending、不报警。 */
+            ui_post_ask_standdown("语音急救收摊");
             ui_post_ask_close();
 
             /* ★ 2026-11-01：收摊时把红报警页也撤掉、板级报警铃也停掉。
@@ -1069,6 +1076,22 @@ static void ask_finish(int confirmed, const char *src)
 
     if (!g_ask_pending) {
         nxsem_post(&g_ask_lock);
+
+        /* ★ 2026-11-02：pending 已被清掉，但**报警还在响**时，「没事」仍然
+         *   必须能停铃。真机：10 秒超时线程把 pending 清掉后，报警继续响
+         *   （voice_emerg 的 180 秒周期），此时点「我没事，取消」被判
+         *   "没有待回答的询问"直接忽略 —— 老人看到的就是"点了按钮铃还响"。
+         *   这里补一刀：只要 voice_emerg 还在报警，取消回答照样执行。 */
+        if (confirmed == 0 && voice_emerg_is_active()) {
+            printf("[Ask] 询问已超时，但报警仍在响（来源=%s）→ 直接取消报警\n", src);
+            alarm_clear();
+            voice_emerg_cancel(src);
+            ai_companion_ask_abort();
+            ui_post_ask_close();
+            ui_post_panel(2, NULL, NULL);   /* 撤红报警页 */
+            return;
+        }
+
         printf("[Ask] 没有待回答的询问（来源=%s，回答=%s），忽略\n",
                src, ask_answer_name(confirmed));
         return;
@@ -4856,6 +4879,18 @@ static void *time_sync_thread(void *arg)
 static volatile uint32_t g_ui_beat_ms;
 static volatile pid_t    g_ui_tid;
 
+/* ★ 2026-11-02：心跳改用**单调时钟**。原来用 time(NULL)*1000 —— 开机还没
+ *   校时的时候 time() 是 0，g_ui_beat_ms 也跟着是 0，看门狗的条件
+ *   `g_ui_beat_ms != 0` 直接把它关掉；之后校时一跳，秒级精度还会让
+ *   "停了几毫秒"算成"停了几千毫秒"。单调时钟没有这两个坑。 */
+static uint32_t ui_mono_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+}
+
 static void *ui_stall_watchdog(void *arg)
 {
     (void)arg;
@@ -4865,7 +4900,7 @@ static void *ui_stall_watchdog(void *arg)
         sleep(5);
 
         {
-            uint32_t now   = (uint32_t)(time(NULL) * 1000);
+            uint32_t now   = ui_mono_ms();
             uint32_t since = now - g_ui_beat_ms;
             pid_t    tid   = (pid_t)g_ui_tid;
 
@@ -5137,7 +5172,7 @@ int main(int argc, char *argv[])
         pthread_t      t;
 
         g_ui_tid = nxsched_gettid();
-        g_ui_beat_ms = (uint32_t)(time(NULL) * 1000);
+        g_ui_beat_ms = ui_mono_ms();
 
         pthread_attr_init(&a);
         pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
@@ -5156,8 +5191,8 @@ int main(int argc, char *argv[])
         static int  time_tick = 0;
         static int  reminder_tick = 0;
 
-        /* 看门狗心跳：这一行跑过 = UI 线程活着 */
-        g_ui_beat_ms = (uint32_t)(time(NULL) * 1000);
+        /* 看门狗心跳：这一行跑过 = UI 线程活着（单调时钟，见 ui_mono_ms） */
+        g_ui_beat_ms = ui_mono_ms();
 
         /* 取走其他线程投递来的界面操作（ui_async.c 的队列）。必须在 LVGL
          * 线程调（本循环就是）；泵在回调锁外执行，回调里再投递也安全。 */

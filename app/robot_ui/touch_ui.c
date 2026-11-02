@@ -2767,8 +2767,31 @@ static void voice_panel_build(bool mirror)
     lv_obj_set_style_pad_row(voice_panel, 10, 0);
 
     /* 页眉：左返回（= 原 ×，停录音 + 丢弃这一轮）+ 中标题 + 右实时时钟 */
-    ui_page_header_create(voice_panel, "语音聊天",
-                          voice_close_event_handler, NULL);
+    {
+        lv_obj_t *hdr = ui_page_header_create(voice_panel, "语音聊天",
+                                              voice_close_event_handler, NULL);
+
+        /* ★ 2026-11-02：**右上角再放一个小返回按钮**（用户要求）。
+         *   和左上角那个走同一个 voice_close_event_handler —— 停录音、
+         *   丢弃这一轮、关面板。56×40 是"小"和"老人按得到"的折中；
+         *   页眉本身右缩进 40，正好躲开屏幕物理圆角。 */
+        if (hdr != NULL) {
+            lv_obj_t *btn = lv_btn_create(hdr);
+            lv_obj_set_size(btn, 56, 40);
+            lv_obj_align(btn, LV_ALIGN_RIGHT_MID, 0, 0);
+            lv_obj_set_style_bg_color(btn, THEME_GREEN_TINT, 0);
+            lv_obj_set_style_radius(btn, 20, 0);
+            lv_obj_set_style_shadow_width(btn, 0, 0);
+            lv_obj_add_event_cb(btn, voice_close_event_handler,
+                                LV_EVENT_CLICKED, NULL);
+
+            lv_obj_t *lbl = lv_label_create(btn);
+            lv_label_set_text(lbl, "返回");
+            lv_obj_set_style_text_color(lbl, THEME_GREEN_DARK, 0);
+            lv_obj_set_style_text_font(lbl, &lv_font_ui_16, 0);
+            lv_obj_center(lbl);
+        }
+    }
 
     /* 录音计时（mm:ss，voice_tick_timer_cb 每秒刷新）。
      * 镜像面板没有录音，这一行不建 —— 建了只会一直停在 00:00，反而让人以为坏了。 */
