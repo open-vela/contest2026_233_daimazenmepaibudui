@@ -118,7 +118,8 @@ static uint32_t audio_calc_frame_energy(const int16_t *data, size_t frames);
 static size_t audio_play_chunk_bytes(const audio_context_t *ctx);
 static void audio_apply_chunk_fade(audio_context_t *ctx, size_t frames);
 static int audio_open_play_device(audio_context_t *ctx);
-static void audio_close_play_device(int fd);
+static void audio_close_play_device(audio_context_t *ctx, int fd);
+static void audio_drop_play_device(audio_context_t *ctx);
 static int audio_apply_volume(int fd, uint8_t volume);
 static int audio_configure_output(int fd, const audio_context_t *ctx);
 static int audio_hw_set_volume(const audio_context_t *ctx, uint8_t volume);
@@ -143,6 +144,29 @@ static const char *g_state_names[] =
   [AUDIO_STATE_PLAYING]    = "PLAYING",
   [AUDIO_STATE_BOTH]       = "BOTH"
 };
+
+/* 用户设定的播放音量（0..100），**模块级单值**，不能记在某个 audio_context_t 上。
+ *
+ * 一份镜像里有两套 audio_context_t：hello_app 常开麦一套（ai_companion_main.c）
+ * 和 robot_ui 面板一套（main.c），而设置页的音量滑块只调得到 robot_ui 那个
+ * （volume_set_handler 里 audio_set_volume(&g_audio_ctx, ...)）。
+ *
+ * 起播时下发的音量以前读的是 ctx->config.volume —— 于是常开麦那条每次起播都
+ * 把自己那套的默认值 70 写回硬件（audio_apply_volume 在 audio_open_play_device
+ * 里每次都跑），把滑块设的值冲掉。表现就是「拖音量对 AI 回话没用」：拖到 30
+ * 显示 30，老人听到的还是 70 的响度。而那条常开麦恰恰是老人日常用的那条。
+ *
+ * 记成模块级单值后，谁起播都用同一个用户音量。顺带修掉另一个隐患：
+ * robot_ui 的 audio_config 是按字段初始化的，.volume 没写 = 0，原来起播前
+ * 会把「0」当成音量下发（最小档），全靠 touch_ui_set_volume_cb 注册时补一下
+ * 才没露馅 —— 现在两者都对齐到这个单值。
+ *
+ * 起播前每次都重新下发（而不是设一次就不管）是**故意**的：板级报警模块
+ * （sf32lb52_alarm.c 的 alarm_audio_open）响铃时会把硬件音量强制写成
+ * ALARM_PLAYBACK_VOLUME(800) 并且不还回来，只有下一次起播重新下发才能把它
+ * 复位到用户值。 */
+
+static uint8_t g_play_volume = AUDIO_VOLUME_DEFAULT;
 
 /****************************************************************************
  * Private Functions
@@ -472,6 +496,158 @@ static int audio_open_play_device(audio_context_t *ctx)
 {
   int fd;
   int ret;
+  uint32_t t0 = audio_now_ms_nonzero();
+  uint32_t t_cfg = 0;     /* 三段拆解计时（2026-10-30）：重配 / 音量 / START */
+  uint32_t t_vol = 0;
+  uint32_t t_start = 0;
+
+  /* ★ 默认「不是保温取来的」，只有下面那条保温分支返回前才会置真。
+   * 判据用途见 ai_audio.h 的 play_open_warm：写循环靠它决定 write 失败时
+   * 允不允许补一次完整热启。放在这里置假，是因为保温分支紧跟着就 return，
+   * 另外两条路（复用 / 全开）都从这儿往下走、不会再改它。 */
+
+  ctx->play_open_warm = false;
+
+#if AUDIO_PLAY_DEVICE_CACHE
+  /* 上一块留下的 fd 还在：设备和方向都配好了，这一块只重配一下方向再起。
+   *
+   * 省掉的是 open() + close() 一整圈。START/STOP 照旧，会话记账每块都回
+   * OPEN，半双工的让路/还麦一字未动。
+   *
+   * ⚠ 判据别再按"省掉约 600 ms"算：实测「全开」280~803 ms 里的大头在
+   * START 里面那段 hw_start 上电时序（开 ADC 通路 / 开 DAC 通路 / 开功放），
+   * 那个无论如何每块都要做。这里省的只是 open+close，几十毫秒量级。
+   *
+   * 判据：串口看 [AUDIO] 播放设备 那行，块 2 起应该是「复用」。 */
+
+#if AUDIO_PLAY_KEEP_WARM
+  /* ★ 保温直取（2026-10-30，用户拍板「要动」）：上一块收尾时**没有** STOP，
+   * 设备这会儿还是 RUNNING —— 这一块连 CONFIGURE / START 都不用发，只把音量
+   * 再下发一次就直接写。
+   *
+   * 砍掉的是每块 391~522 ms 的「重配 + 音量 + START」，其中大头在 START 里
+   * 那段 hw_start 上电时序（开 ADC 模拟通路 / 开 DAC 模拟通路 / 开功放 /
+   * 30ms + 20ms 建立时间）。同时功放不再每块重开一次，那声「啪」也没了。
+   *
+   * 音量**照样每块重发**：板级报警（sf32lb52_alarm.c）会把设备级的
+   * playback_db 强制写成 800 且不还回来，报警若夹在两块之间，不重发就会按
+   * 800 响。AUDIO_TYPE_FEATURE 不属于 INPUT/OUTPUT，audio.c 的转发门永远
+   * 放行它，running 时发也是纯寄存器写（见 hw_start 里 hw_set_volume 那段），
+   * 几毫秒的事。
+   *
+   * 判据：串口看 [AUDIO] 播放设备 那行，一轮里块 2 起应该是「保温直取」，
+   * 拆解计时里的「共 X ms」应该只剩音量那一段（几 ms）。 */
+  if (ctx->play_fd >= 0 && ctx->play_fd_running)
+    {
+      uint32_t t_warm0 = audio_now_ms_nonzero();
+      uint32_t t_warmv;
+
+      ret = audio_apply_volume(ctx->play_fd, g_play_volume);
+      t_warmv = audio_now_ms_nonzero();
+      if (ret != OK)
+        {
+          printf("[AUDIO] 播放音量下发失败 (%d)：这段可能偏小甚至听不见\n",
+                 ret);
+        }
+
+      ctx->play_open_warm = true;   /* ★ 写循环据此允许「write 失败就补热启」 */
+      printf("[AUDIO] 播放设备：保温直取（音量 %lu ms，省掉重配+START，"
+             "连功放都不断 → 没有「啪」）\n",
+             (unsigned long)(t_warmv - t_warm0));
+      return ctx->play_fd;
+    }
+#endif
+
+  if (ctx->play_fd >= 0)
+    {
+      /* ★ 2026-10-26：复用分支必须**先 CONFIGURE(OUTPUT) 再 START**，
+       * 否则 START 恒失败，fd 复用从来没生效过。
+       *
+       * 根因在驱动（nuttx/audio/audio.c 的 audio_start）：
+       *     if (upper->status->state == AUDIO_STATE_OPEN) return -EPERM;
+       * 上一块收尾时 audio_close_play_device() 发的 AUDIOIOC_STOP 会把
+       * upper->status->state 带回 OPEN，而复用分支原来只发 音量+START ——
+       * 状态停在 OPEN，START 必然吃 -EPERM。真机铁证就是每块都打
+       *     [AUDIO] 缓存的播放设备起不动 (1)，摘掉重开
+       * （那个 (1) 就是 EPERM），一次「播放设备：复用」都没有。
+       *
+       * CONFIGURE(OUTPUT) 正是把它从 OPEN 推到 PREPARED 的那一步
+       * （audio.c 里 audio_setstate(upper, AUDIO_STATE_PREPARED)）。驱动的
+       * 转发门对 OPEN / PREPARED 都放行，所以在 PREPARED 重配是**合法**的；
+       * 半双工抢占那条支路也踩不到（它要求 status==RUNNING）。 */
+      ret = audio_configure_output(ctx->play_fd, ctx);
+      t_cfg = audio_now_ms_nonzero();
+      if (ret != OK)
+        {
+          printf("[AUDIO] 缓存的播放设备重配方向失败 (%d)，摘掉重开\n", ret);
+          close(ctx->play_fd);      /* 见下面「摘掉时必须 close」 */
+          ctx->play_fd = -1;
+          ctx->play_fd_running = false;
+        }
+      else
+        {
+          /* 音量**每块都重发**，不跟着 open 一起省掉。
+           *
+           * 为什么不能省：板级报警（sf32lb52_alarm.c 的 alarm_audio_open）
+           * 响铃时会把驱动的 playback_db 强制写成 ALARM_PLAYBACK_VOLUME(800)
+           * 并且不还回来，而 playback_db 是**设备级**的（priv 就是 dev）。
+           * 轮内要是复用了不重发的 fd，报警之后那几块就会按 800 响，滑块设的
+           * 值又不管用了 —— 那正是上一版刚修好的 bug，不能在这里复辟。
+           *
+           * 代价只是一个 ioctl：AUDIO_TYPE_FEATURE 不属于 INPUT/OUTPUT，
+           * audio.c 的转发门永远放行它，几毫秒的事。 */
+          ret = audio_apply_volume(ctx->play_fd, g_play_volume);
+          t_vol = audio_now_ms_nonzero();
+          if (ret != OK)
+            {
+              printf("[AUDIO] 播放音量下发失败 (%d)：这段可能偏小甚至听不见\n",
+                     ret);
+            }
+
+          if (ioctl(ctx->play_fd, AUDIOIOC_START, 0) == 0)
+            {
+              t_start = audio_now_ms_nonzero();
+              ctx->play_fd_running = true;   /* ★ 保温用：这一下真的起来了 */
+
+              /* ★ 2026-10-30 拆解计时：这行原来只打一个总数（391~522 ms），
+               * 归不到实处就只能猜。板级 hw_start 里**刻意**的上电延时只有
+               * 30+20 = 50 ms（sf32lb52_audio.c 的 SETTLE_MS + 等功放），
+               * 所以大头不在那儿。现在把三段分开打，下一轮照着数决定砍哪儿。
+               * 顺带把 START 之后这段（回到调用方之前）也量进去 —— 它同样在
+               * 「尽快出声」的关键路径上。
+               * 不改任何行为，只把一行日志拆细。 */
+              printf("[AUDIO] 播放设备：复用（重配 %lu ms + 音量 %lu ms + "
+                     "START %lu ms，共 %lu ms，省掉 open/close）\n",
+                     (unsigned long)(t_cfg - t0),
+                     (unsigned long)(t_vol - t_cfg),
+                     (unsigned long)(t_start - t_vol),
+                     (unsigned long)(t_start - t0));
+              return ctx->play_fd;
+            }
+
+          /* ★ 摘掉时**必须 close**（2026-10-26 修，原来是不 close 的）。
+           *
+           * 原注释的理由是"上一代播放线程收尾时会认领并关掉它"，但那条路
+           * 根本走不到：audio_close_play_device() 里那句
+           *     if (ctx->play_fd == fd) return;
+           * 就是"留给缓存"——上一代**已经**在它自己的收尾里把这个 fd 交给
+           * 缓存、跳过了 close。
+           * 于是在这里摘掉而不关 = **每块漏一个 fd**（一轮七八块就漏七八个），
+           * 早晚把 fd 表耗干 —— 那正是"玩一会儿就不能对话了"的一种形状。
+           *
+           * 为什么在这里关是安全的（不会双重 close）：能走到 audio_open_play_device
+           * 的新播放线程，一定是在 audio_play_begin() 里 reap 掉上一代之后才
+           * 创建的（reap 放弃 join 时它直接返回 -EBUSY、压根不建新线程）；而
+           * 上一代若被换代顶掉，它自己那句 audio_close_play_device 因
+           * `play_gen != my_gen` **根本不会执行**，也不会来关。所以此刻这个 fd
+           * 没有第二个人会关，只有我们能关。 */
+          printf("[AUDIO] 缓存的播放设备起不动 (%d)，摘掉重开\n", errno);
+          close(ctx->play_fd);
+          ctx->play_fd = -1;
+          ctx->play_fd_running = false;
+        }
+    }
+#endif
 
   fd = open(AUDIO_PLAY_DEVICE, O_WRONLY);
   if (fd < 0)
@@ -495,9 +671,15 @@ static int audio_open_play_device(audio_context_t *ctx)
     }
 
   /* 音量下发失败是非致命的（驱动自己有一份默认音量），但"提示音听不见"
-   * 也可能是这个原因，所以照样留一行。 */
+   * 也可能是这个原因，所以照样留一行。
+   *
+   * 这里读的是模块级 g_play_volume，不是 ctx->config.volume —— 理由见它
+   * 定义处：两套 ctx 各存一份必然漂，滑块只管得到 robot_ui 那套。
+   *
+   * ★ 全开和复用**两条路都重发**这一下（见上面复用分支里的说明：报警会把
+   * 设备级的 playback_db 写成 800 不还回来）。 */
 
-  ret = audio_apply_volume(fd, ctx->config.volume);
+  ret = audio_apply_volume(fd, g_play_volume);
   if (ret != OK)
     {
       printf("[AUDIO] 播放音量下发失败 (%d)：这段可能偏小甚至听不见\n", ret);
@@ -516,26 +698,184 @@ static int audio_open_play_device(audio_context_t *ctx)
       return -errcode;
     }
 
-  AUDIO_DEBUG("播放设备已就绪 (fd=%d)", fd);
+  /* ★ 保温标记：START 真成功了才算 RUNNING（和上面复用分支同一条判据）。 */
+  ctx->play_fd_running = true;
+
+#if AUDIO_PLAY_DEVICE_CACHE
+  /* 只有**一路顺风**才缓存：上面任何一步失败都直接 close 退回了，
+   * 不会留下一个配了一半的 fd 让下一块去复用。 */
+  ctx->play_fd = fd;
+#endif
+
+  printf("[AUDIO] 播放设备：全开（open+CONFIGURE+音量+START 共 %lu ms）\n",
+         (unsigned long)(audio_now_ms_nonzero() - t0));
   return fd;
 }
 
 /**
- * @brief  停止并关闭播放设备（**只能在持有该 fd 的播放线程里调用**）
+ * @brief  一块放完了：停设备，fd 按 AUDIO_PLAY_DEVICE_CACHE / AUDIO_PLAY_KEEP_WARM
+ *         决定留还是关
+ *
+ * **STOP 在"整轮播报中"可以省**（2026-10-30，AUDIO_PLAY_KEEP_WARM）：块与块
+ * 之间没人要这台设备 —— audio_resume_record() 在 record_hold 为真时本来就
+ * 早退（"整轮播报还没结束，暂不还麦"），所以这一刻举着 RUNNING 挡不住任何人。
+ * 省掉 STOP 之后下一块走「保温直取」，砍掉 391~522 ms 的重配+START，还免了
+ * 功放重开那声「啪」。
+ *
+ * **STOP 不能无条件省**：不停的话这个 fd 的会话一直举着 RUNNING，而
+ * audio_stop() 的放行判据是"别的 fd 的 nstate <= PREPARED"（nuttx/audio/
+ * audio.c），它一个人就能把所有 STOP 挡在门外 —— 录音侧从此钉死，那正是
+ * 2026-10-26 那次「AUDIO_IN: started 打了 22 次、hw_start 一次都没有」的
+ * 形状。所以保温只在 record_hold 为真时做；一出整轮播报（record_hold 被
+ * round_hold_give 清掉、或空档超 8 秒提前还麦），这里就照旧 STOP，
+ * priv->state 落回 OPEN，录音侧的放行判据永远不变。
+ *
+ * 只能在持有该 fd 的播放线程里调用。
  */
 
-static void audio_close_play_device(int fd)
+static void audio_close_play_device(audio_context_t *ctx, int fd)
 {
   if (fd < 0)
     {
       return;
     }
 
+#if AUDIO_PLAY_KEEP_WARM
+  /* 保温：整轮播报还没结束，而且这个 fd 就是缓存那个 → 不 STOP，留给下一块。
+   * 三个条件缺一不可：
+   *   - record_hold：块间没人要设备，举着 RUNNING 不挡谁（上面那段）；
+   *   - ctx->play_fd == fd：不是缓存那个就说明这一代已被顶掉，别人的设备
+   *     不能替它保温；
+   *   - play_fd_running：本来就没起来就别记账，免得下一块「以为在跑」。 */
+  if (ctx->record_hold && ctx->play_fd == fd && ctx->play_fd_running)
+    {
+      /* 不打每块一行：一轮七八块会刷屏。真正的判据是上层那行
+       * 「播放设备：保温直取」和变短的块间空档。 */
+      AUDIO_DEBUG("整轮播报中，播放设备保温不 STOP");
+      return;
+    }
+#endif
+
   /* 顺序和录音一样：先 AUDIOIOC_STOP 再 close。
    * 注意这个 STOP 会同时停掉录音通路（半双工），所以它必须是播放的最后一步。 */
 
   ioctl(fd, AUDIOIOC_STOP, 0);
+  ctx->play_fd_running = false;   /* ★ 这一下真的停了 */
+
+#if AUDIO_PLAY_DEVICE_CACHE
+  /* 还是当前缓存的那个 → 留给下一块。此刻它在 audio.c 里已经是 OPEN 态，
+   * 和"关掉再打开"的会话状态完全一致，不会变成陈旧记账。 */
+  if (ctx->play_fd == fd)
+    {
+      return;
+    }
+
+  /* 不是当前缓存（这一代已经被顶掉、缓存早换人了）→ 这个 fd 只能自己关。
+   * 走到这里说明有人把缓存摘掉了，见 audio_open_play_device 里那条注释。 */
+#endif
+
   close(fd);
+}
+
+/**
+ * @brief  真关缓存的播放设备（收摊用）
+ *
+ * 调用点只有两个：audio_play_stop()（上层明确掐掉这一轮）与 audio_deinit()。
+ * **不能在还有播放线程活着的时候调** —— 那条线程可能正在 write 这个 fd，
+ * 跨线程 close 它就是踩 fd（本项目被这条咬过）。所以调用方先 reap，确认
+ * play_exited 之后才来。
+ */
+
+static void audio_drop_play_device(audio_context_t *ctx)
+{
+  int fd;
+
+  if (ctx == NULL)
+    {
+      return;
+    }
+
+  fd = ctx->play_fd;
+  if (fd < 0)
+    {
+      /* 没有缓存的 fd 就没有保温可言 —— 顺手把可能残留的标记清掉，
+       * 免得下一次 audio_open_play_device 读到「以为在跑」。 */
+      ctx->play_fd_running = false;
+      return;
+    }
+
+  /* 先摘再关：万一有人正好在复用它，看到 -1 就会走全新 open，不会用到
+   * 一个正在被关掉的 fd。 */
+  ctx->play_fd = -1;
+  ctx->play_fd_running = false;
+
+  ioctl(fd, AUDIOIOC_STOP, 0);
+  close(fd);
+
+  printf("[AUDIO] 播放设备已关闭（缓存清空）\n");
+}
+
+/**
+ * @brief  强制回收被陈旧记账钉死的音频上半部（2026-10-26）
+ *
+ * **症状**：某个 fd 的 priv->state 卡在 RUNNING，而设备上其实一个会话都没有
+ * （串口判据：`armed=0 busy=0`）。它一个人就能把 audio_stop() 的放行判据
+ * （`audio_getnstate(其它 fd) <= PREPARED`，见 nuttx/audio/audio.c）恒判为假：
+ * 硬件永远停不下来、COMPLETE 永远不发、上层状态机钉在 RUNNING，此后每一次
+ * CONFIGURE/START 都被那道门**静默吞掉却照样返回 OK**。真机指纹就是
+ * 「AUDIO_IN: started」刷屏而「hw_start 真跑了」一次都没有，监听守护每 5 秒
+ * 判定一次僵尸会话重开一圈，**麦克风永久失聪** → 没轮次 → 没回复也没提示音。
+ *
+ * **内核里对症的药早就有了**：audio_configure() 的半双工抢占路径会
+ * `lower->ops->stop()` + `audio_setstate(PREPARED)` + `audio_forget_sessions()`，
+ * 把其它 fd 的陈旧记账清回 OPEN。**但它只在「OUTPUT 抢 INPUT」时触发**，
+ * 而这个死锁里播放永远不会发生（麦聋了 → 不起轮次 → 不播），于是那条自愈
+ * 一辈子等不到 —— 这里就是替它把那一下主动打出去：开一个**一次性**的
+ * OUTPUT fd、发一次 CONFIGURE(OUTPUT)，正好踩进那条自愈路径，然后立刻收摊。
+ *
+ * **幂等**：设备本来就好好的时候，这一下相当于正常的半双工抢占（无害），
+ * 随后 STOP + close 归还，不会留下任何常驻 fd。所以可以每轮僵尸自愈都调。
+ *
+ * @param why  只用来打日志，说明是哪条判据触发的回收
+ *
+ * @return 0 表示这一下打出去了（不保证回收成功，看随后串口有没有
+ *         `audio: 清掉 N 个陈旧的会话记账`）；<0 表示设备都打不开。
+ */
+
+int audio_reclaim_stale(const char *why)
+{
+  struct audio_caps_desc_s capdesc;
+  int fd;
+  int ret;
+
+  fd = open(AUDIO_PLAY_DEVICE, O_WRONLY);
+  if (fd < 0)
+    {
+      printf("[AUDIO] 强制回收陈旧会话（%s）：打不开 %s (%d)\n",
+             why != NULL ? why : "?", AUDIO_PLAY_DEVICE, errno);
+      return -errno;
+    }
+
+  /* 只发一次 CONFIGURE(OUTPUT) —— 这一步才是踩响内核自愈的那一下。
+   * 参数不用精：抢占分支只看 ac_type，转发过来的 CONFIGURE 由驱动自己
+   * 忽略也无所谓，我们紧接着就收摊。 */
+
+  memset(&capdesc, 0, sizeof(capdesc));
+  capdesc.caps.ac_len            = sizeof(struct audio_caps_s);
+  capdesc.caps.ac_type           = AUDIO_TYPE_OUTPUT;
+  capdesc.caps.ac_channels       = 1;
+  capdesc.caps.ac_controls.hw[0] = 16000;
+  capdesc.caps.ac_controls.b[2]  = 16;
+
+  ret = ioctl(fd, AUDIOIOC_CONFIGURE, (unsigned long)&capdesc);
+
+  printf("[AUDIO] 强制回收陈旧会话（%s）：CONFIGURE(OUTPUT)=%d，"
+         "看上面有没有「清掉 N 个陈旧的会话记账」\n",
+         why != NULL ? why : "?", ret);
+
+  ioctl(fd, AUDIOIOC_STOP, 0);
+  close(fd);
+  return ret;
 }
 
 /**
@@ -617,6 +957,23 @@ void audio_record_hold_end(audio_context_t *ctx)
     }
 
   ctx->record_hold = false;
+
+  /* ★ 保温兜底（2026-10-30）：让路锁到此为止，那台一直举着 RUNNING 的播放
+   * 设备必须收掉 —— 不收的话它要么挡住接下来的录音 START，要么就带着功放
+   * 一直开着（PA 常通会发热、也会把底噪送进喇叭）。
+   *
+   * audio_resume_record → audio_record_start 一路走到那里也会做同一件事
+   * （见那里的说明），这里是第二道：覆盖 audio_resume_record 早退的那两种
+   * 情况（没欠还麦 / 还麦失败）。幂等，多调无害。
+   *
+   * 只在没在播的时候动：playing 为真说明播放线程还在写这个 fd，跨线程
+   * STOP/close 就是踩 fd（本项目被这条咬过）。那种情况由 audio_record_start
+   * 的 ctx->playing 分支先 reap 再丢。 */
+  if (!ctx->playing && ctx->play_fd_running)
+    {
+      audio_drop_play_device(ctx);
+    }
+
   audio_resume_record(ctx);
 }
 
@@ -1168,6 +1525,17 @@ static void *audio_record_thread(void *arg)
       ctx->record_died = true;
     }
 
+  /* 死因再细分一层：被抢走的（stolen）是**半双工的正常让路**，不是故障 ——
+   * 对面多半是正在播报的那一路按设计接管了 /dev/audio/audio0。
+   * 监听守护靠这一位决定"要不要去抢设备"（见 ai_audio.h 的 record_stolen：
+   * 2026-10-29 报警按钮那一场 28 次「异常中断」就是没分这一层，
+   * 把"让路"当成"死了"去紧急重开抢回来，把正在放的报警声打死了）。 */
+
+  if (stolen)
+    {
+      ctx->record_stolen = true;
+    }
+
   /* 最后一步：告诉 audio_reap_record_thread() "我已经跑完了"。
    * 必须在所有收尾动作**之后**置位，否则别人会立刻 join 走 TCB。 */
 
@@ -1198,6 +1566,7 @@ static void *audio_play_thread(void *arg)
   size_t chunk_bytes = audio_play_chunk_bytes(ctx);
   size_t done = 0;
   int fail = 0;                  /* 0=没失败；负值=没出声的原因，最后写进 ctx */
+  int healed = 0;                /* ★ 保温自愈只补一次热启（2026-10-30），见下面 */
   int fd;
 
   /* 数据源只认 play_src（拷贝路径＝play_buf，零拷贝路径＝调用方缓冲，
@@ -1251,6 +1620,61 @@ static void *audio_play_thread(void *arg)
 
           if (written <= 0)
             {
+              /* ★ 保温直取的自愈（2026-10-30）：write 立刻返回 0 多半不是
+               * 坏了，而是**这个 fd 在块间被别的会话停了**。play_fd_running
+               * 是 ctx 自己记的账，而设备是两个 ctx 共享一台 —— robot_ui 的
+               * 提醒铃/报警会在块间空档里抢走它并发 AUDIOIOC_STOP，账上
+               * 「在跑」和硬件上「已停」就此脱节，sf32lb52_audio_write() 一看
+               * !priv->running 直接 return 0，整段一声没出。
+               * 真机铁证（2026-10-30 17:37 那一轮）：
+               *     [AUDIO] 播放设备：保温直取（音量 1 ms…）
+               *     [AUDIO] 播放没出声：write 返回 0（已写 0/286720 字节…）
+               * 往前 20 行正是 [Reminder] 语音播报那一路的 hw_stop。
+               *
+               * 补救：摘掉这个陈旧 fd，补一次**完整热启**，重写同一块。
+               * 只在「这次是保温取来的」（play_open_warm）时候补 ——
+               * 冷路（复用 / 全开）刚 START 过还写不进就是真故障，重开救不
+               * 回来，照旧报「播放没出声」走人，和改动前一字不差。
+               *
+               * 代价账（这是它敢动的原因）：撞上这一次就补付 ~455 ms 的全开，
+               * 正是改动前**每一块**都要付的那个数；撞不上就白赚 454 ms 的
+               * START。**任何情况下都不劣于现状**，符合「更稳定更流畅」。
+               *
+               * 只补一次：补完的设备是刚 START 起来的，再写不进就是真坏了。 */
+
+              if (ctx->play_open_warm && !healed)
+                {
+                  healed = 1;
+                  printf("[AUDIO] 保温的播放设备其实已停（write 返回 %zd，"
+                         "已写 %zu/%zu）——块间被别的会话停了，摘掉补一次"
+                         "完整热启后重写这一块\n",
+                         written, done, total_bytes);
+
+                  /* 摘这个陈旧 fd：**先把两个标记清干净**再走
+                   * audio_close_play_device —— 不清的话它那条「整轮播报中
+                   * 保温不 STOP」的分支会连 close 一起跳过，就漏 fd 了
+                   * （本项目被漏 fd 咬过，见 audio_open_play_device 里那段
+                   * 「每块漏一个 fd」的注释）。play_fd 置 -1 之后，它下面
+                   * 那句「还是缓存那个就留给下一块」也不成立，于是走真
+                   * STOP + close，一步不漏。 */
+
+                  ctx->play_fd = -1;
+                  ctx->play_fd_running = false;
+                  audio_close_play_device(ctx, fd);
+                  fd = -1;
+
+                  fd = audio_open_play_device(ctx);  /* 这次一定走全开 */
+                  if (fd >= 0)
+                    {
+                      continue;   /* 重写同一块，done 一动不动 */
+                    }
+
+                  /* 起不来：audio_open_play_device 已经打了「播放没出声：
+                   * 打不开 / 配输出方向失败 / START 被拒」那一行，这里不重复。 */
+                  fail = fd;
+                  break;
+                }
+
               fail = -EIO;
               printf("[AUDIO] 播放没出声：write 返回 %zd"
                      "（已写 %zu/%zu 字节，这段只出了一部分或一声没出）\n",
@@ -1279,10 +1703,21 @@ static void *audio_play_thread(void *arg)
     }
 
   /* 先停设备再退出：AUDIOIOC_STOP 会同时停掉录音通路（半双工），
-   * 所以它必须是播放的最后一步。fd 也是在本线程里关的。 */
+   * 所以它必须是播放的最后一步。
+   *
+   * ★ 2026-10-26：fd 不再在这里 close，改由 AUDIO_PLAY_DEVICE_CACHE 决定
+   * 留给下一块（见 audio_close_play_device）。而**被换代顶掉的那一代什么都不
+   * 动** —— play_begin 起新代之前会 reap 我，正常情况下我早就跑完收尾了；
+   * 走到这里还换了代，只可能是 reap 放弃了有界 join（我卡在设备里）。
+   * 那种情况下设备和 ctx->play_fd 都已经归下一代了，我再 STOP/close 就是
+   * 和它抢同一台设备、甚至双重 close 同一个 fd。静默交出去即可。 */
 
   ctx->play_stage = PLAY_STAGE_CLOSE;  /* 诊断标记：进收尾（STOP/close） */
-  audio_close_play_device(fd);
+
+  if (ctx->play_gen == my_gen)
+    {
+      audio_close_play_device(ctx, fd);
+    }
 
   /* 结果落定：必须在 audio_resume_record() / play_cb **之前** ——
    * 回调里（或回调返回后立刻）读到的要是最终值，不能是中转值。
@@ -1294,30 +1729,49 @@ static void *audio_play_thread(void *arg)
    *   - 写满了 → OK（**即**播放线程收尾时 play_stop 才置位，也照样是"整段
    *     都进了设备"，不该因为一个收尾竞态被报成"被打断"）。 */
 
-  if (fail != 0)
-    {
-      ctx->play_last_result = fail;
-    }
-  else if (done < total_bytes)
-    {
-      ctx->play_last_result = -ECANCELED;
-    }
-  else
-    {
-      ctx->play_last_result = OK;
-    }
+  /* ★ 2026-10-29：下面这几个共享字段只许**当前那条**播放线程写。
+   *
+   * 原来这里是无条件的：被换代作废的那条 T1 一退出，就把 T2 的
+   * `playing` 清成 false、`play_last_result` 覆盖成自己的、`state` 也改掉。
+   * T2 下一次块间隙一看 `playing==false`，自己也退出了 —— 于是**整段只写出
+   * 一个块**，串口就是那句「播放没出声：写了 8000/76800 字节就退出循环了」。
+   * 2026-10-29 真机一次里连着两条，两次的 total 还都不一样（81920 / 76800），
+   * 那就是 T1 读到的 play_frames 已经被 T2 覆盖过 —— 两条线程在并发。
+   *
+   * 同文件 1617 行的 `play_exited` 早就因为**同一个坑**修过一次（见那里的长
+   * 注释），当时用 pthread_equal 做"我是不是当前那条"的判据。这里照抄那个
+   * 判据：pthread_create 覆盖 ctx->play_thread 就是天然的换代信号，语义统一。
+   *
+   * 被换代的那条该做的只有：不碰共享状态、不恢复录音（T2 正在放）、不回调
+   * （下面本来就有判据）、别置 play_exited（下面本来就有判据）—— 静默走完。 */
 
-  ctx->playing = false;
-  ctx->state = ctx->recording ? AUDIO_STATE_RECORDING : AUDIO_STATE_IDLE;
-
-  /* 是播放把录音停掉的，播完按原配置恢复（理由见 audio_prepare_output）。
-   * 顺序要点：必须先把 playing 置 false —— 否则 audio_record_start() 的半双工
-   * 逻辑会反过来再停一次播放，连带把下面的 play_cb 也吞掉。
-   * 被 audio_play_stop() 打断的播放不恢复：那是上层主动要停。 */
-
-  if (!ctx->play_stop)
+  if (pthread_equal(pthread_self(), ctx->play_thread))
     {
-      audio_resume_record(ctx);
+      if (fail != 0)
+        {
+          ctx->play_last_result = fail;
+        }
+      else if (done < total_bytes)
+        {
+          ctx->play_last_result = -ECANCELED;
+        }
+      else
+        {
+          ctx->play_last_result = OK;
+        }
+
+      ctx->playing = false;
+      ctx->state = ctx->recording ? AUDIO_STATE_RECORDING : AUDIO_STATE_IDLE;
+
+      /* 是播放把录音停掉的，播完按原配置恢复（理由见 audio_prepare_output）。
+       * 顺序要点：必须先把 playing 置 false —— 否则 audio_record_start() 的
+       * 半双工会反过来再停一次播放，连带把下面的 play_cb 也吞掉。
+       * 被 audio_play_stop() 打断的播放不恢复：那是上层主动要停。 */
+
+      if (!ctx->play_stop)
+        {
+          audio_resume_record(ctx);
+        }
     }
 
   /* 播放完成回调（在播放线程里回调，调用者可以放心紧跟着开录音）。
@@ -1489,8 +1943,20 @@ int audio_init(audio_context_t *ctx, const audio_config_t *config)
       ctx->config.channels = AUDIO_DEFAULT_CHANNELS;
       ctx->config.format = AUDIO_FORMAT_S16_LE;
       ctx->config.frame_ms = AUDIO_DEFAULT_FRAME_MS;
-      ctx->config.volume = AUDIO_VOLUME_DEFAULT;
     }
+
+  /* 音量这一项无条件对齐到模块级的 g_play_volume（用户设定值），不吃调用方
+   * 传进来的 config.volume。
+   *
+   * 两个理由：
+   *   - 起播下发的就是 g_play_volume（见 audio_open_play_device），ctx 里这份
+   *     只是给 audio_get_volume 看的读数，两边不一致等于读数说谎；
+   *   - robot_ui 传的 audio_config 是按字段初始化的，.volume 根本没写 = 0，
+   *     不对齐就是「起播前把音量下发成 0」（最小档），全靠后面
+   *     touch_ui_set_volume_cb 注册时补一下才没露馅。
+   * 真要给某一套单独的音量，得先想清楚它和共享值谁说了算 —— 现在没有这种需求。 */
+
+  ctx->config.volume = g_play_volume;
 
   if (ctx->config.sample_rate <= 0 ||
       (ctx->config.channels != AUDIO_CH_MONO &&
@@ -1653,6 +2119,25 @@ int audio_record_start(audio_context_t *ctx,
       audio_play_stop(ctx);
     }
 
+  /* ★ 保温的播放设备必须在这里丢掉（2026-10-30，配 AUDIO_PLAY_KEEP_WARM）。
+   *
+   * 它此刻还举着 RUNNING（DAC 模拟通路 + 功放都开着），而本板录放共用一台
+   * 设备、半双工：不 STOP 就开麦，录音的 START 会被驱动的方���冲突判据拒掉
+   * （-EBUSY，见 audio_open_play_device 里那条注释），或者更糟 —— 抢下来了
+   * 但方向标签还是播放（sf32lb52_audio.c 的 pending_playback 毒链）。
+   *
+   * 为什么 ctx->playing 的判据不够：让路锁被冲掉的那几条路
+   * （round_hold_give 的「空档超 8 秒提前还麦」、守护/看门狗强制交还、
+   * 本函数自己那句 record_hold = false）都不经过 audio_play_stop，
+   * playing 早就是 false，可设备还保温着。
+   *
+   * audio_drop_play_device 幂等，没保温时就是个空操作。 */
+  if (ctx->play_fd_running)
+    {
+      printf("[AUDIO] 开麦前丢掉保温的播放设备（半双工，不丢录音起不来）\n");
+      audio_drop_play_device(ctx);
+    }
+
   /* 上一次的录音线程还没回收：**不能直接 pthread_join**。
    * 那个线程可能正阻塞在 audio_in_read() 里，只有设备先停下来它才会返回，
    * 所以必须先走 audio_record_stop()（它内部先 audio_in_stop() 再 join）。 */
@@ -1728,6 +2213,7 @@ int audio_record_start(audio_context_t *ctx,
   ctx->recording = true;
   ctx->record_exited = false;         /* 新一代录音线程的收尾标记 */
   ctx->record_died = false;           /* 上一代的"异常中断"标记到此作废 */
+  ctx->record_stolen = false;         /* 同上：上一代的"被抢走"死因到此作废 */
 
   /* ★ 代际号 + 认领握手（2026-10-25）。顺序很关键：
    *   ① 代际号必须在 pthread_create **之前**自增 —— 线程起跑后读到的必须是
@@ -2436,6 +2922,23 @@ void audio_play_stop(audio_context_t *ctx)
   /* 更新状态 */
 
   ctx->state = ctx->recording ? AUDIO_STATE_RECORDING : AUDIO_STATE_IDLE;
+
+  /* 缓存的播放设备在这里真关（2026-10-26，配 AUDIO_PLAY_DEVICE_CACHE）。
+   *
+   * 上层明确掐掉了这一轮，下一轮要走全新的一圈，留着那个 fd 没意义。
+   *
+   * ⚠ 判据**只能**是 play_exited，不能拿 play_thread_valid 一起 or：
+   * audio_reap_play_thread() 放弃 join 时会"解闩放行"、把 play_thread_valid
+   * 置回 false，可那条线程**还活着**、可能正在 write 这个 fd。跨线程 close
+   * 它就是踩 fd（本项目被这条咬过三次）。那种情况留给下一次 stop / deinit 收。
+   *
+   * play_exited 由播放线程退出前自己置位（audio_play_begin 起新代时清零），
+   * 是"这条线程真的跑完了"的唯一可信信号。 */
+
+  if (ctx->play_exited)
+    {
+      audio_drop_play_device(ctx);
+    }
 }
 
 /**
@@ -2487,8 +2990,13 @@ int audio_set_volume(audio_context_t *ctx, uint8_t volume)
 
   /* 软件字段照旧记下来（audio_get_volume 用），再真正下到硬件。
    * 设备 fd 属于 task group，所以这里在本任务里临时 open 一个专门设音量，
-   * 设完立刻 close —— 不去碰播放线程/录音封装的 fd。 */
+   * 设完立刻 close —— 不去碰播放线程/录音封装的 fd。
+   *
+   * 真正的"用户音量"记在模块级 g_play_volume 上：本函数由设置页调进来时
+   * 传的是 robot_ui 那套 ctx，而下一次起播的可能是 hello_app 那套 ——
+   * 只记进调用方那个 ctx 的话，另一套起播就把音量写回它自己的旧值了。 */
 
+  g_play_volume = volume;
   ctx->config.volume = volume;
 
   ret = audio_hw_set_volume(ctx, volume);
@@ -2511,7 +3019,10 @@ uint8_t audio_get_volume(audio_context_t *ctx)
       return 0;
     }
 
-  return ctx->config.volume;
+  /* 返回模块级那份：它才是"现在放出来的音量是多少"的答案。
+   * ctx->config.volume 只是某一套自己的缓存，两套之间会漂。 */
+
+  return g_play_volume;
 }
 
 /**

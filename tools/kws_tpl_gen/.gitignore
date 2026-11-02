@@ -1,0 +1,6 @@
+# 编出来的 PC 工具和它的产物，不进仓库
+kws_tpl_gen
+kws_dist
+kws_out/
+out/
+

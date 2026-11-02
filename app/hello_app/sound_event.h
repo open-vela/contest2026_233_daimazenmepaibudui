@@ -45,6 +45,17 @@ int sound_event_init(void);
  * 允许任意长度、任意切分地连续调用。 */
 int sound_event_feed(const int16_t *pcm, size_t nsamples);
 
+/* 同上，但带"来源窗口是不是人声"的提示：
+ *   voice_hint != 0 → 本次喂进来的窗口是门控判过的人声（说话/喊叫），
+ *   只允许 SCREAM 类投票，fall/knock 一律按 other 记 —— 否则正常说话会被
+ *   模型误判成敲击/跌倒，一说话就报警（2026-11-01 真机 5 次误报的根因）。
+ *   voice_hint == 0 → 和 sound_event_feed() 完全一样。
+ *   loud_hint != 0 → 这一窗**现在仍然很响**（能量没有回落）：fall/knock 只记票、
+ *   不触发，把持续的环境噪声挡在门外；SCREAM 不受影响。
+ *   真撞击/摔倒是一声短响，回落后的窗口照常触发。 */
+int sound_event_feed_ex(const int16_t *pcm, size_t nsamples, int voice_hint,
+                        int loud_hint);
+
 /* 命中（投票 + 阈值 + 不应期都通过）时的回调。
  * cls 见 SOUND_EVENT_xxx，conf 是这几票的平均置信度（softmax 概率）。 */
 typedef void (*sound_event_cb_t)(int cls, float conf, void *arg);

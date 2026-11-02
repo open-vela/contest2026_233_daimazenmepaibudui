@@ -53,6 +53,8 @@
 #include <errno.h>      /* reminder_play_reason() 要按错误码说人话（-EBUSY / -EIO …） */
 #include <stdint.h>     /* uintptr_t：询问页那条超时看门狗线程要把 gen 当参数传 */
 #include <pthread.h>
+#include <semaphore.h>        /* sem_t / SEM_INITIALIZER */
+#include <nuttx/semaphore.h>  /* nxsem_wait_uninterruptible / nxsem_post */
 
 /* 语音后端（小米 MiMo，实现在 app/hello_app/mimo_voice.c）。
  * voice_asr/voice_tts 是 ai_agent 包的分发层，头文件路径由 CMakeLists.txt
@@ -77,6 +79,7 @@
  *   真机故障形状和取舍见 ai_companion_req.h 头上）。现在 robot_ui 要出声就直接
  *   audio_play_start()，半双工由它内部处理（见 reminder_play_exclusive 头上那段）。 */
 #include "ai_companion_req.h"
+#include "voice_emerg.h"
 
 /* 固定文案的 TTS 预缓存（查询接口，实现在 app/hello_app/tts_cache.c）。
  * 到点提醒那句「该<标题>了」和跌倒询问「您摔到了吗？」都是**写死的固定文案**：
@@ -660,7 +663,8 @@ static void ui_post(int status, int face, const char *reply)
 typedef struct {
     char *a;        /* 标题 / 正文 */
     char *b;        /* 正文（提醒/报错才有第二个参数） */
-    int   kind;     /* 0=提醒 1=报警 2=关报警 3=报错 4=弹询问页 5=撤询问页 */
+    int   kind;     /* 0=提醒 1=报警 2=关报警 3=报错 4=弹询问页 5=撤询问页
+                     * 6=改询问页提示行（统一报警路径的状态改口） */
 } ui_panel_msg_t;
 
 static void ui_apply_panel(void *arg)
@@ -674,6 +678,7 @@ static void ui_apply_panel(void *arg)
         /* 4/5：「检测到异常 → 先问一句」那一页（异常声响二次确认） */
         case 4:  robot_ui_show_ask_alarm(m->a);      break;
         case 5:  robot_ui_close_ask_alarm();         break;
+        case 6:  robot_ui_ask_hint(m->a);            break;
         default: robot_ui_show_error(m->a, m->b);    break;
     }
 
@@ -763,6 +768,52 @@ static void ui_post_ask_show(const char *reason)
 static void ui_post_ask_close(void)
 {
     ui_post_panel(5, NULL, NULL);
+}
+
+/* ★ 改询问页上那行小字（2026-10-31 统一报警路径）：任何线程可调。
+ * "10 秒内说「没事」…" -> 「已通知家人，30 秒后重发」。 */
+static void ui_post_ask_hint(const char *hint)
+{
+    ui_post_panel(6, hint, NULL);
+}
+
+/* ★ 统一报警路径：屏幕跟着 voice_emerg 的状态改口（2026-10-31）。
+ *
+ * 用户要求"ui 界面也要改改" —— 不是换个颜色，是**文案要跟着报警阶段走**：
+ *   确认期  「10 秒内说「没事」或点下面按钮取消」
+ *   已通知  「已通知家人，30 秒后重发」
+ *   收摊了  把红页撤掉
+ *
+ * ⚠ 这个回调在 voice_emerg 的**工作线程**里被调，所以里面只许投递
+ *   （ui_post_* 自己会投到 LVGL 线程），绝不直接碰控件。 */
+static void alarm_unify_hook(enum voice_emerg_phase_e phase,
+                             const char *reason, void *arg)
+{
+    (void)reason;
+    (void)arg;
+
+    switch (phase) {
+        case VOICE_EMERG_NOTIFIED:
+            ui_post_ask_hint("已通知家人，30 秒后重发\n"
+                             "铃继续响\n"
+                             "说「没事」或点「我没事，取消」可停");
+            break;
+
+        case VOICE_EMERG_CANCELLED:
+        case VOICE_EMERG_EXPIRED:
+            ui_post_ask_close();
+
+            /* ★ 2026-11-01：收摊时把红报警页也撤掉、板级报警铃也停掉。
+             *   原来这里只关询问页，红页留在屏幕上，现场看起来就是"报警完
+             *   整机卡住"（用户 2026-10-31 的原话）。robot_ui_close_alarm()
+             *   会 alarm_clear()（没在响时是空操作）+ 回主界面；它必须跑在
+             *   LVGL 线程，所以走 ui_post_panel(2)。 */
+            ui_post_panel(2, NULL, NULL);
+            break;
+
+        default:
+            break;
+    }
 }
 
 /* ==================== 「检测到异常 → 先问一句，确认了才报警」 ==================== */
@@ -873,7 +924,8 @@ static void ask_reason_key(const char *reason, char *out, size_t out_size)
     out[end] = '\0';
 }
 
-static pthread_mutex_t g_ask_lock = PTHREAD_MUTEX_INITIALIZER;
+/* ★ 2026-11-01：不用 mutex（同 alarm_audio_lock / g_audio_in_lock）。 */
+static sem_t g_ask_lock = SEM_INITIALIZER(1);
 static bool            g_ask_pending = false;   /* 有一条询问在等回答（同一时间只允许一条）*/
 static char            g_ask_reason[ASK_ALARM_REASON_MAX];  /* 待回答那条问的是什么 */
 static unsigned        g_ask_gen = 0;           /* 每开始/结束一条 +1（超时线程据此作废）*/
@@ -935,7 +987,7 @@ static bool alarm_claim(const char *src, bool new_event)
 {
     bool mine;
 
-    pthread_mutex_lock(&g_ask_lock);
+    nxsem_wait_uninterruptible(&g_ask_lock);
 
     if (new_event) {
         g_alarm_seq++;
@@ -950,7 +1002,7 @@ static bool alarm_claim(const char *src, bool new_event)
         mine = true;
     }
 
-    pthread_mutex_unlock(&g_ask_lock);
+    nxsem_post(&g_ask_lock);
 
     printf("[Alarm] 报警去重闸：%s（来源=%s，事件序号=%u）\n",
            mine ? "本路执行报警" : "这次异常已经报过警了，本路放弃",
@@ -1013,10 +1065,10 @@ static void ask_finish(int confirmed, const char *src)
     char reason[ASK_ALARM_REASON_MAX];
     char text[160];
 
-    pthread_mutex_lock(&g_ask_lock);
+    nxsem_wait_uninterruptible(&g_ask_lock);
 
     if (!g_ask_pending) {
-        pthread_mutex_unlock(&g_ask_lock);
+        nxsem_post(&g_ask_lock);
         printf("[Ask] 没有待回答的询问（来源=%s，回答=%s），忽略\n",
                src, ask_answer_name(confirmed));
         return;
@@ -1026,19 +1078,37 @@ static void ask_finish(int confirmed, const char *src)
     g_ask_pending = false;
     g_ask_gen++;
 
-    /* 只有"用户明确否认/超时"才记静默期：-1（作废，页面被报警页顶掉）不记 ——
+    /* 只有"用户明确否认"才记静默期：-1（作废，页面被报警页顶掉）不记 ——
      * 那不是用户的回答，记下去会让同一原因 60 秒内问不出来。
      * 这里存的是**归一化之后的类别键**（置信度数字不进去），比较时同样归一化，
-     * 否则同一个类的置信度每次都不一样、这条静默期永远比不上（原 bug）。 */
-    if (confirmed == 0) {
+     * 否则同一个类的置信度每次都不一样、这条静默期永远比不上（原 bug）。
+     *
+     * ★ 2026-10-31：src="超时" 也不再记。统一报警路径下"10 秒没人答"不是
+     *   否认、恰恰相反 —— 那是要**通知家人**；记一条"用户否认过"会把紧跟着
+     *   的第二次真摔倒挡在门外 60 秒。本文件下面本来就写着"20 秒没人应答
+     *   不是用户的回答"，这里只是让记账口径跟上那句话。 */
+    if (confirmed == 0 && strcmp(src, "超时") != 0) {
         ask_reason_key(reason, g_ask_deny_reason, sizeof(g_ask_deny_reason));
         g_ask_deny_ms = ask_now_ms();
     }
 
-    pthread_mutex_unlock(&g_ask_lock);
+    nxsem_post(&g_ask_lock);
 
-    /* 不管哪种回答，询问页都不该再留在屏幕上 */
-    ui_post_ask_close();
+    /* ★ 2026-11-01：voice_emerg 报警还在响时**不关面板**。
+   *   原来这里无条件 ui_post_ask_close()，确认期一到 10 秒面板就没了，
+   *   后面 ui_post_ask_hint("已到确认时间…") 改文案时面板已经关了；
+   *   而「我没事，取消」按钮就在面板上 —— 面板关了就没有任何按钮能停报警。
+   *   现在：voice_emerg 还在响时保留面板（按钮一直在），只是改文案。
+   *   voice_emerg 已收摊 / 用户明确回答 → 照常关面板。 */
+
+    bool keep_panel = (confirmed == 0 && strcmp(src, "超时") == 0
+#if ALARM_UNIFY_VOICE_EMERG
+                       && voice_emerg_is_active()
+#endif
+                      );
+    if (!keep_panel) {
+        ui_post_ask_close();
+    }
 
     if (confirmed == 1) {
         printf("[Ask] ★ 用户确认报警（原因=%s，来源=%s）→ 走既有报警入口\n",
@@ -1054,31 +1124,76 @@ static void ask_finish(int confirmed, const char *src)
          * 没领到票（语音追问那条路已经报过警了）就在收口里记一行日志收工 ——
          * 报警页、铃声、上报三件事都不做，赢家那一路已经全做过了。 */
         alarm_escalate(src, false, "sound_abnormal", text);
+
+#if ALARM_UNIFY_VOICE_EMERG
+        /* ★ 用户明确要报警 ⇒ 立刻联系家人，不用再等 10 秒。
+         * 但 voice_emerg 自己那条"响-停-听"得先收掉 —— 不收就是板级警音和
+         * 它的铃两路一起响（半双工下只会互相顶掉，听着是断断续续的破音）。 */
+        voice_emerg_cancel("用户确认报警");
+
+        /* 再挂回**辅助模式**：板级报警这会儿在响，voice_emerg 探到就会只盯
+         * 「没事」、不重复响铃也不重复推送，说一声就把铃掐掉 —— 和紧急呼叫
+         * 按钮那条完全同一个做法（见 emergency_call_handler）。
+         * 用户拍板过："这过程中，说没事仍可停"。 */
+        voice_emerg_trigger("confirmed", text);
+#endif
     } else if (confirmed == 0) {
-        /* ★ 用户点了「不用了」（或者 20 秒没人应答 → 走 ui_post_ask_answer(0,"超时")，
-         * 也落到这里）：**到这一刻才停铃** —— 异常声命中时先起的那记铃
-         * （robot_ui_alarm_ring()）就是从这里被停掉的。
-         * confirmed == -1（页面被报警页顶掉）那一路**不停**：铃要连着响下去。 */
+        /* ★★ 统一报警路径（2026-10-31）：这一支分两半，方向正好相反。
+         *
+         * 用户原话：「10s 内老人说没事，ai 会停掉报警响铃，否则就直接通过 bark
+         * 联系家人，而且响铃不能中断」。
+         *
+         *   · src="超时" = 10 秒**没人说没事** ⇒ 恰恰是要**通知家人**、
+         *     铃**不许停**。旧代码在这里 alarm_clear()（停铃）+「不报警」，
+         *     和规格是反的 —— 老人真摔了就没人知道，这是本次修的正题。
+         *   · 屏幕按钮「我没事，取消」/ MQTT confirm:false = 有人真答了没事
+         *     ⇒ 停铃、不通知，和说「没事」逐字一致（用户拍板过）。
+         */
+        if (strcmp(src, "超时") == 0) {
+#if ALARM_UNIFY_VOICE_EMERG
+            if (voice_emerg_is_active()) {
+                /* 铃是 voice_emerg 在响（响-停-听），它自己的 10 秒窗和这里的
+                 * 超时是同一个数。到点之后它会 Bark + 持续响 + 30 秒重发，
+                 * 期间说「没事」仍可停 —— 这里一个动作都不做，只改屏幕文案。 */
+                printf("[Ask] 确认期到（%s）：走统一报警路径 —— **不停铃**，"
+                       "通知家人由语音急救模块负责（含 30 秒重发、持续响）\n",
+                       reason);
+                ui_post_ask_hint("已到确认时间\n正在通知家人，铃继续响\n"
+                                 "说「没事」或点「我没事，取消」可停");
+                return;
+            }
+#endif
+            /* 统一路径没起来（比如宏关了 / 这一路根本没触发 voice_emerg）：
+             * 兜底走旧的"直接报警"，也比旧的"不报警"对。 */
+            printf("[Ask] 确认期到（%s）：统一报警模块没在跑，兜底直接报警\n",
+                   reason);
+            snprintf(text, sizeof(text), "检测到异常声响：%s", reason);
+            alarm_escalate(src, false, "sound_abnormal", text);
+            return;
+        }
+
+        /* ---- 下面是"有人真的答了没事" ---- */
+
         if (alarm_clear() != OK) {
             printf("[Ask] 停铃：alarm_clear 返回非 OK（本来就没在响也是正常的）\n");
         }
+
+#if ALARM_UNIFY_VOICE_EMERG
+        /* 屏幕按钮和说「没事」走**同一条**取消（用户拍板：两者逐字一致）。
+         * voice_emerg_cancel 内部会把它的响-停-听循环掐掉；辅助模式下还会
+         * 叫板级报警一起停。 */
+        voice_emerg_cancel(src);
+#endif
 
         /* ★ 2026-10-22：用户**主动**说「不用了」时，喇叭里那条语音追问也要
          * 一起收摊 —— 原来只有"报警真的走起来了"才登记 ai_companion_ask_abort()
          * （robot_ui_show_alarm() 那一处），于是用户明明点了不用了，hello_app
          * 那条追问还在接着问第二轮「您还好吗？」、最后还往家人手机上推一条
-         * unconfirmed_FALL（真机日志就是这个形状）。
-         *
-         * 判据里特意排掉 src="超时"：20 秒没人应答**不是**用户的回答，
-         * 那种情况下"问满两轮仍没人应 → 推给家人"的安全网必须留着
-         * （见 ai_companion_main.c 的 ask_flow_unclear：误报比漏报更伤）。
-         * 只有按钮 / MQTT 这两条"有人真的答了"的路才把语音那条也一并按掉。 */
-        if (strcmp(src, "超时") != 0) {
-            printf("[Ask] 用户已作答（来源=%s），通知语音追问一并收摊\n", src);
-            ai_companion_ask_abort();
-        }
+         * unconfirmed_FALL（真机日志就是这个形状）。 */
+        printf("[Ask] 用户已作答（来源=%s），通知语音追问一并收摊\n", src);
+        ai_companion_ask_abort();
 
-        printf("[Ask] 确认未通过（原因=%s，来源=%s）：不报警、停铃；"
+        printf("[Ask] 用户已取消（原因=%s，来源=%s）：停铃、不通知家人；"
                "同一原因 %u 秒内不再询问\n",
                reason, src,
                (unsigned)(ROBOT_ASK_ALARM_DENY_HOLD_MS / 1000));
@@ -1163,9 +1278,9 @@ void ui_post_ask_standdown(const char *src)
     bool pending;
     const char *who = (src != NULL) ? src : "另一条确认路";
 
-    pthread_mutex_lock(&g_ask_lock);
+    nxsem_wait_uninterruptible(&g_ask_lock);
     pending = g_ask_pending;
-    pthread_mutex_unlock(&g_ask_lock);
+    nxsem_post(&g_ask_lock);
 
     if (!pending) {
         return;
@@ -1193,16 +1308,17 @@ static void *ask_timeout_thread(void *arg)
         usleep(ASK_ALARM_POLL_MS * 1000);
         waited += ASK_ALARM_POLL_MS;
 
-        pthread_mutex_lock(&g_ask_lock);
+        nxsem_wait_uninterruptible(&g_ask_lock);
         still = g_ask_pending && (g_ask_gen == gen);
-        pthread_mutex_unlock(&g_ask_lock);
+        nxsem_post(&g_ask_lock);
 
         if (!still) {
             return NULL;    /* 已经有人回答了（屏幕 / MQTT），本线程没用了 */
         }
     }
 
-    printf("[Ask] 询问超时（%u 秒无人应答），自动按「不用了」处理\n",
+    printf("[Ask] 确认期到（%u 秒无人应答）—— 统一报警路径：**不停铃**，"
+           "改由语音急救模块通知家人\n",
            (unsigned)(ROBOT_ASK_ALARM_TIMEOUT_MS / 1000));
 
     ui_post_ask_answer(0, "超时");
@@ -1236,7 +1352,7 @@ void ui_post_ask_alarm(const char *reason)
     /* 归一化成"类别键"：静默期比的是类别，不是带置信度的整条 reason */
     ask_reason_key(reason, key, sizeof(key));
 
-    pthread_mutex_lock(&g_ask_lock);
+    nxsem_wait_uninterruptible(&g_ask_lock);
 
     /* ⓪ 事件序号 +1：**每一次"有新异常、要问一句"都是一次新事件**，包括这一次
      *    因为"已经在问"或"刚被否认过"而丢掉的那种 —— 新异常就是新事件。
@@ -1248,7 +1364,7 @@ void ui_post_ask_alarm(const char *reason)
     /* ① 已经在问一条了：**丢掉新的，不覆盖旧的**。覆盖会让"屏幕上问的问题"
      *    和"被回答的那条"对不上：用户点的明明是 A，报出去的却是 B。 */
     if (g_ask_pending) {
-        pthread_mutex_unlock(&g_ask_lock);
+        nxsem_post(&g_ask_lock);
         printf("[Ask] 已有一条询问在等回答（原因=%s），本次丢弃（原因=%s）\n",
                g_ask_reason, reason);
         return;
@@ -1263,7 +1379,7 @@ void ui_post_ask_alarm(const char *reason)
         strcmp(g_ask_deny_reason, key) == 0) {
         unsigned left = (unsigned)((ROBOT_ASK_ALARM_DENY_HOLD_MS -
                                     (uint32_t)(now - g_ask_deny_ms)) / 1000);
-        pthread_mutex_unlock(&g_ask_lock);
+        nxsem_post(&g_ask_lock);
         printf("[Ask] 原因 %s 刚被用户否认过（类别键=%s），%u 秒内不再询问"
                "（本次丢弃）\n", reason, key, left);
         return;
@@ -1274,10 +1390,11 @@ void ui_post_ask_alarm(const char *reason)
     gen = ++g_ask_gen;
     snprintf(reason_copy, sizeof(reason_copy), "%s", g_ask_reason);
 
-    pthread_mutex_unlock(&g_ask_lock);
+    nxsem_post(&g_ask_lock);
 
-    printf("[Ask] 检测到异常，先问一句再决定报警：原因=%s"
-           "（%u 秒无人应答按「不用了」处理；MQTT confirm_alarm 也能回答）\n",
+    printf("[Ask] 报警确认页：原因=%s"
+           "（%u 秒内说「没事」/点按钮可取消，否则通知家人；"
+           "MQTT confirm_alarm 也能回答）\n",
            reason_copy, (unsigned)(ROBOT_ASK_ALARM_TIMEOUT_MS / 1000));
 
     /* 弹页面 + 起超时看门狗。
@@ -1834,6 +1951,11 @@ static void voice_speak_reply(voice_task_t *task, const char *response)
 
         voice_task_show(task, status);
         touch_ui_voice_chat_round_done();
+        /* 屏上已经有正文 + 状态行了，但喇叭必须响一声：老人看不到屏
+         * （玻璃是坏的），静音对他就是"不回复"。2026-10-26，同
+         * ai_companion_main.c 那三条。放在 round_done 之后：那个要是顺手
+         * 重开麦，后起的播放在半双工下会抢占并照样出声；反过来会被掐掉。 */
+        prompt_ack_play_kind(&g_audio_ctx, PROMPT_ACK_KIND_FAIL);
         return;
     }
 
@@ -1971,6 +2093,8 @@ static void *voice_worker(void *arg)
          * 走 ui_post_error 投递） */
         voice_show_net_error("语音识别", ret);
         touch_ui_voice_chat_round_done();
+        /* 识别失败 = 我方掉链子，说"出问题了"（见 PROMPT_ACK_KIND_FAIL） */
+        prompt_ack_play_kind(&g_audio_ctx, PROMPT_ACK_KIND_FAIL);
         goto out;
     }
 
@@ -1978,6 +2102,8 @@ static void *voice_worker(void *arg)
         printf("[VoiceChat] 识别结果为空\n");
         voice_task_show(task, "没听清\n请大声一点说");
         touch_ui_voice_chat_round_done();
+        /* 这条是"你再说一遍"，用 MISS 不用 FAIL */
+        prompt_ack_play_kind(&g_audio_ctx, PROMPT_ACK_KIND_MISS);
         goto out;
     }
 
@@ -2008,6 +2134,8 @@ static void *voice_worker(void *arg)
         voice_task_show(task, "AI 请求失败\n请稍后再试");
         voice_show_net_error("AI 回复", ret);
         touch_ui_voice_chat_round_done();
+        /* 我方掉链子，别一声不吭（老人看不到屏） */
+        prompt_ack_play_kind(&g_audio_ctx, PROMPT_ACK_KIND_FAIL);
         goto out;
     }
 
@@ -3160,11 +3288,33 @@ static void emergency_call_handler(void *user_data)
         return;
     }
 
+    /* ★ 语音急救模块挂上来（2026-10-31）：补上"10 秒内说「没事」就能停铃"。
+     *  铃和推送上面那条收口里都已经做了，voice_emerg 探到板级报警在响会自己
+     *   转**辅助模式**：不重复响铃、不重复推送，只盯「没事」好把铃掐掉 ——
+     *   老人误触这个按钮的退路，今天没有。
+     *
+     *   顺序钉死：**必须在 alarm_escalate 成功之后**，因为辅助模式的判据是
+     *   "触发这一刻板级报警在不在响"。
+     *
+     *   ⚠ 本函数跑在 LVGL 线程，voice_emerg_trigger() 是非阻塞的
+     *   （只置标志 + post 一个信号量就返回），符合这里"一个阻塞动作都不能做"。 */
+    voice_emerg_trigger("sos_menu", "紧急呼叫");
+
     /* 主界面的表情和回复区文案（报警页撤下之后老人还能看见这一句）。
      * 手机推送已经在收口里的 report_alarm_queued() 里发过了（一次就够），
-     * 这里**不再**单独 push_send_alarm —— 那样家人的手机会收到两条一样的报警。 */
+     * 这里**不再**单独 push_send_alarm —— 那样家人的手机会收到两条一样的报警。
+     *
+     * ★ 2026-10-26：文案不再无条件写"已通知家人"。push_is_enabled() 为假
+     *   = push_init() 当时没拿到 key（/etc/assets/push_key.txt 不在 ROMFS 里），
+     *   那种情况下 Bark 推送**必然发不出去**（push_send_notification 直接 -1），
+     *   而 MQTT 那条又只到 broker、到不到家人手机取决于对方 app 在不在听 ——
+     *   所以这时候只能老实说"推送没配上"，让老人自己去联系家人。 */
     robot_ui_set_face(ROBOT_FACE_WORRIED);
-    robot_ui_set_ai_reply("已通知家人\n请保持镇静");
+    if (push_is_enabled()) {
+        robot_ui_set_ai_reply("已通知家人\n请保持镇静");
+    } else {
+        robot_ui_set_ai_reply("推送没配上\n请直接联系家人");
+    }
 }
 
 /* 设置里拖「音量」滑块：界面那层只存数字，真正下到音频硬件由这里做。
@@ -4896,6 +5046,11 @@ int main(int argc, char *argv[])
      * 回调跑在 LVGL 线程里，里面不做耗时的事（只投递），见 ask_btn_result_cb。 */
     robot_ui_set_ask_result_cb(ask_btn_result_cb, NULL);
 
+    /* ===== 统一报警路径：屏幕跟着报警阶段改口（2026-10-31）=====
+     * voice_emerg 一到"已通知/已收摊"就回调过来，这边只投递到 LVGL 线程改
+     * 那行小字、撤红页（见 alarm_unify_hook）。 */
+    voice_emerg_set_hook(alarm_unify_hook, NULL);
+
     /* ===== 注册提醒的到点回调 ===== */
     /* 必须在添加提醒之前注册：注册完下面 touch_ui_add_reminder() 会立刻
      * 把"下一条"挂到 RTC 闹钟上，到点时就会走 reminder_on_fire()。 */
@@ -4906,6 +5061,18 @@ int main(int argc, char *argv[])
      * 工具不出现在 tools 表里，见 mimo_voice.c 的 chat_reminder_tool_enabled）。
      * 这一步不注册就等于"语音不认提醒"，界面上手动新增仍然照常。 */
     mimo_set_reminder_hook(voice_add_reminder);
+
+    /* ===== 把"语音改音量/亮度"接到设置上 ===== */
+    /* 同上：注册了这个，adjust_setting 工具才会下发给模型（没注册时不出现在
+     * tools 表里，见 mimo_voice.c 的 chat_setting_tool_enabled）。不注册就等于
+     * 语音答"我改不了音量"，界面上拖滑块仍然照常。
+     *
+     * 直接把 touch_ui_settings_apply 当 hook 用（签名与 mimo_settings_hook_t
+     * 逐字相同：int(int item, int action, int value)），中间不需要转发函数。
+     * 它走的就是设置页滑块那条路 —— 改 user_settings + 真下发硬件 + 存盘，
+     * 所以语音调完再打开设置页，滑块就停在新值上。顺序上必须排在
+     * touch_ui_set_volume_cb() 之后（上面 4896 行），否则音量那一半没接上。 */
+    mimo_set_settings_hook(touch_ui_settings_apply);
 
     /* ===== 添加默认提醒 ===== */
     /* 只是开机示例，用户可以自己加/删（「提醒」→ 列表）。

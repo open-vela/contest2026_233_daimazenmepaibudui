@@ -464,6 +464,12 @@ typedef struct
 {
   float energy;        /* 窗口平均能量（int16 幅度平方的均值，可 > 1） */
   float rms;           /* 归一化 RMS（0..1，1.0 = 满量程） */
+  float peak;          /* 归一化峰值（窗口内最大 |样本| / 32768，0..1）。
+                        * ★ 2026-10-31 补：RMS 是**整窗平均**，摔倒那种
+                        *   0.1~0.2 秒的短促撞击摊到 0.64 秒窗里会被稀释
+                        *   （≈ sqrt(0.15/0.64) ≈ 0.48 倍），而峰值一点都不
+                        *   稀释 —— 一声脆响"峰值很高、RMS 一般"是常态。
+                        *   所以喂模型的判据多给峰值一条路。 */
   float zcr;           /* 过零率（0..1）：宽带冲击高，浊音低 */
   float ac_peak;       /* 自相关峰值比（0..1）：周期性强（浊音）才高 */
   float voiced_ratio;  /* "浊音样"分析帧占比（0..1） */
@@ -478,6 +484,12 @@ typedef struct
   uint32_t voice_windows;   /* 判为人声的窗口数 */
   uint32_t mute_windows;    /* 因播放态被整窗跳过的数量 */
   uint32_t anomaly_windows; /* 判为非人声异常、已喂本地模型的窗口数 */
+  uint32_t peak_feed_windows; /* 靠峰值（而非 RMS）额外喂进模型的窗口数 */
+  uint32_t voice_peak_windows; /* 判成人声、但峰值很高（疑似撞击被人声判据
+                                * 吃掉了）的窗口数 —— 这个数一涨就说明
+                                * "摔倒被当成人声送去云端"，是 2026-10-31
+                                * 排查的重点假说之一 */
+  uint32_t nearmiss_windows;  /* 有声但能量不够、既没当人声也没喂模型的窗口 */
   uint32_t last_voice_ms;   /* 最近一次人声的单调毫秒 */
   uint32_t last_anomaly_ms; /* 最近一次异常的单调毫秒 */
   sound_gate_features_t last;  /* 最近一个判过的窗口的特征 */

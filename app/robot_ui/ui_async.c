@@ -32,6 +32,8 @@
 #include "ui_async.h"
 
 #include <pthread.h>
+#include <semaphore.h>        /* sem_t / SEM_INITIALIZER */
+#include <nuttx/semaphore.h>  /* nxsem_wait_uninterruptible / nxsem_post */
 #include <stdlib.h>
 
 typedef struct ui_async_node_s
@@ -41,7 +43,9 @@ typedef struct ui_async_node_s
     struct ui_async_node_s *next;
 } ui_async_node_t;
 
-static pthread_mutex_t g_ui_async_lock = PTHREAD_MUTEX_INITIALIZER;
+/* ★ 2026-11-01：不用 mutex（同 alarm_audio_lock / g_audio_in_lock 的教训）。
+ *   二值信号量没有持有者跟踪，post 不触发 sem_post.c:63 断言。 */
+static sem_t g_ui_async_lock = SEM_INITIALIZER(1);
 static ui_async_node_t *g_ui_async_head = NULL;
 static ui_async_node_t *g_ui_async_tail = NULL;
 
@@ -65,7 +69,7 @@ lv_result_t ui_async_call(lv_async_cb_t cb, void *arg)
     node->arg  = arg;
     node->next = NULL;
 
-    pthread_mutex_lock(&g_ui_async_lock);
+    nxsem_wait_uninterruptible(&g_ui_async_lock);
     if (g_ui_async_tail == NULL)
     {
         g_ui_async_head = node;
@@ -75,7 +79,7 @@ lv_result_t ui_async_call(lv_async_cb_t cb, void *arg)
         g_ui_async_tail->next = node;
     }
     g_ui_async_tail = node;
-    pthread_mutex_unlock(&g_ui_async_lock);
+    nxsem_post(&g_ui_async_lock);
 
     return LV_RESULT_OK;
 }
@@ -90,7 +94,7 @@ void ui_async_pump(void)
     {
         ui_async_node_t *node;
 
-        pthread_mutex_lock(&g_ui_async_lock);
+        nxsem_wait_uninterruptible(&g_ui_async_lock);
         node = g_ui_async_head;
         if (node != NULL)
         {
@@ -100,7 +104,7 @@ void ui_async_pump(void)
                 g_ui_async_tail = NULL;
             }
         }
-        pthread_mutex_unlock(&g_ui_async_lock);
+        nxsem_post(&g_ui_async_lock);
 
         if (node == NULL)
         {

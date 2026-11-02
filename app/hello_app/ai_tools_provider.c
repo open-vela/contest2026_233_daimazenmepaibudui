@@ -40,6 +40,8 @@
 #include <errno.h>
 
 #include "ai_tools_provider.h"
+#include "mimo_voice.h"
+#include "voice_emerg.h"     /* ★ 统一报警路径：AI 报警也走它（2026-10-31） */
 
 /* 框架的工具 provider 接口（tool_registry_register_provider / _invalidate）。
  * -I<ai_agent>/src 只在开了 CONFIG_HELLO_APP_LLM_AI_AGENT 时才加进编译命令，
@@ -48,6 +50,7 @@
 
 #ifdef CONFIG_HELLO_APP_LLM_AI_AGENT
 #  include "tools/tool_registry.h"
+#  include "tools/tool_guard.h"
 #endif
 
 /****************************************************************************
@@ -132,8 +135,77 @@
   "例如老人原话、你的判断依据。可选。\"}},"                                 \
   "\"required\":[\"reason\"]}}"
 
+/* 定时提醒工具。description 必须写清三件事：什么时候该调、**没调用就不许说
+ * 「已经设好了」**、以及 time 只收 24 小时制 HH:MM（口语时间让模型自己换算）。
+ *
+ * ★ 2026-10-30 把第二条从「调用成功就真的建好了，可以直接告诉用户已经设好」
+ *   **反过来写**。真机抓到的回归就是被原来那句带出来的：三轮「定凌晨…提醒」
+ *   模型一次工具都没调（trace: `iter=0 tool=(none)`、`tool_use=0, calls=0`，
+ *   `[AI_TOOLS] add_reminder` 零行），却照样答「好的，提醒已经设好了」。
+ *   原来那句话给了它"说设好"的许可，它就跳过调用直接说了。
+ *   现在的写法对齐 adjust_setting 那条（本文件下面）已经验证有效的防谎报硬话：
+ *   先说「没调用就说是骗他」，再说「调用成功才是真建好了」—— 前半句堵谎，
+ *   后半句保它不至于连成功了都不敢说。
+ *   ⚠ 说到底这仍是**赌模型老实**。真正不依赖模型的是 ai_companion_main.c 的
+ *   reminder_intent_try() 那条本地快路：有提醒词 + 无歧义时刻就直接建好，
+ *   根本不过模型。这条 description 只兜"快路拿不准"剩下的那部分。
+ *
+ * 最后一条是硬要求，不是啰嗦：板子**不猜**时间。猜错的后果是到点不响，用户
+ * 会以为提醒功能坏了 —— 宁可让它重传一次。这条纪律与 mimo_voice.c 的
+ * chat_tool_add_reminder 一致。 */
+
+#define AI_TOOLS_ADD_REMINDER_JSON                                       \
+  "{\"name\":\"" AI_TOOL_ADD_REMINDER "\","                              \
+  "\"description\":\"替用户设一条定时提醒：到点会在板子的提醒页弹出来并响铃。" \
+  "用户说「八点提醒我吃药」「每天提醒我量血压」「半小时后叫我起床」这类话时" \
+  "调用。**没调用本工具就对用户说「已经设好了」「到点会响」是骗他** —— 他到" \
+  "点没听见响，只会以为这东西坏了，事实上一条提醒都没有。必须先调用本工具，" \
+  "拿到执行结果里那句「add_reminder 成功」，再照着它给的时刻和事项告诉用户。" \
+  "反过来：**调用成功就是真建好了**（进板子提醒页、到点响铃弹窗），可以放心" \
+  "复述时刻和事项。"      \
+  "time 只收 24 小时制的 HH:MM，口语时间你自己换算好再传：「下午三点」写成 "    \
+  "15:00，「晚上八点」写成 20:00，「早上七点半」写成 07:30。"                  \
+  "「晚上十二点」是 00:00 不是 12:00，「夜里两点」是 02:00 不是 14:00。"                  \
+  "板子不会替你猜时间，格式不对会让你重传一次。\","                             \
+  "\"input_schema\":{\"type\":\"object\",\"properties\":{"               \
+  "\"time\":{\"type\":\"string\",\"description\":\"提醒时刻，24 小时制 "  \
+  "HH:MM，例如 08:00 或 20:30。\"},"                                     \
+  "\"title\":{\"type\":\"string\",\"description\":\"提醒做什么，一句简短" \
+  "中文，例如「吃药」「量血压」，不超过 20 个字。\"}},"                       \
+  "\"required\":[\"time\",\"title\"]}}"
+
+/* 语音改音量/亮度工具。description 必须写清两件事：什么时候该调（老人说
+ * 「声音小一点」「看不清屏幕」这类话，不是让他自己去设置里找），以及
+ * **调用成功就是真改好了**（走的是设置页滑块那条路，还存盘），可以放心把
+ * 数值复述给用户 —— 少了这句，模型很容易答成"您可以在设置里调"，功能等于
+ * 没做。
+ *
+ * value 是整数：模型按 schema 传裸数字。解析那边两种写法都认（见
+ * ai_tools_json_find_number）。 */
+
+#define AI_TOOLS_ADJUST_SETTING_JSON                                     \
+  "{\"name\":\"" AI_TOOL_ADJUST_SETTING "\","                            \
+  "\"description\":\"调整本机的音量或者屏幕亮度。用户说声音太小、声音太大、"          \
+  "调高音量、调低音量、把屏幕调亮、把屏幕调暗、看不清屏幕、太刺眼这类话时"              \
+  "调用。**调用成功就是真的改好了**（和在设置页拖滑块是同一条路，还会存下来，"          \
+  "断电重启也还在），可以把改完的数值放心告诉用户，不要说「您可以在设置里调」。"          \
+  "item 传 volume 表示音量、brightness 表示屏幕亮度；action 传 up 表示调高"            \
+  "一档、down 表示调低一档、set 表示直接设成 value 那个数。用户说调到最亮、"            \
+  "最大声就用 set 加 100，说关掉声音就用 set 加 0。"                              \
+  "**没调用本工具就对用户说「已经调好了」「现在是多少」是骗他** —— 他回头"        \
+  "一看根本没变。必须先调用本工具，拿到执行结果里返回的数值，再照着那个数说。\","  \
+  "\"input_schema\":{\"type\":\"object\",\"properties\":{"               \
+  "\"item\":{\"type\":\"string\",\"description\":\"改哪一项\","           \
+  "\"enum\":[\"volume\",\"brightness\"]},"                               \
+  "\"action\":{\"type\":\"string\",\"description\":\"怎么改\","          \
+  "\"enum\":[\"up\",\"down\",\"set\"]},"                                 \
+  "\"value\":{\"type\":\"integer\",\"description\":\"只在 action 是 set " \
+  "的时候传，0 到 100 的整数。\"}},"                                       \
+  "\"required\":[\"item\",\"action\"]}}"
+
 #define AI_TOOLS_JSON_ARRAY                                              \
-  "[" AI_TOOLS_SET_LIGHT_JSON "," AI_TOOLS_REPORT_EMERGENCY_JSON "]"
+  "[" AI_TOOLS_SET_LIGHT_JSON "," AI_TOOLS_REPORT_EMERGENCY_JSON ","     \
+  AI_TOOLS_ADD_REMINDER_JSON "," AI_TOOLS_ADJUST_SETTING_JSON "]"
 
 /****************************************************************************
  * External Symbols
@@ -262,6 +334,82 @@ static const char *ai_tools_json_find_string(const char *json, const char *key,
     *out_len = (size_t)(p - start);
     return start;
   }
+}
+
+/**
+ * @brief  找 "key" 后面那个数字（JSON 里的数值字段，例如 adjust_setting 的 value）
+ *
+ * ai_tools_json_find_string() 只认**带引号的字符串**值，数值字段一个都取不到
+ * —— 模型按 schema 传的是裸数字 `"value":60`，用它去取必然落空。这里两种都
+ * 认：裸数字 `60`，以及有的模型会自作主张写成的 `"60"`。
+ *
+ * @return OK 成功（值在 *out）；-ENOENT 没这个键 / 值不是数字；-EINVAL 参数不对
+ */
+
+static int ai_tools_json_find_number(const char *json, const char *key, int *out)
+{
+  char pat[32];
+  const char *p;
+  char *end;
+  long v;
+
+  if (json == NULL || key == NULL || out == NULL)
+    {
+      return -EINVAL;
+    }
+
+  if (strlen(key) + 3 > sizeof(pat))
+    {
+      return -EINVAL;
+    }
+
+  snprintf(pat, sizeof(pat), "\"%s\"", key);
+
+  p = strstr(json, pat);
+  if (p == NULL)
+    {
+      return -ENOENT;
+    }
+
+  p += strlen(pat);
+
+  while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+    {
+      p++;
+    }
+
+  if (*p != ':')
+    {
+      return -ENOENT;
+    }
+
+  p++;
+
+  while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+    {
+      p++;
+    }
+
+  /* 有的模型会把数字写成字符串，两种都收 */
+
+  if (*p == '"')
+    {
+      p++;
+    }
+
+  if (*p != '-' && (*p < '0' || *p > '9'))
+    {
+      return -ENOENT;
+    }
+
+  v = strtol(p, &end, 10);
+  if (end == p)
+    {
+      return -ENOENT;
+    }
+
+  *out = (int)v;
+  return OK;
 }
 
 /**
@@ -513,6 +661,15 @@ static int ai_tools_report_emergency(const char *input_json, char *output,
    * 假装弹过框：这句话会经模型进到老人耳朵里（"您按下确认就行"），而屏幕上
    * 什么都没有。 */
 
+  /* ★ 统一报警路径（2026-10-31）：用户原话「ai 报警和自主本地检测到摔倒和
+   *   异常声音报警是**一个路径**」。AI 那条（本函数）以前只弹询问框、要等
+   *   用户点了才真报警；本地那条走的是另一套 20 秒追问。两条现在都交给
+   *   voice_emerg —— 响铃不许断、10 秒内说「没事」/点屏幕按钮取消、
+   *   否则 Bark 通知家人、30 秒重发、期间说「没事」仍可停。
+   *   屏幕坏了也照常报警（这一下不依赖界面）。 */
+
+  voice_emerg_trigger("ai_emergency", reason);
+
   if (ui_post_ask_alarm != NULL)
     {
       ui_post_ask_alarm(reason);
@@ -581,6 +738,251 @@ static int ai_tools_report_emergency(const char *input_json, char *output,
 }
 
 /**
+ * @brief  add_reminder 的执行体：替用户在提醒页建一条定时提醒
+ *
+ * 落地统一走 mimo_reminder_apply()（mimo_voice.c）—— 面板语音那条链路的
+ * add_reminder 也走它，标题截断、时间归一化、hook 缺失兜底只有一份，不会
+ * 「面板能建、常开麦建出来是坏的」。真正写进提醒列表、重挂 RTC 闹钟、刷界面
+ * 的是 robot_ui 启动时注册的 voice_add_reminder()，所以提醒**在设定当时就
+ * 出现在提醒页**，到点由 reminder_sched 自己响。
+ *
+ * 时间**不猜**（与 chat_tool_add_reminder 同一纪律）：收到 "八点" / "晚上八点"
+ * 就打回，让模型自己换算成 HH:MM 重传。猜错的后果是到点不响，用户会以为提醒
+ * 功能坏了，比多问一轮坏得多。
+ *
+ * **失败不返回负值**：把中文原因写进 output 当工具结果喂回模型，让它自己跟
+ * 老人解释或改正重试。返回 ERROR 会走成"未知工具"，模型只会看到一句英文报错。
+ *
+ * @param  input_json   模型给的参数（JSON 对象串；可能为 NULL）
+ * @param  output       工具结果（回给模型看的文本）
+ * @param  output_size  output 的大小
+ * @return 恒为 OK（工具名在 execute 里已经认过；失败原因全部写进 output）
+ */
+
+static int ai_tools_add_reminder(const char *input_json, char *output,
+                                 size_t output_size)
+{
+  char time_raw[32];
+  char title_raw[96];
+  char title_used[84];          /* 20 个汉字的 UTF-8 上界 + 余量 */
+  const char *p;
+  size_t len = 0;
+  size_t got;
+  int ret;
+
+  output[0] = '\0';
+
+  /* time 必填，只收 ASCII 记号（HH:MM）—— 带空格、带中文、带反斜杠的一律
+   * 打回，正好符合"不猜"的纪律。 */
+
+  p = ai_tools_json_find_string(input_json, "time", &len);
+
+  if (!ai_tools_copy_token(p, len, time_raw, sizeof(time_raw)))
+    {
+      snprintf(output, output_size,
+               "没执行：time 参数缺失或者不是合法的 24 小时制 HH:MM。"
+               "请把口语时间自己换算好再调用一次，例如「下午三点」写成 "
+               "15:00、「早上七点半」写成 07:30。");
+      ai_tools_info("add_reminder: time 不合法，打回");
+      return OK;
+    }
+
+  /* title 必填，收中文（走 copy_text：截断而不是打回，且截在字符边界上） */
+
+  p = ai_tools_json_find_string(input_json, "title", &len);
+  got = ai_tools_copy_text(p, len, title_raw, sizeof(title_raw));
+
+  if (got == 0)
+    {
+      snprintf(output, output_size,
+               "没执行：title 参数缺失。请用一句简短中文写清楚提醒做什么"
+               "（例如 吃药）重新调用一次。");
+      ai_tools_info("add_reminder: title 不合法，打回");
+      return OK;
+    }
+
+  ret = mimo_reminder_apply(time_raw, title_raw, title_used,
+                            sizeof(title_used));
+
+  if (ret == -EINVAL)
+    {
+      snprintf(output, output_size,
+               "没执行：time 必须是 24 小时制的 HH:MM，收到的是「%.40s」。"
+               "板子不会替你猜时间，请换算好再调用一次。",
+               time_raw);
+      ai_tools_info("add_reminder: time 格式打回");
+      return OK;
+    }
+
+  if (ret == -ENOSYS)
+    {
+      snprintf(output, output_size,
+               "没执行：本机现在没有可用的提醒功能（提醒模块没起来）。"
+               "请如实告诉用户这次没设上，别复述已经设好。");
+      ai_tools_info("add_reminder: 提醒落地未注册");
+      return OK;
+    }
+
+  if (ret < 0)
+    {
+      snprintf(output, output_size,
+               "没执行：%s 的提醒「%s」没能建起来（错误码 %d）。"
+               "请跟用户说一声这次没记住，别复述已经设好。",
+               time_raw, title_used, ret);
+      return OK;
+    }
+
+  snprintf(output, output_size,
+           "已建好：%s 提醒「%s」。板子到点会弹出来并响铃，"
+           "可以直接告诉用户已经设好了。",
+           time_raw, title_raw);
+  return OK;
+}
+
+/**
+ * @brief  adjust_setting 的执行体：替用户改音量 / 屏幕亮度
+ *
+ * 落地统一走 mimo_settings_apply()（mimo_voice.c）—— 面板语音那条链路的
+ * adjust_setting 也走它，参数校验、越界夹取、hook 缺失兜底只有一份，不会
+ * 「面板能改、常开麦改出来是坏的」。真正改 user_settings + 下发硬件 + 存盘
+ * 的是 robot_ui 启动时注册的 touch_ui_settings_apply()，**和设置页拖滑块同
+ * 一条路**，所以语音调完再打开设置页，滑块就停在新值上。
+ *
+ * 参数**不猜**（与 add_reminder 同一纪律）：item / action 只认枚举里的那几个
+ * 值，set 必须带 value，缺了就打回让模型重传。猜错的后果是"说调高结果把亮度
+ * 调没了"，比不调更糟。
+ *
+ * 到顶/到底不是失败：落地回的是当前值（0 或 100），这里如实说成"已经最大了"。
+ *
+ * **失败不返回负值**：把中文原因写进 output 当工具结果喂回模型，让它自己跟
+ * 老人解释或改正重试。返回 ERROR 会走成"未知工具"，模型只会看到一句英文报错。
+ *
+ * @param  input_json   模型给的参数（JSON 对象串；可能为 NULL）
+ * @param  output       工具结果（回给模型看的文本）
+ * @param  output_size  output 的大小
+ * @return 恒为 OK（工具名在 execute 里已经认过；失败原因全部写进 output）
+ */
+
+static int ai_tools_adjust_setting(const char *input_json, char *output,
+                                   size_t output_size)
+{
+  char item_raw[24];
+  char action_raw[16];
+  const char *p;
+  size_t len = 0;
+  int item;
+  int action;
+  int value = 0;
+  int ret;
+
+  output[0] = '\0';
+
+  /* item 必填，只收 ASCII 记号 */
+
+  p = ai_tools_json_find_string(input_json, "item", &len);
+
+  if (!ai_tools_copy_token(p, len, item_raw, sizeof(item_raw)))
+    {
+      snprintf(output, output_size,
+               "没执行：item 参数缺失。volume 是音量、brightness 是屏幕亮度，"
+               "请重新调用一次。");
+      ai_tools_info("adjust_setting: item 缺失，打回");
+      return OK;
+    }
+
+  if (strcmp(item_raw, "volume") == 0)
+    {
+      item = MIMO_SET_ITEM_VOLUME;
+    }
+  else if (strcmp(item_raw, "brightness") == 0)
+    {
+      item = MIMO_SET_ITEM_BRIGHTNESS;
+    }
+  else
+    {
+      snprintf(output, output_size,
+               "没执行：item 只认 volume（音量）和 brightness（屏幕亮度），"
+               "收到的是「%.40s」。请重新调用一次。", item_raw);
+      ai_tools_info("adjust_setting: item 值不合法，打回");
+      return OK;
+    }
+
+  /* action 必填，同样只收 ASCII 记号 */
+
+  p = ai_tools_json_find_string(input_json, "action", &len);
+
+  if (!ai_tools_copy_token(p, len, action_raw, sizeof(action_raw)))
+    {
+      snprintf(output, output_size,
+               "没执行：action 参数缺失。up 是调高一档、down 是调低一档、"
+               "set 是直接设成某个值，请重新调用一次。");
+      ai_tools_info("adjust_setting: action 缺失，打回");
+      return OK;
+    }
+
+  if (strcmp(action_raw, "up") == 0)
+    {
+      action = MIMO_SET_ACT_UP;
+    }
+  else if (strcmp(action_raw, "down") == 0)
+    {
+      action = MIMO_SET_ACT_DOWN;
+    }
+  else if (strcmp(action_raw, "set") == 0)
+    {
+      action = MIMO_SET_ACT_SET;
+
+      /* set 必须给 value —— 不给就打回去让它重传，绝不"猜一个数"。
+       * value 是整数字段，走 find_number（find_string 只认带引号的值）。 */
+
+      if (ai_tools_json_find_number(input_json, "value", &value) != OK)
+        {
+          snprintf(output, output_size,
+                   "没执行：action 是 set 的时候必须给 value（0 到 100 的"
+                   "整数）。请带上 value 重新调用一次。");
+          ai_tools_info("adjust_setting: set 缺 value，打回");
+          return OK;
+        }
+    }
+  else
+    {
+      snprintf(output, output_size,
+               "没执行：action 只认 up、down、set 三个值，收到的是「%.40s」。"
+               "请重新调用一次。", action_raw);
+      ai_tools_info("adjust_setting: action 值不合法，打回");
+      return OK;
+    }
+
+  ret = mimo_settings_apply(item, action, value);
+
+  if (ret == -ENOSYS)
+    {
+      snprintf(output, output_size,
+               "没执行：本机现在改不了这个设置（界面模块没起来）。"
+               "请如实告诉用户这次没改上，别说已经调好了。");
+      ai_tools_info("adjust_setting: 设置落地未注册");
+      return OK;
+    }
+
+  if (ret < 0)
+    {
+      snprintf(output, output_size,
+               "没执行：%s没能改成（错误码 %d）。请跟用户说一声这次没改上，"
+               "可以让他再说一遍。",
+               item == MIMO_SET_ITEM_VOLUME ? "音量" : "亮度", ret);
+      return OK;
+    }
+
+  /* ret 就是**已经生效的新值**，直接复述给模型 */
+
+  snprintf(output, output_size,
+           "已经改好了：%s现在是 %d（0 到 100）。请简短告诉用户，"
+           "顺便说清是调高了还是调低了。",
+           item == MIMO_SET_ITEM_VOLUME ? "音量" : "亮度", ret);
+  return OK;
+}
+
+/**
  * @brief  框架的 execute 回调：执行一个工具调用
  *
  * @param  name         模型要调的工具名
@@ -611,6 +1013,22 @@ static int ai_tools_provider_execute(const char *name, const char *input_json,
   if (strcmp(name, AI_TOOL_REPORT_EMERGENCY) == 0)
     {
       return ai_tools_report_emergency(input_json, output, output_size);
+    }
+
+  /* 定时提醒有自己的入口（收中文 title，且要走 mimo_voice 那份落地），
+   * 下面那段灯控的取值逻辑一行都不用改。 */
+
+  if (strcmp(name, AI_TOOL_ADD_REMINDER) == 0)
+    {
+      return ai_tools_add_reminder(input_json, output, output_size);
+    }
+
+  /* 改音量/亮度也有自己的入口（value 是整数字段，且要走 mimo_voice 那份
+   * 落地），下面那段灯控的取值逻辑一行都不用改。 */
+
+  if (strcmp(name, AI_TOOL_ADJUST_SETTING) == 0)
+    {
+      return ai_tools_adjust_setting(input_json, output, output_size);
     }
 
   if (strcmp(name, AI_TOOL_SET_LIGHT) != 0)
@@ -710,6 +1128,88 @@ void ai_tools_provider_set_network_ctx(ai_network_context_t *ctx)
   ai_tools_info("网络上下文已%s", (ctx != NULL) ? "注册" : "撤销");
 }
 
+/* ── 这台设备的工具裁剪表（2026-10-27）──────────────────────────────
+ *
+ * 背景（实测，2026-10-26 串口）：一轮请求体 **20643 字节**。系统提示词静态
+ * 部分约 2700 字符、SOUL/USER/MEMORY 三份种子加起来约 350 —— **大头在工具
+ * 定义**。ai_agent 内置 38 个工具，加上本 provider 的 3 个，一古脑每次发给
+ * 大模型。
+ *
+ * 代价不只是慢：**工具越多模型越会挑错**。现场那个「该调 add_reminder 却
+ * 去调死路 cron_add」的老毛病，根子就在这儿 —— 38 个摆在眼前，挑错是必然。
+ *
+ * ★ 机制：tool_enabled_<name>="0"。这个 key 以前只拦**执行**，声明照发，
+ * 等于关了个寂寞；2026-10-27 起 tool_registry 的 get_tools_json 也会跳过
+ * 被关的工具（见 tool_registry.c 那段），所以关掉 = 真不发给模型。
+ *
+ * ★ 只关「这台设备用不上」的，**不关「用得上但没配好」的** ——
+ *   web_search / news_search / fetch_url 明确保留：用户要查市场实时信息。
+ *   它们现在报「联网功能用不了」是**缺搜索 key**（tavily_key / serp_key /
+ *   exa_key / news_key），不是工具该关。缺 key 的事单独解决，别用关工具冒充。
+ *
+ * ★ 改这张表 = 加减一行字符串，不用动别的。要恢复某个工具，从表里删掉
+ *   那一行即可（下次开机生效，config.json 里那个 key 会被留在原地但不再
+ *   有影响；想彻底清掉就 set 回 "1"）。
+ *
+ * ★ 判据：串口那行 `Tools JSON loaded: %d bytes` 该明显变小；
+ *   `Tools JSON built (N builtin + M providers)` 的 N **不变**（这里是
+ *   「不广告」不是「没注册」，执行侧仍认得它们）。 */
+
+static const char *const s_unused_tools[] =
+{
+  /* 飞书文档 / 群聊 —— 老人语音用不上 */
+  "feishu_doc_create",
+  "feishu_doc_write",
+  "feishu_doc_read",
+  "feishu_doc_list",
+  "feishu_chat_members",
+  "feishu_send_mention",
+
+  /* 视觉 —— 这块板子没摄像头 */
+  "analyze_image",
+  "camera_capture",
+
+  /* 危险 —— 老人机不该有 shell */
+  "run_shell",
+
+  /* 文件读写 —— 语音场景用不上 */
+  "read_file",
+  "write_file",
+  "edit_file",
+  "list_dir",
+
+  NULL
+};
+
+#ifdef CONFIG_HELLO_APP_LLM_AI_AGENT
+static void ai_tools_apply_device_policy(void)
+{
+  int n = 0;
+  int i;
+
+  for (i = 0; s_unused_tools[i] != NULL; i++)
+    {
+      /* 写不进去就只记一笔，别中断初始化：少关一个工具只是慢一点，
+       * 注册失败才是不能对话。 */
+      if (tool_guard_set_enabled(s_unused_tools[i], false) == OK)
+        {
+          n++;
+        }
+      else
+        {
+          ai_tools_info("关工具失败: %s（继续）", s_unused_tools[i]);
+        }
+    }
+
+  /* 清单带缓存：改完必须打脏，否则要等下一次注册才会重建。 */
+
+  tool_registry_invalidate();
+
+  ai_tools_info("设备工具裁剪：关掉 %d 个用不上的工具，"
+                "清单里的会少掉它们的声明", n);
+}
+#endif
+
 int ai_tools_provider_init(void)
 {
 #ifdef CONFIG_HELLO_APP_LLM_AI_AGENT
@@ -734,8 +1234,18 @@ int ai_tools_provider_init(void)
 
   tool_registry_invalidate();
 
-  ai_tools_info("已注册 provider「%s」，工具 %s / %s", AI_TOOLS_PROVIDER_NAME,
-                AI_TOOL_SET_LIGHT, AI_TOOL_REPORT_EMERGENCY);
+  /* 四个工具一起打：这条是格式串，进不了 flash_screen 的清单筛查，以前漏了
+   * add_reminder 照样编过 —— 照片上看日志的人会以为提醒工具没注册。 */
+  ai_tools_info("已注册 provider「%s」，工具 %s / %s / %s / %s",
+                AI_TOOLS_PROVIDER_NAME, AI_TOOL_SET_LIGHT,
+                AI_TOOL_REPORT_EMERGENCY, AI_TOOL_ADD_REMINDER,
+                AI_TOOL_ADJUST_SETTING);
+
+  /* 这台设备的工具裁剪（见 s_unused_tools 头顶那段）。放在注册之后：
+   * 关的是 ai_agent 内置的那些，和我们刚注册的四个无关，顺序上也不依赖。 */
+
+  ai_tools_apply_device_policy();
+
   return OK;
 
 #else

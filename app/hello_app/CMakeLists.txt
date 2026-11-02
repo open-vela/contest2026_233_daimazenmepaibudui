@@ -45,6 +45,12 @@ if(CONFIG_LVX_USE_CONTEST2026_233_HELLO_APP)
     # "有回应感"。只依赖 ai_audio.h + tts_cache.h，robot_ui 也 include 这个头
     # 文件（跨 app 的符号最终链接时解析），所以两个 app 的提示音是同一份。
     prompt_ack.c
+    # 语音急救报警（喊「救命」「着火了」不需唤醒词 → 响铃 → 10 秒内说「没事」
+    # 就停，否则 Bark 通知家人）。★ 响铃走 ai_audio 的 audio_play_start()，
+    # 不走 sf32lb52_alarm.c —— 那条裸 open/AUDIOIOC_STOP 路没人补"还麦"，
+    # 会把 0.6 秒的偷听窗整个吞掉（来龙去脉见 voice_emerg.h 文件头）。
+    # 只依赖 ai_audio.h + network_comm.h（后者在 ../robot_ui，跨 app 解析）。
+    voice_emerg.c
   )
 
   if(CONFIG_HELLO_APP_SOUND_EVENT)

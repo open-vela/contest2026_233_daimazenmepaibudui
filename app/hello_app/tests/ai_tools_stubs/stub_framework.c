@@ -3,11 +3,13 @@
  *
  * 给谁用：app/hello_app/tests/run_host_tests_ai_tools.sh（那条 cc 命令编的是
  * test_ai_tools_provider.c + 本文件 + ../ai_tools_provider.c）。本文件顶掉
- * ai_tools_provider.c 的三个外部依赖，让 get_tools / execute 两个回调在 PC 上
+ * ai_tools_provider.c 的五个外部依赖，让 get_tools / execute 两个回调在 PC 上
  * 离线可测：
  *   1) 框架工具表 tool_registry_register_provider() / tool_registry_invalidate()
  *   2) 网络出口 ai_network_send_device_command() / ai_network_report_sound_alarm()
  *   3) 二次确认入口 ui_post_ask_alarm()
+ *   4) 提醒落地入口 mimo_reminder_apply()（add_reminder 工具的最终落点）
+ *   5) 工具开关 tool_guard_set_enabled()（设备工具裁剪）
  *
  * 真身在哪（这三样在板子上的实现，下面每个函数头上都注明了对应位置）：
  *   框架工具表：openvela/packages/ai_agent/src/tools/tool_registry.c
@@ -17,6 +19,11 @@
  *             （原型在 app/hello_app/ai_network.h）
  *   二次确认：app/robot_ui/main.c
  *             （原型在 app/robot_ui/robot_ui.h）
+ *   提醒落地：app/hello_app/mimo_voice.c
+ *             （原型在 app/hello_app/mimo_voice.h —— host 上**用真头**，
+ *               所以签名写错一处就编不过）
+ *   工具开关：openvela/packages/ai_agent/src/tools/tool_guard.c
+ *             （原型在同目录 tool_guard.h —— 那个头自给自足，同样用真头）
  *
  * 为什么 host 上需要它：那三个真身一个要 ai_agent 的 pthread 互斥 + cJSON 工具清单
  * 缓存，一个要连着 MQTT 的 network_comm 排队口，一个要 LVGL 线程（ui_post_ask_alarm
@@ -34,10 +41,17 @@
  */
 
 #include <errno.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 
+/* 假的 <nuttx/config.h>：只为 OK / ERROR 两个名字（tool_guard_set_enabled()
+ * 的真身用 ERROR 表示「名字拼不进 64 字节 key 缓冲」，这里照抄同一个码）。 */
+#include <nuttx/config.h>
+
 #include "ai_tools_host_stub.h"
+#include "mimo_voice.h"
+#include "tools/tool_guard.h"
 #include "tools/tool_registry.h"
 
 host_stub_t g_stub;
@@ -63,6 +77,22 @@ void host_stub_reset_calls(void)
 
   g_stub.ask_calls = 0;
   g_stub.last_ask_reason[0] = '\0';
+
+  g_stub.reminder_calls = 0;
+  g_stub.last_reminder_time[0] = '\0';
+  g_stub.last_reminder_title[0] = '\0';
+  g_stub.reminder_ret = 0;
+
+  g_stub.settings_calls = 0;
+  g_stub.last_setting_item = -1;
+  g_stub.last_setting_action = -1;
+  g_stub.last_setting_value = 0;
+  g_stub.settings_ret = 0;
+
+  g_stub.guard_calls = 0;
+  g_stub.guard_off_calls = 0;
+  g_stub.last_guard_tool[0] = '\0';
+  g_stub.guard_ret = 0;
 }
 
 char *host_stub_take_tools_json(void)
@@ -165,3 +195,208 @@ void ui_post_ask_alarm(const char *reason)
            reason);
 }
 #endif
+
+/* 按 UTF-8 **字符**边界截到 max_chars 个字（真身用的是 mimo_voice.c 里的
+ * tts_truncate()，口径一样：整字截，绝不在三字节汉字中间断开）。
+ * 多字节序列在串尾被截断时整条丢掉 —— 宁可少一个字，不产出坏 UTF-8，
+ * 否则这段标题会被 snprintf 原样写进给模型看的话术里。 */
+static void stub_utf8_trunc(const char *src, char *dst, size_t dst_cap,
+                            unsigned int max_chars)
+{
+  unsigned int n = 0;
+  size_t out = 0;
+
+  if (dst_cap == 0)
+    {
+      return;
+    }
+  dst[0] = '\0';
+
+  while (*src != '\0' && n < max_chars)
+    {
+      unsigned char c = (unsigned char)*src;
+      size_t adv;
+      size_t k;
+
+      if ((c & 0x80u) == 0x00u)
+        {
+          adv = 1;
+        }
+      else if ((c & 0xE0u) == 0xC0u)
+        {
+          adv = 2;
+        }
+      else if ((c & 0xF0u) == 0xE0u)
+        {
+          adv = 3;
+        }
+      else if ((c & 0xF8u) == 0xF0u)
+        {
+          adv = 4;
+        }
+      else
+        {
+          src++; /* 不是合法的首字节，跳过，别把它算成一个字符 */
+          continue;
+        }
+
+      for (k = 1; k < adv; k++)
+        {
+          if (src[k] == '\0')
+            {
+              adv = 0;
+              break;
+            }
+        }
+      if (adv == 0)
+        {
+          break; /* 串尾半个字符 */
+        }
+
+      if (out + adv >= dst_cap)
+        {
+          break; /* 放不下整字就不放，给 '\0' 留位置 */
+        }
+
+      memcpy(dst + out, src, adv);
+      out += adv;
+      src += adv;
+      n++;
+    }
+
+  dst[out] = '\0';
+}
+
+/* 真身：app/hello_app/mimo_voice.c 的 mimo_reminder_apply()（原型在
+ * app/hello_app/mimo_voice.h，由上面那个 include 钉住签名）。
+ *
+ * 它是 add_reminder 工具的最终落点，真身依次做四件事：
+ *   1) 判参（NULL / hhmm 不是 24 小时制 H:MM|HH:MM / title 为空 -> -EINVAL）；
+ *   2) 把 hhmm 归一化成 "%02d:%02d"；
+ *   3) 标题按整字截到 20 个字（mimo_voice.c 的 MIMO_REMINDER_TITLE_CHARS，
+ *      那个宏是它私有的、头里没有 —— 下面照抄 20，改真身时记得一起改）；
+ *   4) 调 robot_ui 注册进来的 hook（板子上是 reminder_sched_add + reload +
+ *      界面通知），hook 没注册 -> -ENOSYS，hook 出错 -> **原样透传**它的错误码
+ *      （压成笼统的 -EIO 会让工具话术说不清"提醒记不下了"是满额）。
+ *
+ * host 上没有提醒表、没有界面、也没有 hook，所以 1)~3) 照真身做
+ * （used_title 必须写：调用方要把它拼进给模型看的话术，留着没初始化的缓冲
+ * 就是让模型念垃圾），4) 换成返回 g_stub.reminder_ret —— 默认 0 = 设好了，
+ * 这跟板子上的常态一致（hook 是注册着的）；想走「提醒模块没起来」那条分支就
+ * 把它设成 -ENOSYS，想走「满额记不下」就设成 hook 那边的负错误码。 */
+int mimo_reminder_apply(const char *hhmm, const char *title, char *used_title,
+                        size_t used_title_cap)
+{
+  char normalized[8];
+  char trimmed[84]; /* 20 个汉字的 UTF-8 上界 + 余量，同真身 */
+  int hh;
+  int mm;
+
+  if (hhmm == NULL || title == NULL)
+    {
+      return -EINVAL;
+    }
+
+  if (sscanf(hhmm, "%d:%d", &hh, &mm) != 2 || hh < 0 || hh > 23 || mm < 0
+      || mm > 59)
+    {
+      return -EINVAL;
+    }
+
+  snprintf(normalized, sizeof(normalized), "%02d:%02d", hh, mm);
+
+  if (title[0] == '\0')
+    {
+      return -EINVAL;
+    }
+
+  stub_utf8_trunc(title, trimmed, sizeof(trimmed), 20);
+
+  if (used_title != NULL && used_title_cap > 0)
+    {
+      snprintf(used_title, used_title_cap, "%s", trimmed);
+    }
+
+  g_stub.reminder_calls++;
+  snprintf(g_stub.last_reminder_time, sizeof(g_stub.last_reminder_time), "%s",
+           normalized);
+  snprintf(g_stub.last_reminder_title, sizeof(g_stub.last_reminder_title),
+           "%s", trimmed);
+  return g_stub.reminder_ret;
+}
+
+/* 真身：app/hello_app/voice_emerg.c 的 voice_emerg_trigger()（原型在
+ * app/hello_app/voice_emerg.h），host 上这条不需要重现状态机，只需要让链接
+ * 成功；真正的报警/铃声逻辑在板子上的 C 文件里做。 */
+void voice_emerg_trigger(const char *reason, const char *text)
+{
+  (void)reason;
+  (void)text;
+}
+
+/* 真身：app/hello_app/mimo_voice.c 的 mimo_settings_apply()（原型在
+ * app/hello_app/mimo_voice.h），host 上只复现参数校验 + 记录返回值；调
+ * 真机上的设置页/硬件逻辑不在这里。 */
+int mimo_settings_apply(int item, int action, int value)
+{
+  if (item != MIMO_SET_ITEM_VOLUME && item != MIMO_SET_ITEM_BRIGHTNESS)
+    {
+      return -EINVAL;
+    }
+
+  if (action != MIMO_SET_ACT_UP && action != MIMO_SET_ACT_DOWN
+      && action != MIMO_SET_ACT_SET)
+    {
+      return -EINVAL;
+    }
+
+  if (action == MIMO_SET_ACT_SET && (value < 0 || value > 100))
+    {
+      return -EINVAL;
+    }
+
+  g_stub.settings_calls++;
+  g_stub.last_setting_item = item;
+  g_stub.last_setting_action = action;
+  g_stub.last_setting_value = value;
+  return g_stub.settings_ret;
+}
+
+/* 真身：openvela/packages/ai_agent/src/tools/tool_guard.c 的
+ * tool_guard_set_enabled()（原型在同目录 tool_guard.h，host 上用真头）。
+ * 真身只做 `claw_config_set("tool_enabled_<name>", enabled ? "1" : "0")`，
+ * 名字拼进 64 字节缓冲放不下就返回 ERROR(-1)，其余把 claw_config_set 的
+ * 返回值原样透传（0 / 负 errno）。host 上没有配置库，照抄那个 64 字节上限
+ * 判一次（超长 -> ERROR，和真身同码），其余由 g_stub.guard_ret 摆。
+ *
+ * 谁在用它判数：ai_tools_apply_device_policy() 数「返回 OK 的次数」打
+ * 「关掉 %d 个用不上的工具」，所以 guard_off_calls 记的就是 enabled=false
+ * 的次数 —— 测试要断言「裁剪真的关掉了 N 个」看它。 */
+int tool_guard_set_enabled(const char *tool_name, bool enabled)
+{
+  char key[64]; /* 真身 GUARD_KEY_BUF */
+  int n;
+
+  if (tool_name == NULL)
+    {
+      return ERROR;
+    }
+
+  /* 真身这一句是 snprintf(key, sizeof(key), "%s%s", GUARD_KEY_PREFIX,
+   * tool_name)，前缀 "tool_enabled_" 共 13 字节；这里照样拼一次只为复现
+   * 「拼不下就 ERROR」那条判据，拼出来的 key 本身没人用。 */
+  n = snprintf(key, sizeof(key), "%s%s", "tool_enabled_", tool_name);
+  if (n < 0 || (size_t)n >= sizeof(key))
+    {
+      return ERROR;
+    }
+
+  g_stub.guard_calls++;
+  if (!enabled)
+    {
+      g_stub.guard_off_calls++;
+    }
+  snprintf(g_stub.last_guard_tool, sizeof(g_stub.last_guard_tool), "%s",
+           tool_name);
+  return g_stub.guard_ret;
+}

@@ -203,11 +203,18 @@ static void test_register(void)
         "provider 名字是 \"contest\"（静态存储期，不是栈上的）");
   check(g_stub.provider_count == 1, "register_provider 调了 1 次");
   check(g_stub.execute != NULL, "execute 回调交上去了");
-  check(g_stub.invalidate_calls == 1, "注册完打了脏（不然模型看不到新工具）");
+  /* 打脏恰好两次：注册完一次（不然模型看不到新工具），设备工具裁剪改完再一次
+   * （关掉 13 个内置工具后清单变了，不打脏模型还看得见它们的声明）。
+   * 两次都对应一次真实的状态变更，所以这里坚持数**精确**次数 ——
+   * 多打一次说明有别的东西改了清单却没登记在这里，少打一次就是回归。
+   * （这条断言原本写的是 == 1，那是工具裁剪那一版之前的口径；那一版给
+   *   init 多加了一次打脏，测试没跟着改，一链接就红。） */
+  check(g_stub.invalidate_calls == 2,
+        "注册 + 工具裁剪各打一次脏（不然模型看不到新工具 / 还看得见被关的）");
 
   check(ai_tools_provider_init() == 0, "重复 init 返回 0");
   check(g_stub.provider_count == 1, "重复 init 不重复注册（provider 表只有 4 格）");
-  check(g_stub.invalidate_calls == 1, "重复 init 不再打脏");
+  check(g_stub.invalidate_calls == 2, "重复 init 不再打脏");
 }
 
 /* ── B. 工具清单 JSON ────────────────────────────────────── */
@@ -224,17 +231,34 @@ static void test_tools_json(void)
   check(json_shape_ok(json), "手拼的 JSON 形状正确（引号/括号/无裸控制字符）");
   check(json[0] == '[' && json[strlen(json) - 1] == ']',
         "清单是一个 JSON 数组（框架要的就是数组）");
-  check(count_occurrences(json, "{\"name\":\"") == 2,
-        "两个工具元素都以 {\"name\":\" 开头");
-  check(count_occurrences(json, "\"name\":") == 2, "清单里 2 个工具名");
-  check(count_occurrences(json, "\"description\":") >= 2,
-        "两个工具都带 description（schema 内部的字段描述不计）");
-  check(count_occurrences(json, "\"input_schema\":") == 2, "2 个 input_schema");
+  /* 现在的工具清单是四项：set_light / report_emergency / add_reminder /
+   * adjust_setting。后面两条都属于“板子上现成功能的语音入口”—— 需要把用例
+   * 口径同步到真实实现，否则会在真正的功能被加进来时持续报错。 */
+  check(count_occurrences(json, "{\"name\":\"") == 4,
+        "四个工具元素都以 {\"name\":\" 开头");
+  check(count_occurrences(json, "\"name\":") == 4, "清单里 4 个工具名");
+  check(count_occurrences(json, "\"description\":") >= 4,
+        "四个工具都带 description（schema 内部的字段描述不计）");
+  check(count_occurrences(json, "\"input_schema\":") == 4, "4 个 input_schema");
 
   check(strstr(json, "\"name\":\"" AI_TOOL_SET_LIGHT "\"") != NULL,
         "set_light 还在清单里");
   check(strstr(json, "\"name\":\"" AI_TOOL_REPORT_EMERGENCY "\"") != NULL,
         "report_emergency 在清单里");
+  check(strstr(json, "\"name\":\"" AI_TOOL_ADD_REMINDER "\"") != NULL,
+        "add_reminder 在清单里（常开麦这条链路的提醒缺口）");
+  check(strstr(json, "\"name\":\"" AI_TOOL_ADJUST_SETTING "\"") != NULL,
+        "adjust_setting 在清单里（语音调音量/亮度）");
+  check(strstr(json, "\"required\":[\"time\",\"title\"]") != NULL,
+        "add_reminder 要求 time + title 都传");
+  check(strstr(json, "调用成功就是真建好了") != NULL,
+        "add_reminder 写明「调用成功就是真建好了」（防模型谎报已经设好）");
+  check(strstr(json, "板子不会替你猜时间") != NULL,
+        "add_reminder 写明板子不猜时间（口语时间由模型自己换算）");
+  check(strstr(json, "\"required\":[\"item\",\"action\"]") != NULL,
+        "adjust_setting 要求 item + action 都传");
+  check(strstr(json, "调用成功就是真的改好了") != NULL,
+        "adjust_setting 写明调用成功就是真的改好了（不再说在设置里调）");
   check(strstr(json, "\"required\":[\"command\"]") != NULL,
         "set_light 仍要求 command");
   check(strstr(json, "\"enum\":[\"on\",\"off\"]") != NULL,

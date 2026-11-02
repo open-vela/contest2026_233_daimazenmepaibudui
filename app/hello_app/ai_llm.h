@@ -44,7 +44,30 @@
 #define LLM_MAX_OUTPUT_LENGTH     2048    /* 最大输出文本长度 */
 
 /* HTTP配置 */
-#define LLM_HTTP_TIMEOUT_MS       30000   /* HTTP请求超时30秒 */
+/* ★ 这个值是 **velaclaw/ai_agent 那条 IPC 的等待上限**（不是云端 HTTP 超时 ——
+ * 那条在 mimo_voice.c 里），也是它唯一的作用：ai_llm.c 的看门狗按它起心跳，
+ * 到点就回 -ETIMEDOUT(-110)，然后 llm_complete_callback 改走 mimo_chat() 直连兜底。
+ *
+ * ⚠️⚠️ 2026-10-26 实测：**不许往小调，8000 试过，是错的**。真机串口抓到健康一轮：
+ *     [llm]   OpenAI API with tools (model: mimo-v2.6-flash, 19193 bytes)
+ *     [trace] iter=0 tool=(none) latency=11454ms llm=ok
+ *     [trace] END status=ok iters=1 tools=0 llm_ms=11454 elapsed=12s
+ *     [agent] Dispatching response → local_client:elder_companion
+ * 也就是**云端大模型正常就要 11.5 秒**（19 KB 提示词 + 672 字回复；TLS 握手本身
+ * 就占掉约 3 秒）。当时把它调到 8000，等于在答案到达前 3.4 秒就判死：672 字的
+ * 回复到了却没人收（被下一次请求开头那圈 sem_trywait 排水冲掉），用户照样听到
+ * 「我这边有点问题」——**明明路是通的**。抢跑的兜底还和仍卡着的那条 HTTPS 并发
+ * （vela_tls 打 `Another HTTPS request is in flight, running without serialization`），
+ * 自己也炸了（-12）。
+ *
+ * 所以 30000 不是拍脑袋定的：实测 11454 ms，这个数要盖住网络抖动 + 多轮工具调用
+ * （每多一轮就多一次 LLM 往返）。要往下调，**下限 20000**，且先确认串口里
+ * `latency=` 那个数确实比它小得多。
+ *
+ * ⚠️ velaclaw_ask 根本不读 req.timeout_ms（只入队就返回），调这里不会给对方发任何
+ * 中止；迟到的回包由 llm_do_ai_agent_request 开头那次 sem_trywait 排水收掉，
+ * 不会被当成下一轮的新回包。 */
+#define LLM_HTTP_TIMEOUT_MS       30000   /* velaclaw 等待上限 30 秒（实测健康 11.5s） */
 #define LLM_HTTP_RETRY_COUNT      3       /* 重试次数 */
 #define LLM_HTTP_RETRY_DELAY_MS   1000    /* 重试间隔 */
 

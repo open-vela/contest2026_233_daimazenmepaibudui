@@ -59,6 +59,26 @@ enum alarm_level_e
   ALARM_LEVEL_NONE = 0,
   ALARM_LEVEL_NOTICE,      /* 提示：一声短鸣 */
   ALARM_LEVEL_WARNING,     /* 警告：三声短鸣，然后每 10 秒重复一次 */
+
+  /* 语音急救词走的「响-停-听」档位（见 app/hello_app/voice_emerg.c）。
+   *
+   * 节奏是 响 1.2 秒 / 停 0.6 秒。停的那 0.6 秒音频 fd 是关着的
+   * （见 sf32lb52_alarm.c 里 alarm_audio_close），而板子硬件半双工、
+   * 喇叭响时麦克风是聋的 —— 所以那 0.6 秒就是**唯一能听见老人说「没事」
+   * 的窗口**。这是「响铃不能中断」和「10 秒内说没事要能停」之间唯一的解。
+   *
+   * ⚠ 位置是**故意排在 EMERGENCY 之前**的，不是随手放的：
+   *   alarm_trigger() 用 `level > status.level` 判"级别升高 → 按新级别重来"
+   *   （sf32lb52_alarm.c:728），alarm_recheck() 用同样的比较决定要不要重开
+   *   一轮（:381）。排在 EMERGENCY 之下，才能保证**摔倒/异常声音检测那条
+   *   EMERGENCY 一响就把确认档顶掉**，而不会被一句「报警」降级覆盖 ——
+   *   用户明确要求那一模块不受影响。
+   *
+   *   也因为 EMERGENCY 仍是最大值，alarm_trigger() 的区间校验
+   *   （`level < NOTICE || level > EMERGENCY`）一行都不用改。
+   */
+  ALARM_LEVEL_EMERGENCY_CONFIRM,
+
   ALARM_LEVEL_EMERGENCY,   /* 紧急：高低交替的警报音，每 5 秒重复一次 */
 };
 

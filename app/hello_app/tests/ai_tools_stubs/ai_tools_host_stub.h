@@ -1,12 +1,17 @@
 /**
  * ai_tools_host_stub.h - host 测试用的「假框架 + 假依赖」状态
  *
- * ai_tools_provider.c 的 execute 逻辑离线可测：它一共只依赖三样外部东西 ——
+ * ai_tools_provider.c 的 execute 逻辑离线可测：它一共只依赖五样外部东西 ——
  *   1) 框架的 tool_registry_register_provider() / _invalidate()（收下我们的
  *      两个回调，模型侧的清单和执行都由它转进来）；
  *   2) 发送出口 ai_network_send_device_command()（灯控）和
  *      ai_network_report_sound_alarm()（紧急事件上报）；
- *   3) 二次确认入口 ui_post_ask_alarm()（弹「是否报警？」询问框）。
+ *   3) 二次确认入口 ui_post_ask_alarm()（弹「是否报警？」询问框）；
+ *   4) 提醒落地入口 mimo_reminder_apply()（add_reminder 工具的最终落点，真身
+ *      在 app/hello_app/mimo_voice.c，原型在 app/hello_app/mimo_voice.h）；
+ *   5) 工具开关 tool_guard_set_enabled()（设备工具裁剪用，真身在 openvela/
+ *      packages/ai_agent/src/tools/tool_guard.c，原型在同目录 tool_guard.h ——
+ *      那个头自给自足，host 上直接用真头，不另造假的）。
  *
  * 这三样在 host 上全部由 stub_framework.c 替换掉，并把每次调用的参数记在这里，
  * 测试断言只看这张表 —— 不引 LVGL、不引 cJSON、不起线程。
@@ -80,6 +85,25 @@ typedef struct
   /* ── 二次确认入口 ─────────────────────────────────────── */
   int           ask_calls;
   char          last_ask_reason[256];
+
+  /* ── 提醒落地出口（add_reminder 的 execute -> mimo_reminder_apply）── */
+  int           reminder_calls;
+  char          last_reminder_time[8];    /* 归一化后的 HH:MM */
+  char          last_reminder_title[84];  /* 实际用上的标题（截断后） */
+  int           reminder_ret;             /* 想让 mimo_reminder_apply 返回什么 */
+
+  /* ── 语音设置落地出口（adjust_setting 的 execute -> mimo_settings_apply） */
+  int           settings_calls;
+  int           last_setting_item;
+  int           last_setting_action;
+  int           last_setting_value;
+  int           settings_ret;             /* 想让 mimo_settings_apply 返回什么 */
+
+  /* ── 工具开关出口（设备工具裁剪 -> tool_guard_set_enabled）────── */
+  int           guard_calls;
+  int           guard_off_calls;          /* enabled=false 的次数：裁剪要的就是这个数 */
+  char          last_guard_tool[64];
+  int           guard_ret;                /* 想让 tool_guard_set_enabled 返回什么 */
 } host_stub_t;
 
 extern host_stub_t g_stub;

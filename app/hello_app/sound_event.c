@@ -36,6 +36,7 @@
 
 #include <math.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "sound_event.h"
@@ -115,14 +116,53 @@
 #define SE_PCMBUF      2048                 /* PCM 残余缓冲（样本） */
 #define SE_VOTE_N      4                    /* 看最近 4 个窗口 */
 #define SE_VOTE_NEED   3                    /* 至少 3 票 */
-#define SE_REFRACT_WIN 40                   /* 同类不应期 8s = 40 个窗口步 */
+#define SE_REFRACT_WIN 40                   /* scream 不应期 8s = 40 个窗口步 */
+/* ★ 2026-11-01：fall/knock 都属于"撞击"，不应期给 2 秒（10 窗）。
+ *
+ *   "敲击求救"是连着敲；而且真机把敲击判成 fall 的情况比判成 knock 还多
+ *   （用户连敲时 top1=fall 0.57 出现多次，knock 一次都没有）。如果 fall 还
+ *   保持 8 秒，第二下会被直接吞掉，"15 秒内两下"永远凑不成。
+ *   代价：持续噪声能更频繁地产生 hit —— 由上层"两次确认 + 单次 ≥0.80"
+ *   和门控的"持续声不报/人声余温"兜着。 */
+#define SE_REFRACT_WIN_IMPACT 10
 
 /* 每类阈值（softmax 概率），索引 0 是 other，不触发所以填 0。
- * 这三个数是训练侧按验证集调出来的（见 sound_event_model.h 尾部注释）。 */
+ *
+ * ★ 2026-10-31 从 {0, 0.60, 0.70, 0.70} 整体下调到 0.55 —— 这是真机日志逼出来的，
+ *   不是拍脑袋：
+ *
+ *   用户 2026-10-31 傍晚**大声叫喊**，板子一声没响。串口里小模型其实一直在判：
+ *       #16 top1=knock 0.72 | fall=0 knock=3 scream=0 | ⚠票够了但平均置信度低于阈值
+ *       #18 top1=knock 0.70 | fall=0 knock=4 scream=0 | ⚠票够了但平均置信度低于阈值
+ *   票数早够了（3/4、4/4），卡的全是**置信度**这一关：4 票的均值实测落在
+ *   0.49~0.63 之间，而 knock/scream 的阈值是 0.70 —— 在真机流式音频上根本
+ *   够不着。等于这两类**永远不可能触发**，用户喊破喉咙也没用。
+ *
+ *   0.55 这个数是拿实测分布定的：真命中那一档（fall 0.67、knock 均值 0.62/0.63）
+ *   都在 0.55 之上，纯噪声那一档（top1=other 0.50、knock 0.36~0.46）都在之下。
+ *
+ *   下调阈值涨的是**误报**，不是漏报；而误报的代价已经被下面两道兜住：
+ *     · 3/4 投票 + 8 秒同类不应期（连着几个窗都要判成同一类才算数）；
+ *     · 报警起铃后有 **10 秒说「没事」就能取消**的确认窗（voice_emerg）。
+ *   反过来漏报的代价是老人倒地没人知道 —— 这笔账怎么算都该往下调。 */
 static const float g_threshold[SE_CLASS] =
 {
-  0.0f, 0.60f, 0.70f, 0.70f
+  0.0f, 0.55f, 0.55f, 0.55f
 };
+
+/* ★ 2026-11-01：fall/knock/scream 都回到 0.55，**误报交给上层判据**。
+ *
+ *   真机数据：
+ *     · fall 的误报（开机持续环境噪声）0.74；真敲被模型判成 fall 时
+ *       0.57~0.63 —— 单靠 0.80 会把真敲也挡掉（用户实测"敲击没反应"）；
+ *     · knock 的真事件和误报完全重叠（真敲 0.64~0.73 / 误报 0.57~0.71）；
+ *     · scream 几乎不出分（0.00~0.11），喊叫主要靠云端 ASR 关键词。
+ *
+ *   所以阈值统一 0.55，改由 ai_companion 的**撞击两次确认**兜误报：
+ *     · 单次置信度 ≥ 0.80 → 立刻报（非常像的真事件）；
+ *     · 否则 15 秒内第二次撞击（fall 或 knock 任意组合）→ 报；
+ *     · 单次 0.55~0.80 → 只记时间，不报。
+ *   再加门控的人声余温/持续声 veto，挡住"说话/持续噪声"。 */
 
 /****************************************************************************
  * 只读表 + 流式状态（全部 static，单实例）
@@ -172,6 +212,18 @@ static int      g_fire_win[SE_CLASS];       /* 每类上次触发的窗口序号
 static sound_event_cb_t g_cb;
 static void            *g_cb_arg;
 static int              g_inited;
+
+/* 本次 feed 的来源窗口是不是"人声"（门控判的）。
+ *
+ * ★ 2026-11-01 真机定案：v12 为了让尖叫类能触发，把**人声窗也喂给模型**，
+ *   结果模型把正常说话/喊叫全判成 knock/fall —— 11 分钟里 5 次误报报警
+ *   （fall 0.71 / knock 0.56/0.57/0.71/0.67，全部来自 ac=0.66~0.90 的人声窗）。
+ *   语义上"敲击/跌倒"本来就不该由人声触发，所以人声窗**只允许 SCREAM 类投票**；
+ *   其余类别一律按 other 记。尖叫仍然走本地模型，模型认不出来时由门控把这段
+ *   人声送云端 ASR，走「救命/救我/着火」关键词那条路兜底。 */
+static int              g_voice_hint;
+static int              g_loud_hint;       /* 本次喂入的窗**现在仍然很响** */
+static int              se_voice_dbg_count;
 
 /****************************************************************************
  * 小工具
@@ -602,12 +654,44 @@ static void se_softmax(void)
 }
 
 /* 3/4 窗口投票 + 每类阈值 + 同类 8s 不应期。返回触发的类别，-1 = 没触发。 */
+
+/* ★ 后处理可观测（2026-10-31）。
+ *
+ * 排查"摔倒检测一点反应都没有"时，小模型这边是完全黑的：喂了几个窗、
+ * 每窗 top-1 是什么、票攒到几票、是被阈值挡的还是被不应期挡的 —— 一行都
+ * 没有。于是"门控没喂"和"喂了但投票凑不齐"这两种病因根本分不开。
+ *
+ * 限速规则：top-1 不是 other 就**每一窗都打**（真事件只有几窗，一窗都不能漏）；
+ * top-1 是 other 就 25 窗打一次（5 秒），别把串口灌满。 */
+
+static int se_dbg_count;
+
+static void se_dbg(const char *why, int best, float bestp,
+                   const int *cnt, int nwindows)
+{
+  int interesting = (best != SOUND_EVENT_OTHER);
+
+  if (!interesting)
+    {
+      if ((se_dbg_count++ % 25) != 0)
+        {
+          return;
+        }
+    }
+
+  printf("[小模型] #%-5d top1=%s %.2f | fall=%d knock=%d scream=%d | %s\n",
+         nwindows, sound_event_class_name(best), bestp,
+         cnt[SOUND_EVENT_FALL], cnt[SOUND_EVENT_KNOCK], cnt[SOUND_EVENT_SCREAM],
+         why);
+}
+
 static int se_postprocess(void)
 {
   int   best  = 0;
   float bestp = g_softmax[0];
   int   cnt[SE_CLASS];
   float acc[SE_CLASS];
+  float pk[SE_CLASS];       /* 该类几张票里**最高**的那一票（2026-10-31 加） */
   int   i;
   int   c;
 
@@ -617,6 +701,40 @@ static int se_postprocess(void)
         {
           bestp = g_softmax[i];
           best  = i;
+        }
+    }
+
+  /* ★ 人声窗只允许 SCREAM 类投票（见 g_voice_hint 的注释）。
+   *   这里不能只看 top-1：真实尖叫时 knock 的 softmax 可能更高，
+   *   但 scream 那一维仍然有分数，所以直接看 scream 这一维。
+   *   阈值 0.20 只是"够格投一票"，真正能不能触发仍由 3/4 投票 +
+   *   g_threshold[SCREAM]（0.55）把关。 */
+  if (g_voice_hint)
+    {
+      float sp = g_softmax[SOUND_EVENT_SCREAM];
+
+      if (sp >= 0.20f)
+        {
+          best  = SOUND_EVENT_SCREAM;
+          bestp = sp;
+        }
+      else
+        {
+          best  = SOUND_EVENT_OTHER;
+          bestp = 1.0f - sp;
+        }
+
+      /* 每 5 个人声窗打一行四类分数：下一版调 scream 阈值/判断
+       * "模型到底有没有尖叫检测"就看这行。 */
+      if ((se_voice_dbg_count++ % 5) == 0)
+        {
+          printf("[小模型] 人声窗 scores other=%.2f fall=%.2f knock=%.2f "
+                 "scream=%.2f -> 投 %s\n",
+                 (double)g_softmax[SOUND_EVENT_OTHER],
+                 (double)g_softmax[SOUND_EVENT_FALL],
+                 (double)g_softmax[SOUND_EVENT_KNOCK],
+                 (double)g_softmax[SOUND_EVENT_SCREAM],
+                 sound_event_class_name(best));
         }
     }
 
@@ -630,6 +748,7 @@ static int se_postprocess(void)
   for (i = 0; i < SE_CLASS; i++)
     {
       acc[i] = 0.0f;
+      pk[i]  = 0.0f;
     }
 
   for (i = 0; i < SE_VOTE_N; i++)
@@ -639,11 +758,16 @@ static int se_postprocess(void)
       if (v < 0 || v >= SE_CLASS) continue;
       cnt[v]++;
       acc[v] += g_voteconf[i];
+      if (g_voteconf[i] > pk[v])
+        {
+          pk[v] = g_voteconf[i];
+        }
     }
 
   /* 票数不够（前两个窗口）直接不判：3/4 投票至少要攒到 3 个真实窗口 */
   if (g_nwindows < SE_VOTE_NEED)
     {
+      se_dbg("首窗攒票中，还没得判", best, bestp, cnt, g_nwindows);
       return -1;
     }
 
@@ -651,23 +775,106 @@ static int se_postprocess(void)
     {
       float conf;
 
-      if (cnt[c] < SE_VOTE_NEED) continue;
-
-      conf = acc[c] / (float)cnt[c];
-      if (conf < g_threshold[c]) continue;
-
-      if (g_fire_win[c] >= 0 && (g_nwindows - g_fire_win[c]) < SE_REFRACT_WIN)
+      /* 人声窗这一票只允许尖叫触发：非尖叫类即便靠前面几窗的票凑够了，
+       * 也不在这一窗放行（否则话音一响就把上一声撞击的票补成报警）。 */
+      if (g_voice_hint && c != SOUND_EVENT_SCREAM)
         {
-          continue;   /* 同类 8s 不应期 */
+          continue;
         }
 
+      if (cnt[c] < SE_VOTE_NEED)
+        {
+          if (best == c)
+            {
+              se_dbg("⚠这一窗投给它了，但最近 4 窗里票不够（要 3 票）—— "
+                     "典型的是\"撞击太短，只够一两窗\"",
+                     best, bestp, cnt, g_nwindows);
+            }
+
+          continue;
+        }
+
+      /* ★ 2026-10-31：判据从「均值」放宽成「均值和最高一票取大」。
+       *
+       *   真机日志里最常见的形状是"三票里两票一般、一票很亮"：
+       *       #16 knock 0.59 / 0.56 / 0.72  -> 均值 0.62
+       *       #18 knock 0.56 / 0.50 / 0.70  -> 均值 0.59
+       *   流式音频每一窗只吃到事件的 1/3 左右，本来就不可能窗窗都亮；
+       *   拿均值去卡，等于要求"整段都像"，而短促撞击/一声叫喊天然是
+       *   "中间一两窗特别像"。取大之后这类就能过。
+       *
+       *   误报仍然有 3/4 投票兜着 —— 必须**最近 4 窗里有 3 窗**都判成同一类，
+       *   单单一窗亮不算数。 */
+      {
+        float mean = acc[c] / (float)cnt[c];
+        float peak = pk[c];
+
+        conf = (mean > peak) ? mean : peak;
+
+        if (conf < g_threshold[c])
+          {
+            if (best == c)
+              {
+                se_dbg("⚠票够了但置信度低于阈值（均值和最高一票都不够）",
+                       best, bestp, cnt, g_nwindows);
+              }
+
+            continue;
+          }
+
+        printf("[小模型] 判据 %s：均值 %.2f / 最高一票 %.2f -> 用 %.2f（阈值 %.2f）\n",
+               sound_event_class_name(c), (double)mean, (double)peak,
+               (double)conf, (double)g_threshold[c]);
+      }
+
+      /* ★ 2026-11-01：**声音还在持续（这一窗仍然很响）时，fall/knock 先不报**。
+       *
+       *   真撞击/摔倒是一声短响，能量很快就会回落；风扇、摩擦、持续环境声
+       *   却能连续好几窗都过能量门槛，模型照样能在这几窗里攒够 fall 票。
+       *   真机开机 50 秒、用户什么都没做，就靠一段 rms≈0.05 的持续声报了
+       *   「跌倒 74%」—— 就是这条。
+       *
+       *   处理：这一窗仍然响 → 只记票、不触发；等它回落以后，票的窗口
+       *   （最近 4 窗）大概率已经过期，持续声自然报不出来。短促真事件
+       *   在 0.6~1 秒内就安静了，不受影响。SCREAM 不受此限（尖叫本来就
+       *   是持续的浊音）。 */
+      if (g_loud_hint && c != SOUND_EVENT_SCREAM)
+        {
+          printf("[小模型] ⚠%s 票够了（%.2f），但声音还在持续（未回落），先不报\n",
+                 sound_event_class_name(c), (double)conf);
+          continue;
+        }
+
+      {
+        int refract = (c == SOUND_EVENT_SCREAM) ? SE_REFRACT_WIN
+                                                : SE_REFRACT_WIN_IMPACT;
+
+        if (g_fire_win[c] >= 0 && (g_nwindows - g_fire_win[c]) < refract)
+          {
+            se_dbg("⚠判出来了，但撞上同类不应期", best, bestp, cnt,
+                   g_nwindows);
+            continue;
+          }
+      }
+
       g_fire_win[c] = g_nwindows;
+
+      printf("[小模型] ★命中 %s（置信度 %.2f，第 %d 窗）\n",
+             sound_event_class_name(c), conf, g_nwindows);
+
       if (g_cb != NULL)
         {
           g_cb(c, conf, g_cb_arg);
         }
 
       return c;
+    }
+
+  /* top-1 不是 other 的三种"差一点"上面已经各自打了；这里只兜 top-1=other。 */
+
+  if (best == SOUND_EVENT_OTHER)
+    {
+      se_dbg("没触发", best, bestp, cnt, g_nwindows);
     }
 
   return -1;
@@ -830,15 +1037,23 @@ float sound_event_last_confidence(void)
   return g_last_conf;
 }
 
-int sound_event_feed(const int16_t *pcm, size_t nsamples)
+int sound_event_feed_ex(const int16_t *pcm, size_t nsamples, int voice_hint,
+                        int loud_hint)
 {
   size_t off  = 0;
   int    wins = 0;
+  int    saved_hint;
+  int    saved_loud;
 
   if (!g_inited || (pcm == NULL && nsamples > 0))
     {
       return -1;
     }
+
+  saved_hint   = g_voice_hint;
+  saved_loud   = g_loud_hint;
+  g_voice_hint = voice_hint ? 1 : 0;
+  g_loud_hint  = loud_hint ? 1 : 0;
 
   while (off < nsamples)
     {
@@ -908,7 +1123,14 @@ int sound_event_feed(const int16_t *pcm, size_t nsamples)
         }
     }
 
+  g_voice_hint = saved_hint;
+  g_loud_hint  = saved_loud;
   return wins;
+}
+
+int sound_event_feed(const int16_t *pcm, size_t nsamples)
+{
+  return sound_event_feed_ex(pcm, nsamples, 0, 0);
 }
 
 /****************************************************************************
