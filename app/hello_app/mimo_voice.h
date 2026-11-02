@@ -62,6 +62,12 @@
 int mimo_asr_register(void);
 int mimo_tts_register(void);
 
+/* ★ 2026-11-03：直调 MiMo ASR（不走 voice_asr 的后端切换）。
+ *   专用于报警听窗兜底：火山空结果时再识别一次同一段 PCM。
+ *   返回 OK / 负 errno；text_out 成功时为 UTF-8 文本。 */
+int mimo_asr_recognize_direct(const unsigned char *pcm_data, size_t pcm_len,
+                              char *text_out, size_t text_cap);
+
 /* ★ 2026-11-01：把火山「语音合成模型2.0」设为流式播报的首选后端。
  *   on != 0：mimo_tts_speak_head 先走 volcengine（seed-tts-2.0 + 2.0 音色），
  *            这一块失败再直连 MiMo 兜底；

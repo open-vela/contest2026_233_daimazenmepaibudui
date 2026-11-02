@@ -2209,6 +2209,22 @@ static int mimo_asr_recognize(const unsigned char *pcm_data, size_t pcm_len,
 }
 
 /****************************************************************************
+ * Name: mimo_asr_recognize_direct
+ *
+ * Description:
+ *   给 ai_companion 的「报警听窗兜底」用的直调入口：火山返回空结果时，
+ *   用 MiMo 再识别一遍同一段 PCM。不经过 voice_asr 的后端切换，避免
+ *   改全局 s_active（会把主链路临时切到 MiMo 再切回来）。
+ *
+ ****************************************************************************/
+
+int mimo_asr_recognize_direct(const unsigned char *pcm_data, size_t pcm_len,
+                              char *text_out, size_t text_cap)
+{
+  return mimo_asr_recognize(pcm_data, pcm_len, text_out, text_cap);
+}
+
+/****************************************************************************
  * Name: tts_synth_chunk
  *
  * Description:

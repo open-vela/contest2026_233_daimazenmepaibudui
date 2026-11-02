@@ -8079,6 +8079,52 @@ static bool realtime_try(const char *text, sm_context_t *ctx)
 }
 
 /**
+ * @brief  报警听窗的 ASR 兜底：火山空结果时用 MiMo 再识别一遍
+ *
+ * 真机（2026-11-02 23:5x）：报警听窗里老人说「没事」，火山多次返回
+ * No text recognized(-61)，只能等按钮。MiMo 对同一段音频有时能转出来。
+ *
+ * **只采纳包含否定关键词的结果**（没事 / 不用 / 没有）—— MiMo 在噪声上
+ * 会编字（历史实测把底噪认成「男同学。」这类），所以不能把任意文本都
+ * 当「没事」。命中后直接走 voice_emerg_cancel()，和正常语音取消同一条路。
+ *
+ * @return true  = 已命中否定词并取消报警
+ * @return false = 没转过 / 没命中（调用方照原路忽略这一轮）
+ */
+
+static bool emerg_mimo_second_pass(const int16_t *pcm, size_t frames)
+{
+  char text[256] = {0};
+  int  ret;
+
+  if (!voice_emerg_is_active() || pcm == NULL || frames == 0)
+    {
+      return false;
+    }
+
+  ret = mimo_asr_recognize_direct((const unsigned char *)pcm,
+                                  frames * sizeof(int16_t),
+                                  text, sizeof(text));
+  if (ret < 0 || text[0] == '\0')
+    {
+      printf("[急救] MiMo 二次识别无结果（%d）\n", ret);
+      return false;
+    }
+
+  printf("[急救] MiMo 二次识别：%s\n", text);
+
+  if (strstr(text, "没事") != NULL || strstr(text, "不用") != NULL ||
+      strstr(text, "没有") != NULL)
+    {
+      printf("[急救] MiMo 二次识别命中否定词 -> 取消报警\n");
+      voice_emerg_cancel("MiMo「没事」");
+      return true;
+    }
+
+  return false;
+}
+
+/**
  * @brief  处理AI对话的本体（在AI_TALKING状态调用，见 sm_ai_talking_enter）
  */
 
@@ -8246,6 +8292,26 @@ static void process_ai_dialogue(sm_context_t *ctx)
   ret = voice_asr_recognize((const unsigned char *)asr_ptr,
                             asr_frames * sizeof(int16_t),
                             text_buf, sizeof(text_buf));
+
+  /* ★ 2026-11-03：**报警听窗的二级兜底**。火山返回空结果（-61 或空文本）时，
+   *   用 MiMo 对同一段（已增益/补静音的）音频再识别一遍；只采纳包含
+   *   「没事 / 不用 / 没有」的结果，避免 MiMo 在噪声上编出别的字。
+   *   命中就直接取消报警，省掉老人干等按钮。 */
+  if (voice_emerg_is_active() &&
+      (ret < 0 || !user_said_has_content(text_buf)))
+    {
+      if (emerg_mimo_second_pass(asr_ptr, asr_frames))
+        {
+          if (pad_buf != NULL)
+            {
+              free(pad_buf);
+            }
+
+          round_phase_set(ROUND_PHASE_IDLE);
+          sm_handle_event(ctx, SM_EVENT_AI_ERROR);
+          goto dlg_done;
+        }
+    }
 
   if (pad_buf != NULL)
     {
