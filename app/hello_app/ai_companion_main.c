@@ -7576,6 +7576,62 @@ static bool weather_fast_try(const char *text, sm_context_t *ctx)
  * 局限：ASR 必须把关键词转出来；ASR 丢字时快路也触发不了。
  * ======================================================================== */
 
+/* ==========================================================================
+ * ★ 2026-11-02 常用短句快路（免 LLM，秒回）
+ *
+ *   用户说「你好」「谢谢」「再见」「好的」这类短句时，走 LLM 要 8~10 秒。
+ *   这里直接念预设回复，**不到 1 秒出声**。
+ *   匹配规则：文本 ≤ 8 字 + 精确/前缀匹配关键词。
+ * ======================================================================== */
+
+static bool greeting_fast_try(const char *text, sm_context_t *ctx)
+{
+  static const struct { const char *key; const char *reply; } table[] =
+  {
+    { "你好",     "你好！有什么可以帮你的吗？" },
+    { "您好",     "您好！有什么可以帮你的吗？" },
+    { "谢谢",     "不客气！有需要随时叫我。" },
+    { "谢谢你",   "不客气！有需要随时叫我。" },
+    { "再见",     "好的，再见！注意安全。" },
+    { "拜拜",     "好的，再见！注意安全。" },
+    { "好的",     "好的，我知道了。" },
+    { "好",       "好的。" },
+    { "嗯",       "嗯，我在。" },
+    { "嗯嗯",     "嗯，我在。" },
+    { "晚安",     "晚安！祝您睡个好觉。" },
+    { "早上好",   "早上好！今天天气不错，有什么需要帮忙的吗？" },
+    { "早上好！", "早上好！今天天气不错，有什么需要帮忙的吗？" },
+    { "下午好",   "下午好！有什么可以帮你的吗？" },
+    { "晚上好",   "晚上好！有什么可以帮你的吗？" },
+    { "辛苦了",   "不辛苦！能帮到您就好。" },
+    { "不错",     "谢谢夸奖！" },
+    { "真棒",     "谢谢夸奖！" },
+  };
+
+  size_t i;
+  size_t tlen = (text != NULL) ? strlen(text) : 0;
+
+  if (tlen == 0 || tlen > 8)
+    {
+      return false;
+    }
+
+  for (i = 0; i < sizeof(table) / sizeof(table[0]); i++)
+    {
+      if (strcmp(text, table[i].key) == 0 ||
+          (tlen > strlen(table[i].key) &&
+           strncmp(text, table[i].key, strlen(table[i].key)) == 0 &&
+           tlen - strlen(table[i].key) <= 2))
+        {
+          printf("[短句快路] 「%s」-> 直接念预设回复\n", text);
+          llm_complete_callback(table[i].reply, 0, ctx);
+          return true;
+        }
+    }
+
+  return false;
+}
+
 static bool selfintro_fast_try(const char *text, sm_context_t *ctx)
 {
   static const char *const kw[] =
@@ -8304,6 +8360,11 @@ static void process_ai_dialogue(sm_context_t *ctx)
    * 新闻还绕开"搜完再让 LLM 总结"这一步（真机上 LLM 汇总会挂）。
    * 任何条件不满足它自己返回 false，下面原路照走。 */
   if (news_detail_try(text_buf, ctx))
+    {
+      goto dlg_done;
+    }
+
+  if (greeting_fast_try(text_buf, ctx))
     {
       goto dlg_done;
     }
@@ -9679,6 +9740,20 @@ int main(int argc, char *argv[])
    *   "按钮关了铃还响"。 */
 
   printf("[版本] 按钮取消即刻掐铃 + 短句即没事 + 急救词 20+ 变体（2026-11-02）\n");
+
+  /* ★ v39：提速 —— TTS 首块 20→10 字（首声提前 2~3 秒）+
+   *   常用短句（你好/谢谢/再见/好的/晚安…）免 LLM 秒回。 */
+
+  printf("[版本] TTS 首块 10 字 + 短句秒回（你好/谢谢/再见/好的/晚安）（2026-11-02）\n");
+
+  /* ★ v40：**UI 线程卡死根治**。
+   *   把所有剩余的 pthread_mutex（robot_ui 的 voice/voice_audio/fall 锁、
+   *   ambient_listen/reminder_sched 的 g_lock、板级报警的 nxmutex）全部
+   *   换成二值信号量 —— 没有持有者跟踪，post 不触发 sem_post.c:63 断言，
+   *   holder 损坏也不会让 UI 线程永久阻塞。
+   *   另加 UI 看门狗：主循环 10 秒没打日志就 dumpstack 定位。 */
+
+  printf("[版本] UI 锁全换信号量 + UI 看门狗（2026-11-02）\n");
 
   /* 起状态信标（纯仪表，见 state_beacon_task 的说明）。**起不来不算故障**：
    * 少一条诊断不影响功能，主循环照常跑，所以失败只留一行日志就往下走。 */

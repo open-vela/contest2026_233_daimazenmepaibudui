@@ -53,6 +53,8 @@
 
 #include <errno.h>
 #include <pthread.h>
+#include <semaphore.h>
+#include <nuttx/semaphore.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -214,7 +216,7 @@ typedef enum
  * "把设备开起来"和"把设备关掉"相对彼此是原子的，pause() 返回时设备一定已经
  * 关掉了（否则紧接着的 audio_record_start() 会拿到 -EBUSY）。 */
 
-static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+static sem_t g_lock = SEM_INITIALIZER(1);
 static amb_state_t     g_state = AMB_STATE_IDLE;
 static bool            g_enabled;        /* 用户开关 */
 static bool            g_quit;           /* 让听音线程退出 */
@@ -364,12 +366,12 @@ static void ambient_deliver(ambient_event_t type, const char *text,
   ambient_listen_cb_t  cb;
   void                *arg;
 
-  pthread_mutex_lock(&g_lock);
+  nxsem_wait_uninterruptible(&g_lock);
   cb = g_cb;
   arg = g_cb_arg;
   g_seq++;
   msg.seq = g_seq;
-  pthread_mutex_unlock(&g_lock);
+  nxsem_post(&g_lock);
 
   if (cb == NULL)
     {
@@ -429,9 +431,9 @@ static void ambient_process(size_t clip_len, int level, int peak, int32_t base)
       g_stats.asr_ok++;
     }
 
-  pthread_mutex_lock(&g_lock);
+  nxsem_wait_uninterruptible(&g_lock);
   chat = g_chat_enabled;
-  pthread_mutex_unlock(&g_lock);
+  nxsem_post(&g_lock);
 
   if (!chat)
     {
@@ -513,11 +515,11 @@ static void *ambient_thread(void *arg)
        * 不该在我们的锁里跑） */
       busy = (g_busy_cb != NULL) ? g_busy_cb(g_busy_arg) : false;
 
-      pthread_mutex_lock(&g_lock);
+      nxsem_wait_uninterruptible(&g_lock);
 
       if (g_quit)
         {
-          pthread_mutex_unlock(&g_lock);
+          nxsem_post(&g_lock);
           break;                     /* 收尾在循环后面统一做 */
         }
 
@@ -530,7 +532,7 @@ static void *ambient_thread(void *arg)
               audio_in_stop();
               g_mic_open = false;
             }
-          pthread_mutex_unlock(&g_lock);
+          nxsem_post(&g_lock);
           usleep(AMBIENT_IDLE_POLL_US);
           continue;
         }
@@ -544,7 +546,7 @@ static void *ambient_thread(void *arg)
 
           if (ret != 0)
             {
-              pthread_mutex_unlock(&g_lock);
+              nxsem_post(&g_lock);
               /* -EBUSY = 别人（语音聊天 / 别的 app）正占着麦克风。
                * 别的错误也不刷日志，退避重试即可。 */
               usleep(AMBIENT_RETRY_POLL_US);
@@ -561,7 +563,7 @@ static void *ambient_thread(void *arg)
           guard_until = ambient_tick_ms() + AMBIENT_RESUME_GUARD_MS;
         }
 
-      pthread_mutex_unlock(&g_lock);
+      nxsem_post(&g_lock);
 
       /* ---------- ② 读一帧（20 ms） ---------- */
 
@@ -576,14 +578,14 @@ static void *ambient_thread(void *arg)
           {
             bool quit;
 
-            pthread_mutex_lock(&g_lock);
+            nxsem_wait_uninterruptible(&g_lock);
             if (g_mic_open)
               {
                 audio_in_stop();
                 g_mic_open = false;
               }
             quit = g_quit;
-            pthread_mutex_unlock(&g_lock);
+            nxsem_post(&g_lock);
 
             /* 刚 open 出来就读不出一整帧，多半是设备/下层有毛病（不是被
              * 让路那种正常情况）。重开之前先退避：read 如果是一直"立刻
@@ -672,14 +674,14 @@ static void *ambient_thread(void *arg)
               /* 后面是云端 ASR + 对话（几十秒到一分钟），没有理由占着它；
                * 也必须让出来，父 agent 才可能在这期间放 TTS / 开语音聊天。 */
 
-              pthread_mutex_lock(&g_lock);
+              nxsem_wait_uninterruptible(&g_lock);
               if (g_mic_open)
                 {
                   audio_in_stop();
                   g_mic_open = false;
                 }
               g_processing = true;
-              pthread_mutex_unlock(&g_lock);
+              nxsem_post(&g_lock);
 
               if (AMBIENT_PRE_BYTES + got >= AMBIENT_MIN_CLIP_BYTES)
                 {
@@ -732,7 +734,7 @@ static void *ambient_thread(void *arg)
   /* 收尾：还设备 + 释放缓冲 + 让 enable() 可以再次开起来。
    * 缓冲是听音线程自己分配、自己释放的，所以不存在"一边 free 一边还在用"。 */
 
-  pthread_mutex_lock(&g_lock);
+  nxsem_wait_uninterruptible(&g_lock);
   if (g_mic_open)
     {
       audio_in_stop();
@@ -743,7 +745,7 @@ static void *ambient_thread(void *arg)
   free(g_frame);  g_frame = NULL;
   g_processing = false;
   g_state = AMB_STATE_IDLE;
-  pthread_mutex_unlock(&g_lock);
+  nxsem_post(&g_lock);
 
   printf("[Ambient] 听音线程已退出，缓冲已释放\n");
   return NULL;
@@ -789,10 +791,10 @@ int ambient_listen_init(ambient_listen_cb_t cb, void *user_data)
       return -EINVAL;
     }
 
-  pthread_mutex_lock(&g_lock);
+  nxsem_wait_uninterruptible(&g_lock);
   g_cb     = cb;
   g_cb_arg = user_data;
-  pthread_mutex_unlock(&g_lock);
+  nxsem_post(&g_lock);
 
   /* 开关默认**关**：这个功能要长期占着麦克风（半双工，语音聊天就没法用了），
    * 还要常驻约 250 KiB 堆 —— 必须由用户明确打开。
@@ -828,10 +830,10 @@ int ambient_listen_enable(bool enable)
        * 立刻把设备还回去，线程跑完手上这一次再自己退出、自己释放缓冲。
        * 在那之前再 enable(true) 会返回 -EBUSY。 */
 
-      pthread_mutex_lock(&g_lock);
+      nxsem_wait_uninterruptible(&g_lock);
       if (!g_enabled && g_state == AMB_STATE_IDLE)
         {
-          pthread_mutex_unlock(&g_lock);
+          nxsem_post(&g_lock);
           return OK;
         }
       g_enabled = false;
@@ -841,19 +843,19 @@ int ambient_listen_enable(bool enable)
           audio_in_stop();          /* 会唤醒阻塞中的 audio_in_read() */
           g_mic_open = false;
         }
-      pthread_mutex_unlock(&g_lock);
+      nxsem_post(&g_lock);
 
       printf("[Ambient] 已请求停止听音（线程会在手上那次网络请求结束后退出）\n");
       return OK;
     }
 
-  pthread_mutex_lock(&g_lock);
+  nxsem_wait_uninterruptible(&g_lock);
 
   if (g_state != AMB_STATE_IDLE)
     {
       bool already = g_enabled;
 
-      pthread_mutex_unlock(&g_lock);
+      nxsem_post(&g_lock);
 
       /* 已经开着就是幂等的成功；正在退出（上一次网络请求还没跑完）
        * 则明确告诉调用方稍后再来，不要偷偷起第二个线程抢麦克风。 */
@@ -874,7 +876,7 @@ int ambient_listen_enable(bool enable)
       free(g_ring);   g_ring  = NULL;
       free(g_clip);   g_clip  = NULL;
       free(g_frame);  g_frame = NULL;
-      pthread_mutex_unlock(&g_lock);
+      nxsem_post(&g_lock);
       printf("[Ambient] 缓冲分配失败（需要约 %d KiB）\n",
              (int)((AMBIENT_RING_BYTES + AMBIENT_CLIP_BYTES + AMBIENT_FRAME_BYTES)
                    / 1024));
@@ -888,7 +890,7 @@ int ambient_listen_enable(bool enable)
   g_seq       = 0;
   g_state     = AMB_STATE_RUNNING;
 
-  pthread_mutex_unlock(&g_lock);
+  nxsem_post(&g_lock);
 
   pthread_attr_init(&attr);
   pthread_attr_setstacksize(&attr, AMBIENT_THREAD_STACK);
@@ -901,13 +903,13 @@ int ambient_listen_enable(bool enable)
 
   if (ret != 0)
     {
-      pthread_mutex_lock(&g_lock);
+      nxsem_wait_uninterruptible(&g_lock);
       g_state   = AMB_STATE_IDLE;
       g_enabled = false;
       free(g_ring);   g_ring  = NULL;
       free(g_clip);   g_clip  = NULL;
       free(g_frame);  g_frame = NULL;
-      pthread_mutex_unlock(&g_lock);
+      nxsem_post(&g_lock);
       printf("[Ambient] 听音线程创建失败: %d\n", ret);
       return -ret;
     }
@@ -923,9 +925,9 @@ bool ambient_listen_is_enabled(void)
 {
   bool on;
 
-  pthread_mutex_lock(&g_lock);
+  nxsem_wait_uninterruptible(&g_lock);
   on = g_enabled;
-  pthread_mutex_unlock(&g_lock);
+  nxsem_post(&g_lock);
 
   return on;
 }
@@ -934,9 +936,9 @@ bool ambient_listen_is_paused(void)
 {
   bool paused;
 
-  pthread_mutex_lock(&g_lock);
+  nxsem_wait_uninterruptible(&g_lock);
   paused = (g_hold_mask != 0);
-  pthread_mutex_unlock(&g_lock);
+  nxsem_post(&g_lock);
 
   return paused;
 }
@@ -957,7 +959,7 @@ void ambient_listen_hold(ambient_hold_t who, bool on)
 
   bit = (uint32_t)1 << (int)who;
 
-  pthread_mutex_lock(&g_lock);
+  nxsem_wait_uninterruptible(&g_lock);
   if (on)
     {
       g_hold_mask |= bit;
@@ -966,7 +968,7 @@ void ambient_listen_hold(ambient_hold_t who, bool on)
     {
       g_hold_mask &= ~bit;
     }
-  pthread_mutex_unlock(&g_lock);
+  nxsem_post(&g_lock);
 }
 
 void ambient_listen_pause(void)
@@ -981,7 +983,7 @@ void ambient_listen_pause(void)
    *     g_mic_open 是 true，关掉；
    *   - 这里先拿到锁：先置 hold，线程之后拿到锁时看到 hold 非 0，根本不会开。
    * 两种顺序都安全。 */
-  pthread_mutex_lock(&g_lock);
+  nxsem_wait_uninterruptible(&g_lock);
   g_hold_mask |= (uint32_t)1 << AMBIENT_HOLD_MANUAL;
   need_stop = g_mic_open;
   if (need_stop)
@@ -990,38 +992,38 @@ void ambient_listen_pause(void)
       audio_in_stop();
       g_mic_open = false;
     }
-  pthread_mutex_unlock(&g_lock);
+  nxsem_post(&g_lock);
 }
 
 void ambient_listen_resume(void)
 {
-  pthread_mutex_lock(&g_lock);
+  nxsem_wait_uninterruptible(&g_lock);
   g_hold_mask &= ~((uint32_t)1 << AMBIENT_HOLD_MANUAL);
-  pthread_mutex_unlock(&g_lock);
+  nxsem_post(&g_lock);
 }
 
 void ambient_listen_set_busy_cb(ambient_busy_cb_t fn, void *user_data)
 {
-  pthread_mutex_lock(&g_lock);
+  nxsem_wait_uninterruptible(&g_lock);
   g_busy_cb  = fn;
   g_busy_arg = user_data;
-  pthread_mutex_unlock(&g_lock);
+  nxsem_post(&g_lock);
 }
 
 void ambient_listen_set_chat_enabled(bool enable)
 {
-  pthread_mutex_lock(&g_lock);
+  nxsem_wait_uninterruptible(&g_lock);
   g_chat_enabled = enable;
-  pthread_mutex_unlock(&g_lock);
+  nxsem_post(&g_lock);
 }
 
 bool ambient_listen_chat_enabled(void)
 {
   bool on;
 
-  pthread_mutex_lock(&g_lock);
+  nxsem_wait_uninterruptible(&g_lock);
   on = g_chat_enabled;
-  pthread_mutex_unlock(&g_lock);
+  nxsem_post(&g_lock);
 
   return on;
 }
@@ -1033,9 +1035,9 @@ void ambient_listen_get_stats(ambient_listen_stats_t *stats)
       return;
     }
 
-  pthread_mutex_lock(&g_lock);
+  nxsem_wait_uninterruptible(&g_lock);
   *stats          = g_stats;
   stats->noise_floor = g_noise_floor;
   stats->holds       = g_hold_mask;
-  pthread_mutex_unlock(&g_lock);
+  nxsem_post(&g_lock);
 }

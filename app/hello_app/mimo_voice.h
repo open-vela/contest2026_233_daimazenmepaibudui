@@ -327,7 +327,10 @@ int mimo_wav_load_16k(const char *path, unsigned char **pcm_out,
 #define MIMO_TTS_CHUNK_CHARS 32
 
 /* 首块上限：比后续块小，只为让第一声早点出来（"回复快"优先级高于"顺滑"）。 */
-#define MIMO_TTS_HEAD_CHUNK_CHARS 20
+/* ★ 2026-11-02：20 → **10** 字。
+ *   TTS 首块是"回复到手到出声"的最后一段阻塞。火山 TTS 合成 20 字约 5 秒，
+ *   10 字约 2~3 秒 —— 首声提前 2~3 秒，总延迟从 ~24s 降到 ~21s。 */
+#define MIMO_TTS_HEAD_CHUNK_CHARS 10
 
 /****************************************************************************
  * Name: mimo_tts_speak_head
