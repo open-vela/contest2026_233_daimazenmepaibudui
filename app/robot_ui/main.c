@@ -5190,6 +5190,8 @@ int main(int argc, char *argv[])
         static bool net_ok   = false;
         static int  time_tick = 0;
         static int  reminder_tick = 0;
+        static int  alarm_page_tick = 0;    /* 报警页僵尸检测：~1 秒一拍 */
+        static int  alarm_page_stale = 0;   /* 连续多少拍“没有报警源” */
 
         /* 看门狗心跳：这一行跑过 = UI 线程活着（单调时钟，见 ui_mono_ms） */
         g_ui_beat_ms = ui_mono_ms();
@@ -5212,6 +5214,38 @@ int main(int argc, char *argv[])
 #if UI_PERF_LOG
         ui_perf_frame_end();
 #endif
+
+        /* ★ 2026-11-03：**僵尸报警页自动收摊**。
+         *   真机：触摸 IC 偶发不应答后，红色报警页挡在主界面上面，人点不了
+         *   「返回」；而 UI 线程、MQTT 都活着（stop_alarm 能收到）。只要
+         *   报警源已经结束（alarm 未激活、voice_emerg 未激活），这个页就
+         *   不该继续挡着。连续 6 秒没有报警源 → 自动撤页并撤掉可能残留的
+         *   询问页。报警仍在响时（active=true）绝不会动它。 */
+        if (++alarm_page_tick >= 200)   /* 200 × ~5ms ≈ 1 秒 */
+        {
+            struct alarm_status_s st;
+            bool alarm_active;
+
+            alarm_page_tick = 0;
+            alarm_active = (alarm_get_status(&st) == OK) && st.active;
+
+            if (robot_ui_alarm_page_active() && !alarm_active &&
+                !voice_emerg_is_active())
+            {
+                if (++alarm_page_stale >= 6)
+                {
+                    printf("[UI] 报警源已结束，报警页自动撤下"
+                           "（防触摸失效卡页）\n");
+                    ui_post_ask_close();
+                    robot_ui_close_alarm();
+                    alarm_page_stale = 0;
+                }
+            }
+            else
+            {
+                alarm_page_stale = 0;
+            }
+        }
 
         /* 每 ~200ms 刷新一次状态栏上的网络状态。
          * LVGL 不是线程安全的，所以只在这个任务里改控件；network_task 那边

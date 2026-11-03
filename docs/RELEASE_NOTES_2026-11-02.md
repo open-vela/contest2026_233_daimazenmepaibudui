@@ -134,6 +134,10 @@ static 的 `g_dlg_thread_valid / g_dlg_worker_alive` 仍是 true，新实例判�
 约 20 秒才出声。新增 `time_fast_try()`：本地 RTC（UTC+8）直接组一句话交给 TTS，
 不再经过云端 LLM。串口判据：`[时间快路] 现在是 X 点 X 分。`
 
+**真机实测（2026-11-03 18:05）**：ASR 6.9 s + 本地回复 **10 ms** + TTS 约 2.2 s，
+首响约 **9 秒**；省掉的是 LLM 的 5~11.5 秒，不是 ASR/TTS 的时间。
+对外口径写「约 9 秒」，不要写「3 秒内」。
+
 ## 6. 实时信息功能简化
 
 - 删除「娱乐/体育/财经…」分类猜测和「第X条详细说说」专门路径；
@@ -146,7 +150,7 @@ static 的 `g_dlg_thread_valid / g_dlg_worker_alive` 仍是 true，新实例判�
 
 ---
 
-## 6. 界面
+## 7. 界面
 
 - 语音聊天页**右上角新增 56×40 的「返回」按钮**，与左上角返回走同一关闭逻辑
   （停录音、丢弃本轮、关面板）；
@@ -158,7 +162,7 @@ static 的 `g_dlg_thread_valid / g_dlg_worker_alive` 仍是 true，新实例判�
 
 ---
 
-## 7. 简单问答直连 MiMo（2026-11-03）
+## 8. 简单问答直连 MiMo（2026-11-03）
 
 真机 velaclaw 一段要 5~11.5 秒。现在**不带工具的简单问答**直接调
 `mimo_chat()`（同一个 key/host，走 HTTPS），跳过 ReAct 决策与工具调度：
@@ -173,7 +177,18 @@ static 的 `g_dlg_thread_valid / g_dlg_worker_alive` 仍是 true，新实例判�
 `[LLM] 直连 MiMo 成功（N 字节），进入 TTS`；
 工具意图会打 `[LLM] 命中工具意图「…」-> 走 velaclaw`。
 
-## 8. 已知未闭环
+## 9. 僵尸报警页自动收摊（2026-11-03）
+
+真机复现：触摸 IC 偶发不应答后，红色报警页挡在主界面上面，人点不了「返回」；
+但 UI 线程、MQTT 心跳都正常，`stop_alarm` 也能被收到并执行。
+
+修复：UI 主循环每约 1 秒检查一次——报警页在最上层、且
+`alarm_get_status().active == false`、`voice_emerg_is_active() == false`
+连续 6 秒，就自动 `ui_post_ask_close()` + `robot_ui_close_alarm()`，
+撤掉僵尸页并回到主界面。**报警仍在响（active=true）时绝不会动它。**
+串口判据：`[UI] 报警源已结束，报警页自动撤下（防触摸失效卡页）`。
+
+## 10. 已知未闭环
 
 - TLS 修复需要长时间真机回归（见上）；
 - 极短语音（< 0.8 秒）ASR 仍可能只转出单字，靠“短句即没事”兜底；

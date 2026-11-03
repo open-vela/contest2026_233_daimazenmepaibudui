@@ -98,6 +98,9 @@ int robot_ui_alarm_ring(const char *reason);
 /* 关闭报警 */
 void robot_ui_close_alarm(void);
 
+/* 报警页是否为当前活动屏幕（用于“报警源已结束但页面还挡着”的自动收摊）。 */
+bool robot_ui_alarm_page_active(void);
+
 /* 刷新状态栏时钟（从 main 主循环调用，与 LVGL 定时器双重保障） */
 void robot_ui_update_time(void);
 

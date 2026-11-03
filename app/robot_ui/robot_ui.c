@@ -1476,6 +1476,14 @@ void robot_ui_show_alarm(const char *content)
 }
 
 /* ==================== 关闭报警 ==================== */
+/* ★ 2026-11-03：报警页是不是当前最上层屏幕（给 main.c 的“僵尸报警页”
+ *   自动收摊用）。触摸 IC 偶发不应答时，人点不了「返回」；只要报警源
+ *   已经结束，这个页就不该继续挡着主界面。 */
+bool robot_ui_alarm_page_active(void)
+{
+    return (scr_alarm != NULL) && (lv_screen_active() == scr_alarm);
+}
+
 void robot_ui_close_alarm(void)
 {
     int ret;
