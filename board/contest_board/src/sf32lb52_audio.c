@@ -3334,6 +3334,37 @@ static ssize_t sf32lb52_audio_write(FAR struct audio_lowerhalf_s *dev,
       return 0;
     }
 
+  /* ★ 2026-11-03：**同一时刻只许一个 write 进设备**。
+   *
+   *   真机：TTS（hello_app）与提醒铃/报警（robot_ui）是两个 task group，
+   *   各自 open 同一个 /dev/audio0，却共用驱动里的 `wr_sem / wr_wait_wdog`
+   *   这一份等待状态。第二个 write 一进来就 `nxsem_reset` + `wd_cancel`，
+   *   把第一个正在等的超时心跳和信号量一起拆掉 → 第一个永久卡在 write
+   *   （日志 `播放卡死：阶段=write` / `播放线程 1000ms 内没退出`），
+   *   上层再换代起播，越卡越多。
+   *
+   *   这里用原子占位把并发 write 串起来：第二个写等最多 2 秒（等前一个
+   *   块放完），等不到就返回 -EBUSY，让上层掉这一块、下一块再试；
+   *   **绝不再去 reset / cancel 别人正在用的等待状态**。
+   *   原来那句 `priv->wr_busy = true` 移到这里（占位即置真），下面删掉。 */
+
+  {
+    int waited = 0;
+
+    while (__atomic_exchange_n(&priv->wr_busy, true, __ATOMIC_ACQ_REL))
+      {
+        if (waited >= 2000)
+          {
+            syslog(LOG_WARNING,
+                   "AUDIO: write 被占用超过 2s，丢弃本块（另一会话还在写）\n");
+            return -EBUSY;
+          }
+
+        usleep(5000);
+        waited += 5;
+      }
+  }
+
   /* 记下"这次会话最近一次真的有人在写"（判残留时的一条证据，见
    * sf32lb52_audio_holder_alive）。放在 running 早退之后：设备没在跑就不算
    * 有人用它。last_write（**只有这一处**更新）供 L5 的僵尸播放判定用
@@ -3357,7 +3388,7 @@ static ssize_t sf32lb52_audio_write(FAR struct audio_lowerhalf_s *dev,
   nxsem_reset(&priv->wr_sem, 0);
   (void)wd_cancel(&priv->wr_wait_wdog);
 
-  priv->wr_busy = true;
+  /* wr_busy 已在函数入口用原子占位置真（见上面那段并发 write 的说明）。 */
 
   /* 数据体检：样本是否为空/异常（全 0 会让 DAC 只输出直流，只有开关爆音） */
   {

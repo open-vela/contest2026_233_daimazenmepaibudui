@@ -1,0 +1,6 @@
+[
+  {"pattern": "tp-[A-Za-z0-9]{20,}", "replacement": "tp-***REDACTED***"},
+  {"pattern": "tvly-[A-Za-z0-9]{20,}", "replacement": "tvly-***REDACTED***"},
+  {"pattern": "day\\.app/push/[A-Za-z0-9]+", "replacement": "day.app/push/***REDACTED***"},
+  {"pattern": "(?i)(qweather_api_key|volc_api_key|push_key|api_key)[\"']?\\s*[:=]\\s*[\"'][^\"']{8,}", "replacement": "\\1\":\"***REDACTED***"}
+]

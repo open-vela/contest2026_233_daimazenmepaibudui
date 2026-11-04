@@ -15,10 +15,10 @@
 | 实时信息 | 用户原话直接交 Tavily 通用检索 → 新浪财经免 key 兜底；念前 3 条标题 + 第一段正文（过滤版权/页脚） |
 | 搜索 | Tavily → SerpAPI → Exa（按配置的 key 依次尝试） |
 | 急救报警 | 关键词「救命/报警/着火」（20+ 变体）+ 本地撞击检测；响铃 → 10 秒确认 → Bark 通知 → 30 秒重发 → 3 分钟自停 |
-| 语音取消 | 报警听窗内短句（≤15 字）即当「没事」停铃；屏幕按钮也停铃 |
+| 语音取消 | 报警听窗内短句按 UTF-8 字符数（≤15 字）判「没事」；低电平短句补静音+最多 10× 增益；火山空结果时 MiMo 二次识别（只认「没事/不用/没有」）；屏幕按钮也停铃 |
 | 本地声音 | DSCNN-lite：fall/knock/scream；撞击需单次 ≥0.80 或 15 秒内两次 |
 | 提醒 | RTC 日循环闹钟 + 语音建提醒（RAM，掉电丢失） |
-| 屏幕/交互 | 390×450 圆角屏、绿色主题、时钟（UTC+8）、菜单、设置、报警页 |
+| 屏幕/交互 | 390×450 圆角屏、**黄白色暖调主题**（奶油黄白底 + 白色圆角卡片 + 暖阳黄主色）、时钟（UTC+8）、菜单、设置、报警页 |
 | 联网 | USB RNDIS + PC 侧 NAT；联网后 HTTPS `Date:` 头自动对时 |
 
 ## 2. 使用的模型与服务
@@ -76,11 +76,11 @@ board/contest_board/src/etc/assets/
 ```json
 {
   "model": "mimo-v2.6-flash",
-  "llm_host": "token-plan-cn.xiaomimimo.com",
+  "llm_host": "api.xiaomimimo.com",
   "llm_path": "/v1/chat/completions",
   "llm_port": "443",
   "api_key": "<小米 MiMo API Key>",
-  "llm_backend_0": "{\"host\":\"token-plan-cn.xiaomimimo.com\",\"path\":\"/v1/chat/completions\",\"port\":\"443\",\"api_key\":\"<同 api_key>\",\"model\":\"mimo-v2.6-flash\",\"priority\":0,\"cost_tier\":1}",
+  "llm_backend_0": "{\"host\":\"api.xiaomimimo.com\",\"path\":\"/v1/chat/completions\",\"port\":\"443\",\"api_key\":\"<同 api_key>\",\"model\":\"mimo-v2.6-flash\",\"priority\":0,\"cost_tier\":1}",
 
   "asr_model": "mimo-v2.5-asr",
   "asr_language": "zh",
@@ -100,7 +100,7 @@ board/contest_board/src/etc/assets/
 
 | 字段 | 获取位置 | 格式示例 |
 |---|---|---|
-| `api_key` | [小米 MiMo 开放平台](https://xiaomimimo.com) → API Key | `tp-xxxxxxxx...`（51 位） |
+| `api_key` | [小米 MiMo 开放平台](https://xiaomimimo.com) → API Key | `sk-xxxxxxxx...`（按控制台签发为准） |
 | `volc_api_key` | 火山引擎控制台 → API Key 管理 | `xxxxxxxx-xxxx-...-xxxxxxxxxxxx`（36 位 UUID） |
 | `volc_asr_resource` | 固定值 | `volc.seedasr.sauc.duration` |
 | `volc_speaker` | 固定值（TTS 2.0 音色） | `zh_female_vv_uranus_bigtts` |
@@ -237,10 +237,12 @@ contest2026_233_daimazenmepaibudui/
 
 - 本板无摄像头/IMU/独立 Wi-Fi。
 - `/data` 是 tmpfs：提醒、设置重启丢失。
-- 普通问答首字约 20 秒（ASR ~8s + LLM ~8s + TTS 首块 ~2s）。
+- 普通问答首出约 15~25 秒（ASR 4~12s + velaclaw 5~11.5s + TTS 首块 ~2.2s）；本地时间快路约 9 秒，短句 1 秒内。
 - 实时检索条数受 Tavily 索引限制（中文约 1~3 条）；已取消「第X条详细说说」专门路径。
 - TLS 出站连接堆积（`[TCP] pool` / `st[D…]` 指纹）已在内核修复：TIME_WAIT 到期补 `tcp_free`，并在每次新建连接时主动回收僵尸 CLOSED 条目；45 分钟真机回归 `pool` 稳定在 5~7、`D` 为 0~1。
-- 录音 8 秒卡读已加 `owner_gen` 修复，需长时间真机验证。
+- 播放看门狗不再误杀 TTS 尾音（DONE 阶段跳过停滞判据）；驱动 `write()` 已原子串行化，TTS 与提醒/报警并发写不再卡死——长故事已能完整念完。
+- 极短语音（<0.8 秒）与轻声说话仍可能只转出单字或返回 -61；已用补静音、低增益与 MiMo 二次识别兜底，但识别率仍受麦克风距离与云端能力限制。
+- 录音 8 秒卡读已加 `owner_gen` 修复；极端负载下 HAL 读等待仍偶发卡读，监听守护会重开会话，需继续收口。
 
 ## 10. 文档索引
 

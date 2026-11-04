@@ -8387,9 +8387,13 @@ static void process_ai_dialogue(sm_context_t *ctx)
 
               if (need_gain)
                 {
-                  int32_t gain = 6000 / maxabs;
+                  /* ★ 2026-11-03：真机安静段峰值只有 200~800，6× 后仍只有
+                   * 1200~4800，火山还是 -61。把目标抬到 8000、上限放到 10×，
+                   * 让安静段也能到 2000~8000（正常说话量级）；仍然只改送
+                   * ASR 的副本，不碰录音/播放。 */
+                  int32_t gain = 8000 / maxabs;
 
-                  if (gain > 6) gain = 6;
+                  if (gain > 10) gain = 10;
                   if (gain < 2) gain = 2;
 
                   for (size_t k = 0; k < asr_frames; k++)
@@ -8747,14 +8751,20 @@ static void process_ai_dialogue(sm_context_t *ctx)
       goto dlg_done;
     }
 
-  /* ★ 2026-11-03：**简单问答直连 MiMo，跳过 velaclaw**。
-   *   真机 velaclaw 一段就要 5~11.5 秒；直连 mimo_chat 走同一条 HTTPS，
-   *   省掉 ReAct 决策/工具调度的开销。
-   *   带工具意图（提醒、音量/亮度、天气、搜索、家居/媒体）一律仍走
-   *   velaclaw —— 见 intent_needs_tools()，宁可慢也不让功能退化。
-   *   注意：直连这条路不带多轮上下文（mimo_chat 每次只发当前这句话），
-   *   简单问答够用；需要上下文的工具型会话仍由 velaclaw 承担。 */
-  if (g_net_started && !intent_needs_tools(text_buf))
+  /* ★ 2026-11-03 晚：**直连 MiMo 实测更慢，先整体关掉**。
+   *
+   *   真机这一轮：直连 MiMo 的 LLM 段分别是 11.9 s / 10.5 s / **26.3 s**，
+   *   比 velaclaw 的 5~11.5 s 还慢；而且它占住唯一一条识别线程，后面排队
+   *   的轮次全被 30 秒看门狗判成“卡在 ASR 相位”——用户看到的就是
+   *   “有的甚至不回复”。
+   *
+   *   现在把开关置 0，所有问答回到 velaclaw（原有稳定路径）；代码保留，
+   *   以后网关稳定了把 AI_SIMPLE_CHAT_DIRECT 改 1 即可重新启用。 */
+#ifndef AI_SIMPLE_CHAT_DIRECT
+#define AI_SIMPLE_CHAT_DIRECT 0
+#endif
+
+  if (AI_SIMPLE_CHAT_DIRECT && g_net_started && !intent_needs_tools(text_buf))
     {
       int fb;
 
