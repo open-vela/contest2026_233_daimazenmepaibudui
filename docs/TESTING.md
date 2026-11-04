@@ -162,6 +162,55 @@
 - 报警页/确认页出现后，取消或到点应撤页回主屏（`ui_post_panel(2)`）；
 - AI 播报时屏幕文字随音频逐句推进（看 `[Bridge] AI 回复已上屏: …` 的前缀在变长）。
 
+## 8.1 屏幕镜像与虚拟触摸（lcd_mirror）
+
+用途：本板屏幕玻璃损坏、FT6146 触摸 IC 偶发不应答，PC 镜像用来实时看屏
+并用鼠标操作界面；触摸恢复前它是唯一可操作通道，也用于演示、录屏和截图。
+
+板端（默认 autostart，目标 192.168.137.1:5600）：
+
+```text
+hw_test lcdmirror status                 # 看传输方式/目标/已发帧/触摸事件
+hw_test lcdmirror stop / start           # 停/起（停掉连鼠标注入一起停）
+hw_test lcdmirror start 192.168.137.1 5600
+hw_test lcdmirror uart [dev]             # 切控制台串口（默认 /dev/console）
+hw_test lcdmirror tcp <ip> [port]        # 切回 TCP
+hw_test lcdtap <x> <y> <0|1>             # 串口模式下手动注入触摸
+```
+
+PC 端（Windows，Python 3.10 + Pillow；串口模式再加 pyserial）：
+
+```bash
+py -3.10 tools/lcd_mirror/lcd_mirror.py                 # TCP 5600
+py -3.10 tools/lcd_mirror/lcd_mirror.py --scale 1.5     # 放大窗口
+py -3.10 tools/lcd_mirror/lcd_mirror.py --serial COM4 --baud 1000000
+```
+
+操作：左键按下 = 触摸按下，拖动 = 滑动，松开 = 抬起；空格暂停显示，
+`t` 开关计时打印，Esc 退出。窗口 `fps` 应持续 >0，`#seq` 递增；板端
+`status` 的触摸事件数应随点击增加。
+
+其他脚本：
+
+- `lcd_mirror_dump.py`：无头收帧，按脏矩形拼成 PNG（截图归档）；
+- `mirror_tap.py`：脚本化点击一次（自动化测试）；
+- `mirror_latency.py`：量「点一下 → 画面变化」的端到端延迟；
+- `lcdmirror_serial_dump.py`：串口模式无头收帧；
+- `host_test/`：协议解析、坐标映射、串口重同步的主机侧测试。
+
+判据：
+
+- PC 窗口能看到 390×450 主屏，时钟走字，点击「菜单/设置」板端界面响应；
+- 板端 `hw_test lcdmirror status` 显示已连接（TCP 或 UART）、触摸事件递增；
+- 拔掉 RNDIS 后 TCP 断开，切 `hw_test lcdmirror uart` + PC `--serial` 仍能看/点。
+
+限制：
+
+- 只镜像走 LVGL 的刷屏；`hw_test lcdcolor` 这类直接写 `/dev/fb0` 的不进镜像；
+- 快速变化区域可能撕裂（下一帧自愈）；
+- 面板固定 390×450 竖屏（CO5300 不吃 MADCTL，横屏只能软件转置）；
+- TCP 依赖 RNDIS；RNDIS 挂死时用串口链路。
+
 ## 9. 稳定性回归（建议 30 分钟）
 
 | 观察项 | 正常 | 异常指纹 |

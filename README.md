@@ -246,6 +246,29 @@ contest2026_233_daimazenmepaibudui/
 7. **RTC/报警/按键**：`/dev/rtc0` 的 `read()` 永远 EOF，只能用 `RTC_SET_ALARM` + 信号；板级单独 worker 设 alarm、收信号、回调；未开 `CONFIG_LIBC_LOCALTIME`，UTC+8 与日期进位在板级手算；板级报警 worker 优先级 115，每 50 ms 写一块 PCM，`alarm_trigger/clear` 非阻塞。
 8. **启动/ROMFS/交付**：`board_late_initialize` 初始化 RTC/ADC/audio/GPIO/PWM/buttons/I2C/SPI/LCD 异步任务/看门狗/MTD/CDC-ACM；挂载 tmpfs `/data`，把只读 ROMFS 的 `agent_config.json` 拷入；`task_create` 拉起 `robot_ui(110)`、`ai_agent(100)`、`hello_app(100)` 和 `hello_app_wd(110)`；改 `etc/` 必须删 ROMFS 三个产物再编；上游改动以三份 working-tree 补丁交付。
 
+## 8.2 屏幕镜像与虚拟触摸（现场兜底）
+
+本板屏幕玻璃损坏、FT6146 触摸 IC 偶发不应答（`/dev/input0` 可能不存在），
+所以现场用 PC 当显示器：板端在 LVGL flush 钩子里抓脏矩形，经 TCP 5600
+（默认目标 192.168.137.1）或控制台串口发给 PC；PC 端
+`tools/lcd_mirror/lcd_mirror.py` 实时显示 390×450 画面，并把鼠标左键/拖动
+反向注入为板端触摸（TCP 上走 8 字节 `LT` 消息；串口模式走
+`hw_test lcdtap <x> <y> <0|1>`）。它不依赖 `/dev/input0`，是触摸失效时唯一
+能操作界面的通道，也用于演示、录屏和远程调试。
+
+```bash
+# PC（Windows，Python 3.10 + Pillow）
+py -3.10 tools/lcd_mirror/lcd_mirror.py --scale 1.5
+
+# 板端（默认已 autostart；需要时手动）
+hw_test lcdmirror status
+hw_test lcdmirror start 192.168.137.1 5600
+hw_test lcdmirror uart          # RNDIS 挂了改走串口（PC 加 --serial COM4）
+```
+
+完整步骤、判据、协议和无头截图/自动化点击脚本见
+[docs/TESTING.md](docs/TESTING.md) 的「8.1 屏幕镜像与虚拟触摸」。
+
 ## 9. 已知限制
 
 - 本板无摄像头/IMU/独立 Wi-Fi。
