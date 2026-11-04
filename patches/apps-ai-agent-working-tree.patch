@@ -1678,7 +1678,7 @@ index 64d11f1..5ddc6d0 100644
      return OK;
  }
 diff --git a/src/infra/vela_tls.c b/src/infra/vela_tls.c
-index 0b36760..8742dd5 100644
+index 0b36760..5b76505 100644
 --- a/src/infra/vela_tls.c
 +++ b/src/infra/vela_tls.c
 @@ -31,9 +31,11 @@
@@ -2036,7 +2036,7 @@ index 0b36760..8742dd5 100644
      /* Force blocking mode and set socket-level read timeout.
       * This avoids using select()/poll() inside mbedtls_net_recv_timeout
       * which returns MBEDTLS_ERR_NET_POLL_FAILED (-0x0047) on NuttX/QEMU.
-@@ -306,6 +531,17 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
+@@ -306,6 +531,32 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
  #endif
          setsockopt(ctx->net.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
  
@@ -2051,10 +2051,25 @@ index 0b36760..8742dd5 100644
 +            setsockopt(ctx->net.fd, SOL_SOCKET, SO_SNDTIMEO, &stv, sizeof(stv));
 +        }
 +
++        /* ★ 2026-11-04：TCP keep-alive。连接池里的长连接如果对端悄悄消失
++         *   （NAT 超时/服务端回收），没有 keep-alive 时下一次复用会写到
++         *   半开连接上，只能等 RCVTIMEO 超时才重连。打开 SO_KEEPALIVE，
++         *   让内核定期探测并把死连接标记出来；不改变握手/复用语义。
++         *   需要 CONFIG_NET_TCP_KEEPALIVE=y（板级 defconfig 已开）。 */
++        {
++            int ka_on = 1;
++            if (setsockopt(ctx->net.fd, SOL_SOCKET, SO_KEEPALIVE,
++                           &ka_on, sizeof(ka_on)) == 0)
++              {
++                syslog(LOG_INFO, "[%s] keepalive on fd=%d\n",
++                       TAG, (int)ctx->net.fd);
++              }
++        }
++
  #ifdef CONFIG_AI_AGENT_NET_RPMSG
          {
              int timeout_sec = network_get_connect_timeout();
-@@ -378,9 +614,9 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
+@@ -378,9 +629,9 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
  #if defined(MBEDTLS_ERROR_C)
              char err_buf[128];
              mbedtls_strerror(ret, err_buf, sizeof(err_buf));
@@ -2066,7 +2081,7 @@ index 0b36760..8742dd5 100644
  #endif
              /* Log if it was a fatal alert */
              if (ret == MBEDTLS_ERR_SSL_FATAL_ALERT_MESSAGE) {
-@@ -396,6 +632,42 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
+@@ -396,6 +647,42 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
      return 0;
  }
  
@@ -2109,7 +2124,7 @@ index 0b36760..8742dd5 100644
  /* ── HTTP/1.1 framing ────────────────────────────────────────── */
  
  static int tls_write_request(tls_ctx_t* ctx,
-@@ -524,6 +796,37 @@ static void tls_raw_release(char* buf)
+@@ -524,6 +811,37 @@ static void tls_raw_release(char* buf)
      }
  }
  
@@ -2147,7 +2162,7 @@ index 0b36760..8742dd5 100644
  static int tls_read_response(tls_ctx_t* ctx, char* resp_buf, size_t resp_cap,
      size_t* out_body_len, bool* out_keep_alive)
  {
-@@ -618,6 +921,11 @@ static int tls_read_response(tls_ctx_t* ctx, char* resp_buf, size_t resp_cap,
+@@ -618,6 +936,11 @@ static int tls_read_response(tls_ctx_t* ctx, char* resp_buf, size_t resp_cap,
                  resp_cap - 1 - resp_pos);
              if (ret > 0) {
                  resp_pos += (size_t)ret;
@@ -2159,7 +2174,7 @@ index 0b36760..8742dd5 100644
              } else if (ret == 0 || ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
                  break;
              } else if (ret != MBEDTLS_ERR_SSL_WANT_READ) {
-@@ -641,9 +949,88 @@ static int tls_read_response(tls_ctx_t* ctx, char* resp_buf, size_t resp_cap,
+@@ -641,9 +964,88 @@ static int tls_read_response(tls_ctx_t* ctx, char* resp_buf, size_t resp_cap,
      return http_status;
  }
  
@@ -2249,7 +2264,7 @@ index 0b36760..8742dd5 100644
      const char* host,
      const char* port,
      const char* method,
-@@ -661,6 +1048,10 @@ int vela_https_request(
+@@ -661,6 +1063,10 @@ int vela_https_request(
      conn_slot_t* slot = pool_acquire(host, port);
  
      if (slot && slot->valid) {
@@ -2260,7 +2275,7 @@ index 0b36760..8742dd5 100644
          /* Drain any leftover data from previous response before reuse.
           * Without this, a partially-read response body (e.g. truncated
           * chunked data) would be misinterpreted as the next HTTP status. */
-@@ -673,18 +1064,46 @@ int vela_https_request(
+@@ -673,18 +1079,46 @@ int vela_https_request(
                  .tv_usec = 0 };
              setsockopt(slot->ctx.net.fd, SOL_SOCKET, SO_RCVTIMEO,
                  &tv_drain, sizeof(tv_drain));
@@ -2309,7 +2324,7 @@ index 0b36760..8742dd5 100644
  
          /* Reuse existing connection — skip TLS handshake */
          syslog(LOG_DEBUG, "[%s] Reusing pooled connection to %s:%s\n", TAG, host, port);
-@@ -696,12 +1115,44 @@ int vela_https_request(
+@@ -696,12 +1130,44 @@ int vela_https_request(
                  pool_release(slot, host, port, keep);
                  return ret;
              }
@@ -2354,7 +2369,7 @@ index 0b36760..8742dd5 100644
      }
  
      /* New connection */
-@@ -744,6 +1195,29 @@ int vela_https_request(
+@@ -744,6 +1210,29 @@ int vela_https_request(
      return ret;
  }
  
@@ -2384,7 +2399,7 @@ index 0b36760..8742dd5 100644
  int vela_https_get(const char* host, const char* port, const char* path,
      char* resp_buf, size_t resp_cap)
  {
-@@ -984,6 +1458,10 @@ int vela_http_post_json(const char* host, const char* port, const char* path,
+@@ -984,6 +1473,10 @@ int vela_http_post_json(const char* host, const char* port, const char* path,
              if (n <= 0)
                  break;
              resp_pos += (size_t)n;

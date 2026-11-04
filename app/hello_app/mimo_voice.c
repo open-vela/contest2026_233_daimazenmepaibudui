@@ -2170,7 +2170,17 @@ static int mimo_asr_recognize(const unsigned char *pcm_data, size_t pcm_len,
       return -ENOMEM;
     }
 
+  /* ★ 2026-11-04：量一下 MiMo ASR 的**单次 HTTPS 请求**耗时。
+   *   用户要把 MiMo 和火山 e2e 对比：火山日志有 infer(0.5s) 与 e2e(6~10s)，
+   *   MiMo 是单个 POST，这个数就是它的端到端网络段。 */
+  struct timespec asr_t0, asr_t1;
+  clock_gettime(CLOCK_MONOTONIC, &asr_t0);
   status = mimo_post(body, resp, MIMO_ASR_RESP_CAP);
+  clock_gettime(CLOCK_MONOTONIC, &asr_t1);
+  syslog(LOG_INFO, "[%s] ASR: 请求耗时 %ld ms (HTTP %d)\n", TAG,
+         (long)((asr_t1.tv_sec - asr_t0.tv_sec) * 1000 +
+                (asr_t1.tv_nsec - asr_t0.tv_nsec) / 1000000),
+         status);
 
   /* body 是 16k*2*最长 15 秒 PCM 的 base64（~640 KB，见
    * ai_companion_main.c 的 SPEECH_BUF_MAX_FRAMES），请求一回来就还给堆 ——

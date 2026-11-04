@@ -7480,6 +7480,64 @@ static void weather_tts_friendly(const char *in, char *out, size_t cap)
  * @brief  天气快速通道。返回 true = 已经交给 TTS 回调（本轮到止）。
  */
 
+/* ★ 2026-11-04：**天气直接问 MiMo**（不再接和风天气）。
+ *
+ *   MiMo 侧 weather 工具默认开启，工具内部用 IP 定位 + Open-Meteo；
+ *   这里把整句话交给 mimo_chat()，让 MiMo 自己调 get_weather 并组织回答。
+ *   MiMo 失败/没配时才回落到原来的本地天气快路（Open-Meteo 直查）。
+ *   和风天气的配置键已从 agent_config.json 移除，代码不再依赖它。 */
+static bool weather_mimo_try(const char *text, sm_context_t *ctx)
+{
+  static const char *const kw[] =
+  {
+    "天气", "气温", "下雨", "温度", "冷不冷", "热不热", "刮风",
+  };
+
+  char   reply[512];
+  bool   hit = false;
+  size_t i;
+  int    ret;
+
+  if (text == NULL || text[0] == '\0' || !g_net_started ||
+      !mimo_voice_available())
+    {
+      return false;
+    }
+
+  for (i = 0; i < sizeof(kw) / sizeof(kw[0]); i++)
+    {
+      if (strstr(text, kw[i]) != NULL)
+        {
+          hit = true;
+          break;
+        }
+    }
+
+  if (!hit)
+    {
+      return false;
+    }
+
+  round_phase_set(ROUND_PHASE_LLM);
+  ai_network_send_face(&g_net_ctx, AI_CMD_FACE_THINKING);
+
+  strncpy(g_llm_sent_text, text, sizeof(g_llm_sent_text) - 1);
+  g_llm_sent_text[sizeof(g_llm_sent_text) - 1] = '\0';
+
+  printf("[天气] 直接问 MiMo（get_weather -> Open-Meteo）：%s\n", text);
+
+  ret = mimo_chat(text, reply, sizeof(reply));
+  if (ret > 0 && reply[0] != '\0')
+    {
+      printf("[天气] MiMo 回复（%d 字节）：%.100s\n", ret, reply);
+      llm_complete_callback(reply, 0, ctx);
+      return true;
+    }
+
+  printf("[天气] MiMo 失败（%d），回落本地 Open-Meteo 快路\n", ret);
+  return false;
+}
+
 static bool weather_fast_try(const char *text, sm_context_t *ctx)
 {
   const char *kwpos = NULL;
@@ -8207,6 +8265,235 @@ static bool time_fast_try(const char *text, sm_context_t *ctx)
   return true;
 }
 
+/* ==========================================================================
+ * ★ 2026-11-04：ASR 并行赛跑（MiMo 先发，火山同时发，先返回者用）
+ *
+ *   背景：火山流式 ASR 的 e2e 6~10 s，而 infer 只有 0.5 s；大部分时间花在
+ *   TLS/WebSocket 升级、3200 字节分块上传和服务端端点判定上。MiMo ASR 是
+ *   单个 HTTPS POST，两个后端同时跑，谁先给出非空文本就用谁；另一个线程
+ *   继续跑完并把结果丢掉（不取消，避免中途拆 TLS 会话）。
+ *
+ *   · MiMo 线程先创建（用户要求“优先连接 MiMo”）；
+ *   · 两个线程各自读同一份 PCM 副本，谁都不改；
+ *   · 结果/引用计数用 sem 保护；最后一个使用者负责 free，避免 worker
+ *     返回后 loser 线程读已释放的 PCM；
+ *   · 任一后端不可用就退回原来的串行 voice_asr_recognize()。
+ * ========================================================================== */
+
+#ifndef ASR_RACE_MIMO_VOLC
+#define ASR_RACE_MIMO_VOLC 1
+#endif
+#define ASR_RACE_TIMEOUT_MS 12000
+
+typedef struct
+{
+  const int16_t *pcm;
+  size_t         frames;
+  char           text[512];
+  volatile int   winner;        /* 0=无，1=MiMo，2=火山 */
+  volatile int   finished;      /* 两个线程都收工（或都没起来） */
+  int            threads_left;
+  int            refs;          /* worker + 两条线程 */
+  sem_t          lock;
+} asr_race_t;
+
+static void asr_race_lock(asr_race_t *r)
+{
+  while (sem_wait(&r->lock) != 0 && errno == EINTR) { }
+}
+
+static void asr_race_unlock(asr_race_t *r)
+{
+  sem_post(&r->lock);
+}
+
+static void asr_race_done(asr_race_t *r, int who, const char *text)
+{
+  int free_now = 0;
+
+  asr_race_lock(r);
+
+  if (r->winner == 0 && text != NULL && text[0] != '\0')
+    {
+      r->winner = who;
+      strncpy(r->text, text, sizeof(r->text) - 1);
+      r->text[sizeof(r->text) - 1] = '\0';
+    }
+
+  if (--r->threads_left <= 0)
+    {
+      r->finished = 1;
+    }
+
+  asr_race_unlock(r);
+
+  if (__atomic_sub_fetch(&r->refs, 1, __ATOMIC_ACQ_REL) == 0)
+    {
+      free_now = 1;
+    }
+
+  if (free_now)
+    {
+      sem_destroy(&r->lock);
+      free((void *)r->pcm);
+      free(r);
+    }
+}
+
+static void *asr_race_mimo(void *arg)
+{
+  asr_race_t *r = (asr_race_t *)arg;
+  char text[512] = {0};
+  int  ret;
+
+  ret = mimo_asr_recognize_direct((const unsigned char *)r->pcm,
+                                  r->frames * sizeof(int16_t),
+                                  text, sizeof(text));
+  if (ret < 0)
+    {
+      text[0] = '\0';
+    }
+
+  printf("[ASR] 并行 MiMo 返回（%d，%zu 字节）\n",
+         ret, strnlen(text, sizeof(text)));
+  asr_race_done(r, 1, text);
+  return NULL;
+}
+
+static void *asr_race_volc(void *arg)
+{
+  asr_race_t *r = (asr_race_t *)arg;
+  char text[512] = {0};
+  int  ret;
+
+  ret = volc_asr_recognize((const unsigned char *)r->pcm,
+                           r->frames * sizeof(int16_t),
+                           text, sizeof(text));
+  if (ret < 0)
+    {
+      text[0] = '\0';
+    }
+
+  printf("[ASR] 并行火山返回（%d，%zu 字节）\n",
+         ret, strnlen(text, sizeof(text)));
+  asr_race_done(r, 2, text);
+  return NULL;
+}
+
+static int asr_race_recognize(const int16_t *pcm, size_t frames,
+                              char *out, size_t out_cap)
+{
+  asr_race_t *r;
+  int16_t    *copy;
+  pthread_attr_t attr;
+  pthread_t  th;
+  int        winner = 0;
+  int        waited = 0;
+  int        free_now = 0;
+
+  if (pcm == NULL || frames == 0 || out == NULL || out_cap == 0)
+    {
+      return -EINVAL;
+    }
+
+  r = calloc(1, sizeof(*r));
+  copy = malloc(frames * sizeof(int16_t));
+  if (r == NULL || copy == NULL)
+    {
+      free(r);
+      free(copy);
+      return -ENOMEM;
+    }
+
+  memcpy(copy, pcm, frames * sizeof(int16_t));
+  r->pcm = copy;
+  r->frames = frames;
+  r->refs = 1;                 /* worker 自己 */
+  r->threads_left = 0;
+
+  if (sem_init(&r->lock, 0, 1) != 0)
+    {
+      free(copy);
+      free(r);
+      return -ENOMEM;
+    }
+
+  pthread_attr_init(&attr);
+  pthread_attr_setstacksize(&attr, 32768);
+  pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+
+  /* 先 MiMo，后火山；两个都先登记引用，线程失败再回退。 */
+  asr_race_lock(r);
+  __atomic_add_fetch(&r->refs, 2, __ATOMIC_ACQ_REL);
+  asr_race_unlock(r);
+
+  asr_race_lock(r);
+  r->threads_left++;
+  asr_race_unlock(r);
+  if (pthread_create(&th, &attr, asr_race_mimo, r) != 0)
+    {
+      asr_race_lock(r);
+      r->threads_left--;
+      if (r->threads_left <= 0) r->finished = 1;
+      asr_race_unlock(r);
+      __atomic_sub_fetch(&r->refs, 1, __ATOMIC_ACQ_REL);
+    }
+
+  asr_race_lock(r);
+  r->threads_left++;
+  asr_race_unlock(r);
+  if (pthread_create(&th, &attr, asr_race_volc, r) != 0)
+    {
+      asr_race_lock(r);
+      r->threads_left--;
+      if (r->threads_left <= 0) r->finished = 1;
+      asr_race_unlock(r);
+      __atomic_sub_fetch(&r->refs, 1, __ATOMIC_ACQ_REL);
+    }
+
+  pthread_attr_destroy(&attr);
+
+  while (waited < ASR_RACE_TIMEOUT_MS)
+    {
+      asr_race_lock(r);
+      winner = r->winner;
+      int fin = r->finished;
+      asr_race_unlock(r);
+
+      if (winner != 0 || fin)
+        {
+          break;
+        }
+
+      usleep(10000);
+      waited += 10;
+    }
+
+  asr_race_lock(r);
+  winner = r->winner;
+  if (winner != 0)
+    {
+      strncpy(out, r->text, out_cap - 1);
+      out[out_cap - 1] = '\0';
+    }
+
+  if (__atomic_sub_fetch(&r->refs, 1, __ATOMIC_ACQ_REL) == 0)
+    {
+      r->finished = 1;
+      free_now = 1;
+    }
+  asr_race_unlock(r);
+
+  if (free_now)
+    {
+      sem_destroy(&r->lock);
+      free((void *)r->pcm);
+      free(r);
+    }
+
+  return (winner != 0) ? 0 : -ENODATA;
+}
+
 /**
  * @brief  报警听窗的 ASR 兜底：火山空结果时用 MiMo 再识别一遍
  *
@@ -8422,9 +8709,19 @@ static void process_ai_dialogue(sm_context_t *ctx)
         }
     }
 
-  ret = voice_asr_recognize((const unsigned char *)asr_ptr,
-                            asr_frames * sizeof(int16_t),
-                            text_buf, sizeof(text_buf));
+#if ASR_RACE_MIMO_VOLC
+  if (mimo_voice_available() && volc_asr_available())
+    {
+      ret = asr_race_recognize(asr_ptr, asr_frames, text_buf, sizeof(text_buf));
+      printf("[ASR] 并行赛跑（MiMo 先发 / 火山同时发）ret=%d\n", ret);
+    }
+  else
+#endif
+    {
+      ret = voice_asr_recognize((const unsigned char *)asr_ptr,
+                                asr_frames * sizeof(int16_t),
+                                text_buf, sizeof(text_buf));
+    }
 
   /* ★ 2026-11-03：**报警听窗的二级兜底**。火山返回空结果（-61 或空文本）时，
    *   用 MiMo 对同一段（已增益/补静音的）音频再识别一遍；只采纳包含
@@ -8742,6 +9039,11 @@ static void process_ai_dialogue(sm_context_t *ctx)
     }
 
   if (realtime_try(text_buf, ctx))
+    {
+      goto dlg_done;
+    }
+
+  if (weather_mimo_try(text_buf, ctx))
     {
       goto dlg_done;
     }
@@ -9632,8 +9934,22 @@ int main(int argc, char *argv[])
       printf("[警告] TTS 后端都不可用\n");
     }
 
-  /* ── ASR：配了火山凭据就火山优先（能听方言），否则 MiMo ── */
-  if (volc_asr_available() && voice_asr_set_backend("volcengine") == 0)
+  /* ── ASR：配了火山凭据就火山优先（能听方言），否则 MiMo ──
+   *
+   * ★ 2026-11-04 测试开关：**MiMo 主用**。用户怀疑火山流式 ASR 的
+   *   TLS/WebSocket/分块上传占了 e2e 的大头（日志 infer 只有 0.5s，
+   *   e2e 却 6~10s）。MiMo ASR 是单个 HTTPS POST，先用它测同一批短句
+   *   的耗时与准确率；失败自动回落火山。测完把下面的宏改 0 即恢复火山主用。 */
+#ifndef ASR_PRIMARY_MIMO_TEST
+#define ASR_PRIMARY_MIMO_TEST 1
+#endif
+
+  if (ASR_PRIMARY_MIMO_TEST && mimo_voice_available() &&
+      voice_asr_set_backend("mimo") == 0)
+    {
+      printf("[初始化] ASR 后端: MiMo 主用（测试：先 MiMo，失败回落火山）\n");
+    }
+  else if (volc_asr_available() && voice_asr_set_backend("volcengine") == 0)
     {
       printf("[初始化] ASR 后端: 火山引擎 (volcengine)"
              "（方言自动判别，出错自动回落 MiMo）\n");

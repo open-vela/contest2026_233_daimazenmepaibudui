@@ -226,3 +226,13 @@ close**（`stage=DONE`），驱动的 DMA 缓冲里还有尾音在放；`play_pr
 - **简单问答直连 MiMo 关闭**：真机实测直连 LLM 段 11.9/10.5/26.3 秒，反而更慢且占住识别线程；已置 `AI_SIMPLE_CHAT_DIRECT=0`，问答统一回 velaclaw。
 - **UI 主题修正**：整机为**黄白色暖调**（奶油黄白底、白色圆角卡片、暖阳黄主色），此前 README 写成“绿色主题”有误，已修正。
 - **僵尸报警页自动收摊**：报警源结束且 voice_emerg 未激活连续 6 秒，自动撤页，防触摸 IC 失效把页面永久挡在主界面上。
+
+## 13. 语音链路加速与长连接保活（2026-11-04，complete5）
+
+- **ASR 并行赛跑**：每段语音先起 MiMo 线程，再起火山线程，两个后端同时跑；谁先返回非空文本就用谁，另一个线程跑完丢弃（不中途拆 TLS）。12 秒超时；PCM 用引用计数，loser 返回时不会读到已释放的缓冲。任一后端不可用自动退回原来的串行 `voice_asr_recognize()`。串口判据：`[ASR] 并行赛跑（MiMo 先发 / 火山同时发）ret=0`、`[ASR] 并行 MiMo 返回（…）`、`[ASR] 并行火山返回（…）`。
+- **MiMo 主用测试开关**：`ASR_PRIMARY_MIMO_TEST=1` 时串行兜底也优先 MiMo，失败回落火山。注意该宏不影响并行赛跑分支（赛跑由 `ASR_RACE_MIMO_VOLC` 独立控制）。
+- **TCP keep-alive**：`vela_tls.c` 在每条 TLS socket 上设置 `SO_KEEPALIVE`；板级 defconfig 打开 `CONFIG_NET_TCP_KEEPALIVE=y`。连接池中的长连接对端悄悄消失时由内核探测并标记，减少“复用半开连接等到超时”。串口判据：`[vela_tls] keepalive on fd=N`。
+- **天气直接问 MiMo**：天气意图交给 MiMo 的 `get_weather` 工具（IP 定位 + Open-Meteo），MiMo 失败时回落本地 Open-Meteo 快路；不再使用和风天气，配置里已移除 `qweather_host` / `qweather_api_key`。
+- **MiMo ASR 耗时打点**：每次请求打印 `[mimo_voice] ASR: 请求耗时 N ms (HTTP 200)`，用于和火山 e2e 对比。
+
+真机 10 句回归（17:05 固件）：25 轮并行中 MiMo 全部返回文本，火山 24 次返回、其中绝大多数为 `-61`（ENODATA，服务端未听出字）；火山唯一出字一轮用时 3830 ms，略快于同轮 MiMo 的 4122 ms。MiMo 单次 ASR 实测 1.6~8.5 s。**已知风险**：弱音/噪声下 MiMo 会编字（实测“Okay.”“Yeah.”“八百万。”“上楼，这几年没有买裤子。”），火山 `-61` 时不能无条件采信 MiMo 结果，后续需按音频能量门控或只认火山结果。
