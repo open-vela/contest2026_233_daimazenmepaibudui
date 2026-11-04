@@ -11,7 +11,7 @@
 | 功能 | 实现 |
 |---|---|
 | 语音问答 | 火山 ASR 2.0 与 MiMo ASR **并行赛跑**（先返回非空文本者用）→ 大模型（velaclaw/ReAct，超时回落直连）→ 火山「语音合成2.0」TTS，MiMo 单块兜底 |
-| 天气 | **直接问 MiMo**（get_weather 工具：IP 定位 + Open-Meteo 免 key）；MiMo 失败时回落本地 Open-Meteo 快路 |
+| 天气 | 和风天气（配置后优先）→ Open-Meteo（免 key 兜底）；识别到天气意图直接查，跳过 LLM |
 | 实时信息 | 用户原话直接交 Tavily 通用检索 → 新浪财经免 key 兜底；念前 3 条标题 + 第一段正文（过滤版权/页脚） |
 | 搜索 | Tavily → SerpAPI → Exa（按配置的 key 依次尝试） |
 | 急救报警 | 关键词「救命/报警/着火」（20+ 变体）+ 本地撞击检测；响铃 → 10 秒确认 → Bark 通知 → 30 秒重发 → 3 分钟自停 |
@@ -52,6 +52,7 @@
 
 | 服务 | 用途 | 是否必需 |
 |---|---|---|
+| 和风天气（QWeather） | 天气（配置后优先） | 否，未配置走 Open-Meteo |
 | Tavily | 新闻 / 搜索 | 强烈建议配置 |
 | 新浪财经 | 新闻免 key 兜底 | 否（免 key） |
 | Open-Meteo | 天气免 key 兜底 | 否（免 key） |
@@ -90,6 +91,9 @@ board/contest_board/src/etc/assets/
   "volc_asr_resource": "volc.seedasr.sauc.duration",
   "volc_speaker": "zh_female_vv_uranus_bigtts",
 
+  "qweather_host": "<你的和风天气 API Host>",
+  "qweather_api_key": "<你的和风天气 API Key>",
+
   "tavily_key": "<你的 Tavily API Key（tvly- 开头）>"
 }
 ```
@@ -102,14 +106,21 @@ board/contest_board/src/etc/assets/
 | `volc_api_key` | 火山引擎控制台 → API Key 管理 | `xxxxxxxx-xxxx-...-xxxxxxxxxxxx`（36 位 UUID） |
 | `volc_asr_resource` | 固定值 | `volc.seedasr.sauc.duration` |
 | `volc_speaker` | 固定值（TTS 2.0 音色） | `zh_female_vv_uranus_bigtts` |
+| `qweather_host` | [和风天气控制台](https://console.qweather.com) → 设置 → API Host | `xxxxxxxxxx.re.qweatherapi.com` |
+| `qweather_api_key` | 和风天气控制台 → 项目管理 → API KEY | `xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx`（32 位） |
 | `tavily_key` | [Tavily 控制台](https://app.tavily.com) → API Keys | `tvly-xxxxxxxx...`（58 位） |
 | `push_key.txt` | Bark App → 设备 → 复制 Key | 一行纯文本 |
 
-### 3.4 天气：MiMo + Open-Meteo（不再接和风）
+### 3.4 和风天气配置说明
 
-天气问题直接交给 MiMo 的 `get_weather` 工具：MiMo 用 IP 定位到城市（城市级），
-再调 Open-Meteo 免 key 接口取实况；MiMo 失败时回落到本地 Open-Meteo 快路。
-**不再使用和风天气**，配置里不需要 `qweather_host` / `qweather_api_key`。
+和风天气使用**新版控制台**，每个账号有独立的 API Host：
+
+1. 登录 [console.qweather.com](https://console.qweather.com)
+2. 进入「设置」→「API Host」，复制你的专属 Host（如 `xxxxxxxxxx.re.qweatherapi.com`）
+3. 进入「项目管理」→ 创建项目 → 获取 API KEY（32 位十六进制）
+4. 填入 `agent_config.json` 的 `qweather_host` 和 `qweather_api_key`
+
+> 未配置时自动退化到 Open-Meteo（免 key），功能不受影响，只是城市精度稍差。
 
 ### 3.5 Tavily 配置说明
 
@@ -186,7 +197,7 @@ ping -c 2 192.168.137.2    # 通
 |---|---|---|
 | 语音问答 | 说「给我讲个小故事」 | `[AI] 识别结果` → `[volc_tts] TTS V3 request` → 出声 |
 | 短句秒回 | 说「你好」 | `[短句快路]` → 1 秒内出声 |
-| 天气 | 说「济南天气怎么样」 | `[天气] 直接问 MiMo`（MiMo 失败后回落 `[天气快路]`），20 秒内出声 |
+| 天气 | 说「济南天气怎么样」 | `[天气快路]` 或 `[web_search] QWeather configured`，20 秒内出声 |
 | 实时信息 | 说「今天有什么新闻」 | `[实时] Tavily 查询：…` + `[实时] 取到结果`，念标题+正文 |
 | 急救关键词 | 喊「救命」 | `[急救词] 命中` → 响铃 |
 | 撞击求救 | 15 秒内敲两下 | `第一次撞击…` → `第二次撞击…确认求救` |

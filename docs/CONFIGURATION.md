@@ -36,7 +36,10 @@
   "volc_asr_resource": "volc.seedasr.sauc.duration",
   "volc_speaker": "zh_female_vv_uranus_bigtts",
 
-  "tavily_key": "<你的 Tavily API Key（tvly…）>"
+  "tavily_key": "<你的 Tavily API Key（tvly…）>",
+
+  "qweather_host": "<你的和风天气 API Host>",
+  "qweather_api_key": "<你的和风天气 API Key（32 位）>"
 }
 ```
 
@@ -52,6 +55,8 @@
 | `volc_asr_resource` | 火山 ASR 2.0：`volc.seedasr.sauc.duration` |
 | `volc_speaker` | 火山 TTS 2.0 音色；必须属于 `seed-tts-2.0` 资源 |
 | `tavily_key` | **键名必须是 `tavily_key`**（`tvly-` 开头，58 位）。配了它，web_search/新闻优先走 Tavily；新浪财经只是免 key 兜底。⚠ 搜索 key 是**每个 app 一份静态变量**：ai_agent 与 hello_app 都要调用 `tool_web_search_init()`（已在 hello_app 启动时补上） |
+| `qweather_host` | 和风天气**新版控制台**的专属 API Host（如 `xxxxxxxxxx.re.qweatherapi.com`）。在 [console.qweather.com](https://console.qweather.com) → 设置 → API Host 获取 |
+| `qweather_api_key` | 和风天气 API KEY（32 位十六进制）。控制台 → 项目管理 → API KEY 获取。**两个都配齐才走和风**，缺一走 Open-Meteo 免 key |
 
 ### 火山 TTS 2.0（2026-11-01 起）
 
@@ -86,18 +91,30 @@ Content-Type: application/json
 **报警推送节奏**（`voice_emerg.c`）：10 秒确认期没人说「没事」→ 首发 Bark；
 之后每 30 秒重发；180 秒自停。串口判据：`[PUSH] OK: HTTP 200`。
 
-## 3.6 天气：MiMo + Open-Meteo（不再接和风）
+## 3.6 和风天气（QWeather）详细配置
 
-天气问题直接交给 MiMo 的 `get_weather` 工具：MiMo 用 IP 定位到城市（城市级），
-再调 Open-Meteo 免 key 接口取实况；MiMo 失败时回落到本地 Open-Meteo 快路。
-**不再使用和风天气**，配置里不需要 `qweather_host` / `qweather_api_key`。
+和风天气新版控制台给每个账号分配**独立的 API Host**，不再共用 `devapi.qweather.com`：
 
-串口判据：
+1. 登录 [console.qweather.com](https://console.qweather.com)
+2. 左侧「设置」→「API Host」→ 复制你的专属 Host
+3. 「项目管理」→ 新建项目 → 免费订阅 → 在项目详情「KEY」处复制 API KEY
+4. 填入 `agent_config.json`：
+
+```json
+"qweather_host": "<你的专属 API Host，如 xxxxx.re.qweatherapi.com>",
+"qweather_api_key": "<你的 32 位 API KEY>"
+```
+
+**判据**（串口）：
 
 ```
-[天气] 直接问 MiMo（get_weather -> Open-Meteo）：…
-[天气] MiMo 回复（N 字节）：…
+[web_search] QWeather configured（host/key 长度 xx/xx，值不打）
 ```
+
+如果看到 `QWeather 未配齐`，说明两个字段有一个没填。
+
+> 和风天气免费额度：每天 1000 次，对家用足够。
+> 未配置时自动走 Open-Meteo（免 key），天气照常可用，只是城市精度稍差。
 
 ## 3.7 Tavily 详细配置
 
@@ -113,7 +130,7 @@ Content-Type: application/json
 ```
 
 > 免费额度：每月 1000 次搜索。未配置时新闻走新浪财经（只有财经要闻），
-> 搜索功能不可用；天气走 MiMo + Open-Meteo，不受影响。
+> 搜索功能不可用，但天气快路不受影响（它走和风/Open-Meteo）。
 
 ## 4. 常见配置问题
 

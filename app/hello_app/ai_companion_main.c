@@ -7480,64 +7480,6 @@ static void weather_tts_friendly(const char *in, char *out, size_t cap)
  * @brief  天气快速通道。返回 true = 已经交给 TTS 回调（本轮到止）。
  */
 
-/* ★ 2026-11-04：**天气直接问 MiMo**（不再接和风天气）。
- *
- *   MiMo 侧 weather 工具默认开启，工具内部用 IP 定位 + Open-Meteo；
- *   这里把整句话交给 mimo_chat()，让 MiMo 自己调 get_weather 并组织回答。
- *   MiMo 失败/没配时才回落到原来的本地天气快路（Open-Meteo 直查）。
- *   和风天气的配置键已从 agent_config.json 移除，代码不再依赖它。 */
-static bool weather_mimo_try(const char *text, sm_context_t *ctx)
-{
-  static const char *const kw[] =
-  {
-    "天气", "气温", "下雨", "温度", "冷不冷", "热不热", "刮风",
-  };
-
-  char   reply[512];
-  bool   hit = false;
-  size_t i;
-  int    ret;
-
-  if (text == NULL || text[0] == '\0' || !g_net_started ||
-      !mimo_voice_available())
-    {
-      return false;
-    }
-
-  for (i = 0; i < sizeof(kw) / sizeof(kw[0]); i++)
-    {
-      if (strstr(text, kw[i]) != NULL)
-        {
-          hit = true;
-          break;
-        }
-    }
-
-  if (!hit)
-    {
-      return false;
-    }
-
-  round_phase_set(ROUND_PHASE_LLM);
-  ai_network_send_face(&g_net_ctx, AI_CMD_FACE_THINKING);
-
-  strncpy(g_llm_sent_text, text, sizeof(g_llm_sent_text) - 1);
-  g_llm_sent_text[sizeof(g_llm_sent_text) - 1] = '\0';
-
-  printf("[天气] 直接问 MiMo（get_weather -> Open-Meteo）：%s\n", text);
-
-  ret = mimo_chat(text, reply, sizeof(reply));
-  if (ret > 0 && reply[0] != '\0')
-    {
-      printf("[天气] MiMo 回复（%d 字节）：%.100s\n", ret, reply);
-      llm_complete_callback(reply, 0, ctx);
-      return true;
-    }
-
-  printf("[天气] MiMo 失败（%d），回落本地 Open-Meteo 快路\n", ret);
-  return false;
-}
-
 static bool weather_fast_try(const char *text, sm_context_t *ctx)
 {
   const char *kwpos = NULL;
@@ -9039,11 +8981,6 @@ static void process_ai_dialogue(sm_context_t *ctx)
     }
 
   if (realtime_try(text_buf, ctx))
-    {
-      goto dlg_done;
-    }
-
-  if (weather_mimo_try(text_buf, ctx))
     {
       goto dlg_done;
     }
