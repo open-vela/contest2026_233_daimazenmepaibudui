@@ -16,7 +16,7 @@
 | 搜索 | Tavily → SerpAPI → Exa（按配置的 key 依次尝试） |
 | 急救报警 | 关键词「救命/报警/着火」（20+ 变体）+ 本地撞击检测；响铃 → 10 秒确认 → Bark 通知 → 30 秒重发 → 3 分钟自停 |
 | 语音取消 | 报警听窗内短句按 UTF-8 字符数（≤15 字）判「没事」；低电平短句补静音+最多 10× 增益；火山空结果时 MiMo 二次识别（只认「没事/不用/没有」）；屏幕按钮也停铃 |
-| 本地声音 | DSCNN-lite：fall/knock/scream；撞击需单次 ≥0.80 或 15 秒内两次 |
+| 本地声音 | DSCNN-lite：fall/knock/scream；撞击需单次 ≥0.80 或 15 秒内两次；训练/导出见 [tools/audio_event/README.md](tools/audio_event/README.md) |
 | 提醒 | RTC 日循环闹钟 + 语音建提醒（RAM，掉电丢失） |
 | 屏幕/交互 | 390×450 圆角屏、**黄白色暖调主题**（奶油黄白底 + 白色圆角卡片 + 暖阳黄主色）、时钟（UTC+8）、菜单、设置、报警页 |
 | 联网 | USB RNDIS + PC 侧 NAT；TLS 长连接开启 TCP keep-alive；联网后 HTTPS `Date:` 头自动对时 |
