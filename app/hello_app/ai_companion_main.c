@@ -1137,6 +1137,22 @@ static bool              g_dlg_thread_valid = false;
 static bool              g_dlg_ready = false;  /* sem 已 init */
 static volatile bool     g_dlg_worker_alive = false;  /* 线程此刻还在圈里 */
 
+/* ★ 2026-11-02：**识别线程的"代"**。
+ *
+ *   hello_app 被界面「重置」/ --assume-dead 拉起时，上一代的识别线程可能
+ *   正卡在 ASR 的网络调用里（不在 sem_wait 上），主线程收尾根本等不到它。
+ *   上一代 static 里 g_dlg_thread_valid / g_dlg_worker_alive 都还是 true，
+ *   新实例开机看到「识别线程已在跑（接管路径，沿用）」就不再建线程 ——
+ *   可真正等信号量的那条线程已经不会回来了。结果：每一段语音投进信号量
+ *   没人取，30 秒后看门狗把它作废，**整机从此"说了没反应"**。
+ *   （真机 2026-11-02 20:06：重置后第 6/7 轮都卡在 ASR 相位作废。）
+ *
+ *   现在每次 main() 真正初始化时 g_app_instance++；工作线程记住自己那一代，
+ *   循环里一发现代变了就退出（绝不再抢信号量）；新实例的建线程条件带上
+ *   "工作线程的代 == 当前代"，代对不上就新建一条。 */
+static volatile uint32_t g_app_instance;
+static volatile uint32_t g_dlg_worker_instance;
+
 static void dialogue_request(sm_context_t *ctx);
 static void process_ai_dialogue(sm_context_t *ctx);   /* 定义在识别线程之后 */
 
@@ -1226,14 +1242,25 @@ static void speech_capture_complete(sm_context_t *ctx)
       printf("[VAD] 峰值 %u < 300，判定为没听到有效人声，不送云端识别\n",
              (unsigned)g_speech_peak);
 
-      /* 上屏 + 出声（S4.3）。文案用 prompt_ack.h 的 PROMPT_MISS_TEXT，
-       * **必须和以后要合成进 ROMFS 的那句逐字一样** —— tts_cache 是按文案
-       * 算哈希查表的，屏上念的和将来要说的是同一句才对得上。 */
-      robot_ui_bridge_voice_reply(PROMPT_MISS_TEXT);
+      /* ★ 2026-11-02：**报警中绝不播「没听清」**。
+       *   真机（19:55 报警）：「没听清」两次各 2.7 秒，正好压在急救听窗上，
+       *   半双工把录音掐掉 → 老人说「没事」根本没进 ASR，只能干等按钮。
+       *   报警时麦克风是唯一重要的东西，任何提示音都必须让路。 */
+      if (voice_emerg_is_active())
+        {
+          printf("[提示音] 报警中，跳过「没听清」提示（不能抢麦克风）\n");
+        }
+      else
+        {
+          /* 上屏 + 出声（S4.3）。文案用 prompt_ack.h 的 PROMPT_MISS_TEXT，
+           * **必须和以后要合成进 ROMFS 的那句逐字一样** —— tts_cache 是按文案
+           * 算哈希查表的，屏上念的和将来要说的是同一句才对得上。 */
+          robot_ui_bridge_voice_reply(PROMPT_MISS_TEXT);
 
-      /* 本函数跑在录音线程上，出声只能托给 main_loop_task（见
-       * g_say_miss_pending 的说明）。 */
-      g_say_miss_pending = true;
+          /* 本函数跑在录音线程上，出声只能托给 main_loop_task（见
+           * g_say_miss_pending 的说明）。 */
+          g_say_miss_pending = true;
+        }
 
       robot_ui_bridge_voice_state(ROBOT_UI_BRIDGE_VOICE_IDLE);
 
@@ -2381,6 +2408,55 @@ static void listen_supervise_tick(sm_context_t *ctx)
    *
    * 用户反馈："AI 在说话的时候有时候会断掉，一会自己会继续说，怀疑如果 AI
    * 在说话时旁边又有声音，AI 会停止说话然后监听，这个问题要解决。"
+   *
+   * 实锤是流水线 TTS 的首句→尾段空档（尾段还在"每 64 字一次 HTTPS"地合成）：
+   * 那段里半双工契约会把常开监听恢复起来，麦一开，VAD 就把状态机从"正在说"
+   * 切到"正在听"。record_hold 由播报轮在首句起播前置真、整轮收尾
+   * （play_complete_callback → audio_record_hold_end）才清。
+   *
+   * 这里必须挡：上面那条"扬声器在响就别抢"只看 audio_is_playing()，而空档里
+   * playing 已经是 false 了；再往下 want_mute（5 秒）就会把锁冲掉、直接开麦。
+   * 计时器一并清零 —— 让路期间的"听不见"不算断，锁一解除从头计。
+   *
+   * ★★ 但**不能整体早退**（2026-10-25 修）：原来这里 return 一行直接走人，
+   * 结果是"看门狗被它要看护的东西关掉了" —— 一轮若死在置锁之后、交还之前
+   * （三条清锁路径 audio_record_start / audio_play_stop / audio_record_hold_end
+   * 一条都没触发），麦永久锁死，而守护因为锁立着连查都不查，只能重启。
+   * 现在让路期间**只豁免其它判据，保留「查持锁截止」这一条**：锁立着且超过
+   * HOLD_MAX_MS 就当持有者已经死了，强制交还并大声留一行。
+   *
+   * 另外两条兜底不变：audio_record_start() / audio_play_stop() 都会主动清它
+   * （有人明确要动设备，锁就该让路），加上整轮收尾那条。 */
+
+  if (g_audio_ctx.record_hold)
+    {
+      g_listen_dead_since = 0;
+      g_listen_mute_since = 0;
+      g_listen_mute_logged = false;
+      g_listen_zombie_since = 0;
+      g_listen_zombie_logged = false;
+
+      /* 【唯一保留的判据】持锁超期 = 持有者没能把它交回来。 */
+      if (g_hold_deadline_ms != 0 &&
+          (int32_t)(main_now_ms() - g_hold_deadline_ms) >= 0)
+        {
+          printf("[音频] ★★ 让路锁超期（轮 %lu，超 %ld ms）强制交还麦克风"
+                 "—— 持锁那一轮死了没来收，这是「后面又不能对话」的形状\n",
+                 (unsigned long)g_hold_owner_round,
+                 (long)(main_now_ms() - g_hold_deadline_ms));
+          round_hold_give("守护：持锁超期强制交还");
+        }
+
+      return;
+    }
+
+  /* ---- 【2026-09-19 新加】"会话活着、设备读却再也不回来"那种永久聋 -------
+   *
+   * 真机形状（本轮定案）：录音标志全健康，但录音线程卡在 sf32lb52_audio_read()
+   * 里那次等待上再也出不来（内核定时等待的超时被 DMA 中断抢掉，之后这一次等待
+   * 彻底没有上界）。唯一看得见它的量是录音线程自己写下的 record_read_start_ms
+   * 的年龄 —— 就是 diag 里那个 wait。判据和理由（为什么 8 秒、为什么不带任何
+   * 别人维护的豁免项）写在 LISTEN_SUPERVISE_RX_STALL_MS 头顶那一段。
    *
    * 实锤是流水线 TTS 的首句→尾段空档（尾段还在"每 64 字一次 HTTPS"地合成）：
    * 那段里半双工契约会把常开监听恢复起来，麦一开，VAD 就把状态机从"正在说"
@@ -7138,11 +7214,14 @@ static void publish_user_said(const char *text)
 static void *dialogue_worker(void *arg)
 {
   sm_context_t *ctx = (sm_context_t *)arg;
+  uint32_t      my_instance = g_app_instance;
 
+  g_dlg_worker_instance = my_instance;
   g_dlg_worker_alive = true;
-  printf("[识别] 识别线程进入服务\n");
+  printf("[识别] 识别线程进入服务（代 %lu）\n",
+         (unsigned long)my_instance);
 
-  while (g_running)
+  while (g_running && g_app_instance == my_instance)
     {
       if (sem_wait(&g_dlg_sem) != 0)
         {
@@ -7155,7 +7234,7 @@ static void *dialogue_worker(void *arg)
           break;
         }
 
-      if (!g_running)
+      if (!g_running || g_app_instance != my_instance)
         {
           break;
         }
@@ -7179,7 +7258,15 @@ static void *dialogue_worker(void *arg)
        * 失败不用管：-EBUSY 说明真答复已经先出声了（正常竞态），其它负值
        * 只是没听到这一声，不影响本轮对话继续往下走。 */
 
-      if (g_wake_greet_pending)
+      /* ★ 2026-11-02：**报警期间绝不播「嗯，我在」**。
+       *   真机：报警听窗里收到「没事」→ 开麦 → 紧接着 prompt_ack 起播，
+       *   半双工把录音掐掉，ASR 只拿到 300 ms 音频 → No text recognized。
+       *   报警时麦克风是唯一重要的东西，提示音必须让路。 */
+      if (voice_emerg_is_active())
+        {
+          printf("[提示音] 报警中，跳过「嗯，我在」（不能抢麦克风）\n");
+        }
+      else if (g_wake_greet_pending)
         {
           /* ★ 唤醒问候（「你好！有什么需要帮助的吗？」）刚说过，这一声
            *   「嗯，我在」跳过 —— 两句话啰嗦，而且 prompt_ack 那条会把
@@ -7200,8 +7287,18 @@ static void *dialogue_worker(void *arg)
    * 醒来，它就真的退了 —— 而 g_dlg_thread_valid 还是 true，之后每一句的
    * sem_post 都落进没人听的信号量里，对话从此静默。有了这一句，
    * dialogue_request 能发现"线程不在了"，直接同步跑，退化而不是失聪。 */
-  g_dlg_worker_alive = false;
-  printf("[识别] 识别线程退出（之后每一轮走同步兜底）\n");
+  /* 只清自己那一代的标记：新一代可能已经起来（收尾慢的旧线程醒来时），
+   * 不能把新线程的 alive 一并抹掉。 */
+  if (g_dlg_worker_instance == my_instance)
+    {
+      g_dlg_worker_alive = false;
+      printf("[识别] 识别线程退出（之后每一轮走同步兜底）\n");
+    }
+  else
+    {
+      printf("[识别] 上一代识别线程退出（代 %lu），不碰当前代\n",
+             (unsigned long)my_instance);
+    }
   return NULL;
 }
 
@@ -7423,6 +7520,8 @@ static void weather_tts_friendly(const char *in, char *out, size_t cap)
         {
           out[o++] = *p++;
         }
+
+      return 1;
     }
 
   out[o] = '\0';
@@ -7548,6 +7647,13 @@ static bool weather_fast_try(const char *text, sm_context_t *ctx)
 
   printf("[天气快路] 城市=%s，直接查 Open-Meteo（跳过 velaclaw/LLM）\n", city);
 
+  /* ★ 2026-11-02：**查天气前把轮次相位从 ASR 挪到 LLM**。
+   *   真机 20:33：Open-Meteo 那一路走了 27 秒（geocoding + 预报两次
+   *   TLS），可看门狗还按"ASR 30 秒"计时 → 15 秒后把这一轮作废，天气
+   *   其实随后查成了、TTS 也念了，但轮次状态已经乱了，后面几轮接连
+   *   "卡在 ASR 相位"作废。LLM 相位上限 45 秒，够这类快路用。 */
+  round_phase_set(ROUND_PHASE_LLM);
+
   if (mimo_weather_lookup(city, raw, sizeof(raw)) != 0 ||
       raw[0] == '\0' ||
       strstr(raw, "没找到") != NULL || strstr(raw, "不可用") != NULL ||
@@ -7575,6 +7681,62 @@ static bool weather_fast_try(const char *text, sm_context_t *ctx)
  * 模板，不经过任何大模型（不受模型心情、上下文、工具轮影响）。
  * 局限：ASR 必须把关键词转出来；ASR 丢字时快路也触发不了。
  * ======================================================================== */
+
+/* ==========================================================================
+ * ★ 2026-11-02 常用短句快路（免 LLM，秒回）
+ *
+ *   用户说「你好」「谢谢」「再见」「好的」这类短句时，走 LLM 要 8~10 秒。
+ *   这里直接念预设回复，**不到 1 秒出声**。
+ *   匹配规则：文本 ≤ 8 字 + 精确/前缀匹配关键词。
+ * ======================================================================== */
+
+static bool greeting_fast_try(const char *text, sm_context_t *ctx)
+{
+  static const struct { const char *key; const char *reply; } table[] =
+  {
+    { "你好",     "你好！有什么可以帮你的吗？" },
+    { "您好",     "您好！有什么可以帮你的吗？" },
+    { "谢谢",     "不客气！有需要随时叫我。" },
+    { "谢谢你",   "不客气！有需要随时叫我。" },
+    { "再见",     "好的，再见！注意安全。" },
+    { "拜拜",     "好的，再见！注意安全。" },
+    { "好的",     "好的，我知道了。" },
+    { "好",       "好的。" },
+    { "嗯",       "嗯，我在。" },
+    { "嗯嗯",     "嗯，我在。" },
+    { "晚安",     "晚安！祝您睡个好觉。" },
+    { "早上好",   "早上好！今天天气不错，有什么需要帮忙的吗？" },
+    { "早上好！", "早上好！今天天气不错，有什么需要帮忙的吗？" },
+    { "下午好",   "下午好！有什么可以帮你的吗？" },
+    { "晚上好",   "晚上好！有什么可以帮你的吗？" },
+    { "辛苦了",   "不辛苦！能帮到您就好。" },
+    { "不错",     "谢谢夸奖！" },
+    { "真棒",     "谢谢夸奖！" },
+  };
+
+  size_t i;
+  size_t tlen = (text != NULL) ? strlen(text) : 0;
+
+  if (tlen == 0 || tlen > 8)
+    {
+      return false;
+    }
+
+  for (i = 0; i < sizeof(table) / sizeof(table[0]); i++)
+    {
+      if (strcmp(text, table[i].key) == 0 ||
+          (tlen > strlen(table[i].key) &&
+           strncmp(text, table[i].key, strlen(table[i].key)) == 0 &&
+           tlen - strlen(table[i].key) <= 2))
+        {
+          printf("[短句快路] 「%s」-> 直接念预设回复\n", text);
+          llm_complete_callback(table[i].reply, 0, ctx);
+          return true;
+        }
+    }
+
+  return false;
+}
 
 static bool selfintro_fast_try(const char *text, sm_context_t *ctx)
 {
@@ -7613,125 +7775,6 @@ static bool selfintro_fast_try(const char *text, sm_context_t *ctx)
 }
 
 /* ==========================================================================
- * ★ 2026-11-02 新闻概括（用户问「第X条详细说说」）
- *
- *   新闻快路念完 5 条标题后，用户想了解某一条的具体内容。
- *   这里存最近一次搜索的标题，用户说「第X条」「详细说说」「概括一下」时，
- *   用 Tavily 搜那条标题拿正文摘要，念前 2~3 句。
- *   不经过大模型 —— 直接从 Tavily 的 content 字段截取。
- * ======================================================================== */
-
-static char g_news_titles[5][128];
-static int  g_news_count = 0;
-
-static bool news_detail_try(const char *text, sm_context_t *ctx)
-{
-  static const char *const kw[] =
-  {
-    "详细", "概括", "讲讲", "说说", "说一下", "介绍", "内容", "讲什么",
-    "第一条", "第二条", "第三条", "第四条", "第五条",
-    "第1条", "第2条", "第3条", "第4条", "第5条",
-    "1条", "2条", "3条", "4条", "5条",
-  };
-
-  char     json[256];
-  char     out[2048];
-  char     reply[400];
-  int      idx = -1;
-  size_t   i;
-  int      ret;
-  const char *title;
-
-  if (g_news_count == 0 || text == NULL || text[0] == '\0')
-    {
-      return false;
-    }
-
-  /* 判断是不是"想了解某条新闻" */
-  {
-    bool hit = false;
-
-    for (i = 0; i < sizeof(kw) / sizeof(kw[0]); i++)
-      {
-        if (strstr(text, kw[i]) != NULL)
-          {
-            hit = true;
-            break;
-          }
-      }
-
-    if (!hit)
-      {
-        return false;
-      }
-  }
-
-  /* 解析第几条（支持中文数字和阿拉伯数字） */
-  if (strstr(text, "一") != NULL || strstr(text, "1") != NULL)      idx = 0;
-  else if (strstr(text, "二") != NULL || strstr(text, "2") != NULL)  idx = 1;
-  else if (strstr(text, "三") != NULL || strstr(text, "3") != NULL)  idx = 2;
-  else if (strstr(text, "四") != NULL || strstr(text, "4") != NULL)  idx = 3;
-  else if (strstr(text, "五") != NULL || strstr(text, "5") != NULL)  idx = 4;
-
-  if (idx < 0 || idx >= g_news_count)
-    {
-      /* 没指定第几条 → 概括第一条 */
-      idx = 0;
-    }
-
-  title = g_news_titles[idx];
-  printf("[新闻概括] 第 %d 条「%s」-> 搜正文\n", idx + 1, title);
-
-  /* ★ 2026-11-02：用 **tool_news_search_execute**（带 topic=news），
-   *   不是通用 web_search —— 通用搜索对新闻标题经常返回 0 条或不相关内容。
-   *   news_search 走 Tavily topic=news，能找到对应新闻的正文摘要。 */
-  snprintf(json, sizeof(json), "{\"query\":\"%s\"}", title);
-  out[0] = '\0';
-  ret = tool_news_search_execute(json, out, sizeof(out));
-  if (ret != 0 || out[0] == '\0')
-    {
-      printf("[新闻概括] 搜正文失败（%d），回落到大模型\n", ret);
-      return false;
-    }
-
-  /* 取第一条结果的 content 前 200 字节（Tavily 输出格式：1. 标题\n   URL\n   内容） */
-  {
-    const char *body = strstr(out, "\n   ");
-    size_t n = 0;
-
-    if (body != NULL)
-      {
-        body += 4;   /* skip "\n   " */
-        /* 跳过 URL 行 */
-        const char *nl = strchr(body, '\n');
-        if (nl != NULL) body = nl + 1;
-        /* 跳过前导空格 */
-        while (*body == ' ') body++;
-
-        while (body[n] != '\0' && body[n] != '\n' && n < 200)
-          {
-            n++;
-          }
-        while (n > 0 && ((unsigned char)body[n] & 0xc0) == 0x80)
-          {
-            n--;
-          }
-        memcpy(reply, body, n);
-        reply[n] = '\0';
-      }
-    else
-      {
-        /* 没有 content 格式，取第一条标题行 */
-        snprintf(reply, sizeof(reply), "%s", out);
-      }
-  }
-
-  printf("[新闻概括] 摘要：%s\n", reply);
-  llm_complete_callback(reply, 0, ctx);
-  return true;
-}
-
-/* ==========================================================================
  * ★ 2026-11-01 新闻快速通道
  *
  * 真机：问「今天有什么国际新闻吗」——新浪 5 条、Tavily 8191 字节**都搜到了**，
@@ -7744,22 +7787,89 @@ static bool news_detail_try(const char *text, sm_context_t *ctx)
  * 标题直接交给 TTS。失败就回落原路径。
  * ======================================================================== */
 
-static bool news_fast_try(const char *text, sm_context_t *ctx)
+/* 在 [b, b+n) 里找 needle（行长没有 NUL 结尾，不能用 strstr —— 会串到下一行）。 */
+static bool news_line_has(const char *b, size_t n, const char *needle)
+{
+  size_t nl = strlen(needle);
+  size_t i;
+
+  if (nl == 0 || nl > n)
+    {
+      return false;
+    }
+
+  for (i = 0; i + nl <= n; i++)
+    {
+      if (memcmp(b + i, needle, nl) == 0)
+        {
+          return true;
+        }
+    }
+
+  return false;
+}
+
+/* 这一行是不是页脚/版权/导航之类，**不该念给老人听**的东西。
+ *
+ * 真机样本（2026-11-02，问「娱乐新闻」）：Tavily 对「张震岳宣布开唱」
+ * 这条抽出的正文只有站点页脚
+ *   "Copyright© 2000 - 2026 The Epoch TimesAssociation Inc.All R..."
+ * 旧逻辑把第一段非空行当正文念，于是喇叭里念版权声明。 */
+static bool news_body_line_is_junk(const char *b, size_t n)
+{
+  static const char *const junk[] =
+  {
+    "Copyright", "copyright", "©", "All Rights", "All rights",
+    "版权所有", "免责声明", "责任编辑", "京ICP", "ICP备", "网站地图",
+    "扫一扫", "扫码", "关注我们", "客户端", "下载", "登录", "注册",
+    "关于我们", "联系我们", "首页", "广告", "window.", "document.",
+    "function(", "var ", ".js",
+  };
+
+  size_t i;
+
+  if (n < 6)                    /* 太短，不像一句话（标点/分隔符） */
+    {
+      return true;
+    }
+
+  for (i = 0; i < sizeof(junk) / sizeof(junk[0]); i++)
+    {
+      if (news_line_has(b, n, junk[i]))
+        {
+          return true;
+        }
+    }
+
+  return false;
+}
+
+/* ★ 2026-11-02：新闻分类/概括那套整个撤掉，只留这一条主干 ——
+ *   **用户问实时消息时，直接把原话交给 Tavily 搜，念前 3 条标题+一句正文。**
+ *   用户原话："新闻解决不了就不要了，就单纯的可以用 Tavily 来实现获得实时消息
+ *   功能就好了。" 所以这里不再猜娱乐/体育/财经，也不再存标题做「第X条」追问。 */
+static bool realtime_try(const char *text, sm_context_t *ctx)
 {
   static const char *const kw[] =
   {
-    "新闻", "头条", "要闻", "热点", "时事", "国际消息", "国内消息",
+    "新闻", "头条", "要闻", "热点", "时事", "实时", "最新", "消息",
+    "国际消息", "国内消息", "今天发生", "最近发生", "发生了什么",
   };
 
   char   json[128];
-  char   out[1024];
+  /* ★ 2026-11-02：**原来的 1024 字节就是"只念一条"的元凶**。
+   *   Tavily 新闻一次能返回 10 条（每条 title+url+content），格式化后
+   *   远超 1 KB；工具按 output_size 截断，串口那句
+   *   "News via Tavily OK: 1023 bytes" 正是顶到 1023/1024 的证据。
+   *   放大到 12 KB（线程栈 32 KB，够用），让 3 条标题+正文拿得全。 */
+  char   out[12288];
   char   reply[960];
   size_t i;
   size_t n;
   bool   hit = false;
   int    ret;
 
-  if (text == NULL || text[0] == '\0')
+  if (text == NULL)
     {
       return false;
     }
@@ -7778,43 +7888,77 @@ static bool news_fast_try(const char *text, sm_context_t *ctx)
       return false;
     }
 
-  /* ★ 2026-11-02：**用简单短查询**。
-   *   真机实测：长查询（如"娱乐圈 明星 最新消息 动态"）在板子上 Tavily 直接
-   *   失败（可能 URL 编码问题），退回新浪给的是财经。PC 实测简单短词全部
-   *   返回 5 条对应类别：「娱乐新闻」→ 明星/影视，「时事新闻」→ 政治/国际。 */
+  /* ★ 2026-11-02：**查询就用用户原话**（去掉 ASR 常带的开头问候语）。
+   *   Tavily 吃自然语言，不需要再手工拆成"娱乐新闻/体育新闻"这种短词；
+   *   那套分类正是"问娱乐给财经"的来源。先走通用 web_search（正文质量比
+   *   news 索引稳），没结果再退 news_search 兜底。 */
 
   {
-    const char *q = "今日新闻";
+    char q[96];
+    size_t qo = 0;
+    const char *s = text;
 
-    if (strstr(text, "娱乐") != NULL || strstr(text, "八卦") != NULL ||
-        strstr(text, "明星") != NULL)
-      q = "娱乐新闻";
-    else if (strstr(text, "体育") != NULL || strstr(text, "球") != NULL)
-      q = "体育新闻";
-    else if (strstr(text, "科技") != NULL || strstr(text, "手机") != NULL ||
-             strstr(text, "AI") != NULL)
-      q = "科技新闻";
-    else if (strstr(text, "政治") != NULL || strstr(text, "时政") != NULL ||
-             strstr(text, "时事") != NULL)
-      q = "时事新闻";
-    else if (strstr(text, "军事") != NULL)
-      q = "军事新闻";
-    else if (strstr(text, "财经") != NULL || strstr(text, "股票") != NULL ||
-             strstr(text, "经济") != NULL)
-      q = "财经新闻";
-    else if (strstr(text, "国际") != NULL)
-      q = "国际新闻";
-    else if (strstr(text, "健康") != NULL || strstr(text, "养生") != NULL)
-      q = "健康新闻";
+    /* 去掉开头的「你好」「你好你好」以及紧跟的逗号/空格 */
+    for (;;)
+      {
+        if (strncmp(s, "你好你好", 12) == 0)
+          {
+            s += 12;
+          }
+        else if (strncmp(s, "你好", 6) == 0)
+          {
+            s += 6;
+          }
+        else
+          {
+            break;
+          }
 
+        while (*s == ' ' || *s == '\t') s++;
+        if ((unsigned char)s[0] == 0xEF && (unsigned char)s[1] == 0xBC &&
+            (unsigned char)s[2] == 0x8C)   /* ， */
+          {
+            s += 3;
+          }
+      }
+
+    while (*s != '\0' && qo < sizeof(q) - 1)
+      {
+        /* 原话里若有引号/反斜杠，会把查询 JSON 拼坏 —— 换成空格 */
+        q[qo++] = (*s == '"' || *s == '\\') ? ' ' : *s;
+        s++;
+      }
+    while (qo > 0 && (q[qo-1] == ' ' || q[qo-1] == '\t'))
+      {
+        qo--;
+      }
+    q[qo] = '\0';
+
+    if (qo == 0)
+      {
+        strcpy(q, "今日新闻");
+      }
+
+    printf("[实时] Tavily 查询：%s\n", q);
     snprintf(json, sizeof(json), "{\"query\":\"%s\"}", q);
   }
 
+  /* 实时检索同样是网络段：先离开 ASR 相位（30 秒上限），否则 Tavily
+   * 一慢就被看门狗当成"ASR 卡死"作废。 */
+  round_phase_set(ROUND_PHASE_LLM);
+
   out[0] = '\0';
-  ret = tool_news_search_execute(json, out, sizeof(out));
-  if (ret != 0 || out[0] == '\0')
+  ret = tool_web_search_execute(json, out, sizeof(out));
+  if (ret != 0 || out[0] == '\0' || strncmp(out, "Error:", 6) == 0)
     {
-      printf("[新闻快路] 搜索没取到（%d），回落到大模型\n", ret);
+      printf("[实时] 通用搜索没取到（%d），改走新闻搜索\n", ret);
+      out[0] = '\0';
+      ret = tool_news_search_execute(json, out, sizeof(out));
+    }
+
+  if (ret != 0 || out[0] == '\0' || strncmp(out, "Error:", 6) == 0)
+    {
+      printf("[实时] 搜索没取到（%d），回落到大模型\n", ret);
       return false;
     }
 
@@ -7836,7 +7980,18 @@ static bool news_fast_try(const char *text, sm_context_t *ctx)
     size_t      w = 0;
     int         taken = 0;
 
-    while (*p != '\0' && taken < 3 && w + 20 < sizeof(reply))
+    /* ★ 2026-11-02：**标题只念一行、正文只念第一段可读文字**。
+     *
+     *   真机乱码的根因：Tavily 的 content 是**多行**（"生活天地\n\n 房产天地…"），
+     *   旧逻辑把"第一个以空格开头的行"当正文，取到的往往是空行后的半个字。
+     *   现在：
+     *     · 编号行 → 标题（剥掉 * 号与 | 来源后缀以后照原样保留）；
+     *     · 其后的 URL 行 → 跳过；
+     *     · 剩余连续的非空行拼成一段，截前 60 字节且**退到 UTF-8 边界**；
+     *     · 最多 3 条。
+     */
+
+    while (*p != '\0' && taken < 3 && w + 24 < sizeof(reply))
       {
         const char *eol = strchr(p, '\n');
         size_t      len = eol ? (size_t)(eol - p) : strlen(p);
@@ -7844,50 +7999,84 @@ static bool news_fast_try(const char *text, sm_context_t *ctx)
         if (len >= 2 && p[0] >= '1' && p[0] <= '9' && p[1] == '.')
           {
             size_t k;
+            size_t tlen = len;
 
-            /* 标题 */
-            for (k = 0; k < len && w + 2 < sizeof(reply); k++)
+            /* ★ 2026-11-02：标题末尾的「 | 来源」不念（「…开唱 | 大紀元」）。
+             *   只认 ASCII 的 " | "，不碰正文里的中文标点。 */
+            for (k = 0; k + 3 <= len; k++)
+              {
+                if (p[k] == ' ' && p[k + 1] == '|' && p[k + 2] == ' ')
+                  {
+                    tlen = k;
+                    break;
+                  }
+              }
+
+            /* ① 标题：整行（去掉 * 号） */
+            for (k = 0; k < tlen && w + 2 < sizeof(reply); k++)
               {
                 if (p[k] != '*') reply[w++] = p[k];
               }
             reply[w++] = '\n';
 
-            /* 往后找内容摘要行（跳过 URL 行） */
+            /* ② 正文：跳过 URL 行，拼接下来的非空行 */
             {
               const char *q = eol ? eol + 1 : NULL;
-              int skipped = 0;
+              size_t      body_bytes = 0;
+              int         guard = 0;
 
-              while (q != NULL && skipped < 3)
+              while (q != NULL && guard < 40 && body_bytes < 60)
                 {
                   const char *qe = strchr(q, '\n');
-                  size_t qlen = qe ? (size_t)(qe - q) : strlen(q);
+                  size_t      qlen = qe ? (size_t)(qe - q) : strlen(q);
+                  const char *b = q;
+                  size_t      n = qlen;
 
-                  /* URL 行（含 http 或以 www 开头）→ 跳过 */
-                  if (qlen > 10 && (strstr(q, "http") == q || strstr(q, "www.") == q))
-                    {
-                      q = qe ? qe + 1 : NULL;
-                      skipped++;
-                      continue;
-                    }
+                  guard++;
 
-                  /* 内容摘要行 → 截前 40 字念出来 */
-                  if (qlen > 4 && q[0] == ' ')
+                  /* 下一条编号行 = 本条结束 */
+                  if (n >= 2 && b[0] >= '1' && b[0] <= '9' && b[1] == '.')
                     {
-                      const char *body = q;
-                      while (*body == ' ') body++;
-                      size_t blen = strlen(body);
-                      if (blen > 60) blen = 60;
-                      while (blen > 0 && ((unsigned char)body[blen] & 0xc0) == 0x80) blen--;
-                      for (k = 0; k < blen && w + 2 < sizeof(reply); k++)
-                        {
-                          if (body[k] != '*') reply[w++] = body[k];
-                        }
-                      reply[w++] = '\n';
                       break;
                     }
 
+                  while (n > 0 && (*b == ' ' || *b == '\t')) { b++; n--; }
+
+                  /* URL 行跳过 */
+                  if (n >= 4 && (strncmp(b, "http", 4) == 0 ||
+                                 strncmp(b, "www.", 4) == 0))
+                    {
+                      q = qe ? qe + 1 : NULL;
+                      continue;
+                    }
+
+                  /* 页脚/版权/导航行跳过，继续找下一行 —— 不能拿版权声明当正文 */
+                  if (news_body_line_is_junk(b, n))
+                    {
+                      q = qe ? qe + 1 : NULL;
+                      continue;
+                    }
+
+                  /* 真正文 → 拼进回复（最多 60 字节，退到 UTF-8 边界） */
+                  {
+                    size_t take = n;
+                    if (body_bytes + take > 60) take = 60 - body_bytes;
+                    while (take > 0 && ((unsigned char)b[take] & 0xc0) == 0x80)
+                      take--;
+                    for (k = 0; k < take && w + 2 < sizeof(reply); k++)
+                      {
+                        if (b[k] != '*') reply[w++] = b[k];
+                      }
+                    body_bytes += take;
+                    break;            /* 正文只取第一段 */
+                  }
+
                   q = qe ? qe + 1 : NULL;
-                  skipped++;
+                }
+
+              if (body_bytes > 0)
+                {
+                  reply[w++] = '\n';
                 }
             }
 
@@ -7933,34 +8122,417 @@ static bool news_fast_try(const char *text, sm_context_t *ctx)
       }
   }
 
-  /* 存标题供「详细说说第X条」用 */
-  g_news_count = 0;
-  {
-    const char *p = reply;
-    while (*p != '\0' && g_news_count < 5)
-      {
-        const char *nl = strchr(p, '\n');
-        size_t len = nl ? (size_t)(nl - p) : strlen(p);
-        if (len >= 2 && p[0] >= '1' && p[0] <= '9' && p[1] == '.')
-          {
-            size_t k = 0;
-            for (size_t j = 2; j < len && k < 126; j++)
-              {
-                if (p[j] != '*') g_news_titles[g_news_count][k++] = p[j];
-              }
-            g_news_titles[g_news_count][k] = '\0';
-            g_news_count++;
-          }
-        if (nl == NULL) break;
-        p = nl + 1;
-      }
-  }
-
-  printf("[新闻快路] 取到头条，直接念（Tavily 优先 / 新浪兜底，跳过 LLM 汇总）：%s\n",
+  printf("[实时] 取到结果，直接念（Tavily 优先 / 新浪兜底，跳过 LLM 汇总）：%s\n",
          reply);
 
   llm_complete_callback(reply, 0, ctx);
   return true;
+}
+
+/**
+ * @brief  这句话是否必须走带工具链的 velaclaw（而不是直连 MiMo）
+ *
+ * 简单问答直连 MiMo 可以把 LLM 一段从 5~11 秒压下来；但下面这些意图
+ * 依赖 ai_agent 的工具，必须保持原路，否则功能会退化：
+ *   提醒（建/删/查）、音量/亮度/设置、天气、搜索/实时、家居/媒体。
+ *
+ * 关键词宁可多列：多走一次 velaclaw 只是慢一点；漏判会直接影响功能。
+ */
+
+static bool intent_needs_tools(const char *text)
+{
+  static const char *const kw[] =
+  {
+    /* 提醒 */
+    "提醒", "闹钟", "叫我", "记得", "定时", "日程", "备忘",
+    /* 音量 / 亮度 / 设置 */
+    "音量", "声音", "大声", "小声", "调高", "调低", "亮度", "屏幕", "设置",
+    /* 天气 */
+    "天气", "气温", "下雨", "温度", "刮风",
+    /* 搜索 / 实时 */
+    "新闻", "搜索", "搜一下", "查一下", "查询", "最新", "实时",
+    "热点", "头条", "消息", "百科",
+    /* 家居 / 媒体 */
+    "开灯", "关灯", "灯", "打电话", "发消息", "播放", "放首", "音乐", "歌",
+  };
+
+  size_t i;
+
+  if (text == NULL || text[0] == '\0')
+    {
+      return true;   /* 空话别直连，按原路处理 */
+    }
+
+  for (i = 0; i < sizeof(kw) / sizeof(kw[0]); i++)
+    {
+      if (strstr(text, kw[i]) != NULL)
+        {
+          printf("[LLM] 命中工具意图「%s」-> 走 velaclaw\n", kw[i]);
+          return true;
+        }
+
+      process_ai_dialogue(ctx);
+    }
+
+  return false;
+}
+
+/**
+ * @brief  本地时间/日期快路（不经过云端）
+ *
+ * 真机：问「现在几点了」原来要 ASR(~6s) + velaclaw LLM(~11s) + TTS(~2s)，
+ * 20 秒才出声。时间和日期是本地 RTC 就能回答的事，直接一句话念。
+ * 本构建没开 CONFIG_LIBC_LOCALTIME，localtime 等于 gmtime —— 手动 +8h。
+ */
+
+static bool time_fast_try(const char *text, sm_context_t *ctx)
+{
+  static const char *const kw[] =
+  {
+    "几点", "现在时间", "什么时间", "几号", "日期", "星期几", "周几",
+    "今天星期", "今天几",
+  };
+
+  static const char *const wd[] =
+  {
+    "日", "一", "二", "三", "四", "五", "六",
+  };
+
+  char   reply[160];
+  time_t now;
+  struct tm tm_buf;
+  size_t i;
+  bool   hit      = false;
+  bool   want_date = false;
+
+  if (text == NULL || text[0] == '\0')
+    {
+      return false;
+    }
+
+  for (i = 0; i < sizeof(kw) / sizeof(kw[0]); i++)
+    {
+      if (strstr(text, kw[i]) != NULL)
+        {
+          hit = true;
+          break;
+        }
+    }
+
+  if (!hit)
+    {
+      return false;
+    }
+
+  if (strstr(text, "几号") != NULL || strstr(text, "日期") != NULL ||
+      strstr(text, "星期") != NULL || strstr(text, "周几") != NULL)
+    {
+      want_date = true;
+    }
+
+  now = time(NULL);
+  if (now < 1704067200)          /* 还没对时：交给大模型/联网对时后再答 */
+    {
+      return false;
+    }
+
+  now += 8 * 3600;               /* UTC+8 */
+  if (gmtime_r(&now, &tm_buf) == NULL)
+    {
+      return false;
+    }
+
+  if (want_date)
+    {
+      snprintf(reply, sizeof(reply),
+               "今天是 %d 月 %d 日，星期%s。现在 %d 点 %d 分。",
+               tm_buf.tm_mon + 1, tm_buf.tm_mday, wd[tm_buf.tm_wday % 7],
+               tm_buf.tm_hour, tm_buf.tm_min);
+    }
+  else
+    {
+      snprintf(reply, sizeof(reply), "现在是 %d 点 %d 分。",
+               tm_buf.tm_hour, tm_buf.tm_min);
+    }
+
+  printf("[时间快路] %s\n", reply);
+  llm_complete_callback(reply, 0, ctx);
+  return true;
+}
+
+/* ==========================================================================
+ * ★ 2026-11-04：ASR 并行赛跑（MiMo 先发，火山同时发，先返回者用）
+ *
+ *   背景：火山流式 ASR 的 e2e 6~10 s，而 infer 只有 0.5 s；大部分时间花在
+ *   TLS/WebSocket 升级、3200 字节分块上传和服务端端点判定上。MiMo ASR 是
+ *   单个 HTTPS POST，两个后端同时跑，谁先给出非空文本就用谁；另一个线程
+ *   继续跑完并把结果丢掉（不取消，避免中途拆 TLS 会话）。
+ *
+ *   · MiMo 线程先创建（用户要求“优先连接 MiMo”）；
+ *   · 两个线程各自读同一份 PCM 副本，谁都不改；
+ *   · 结果/引用计数用 sem 保护；最后一个使用者负责 free，避免 worker
+ *     返回后 loser 线程读已释放的 PCM；
+ *   · 任一后端不可用就退回原来的串行 voice_asr_recognize()。
+ * ========================================================================== */
+
+#ifndef ASR_RACE_MIMO_VOLC
+#define ASR_RACE_MIMO_VOLC 1
+#endif
+#define ASR_RACE_TIMEOUT_MS 12000
+
+typedef struct
+{
+  const int16_t *pcm;
+  size_t         frames;
+  char           text[512];
+  volatile int   winner;        /* 0=无，1=MiMo，2=火山 */
+  volatile int   finished;      /* 两个线程都收工（或都没起来） */
+  int            threads_left;
+  int            refs;          /* worker + 两条线程 */
+  sem_t          lock;
+} asr_race_t;
+
+static void asr_race_lock(asr_race_t *r)
+{
+  while (sem_wait(&r->lock) != 0 && errno == EINTR) { }
+}
+
+static void asr_race_unlock(asr_race_t *r)
+{
+  sem_post(&r->lock);
+}
+
+static void asr_race_done(asr_race_t *r, int who, const char *text)
+{
+  int free_now = 0;
+
+  asr_race_lock(r);
+
+  if (r->winner == 0 && text != NULL && text[0] != '\0')
+    {
+      r->winner = who;
+      strncpy(r->text, text, sizeof(r->text) - 1);
+      r->text[sizeof(r->text) - 1] = '\0';
+    }
+
+  if (--r->threads_left <= 0)
+    {
+      r->finished = 1;
+    }
+
+  asr_race_unlock(r);
+
+  if (__atomic_sub_fetch(&r->refs, 1, __ATOMIC_ACQ_REL) == 0)
+    {
+      free_now = 1;
+    }
+
+  if (free_now)
+    {
+      sem_destroy(&r->lock);
+      free((void *)r->pcm);
+      free(r);
+    }
+}
+
+static void *asr_race_mimo(void *arg)
+{
+  asr_race_t *r = (asr_race_t *)arg;
+  char text[512] = {0};
+  int  ret;
+
+  ret = mimo_asr_recognize_direct((const unsigned char *)r->pcm,
+                                  r->frames * sizeof(int16_t),
+                                  text, sizeof(text));
+  if (ret < 0)
+    {
+      text[0] = '\0';
+    }
+
+  printf("[ASR] 并行 MiMo 返回（%d，%zu 字节）\n",
+         ret, strnlen(text, sizeof(text)));
+  asr_race_done(r, 1, text);
+  return NULL;
+}
+
+static void *asr_race_volc(void *arg)
+{
+  asr_race_t *r = (asr_race_t *)arg;
+  char text[512] = {0};
+  int  ret;
+
+  ret = volc_asr_recognize((const unsigned char *)r->pcm,
+                           r->frames * sizeof(int16_t),
+                           text, sizeof(text));
+  if (ret < 0)
+    {
+      text[0] = '\0';
+    }
+
+  printf("[ASR] 并行火山返回（%d，%zu 字节）\n",
+         ret, strnlen(text, sizeof(text)));
+  asr_race_done(r, 2, text);
+  return NULL;
+}
+
+static int asr_race_recognize(const int16_t *pcm, size_t frames,
+                              char *out, size_t out_cap)
+{
+  asr_race_t *r;
+  int16_t    *copy;
+  pthread_attr_t attr;
+  pthread_t  th;
+  int        winner = 0;
+  int        waited = 0;
+  int        free_now = 0;
+
+  if (pcm == NULL || frames == 0 || out == NULL || out_cap == 0)
+    {
+      return -EINVAL;
+    }
+
+  r = calloc(1, sizeof(*r));
+  copy = malloc(frames * sizeof(int16_t));
+  if (r == NULL || copy == NULL)
+    {
+      free(r);
+      free(copy);
+      return -ENOMEM;
+    }
+
+  memcpy(copy, pcm, frames * sizeof(int16_t));
+  r->pcm = copy;
+  r->frames = frames;
+  r->refs = 1;                 /* worker 自己 */
+  r->threads_left = 0;
+
+  if (sem_init(&r->lock, 0, 1) != 0)
+    {
+      free(copy);
+      free(r);
+      return -ENOMEM;
+    }
+
+  pthread_attr_init(&attr);
+  pthread_attr_setstacksize(&attr, 32768);
+  pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+
+  /* 先 MiMo，后火山；两个都先登记引用，线程失败再回退。 */
+  asr_race_lock(r);
+  __atomic_add_fetch(&r->refs, 2, __ATOMIC_ACQ_REL);
+  asr_race_unlock(r);
+
+  asr_race_lock(r);
+  r->threads_left++;
+  asr_race_unlock(r);
+  if (pthread_create(&th, &attr, asr_race_mimo, r) != 0)
+    {
+      asr_race_lock(r);
+      r->threads_left--;
+      if (r->threads_left <= 0) r->finished = 1;
+      asr_race_unlock(r);
+      __atomic_sub_fetch(&r->refs, 1, __ATOMIC_ACQ_REL);
+    }
+
+  asr_race_lock(r);
+  r->threads_left++;
+  asr_race_unlock(r);
+  if (pthread_create(&th, &attr, asr_race_volc, r) != 0)
+    {
+      asr_race_lock(r);
+      r->threads_left--;
+      if (r->threads_left <= 0) r->finished = 1;
+      asr_race_unlock(r);
+      __atomic_sub_fetch(&r->refs, 1, __ATOMIC_ACQ_REL);
+    }
+
+  pthread_attr_destroy(&attr);
+
+  while (waited < ASR_RACE_TIMEOUT_MS)
+    {
+      asr_race_lock(r);
+      winner = r->winner;
+      int fin = r->finished;
+      asr_race_unlock(r);
+
+      if (winner != 0 || fin)
+        {
+          break;
+        }
+
+      usleep(10000);
+      waited += 10;
+    }
+
+  asr_race_lock(r);
+  winner = r->winner;
+  if (winner != 0)
+    {
+      strncpy(out, r->text, out_cap - 1);
+      out[out_cap - 1] = '\0';
+    }
+
+  if (__atomic_sub_fetch(&r->refs, 1, __ATOMIC_ACQ_REL) == 0)
+    {
+      r->finished = 1;
+      free_now = 1;
+    }
+  asr_race_unlock(r);
+
+  if (free_now)
+    {
+      sem_destroy(&r->lock);
+      free((void *)r->pcm);
+      free(r);
+    }
+
+  return (winner != 0) ? 0 : -ENODATA;
+}
+
+/**
+ * @brief  报警听窗的 ASR 兜底：火山空结果时用 MiMo 再识别一遍
+ *
+ * 真机（2026-11-02 23:5x）：报警听窗里老人说「没事」，火山多次返回
+ * No text recognized(-61)，只能等按钮。MiMo 对同一段音频有时能转出来。
+ *
+ * **只采纳包含否定关键词的结果**（没事 / 不用 / 没有）—— MiMo 在噪声上
+ * 会编字（历史实测把底噪认成「男同学。」这类），所以不能把任意文本都
+ * 当「没事」。命中后直接走 voice_emerg_cancel()，和正常语音取消同一条路。
+ *
+ * @return true  = 已命中否定词并取消报警
+ * @return false = 没转过 / 没命中（调用方照原路忽略这一轮）
+ */
+
+static bool emerg_mimo_second_pass(const int16_t *pcm, size_t frames)
+{
+  char text[256] = {0};
+  int  ret;
+
+  if (!voice_emerg_is_active() || pcm == NULL || frames == 0)
+    {
+      return false;
+    }
+
+  ret = mimo_asr_recognize_direct((const unsigned char *)pcm,
+                                  frames * sizeof(int16_t),
+                                  text, sizeof(text));
+  if (ret < 0 || text[0] == '\0')
+    {
+      printf("[急救] MiMo 二次识别无结果（%d）\n", ret);
+      return false;
+    }
+
+  printf("[急救] MiMo 二次识别：%s\n", text);
+
+  if (strstr(text, "没事") != NULL || strstr(text, "不用") != NULL ||
+      strstr(text, "没有") != NULL)
+    {
+      printf("[急救] MiMo 二次识别命中否定词 -> 取消报警\n");
+      voice_emerg_cancel("MiMo「没事」");
+      return true;
+    }
+
+  return false;
 }
 
 /**
@@ -8012,9 +8584,16 @@ static void process_ai_dialogue(sm_context_t *ctx)
       if (ask_mode)
         {
           ask_flow_mark_answer(NULL);
+          /* ★ 2026-11-02：追问/急救这条路不上云，必须自己把轮次相位收回
+           *   IDLE —— 否则看门狗一直按"卡在 ASR"计时，30 秒后把这一轮
+           *   连同后面刚开的那一轮一起作废。真机现象：报警里说「没事」
+           *   没识别出来 → 30 秒内再说什么都"轮次作废"，铃也停不了。 */
+          round_phase_set(ROUND_PHASE_IDLE);
         }
       else
         {
+          /* 不走云端也一样要收相位：AI_ERROR 只推状态机，不动轮次看门狗。 */
+          round_phase_set(ROUND_PHASE_IDLE);
           sm_handle_event(ctx, SM_EVENT_AI_ERROR);
         }
 
@@ -8046,9 +8625,123 @@ static void process_ai_dialogue(sm_context_t *ctx)
              (size_t)((frames - send_frames) * sizeof(int16_t)));
     }
 
-  ret = voice_asr_recognize((const unsigned char *)send_ptr,
-                            send_frames * sizeof(int16_t),
-                            text_buf, sizeof(text_buf));
+  /* ★ 2026-11-02：送 ASR 前统一做两件事（只改副本，不动录音/播放）：
+   *
+   *   ① **低电平增益**：真机大量 1.4~1.9 秒语音峰值只有 1600~2200
+   *      （正常说话 3000+），火山判“没人声”直接 -61。峰值低于 3000 时
+   *      抬到约 6000（最多 6×）。这条对**普通对话**同样生效 —— 用户反馈
+   *      “收音不好”，不是麦克风坏，是这段音频电平太低。
+   *   ② **追问/急救短句补静音到 1 秒**：500 ms 的「没事」服务端端点判定
+   *      不够，2 秒的「救命啊救命啊」才稳定。
+   *
+   *   先算峰值，只有确实需要增益/补静音时才 malloc 一份副本；
+   *   长音频（>5 秒）不做增益，避免为几百 KB 的副本折腾堆。 */
+  int16_t       *pad_buf    = NULL;
+  const int16_t *asr_ptr    = send_ptr;
+  size_t         asr_frames = send_frames;
+
+  if (asr_frames > 0 && asr_frames <= 80000)
+    {
+      int32_t maxabs    = 0;
+      bool    need_pad  = (ask_mode || voice_emerg_is_active()) &&
+                          (asr_frames < 16000);
+      bool    need_gain;
+      size_t  target;
+
+      for (size_t k = 0; k < asr_frames; k++)
+        {
+          int32_t v = asr_ptr[k] < 0 ? -(int32_t)asr_ptr[k] : asr_ptr[k];
+          if (v > maxabs)
+            {
+              maxabs = v;
+            }
+        }
+
+      need_gain = (maxabs > 100 && maxabs < 3000);
+      target    = need_pad ? 16000 : asr_frames;   /* 补静音时至少 1 秒 */
+
+      if (need_pad || need_gain)
+        {
+          pad_buf = calloc(target, sizeof(int16_t));
+          if (pad_buf != NULL)
+            {
+              memcpy(pad_buf, asr_ptr, asr_frames * sizeof(int16_t));
+
+              if (need_gain)
+                {
+                  /* ★ 2026-11-03：真机安静段峰值只有 200~800，6× 后仍只有
+                   * 1200~4800，火山还是 -61。把目标抬到 8000、上限放到 10×，
+                   * 让安静段也能到 2000~8000（正常说话量级）；仍然只改送
+                   * ASR 的副本，不碰录音/播放。 */
+                  int32_t gain = 8000 / maxabs;
+
+                  if (gain > 10) gain = 10;
+                  if (gain < 2) gain = 2;
+
+                  for (size_t k = 0; k < asr_frames; k++)
+                    {
+                      int32_t v = (int32_t)pad_buf[k] * gain;
+
+                      if (v > 32767)  v = 32767;
+                      if (v < -32768) v = -32768;
+
+                      pad_buf[k] = (int16_t)v;
+                    }
+
+                  printf("[AI] ASR 音频增益 x%ld（原始峰值 %ld）\n",
+                         (long)gain, (long)maxabs);
+                }
+
+              if (need_pad)
+                {
+                  printf("[AI] 追问短句补静音：%zu → %zu 帧\n",
+                         asr_frames, target);
+                }
+
+              asr_ptr    = pad_buf;
+              asr_frames = target;
+            }
+        }
+    }
+
+#if ASR_RACE_MIMO_VOLC
+  if (mimo_voice_available() && volc_asr_available())
+    {
+      ret = asr_race_recognize(asr_ptr, asr_frames, text_buf, sizeof(text_buf));
+      printf("[ASR] 并行赛跑（MiMo 先发 / 火山同时发）ret=%d\n", ret);
+    }
+  else
+#endif
+    {
+      ret = voice_asr_recognize((const unsigned char *)asr_ptr,
+                                asr_frames * sizeof(int16_t),
+                                text_buf, sizeof(text_buf));
+    }
+
+  /* ★ 2026-11-03：**报警听窗的二级兜底**。火山返回空结果（-61 或空文本）时，
+   *   用 MiMo 对同一段（已增益/补静音的）音频再识别一遍；只采纳包含
+   *   「没事 / 不用 / 没有」的结果，避免 MiMo 在噪声上编出别的字。
+   *   命中就直接取消报警，省掉老人干等按钮。 */
+  if (voice_emerg_is_active() &&
+      (ret < 0 || !user_said_has_content(text_buf)))
+    {
+      if (emerg_mimo_second_pass(asr_ptr, asr_frames))
+        {
+          if (pad_buf != NULL)
+            {
+              free(pad_buf);
+            }
+
+          round_phase_set(ROUND_PHASE_IDLE);
+          sm_handle_event(ctx, SM_EVENT_AI_ERROR);
+          goto dlg_done;
+        }
+    }
+
+  if (pad_buf != NULL)
+    {
+      free(pad_buf);
+    }
 
   /* ★ 2026-11-02：迟到的 ASR 结果**不再一律丢弃**。
    *
@@ -8098,6 +8791,7 @@ static void process_ai_dialogue(sm_context_t *ctx)
       if (ask_mode)
         {
           ask_flow_mark_answer(NULL);
+          round_phase_set(ROUND_PHASE_IDLE);   /* 同上：不上云就别让看门狗盯 */
         }
       else
         {
@@ -8105,7 +8799,19 @@ static void process_ai_dialogue(sm_context_t *ctx)
            * 一次 sm_handle_event() 收尾，状态机回"听"要开麦，
            * audio_record_start() 一看在播就 audio_play_stop() 把这声掐了
            * （见 g_say_fail_pending 那段注释的完整理由）。 */
-          g_say_fail_pending = true;
+          if (voice_emerg_is_active())
+            {
+              printf("[提示音] 报警中，跳过「识别失败」提示（不能抢麦克风）\n");
+            }
+          else
+            {
+              g_say_fail_pending = true;
+            }
+          /* ★ 2026-11-02：轮次相位必须自己收回 —— 真机日志（19:10）：
+           *   ASR 返回 -61 后这一轮一直挂在 ASR 相位，30 秒后看门狗作废
+           *   它，并把紧接着开的下一轮（老人说的「没事」）一起作废。
+           *   AI_ERROR 只推状态机，不碰轮次看门狗。 */
+          round_phase_set(ROUND_PHASE_IDLE);
           sm_handle_event(ctx, SM_EVENT_AI_ERROR);
         }
 
@@ -8131,14 +8837,23 @@ static void process_ai_dialogue(sm_context_t *ctx)
       if (ask_mode)
         {
           ask_flow_mark_answer(NULL);
+          round_phase_set(ROUND_PHASE_IDLE);   /* 同上：不上云就别让看门狗盯 */
         }
       else
         {
           /* S4.3「没听清」必须出声（走 pending，理由同上）。
            * 文案用 PROMPT_MISS_TEXT，和峰值门那一支（speech_capture_complete）
            * 是同一句 —— 将来合成进 ROMFS 时按文案算哈希查表，两处必须逐字一样。 */
-          robot_ui_bridge_voice_reply(PROMPT_MISS_TEXT);
-          g_say_miss_pending = true;
+          if (voice_emerg_is_active())
+            {
+              printf("[提示音] 报警中，跳过「没听清」提示（不能抢麦克风）\n");
+            }
+          else
+            {
+              robot_ui_bridge_voice_reply(PROMPT_MISS_TEXT);
+              g_say_miss_pending = true;
+            }
+          round_phase_set(ROUND_PHASE_IDLE);   /* 同上：让轮次看门狗收手 */
           sm_handle_event(ctx, SM_EVENT_AI_ERROR);
         }
 
@@ -8303,7 +9018,7 @@ static void process_ai_dialogue(sm_context_t *ctx)
    * 不再经过 velaclaw（真机 -110 45s）和直连兜底（又 45s）那条慢链；
    * 新闻还绕开"搜完再让 LLM 总结"这一步（真机上 LLM 汇总会挂）。
    * 任何条件不满足它自己返回 false，下面原路照走。 */
-  if (news_detail_try(text_buf, ctx))
+  if (greeting_fast_try(text_buf, ctx))
     {
       goto dlg_done;
     }
@@ -8313,7 +9028,12 @@ static void process_ai_dialogue(sm_context_t *ctx)
       goto dlg_done;
     }
 
-  if (news_fast_try(text_buf, ctx))
+  if (time_fast_try(text_buf, ctx))
+    {
+      goto dlg_done;
+    }
+
+  if (realtime_try(text_buf, ctx))
     {
       goto dlg_done;
     }
@@ -8321,6 +9041,46 @@ static void process_ai_dialogue(sm_context_t *ctx)
   if (weather_fast_try(text_buf, ctx))
     {
       goto dlg_done;
+    }
+
+  /* ★ 2026-11-03 晚：**直连 MiMo 实测更慢，先整体关掉**。
+   *
+   *   真机这一轮：直连 MiMo 的 LLM 段分别是 11.9 s / 10.5 s / **26.3 s**，
+   *   比 velaclaw 的 5~11.5 s 还慢；而且它占住唯一一条识别线程，后面排队
+   *   的轮次全被 30 秒看门狗判成“卡在 ASR 相位”——用户看到的就是
+   *   “有的甚至不回复”。
+   *
+   *   现在把开关置 0，所有问答回到 velaclaw（原有稳定路径）；代码保留，
+   *   以后网关稳定了把 AI_SIMPLE_CHAT_DIRECT 改 1 即可重新启用。 */
+#ifndef AI_SIMPLE_CHAT_DIRECT
+#define AI_SIMPLE_CHAT_DIRECT 0
+#endif
+
+  if (AI_SIMPLE_CHAT_DIRECT && g_net_started && !intent_needs_tools(text_buf))
+    {
+      int fb;
+
+      round_phase_set(ROUND_PHASE_LLM);
+
+      ai_network_send_face(&g_net_ctx, AI_CMD_FACE_THINKING);
+
+      strncpy(g_llm_sent_text, text_buf, sizeof(g_llm_sent_text) - 1);
+      g_llm_sent_text[sizeof(g_llm_sent_text) - 1] = '\0';
+
+      printf("[LLM] 简单问答直连 MiMo（跳过 velaclaw）：%s\n", text_buf);
+
+      fb = mimo_chat(text_buf, g_llm_fallback_reply,
+                     sizeof(g_llm_fallback_reply));
+
+      if (fb > 0 && g_llm_fallback_reply[0] != '\0')
+        {
+          printf("[LLM] 直连 MiMo 成功（%d 字节），进入 TTS\n",
+                 fb);
+          llm_complete_callback(g_llm_fallback_reply, 0, ctx);
+          goto dlg_done;
+        }
+
+      printf("[LLM] 直连 MiMo 失败（%d），回落 velaclaw\n", fb);
     }
 
   round_phase_set(ROUND_PHASE_LLM);
@@ -8598,13 +9358,28 @@ static void *main_loop_task(void *arg)
       if (g_say_fail_pending)
         {
           g_say_fail_pending = false;
-          miss_speak_kick(PROMPT_ACK_KIND_FAIL);
+          /* 报警中丢弃（可能是置位之后报警才起来，竞态兜底） */
+          if (voice_emerg_is_active())
+            {
+              printf("[提示音] 报警中，丢弃「识别失败」提示\n");
+            }
+          else
+            {
+              miss_speak_kick(PROMPT_ACK_KIND_FAIL);
+            }
         }
 
       if (g_say_miss_pending)
         {
           g_say_miss_pending = false;
-          miss_speak_kick(PROMPT_ACK_KIND_MISS);
+          if (voice_emerg_is_active())
+            {
+              printf("[提示音] 报警中，丢弃「没听清」提示\n");
+            }
+          else
+            {
+              miss_speak_kick(PROMPT_ACK_KIND_MISS);
+            }
         }
 
       /* 5.2 录音卡死的串口观测（**只打印**，不做任何恢复动作）：
@@ -8996,6 +9771,11 @@ int main(int argc, char *argv[])
   /* 心跳从"认领位子"这一刻起算：主循环起来之前那 1~3 秒的初始化窗口里，
    * 心跳的年龄就是"刚认领"，看护不会在这段窗口里把新实例当成死的拉第二遍。 */
 
+  /* ★ 2026-11-02：新实例的代际号。必须在起识别线程之前 +
+   *   在 g_running 置 1 之前生效 —— 上一代卡在 ASR 的线程醒来时靠它退出。 */
+  g_app_instance++;
+  printf("[启动] 实例代际 = %lu\n", (unsigned long)g_app_instance);
+
   g_inited_at_ms = (uint32_t)TICK2MSEC(clock_systime_ticks());
   g_running = 1;
 
@@ -9144,8 +9924,22 @@ int main(int argc, char *argv[])
       printf("[警告] TTS 后端都不可用\n");
     }
 
-  /* ── ASR：配了火山凭据就火山优先（能听方言），否则 MiMo ── */
-  if (volc_asr_available() && voice_asr_set_backend("volcengine") == 0)
+  /* ── ASR：配了火山凭据就火山优先（能听方言），否则 MiMo ──
+   *
+   * ★ 2026-11-04 测试开关：**MiMo 主用**。用户怀疑火山流式 ASR 的
+   *   TLS/WebSocket/分块上传占了 e2e 的大头（日志 infer 只有 0.5s，
+   *   e2e 却 6~10s）。MiMo ASR 是单个 HTTPS POST，先用它测同一批短句
+   *   的耗时与准确率；失败自动回落火山。测完把下面的宏改 0 即恢复火山主用。 */
+#ifndef ASR_PRIMARY_MIMO_TEST
+#define ASR_PRIMARY_MIMO_TEST 1
+#endif
+
+  if (ASR_PRIMARY_MIMO_TEST && mimo_voice_available() &&
+      voice_asr_set_backend("mimo") == 0)
+    {
+      printf("[初始化] ASR 后端: MiMo 主用（测试：先 MiMo，失败回落火山）\n");
+    }
+  else if (volc_asr_available() && voice_asr_set_backend("volcengine") == 0)
     {
       printf("[初始化] ASR 后端: 火山引擎 (volcengine)"
              "（方言自动判别，出错自动回落 MiMo）\n");
@@ -9282,7 +10076,10 @@ int main(int argc, char *argv[])
         }
     }
 
-  if (g_dlg_ready && g_dlg_buf != NULL && !g_dlg_thread_valid)
+  /* 判定"要不要新建"：线程没起过，或者上一代的工作线程已经作废
+   * （g_dlg_worker_instance 对不上当前 g_app_instance）—— 见代际说明。 */
+  if (g_dlg_ready && g_dlg_buf != NULL &&
+      (!g_dlg_thread_valid || g_dlg_worker_instance != g_app_instance))
     {
       pthread_attr_t dattr;
 
@@ -9679,6 +10476,33 @@ int main(int argc, char *argv[])
    *   "按钮关了铃还响"。 */
 
   printf("[版本] 按钮取消即刻掐铃 + 短句即没事 + 急救词 20+ 变体（2026-11-02）\n");
+
+  /* ★ v39：提速 —— TTS 首块 20→10 字（首声提前 2~3 秒）+
+   *   常用短句（你好/谢谢/再见/好的/晚安…）免 LLM 秒回。 */
+
+  printf("[版本] TTS 首块 10 字 + 短句秒回（你好/谢谢/再见/好的/晚安）（2026-11-02）\n");
+
+  /* ★ v40：**UI 线程卡死根治**。
+   *   把所有剩余的 pthread_mutex（robot_ui 的 voice/voice_audio/fall 锁、
+   *   ambient_listen/reminder_sched 的 g_lock、板级报警的 nxmutex）全部
+   *   换成二值信号量 —— 没有持有者跟踪，post 不触发 sem_post.c:63 断言，
+   *   holder 损坏也不会让 UI 线程永久阻塞。
+   *   另加 UI 看门狗：主循环 10 秒没打日志就 dumpstack 定位。 */
+
+  printf("[版本] UI 锁全换信号量 + UI 看门狗（2026-11-02）\n");
+
+  /* ★ v41：新闻两处修复 + 报警收摊防复燃。
+   *   ① Tavily 搜索缓冲 16KB→64KB（真机响应 23KB 被截断 → 静默退回新浪财经）；
+   *   ② 新闻概括剥掉标题里的来源括号，news 搜不到时回落通用搜索；
+   *   ③ voice_emerg 收摊时同步作废 pending 询问（否则 10 秒超时线程
+   *      会把已停的报警重新拉起，表现为"说没事停铃后报警页又弹回来卡住"）。 */
+
+  printf("[版本] Tavily 缓冲 64KB + 新闻概括清洗标题 + 报警收摊作废询问"
+         "（2026-11-02）\n");
+
+  /* ★ v42：新闻分类/概括整套撤掉，只留"用户原话 -> Tavily -> 念前 3 条"。 */
+  printf("[版本] 实时信息只走 Tavily 原话检索（去掉新闻分类/「第X条」概括）+ "
+         "语音聊天右上角返回（2026-11-02）\n");
 
   /* 起状态信标（纯仪表，见 state_beacon_task 的说明）。**起不来不算故障**：
    * 少一条诊断不影响功能，主循环照常跑，所以失败只留一行日志就往下走。 */

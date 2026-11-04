@@ -960,7 +960,20 @@ void voice_emerg_on_text(const char *text)
    *   急救词拦走，不会误停真正的求救。 */
 
   {
-    size_t tlen = strlen(text);
+    /* ★ 2026-11-02：**按字符数，不按字节数**。原来 strlen() 对 UTF-8 中文
+     *   是字节数：一句「我没事，取消报警」= 8 个字 = 24 字节，被判成
+     *   ">15 字长句" —— 用户按提示说完整句，反而被当噪音，铃照响。
+     *   真机 20:16：「你是石小姐？」（6 个字/18 字节）也被判成长句。 */
+    size_t tlen = 0;
+    const char *p;
+
+    for (p = text; *p != '\0'; p++)
+      {
+        if (((unsigned char)*p & 0xc0) != 0x80)   /* 只数 UTF-8 引导字节 */
+          {
+            tlen++;
+          }
+      }
 
     if (tlen > 15)
       {

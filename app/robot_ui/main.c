@@ -175,7 +175,7 @@ static bool g_ai_initialized = false;
 #define VOICE_REPLY_TEXT_MAX  2048
 
 /* 录音累积缓冲：堆上按需分配，跨线程访问一律加 g_voice_lock */
-static pthread_mutex_t g_voice_lock = PTHREAD_MUTEX_INITIALIZER;
+static sem_t g_voice_lock = SEM_INITIALIZER(1);
 static unsigned char  *g_voice_pcm = NULL;
 static size_t          g_voice_pcm_len = 0;
 static volatile bool   g_voice_pcm_full = false;
@@ -299,12 +299,12 @@ static void voice_record_callback(const int16_t *data, size_t frames,
         return;
     }
 
-    pthread_mutex_lock(&g_voice_lock);
+    nxsem_wait_uninterruptible(&g_voice_lock);
 
     if (g_voice_pcm == NULL) {
         g_voice_pcm = malloc(VOICE_PCM_MAX_BYTES);
         if (g_voice_pcm == NULL) {
-            pthread_mutex_unlock(&g_voice_lock);
+            nxsem_post(&g_voice_lock);
             printf("[VoiceChat] PCM 缓冲分配失败\n");
             return;
         }
@@ -322,7 +322,7 @@ static void voice_record_callback(const int16_t *data, size_t frames,
         }
     }
 
-    pthread_mutex_unlock(&g_voice_lock);
+    nxsem_post(&g_voice_lock);
 }
 
 /* ==================== 显示用文本清洗（只影响显示，不影响 TTS） ==================== */
@@ -801,6 +801,13 @@ static void alarm_unify_hook(enum voice_emerg_phase_e phase,
 
         case VOICE_EMERG_CANCELLED:
         case VOICE_EMERG_EXPIRED:
+            /* ★ 2026-11-02：**必须把 ask_pending 一起作废**。
+             *   只关页面不清状态的话，10 秒超时线程仍按旧 gen 触发
+             *   ask_finish(0,"超时")，而那时 voice_emerg 已经收摊，
+             *   于是走「统一报警模块没在跑，兜底直接报警」→ 报警页重新
+             *   弹出并响铃（真机现象：说「没事」停铃后十秒报警页又弹回来）。
+             *   standdown 走 ask_finish(-1)：撤页、清 pending、不报警。 */
+            ui_post_ask_standdown("语音急救收摊");
             ui_post_ask_close();
 
             /* ★ 2026-11-01：收摊时把红报警页也撤掉、板级报警铃也停掉。
@@ -1069,6 +1076,22 @@ static void ask_finish(int confirmed, const char *src)
 
     if (!g_ask_pending) {
         nxsem_post(&g_ask_lock);
+
+        /* ★ 2026-11-02：pending 已被清掉，但**报警还在响**时，「没事」仍然
+         *   必须能停铃。真机：10 秒超时线程把 pending 清掉后，报警继续响
+         *   （voice_emerg 的 180 秒周期），此时点「我没事，取消」被判
+         *   "没有待回答的询问"直接忽略 —— 老人看到的就是"点了按钮铃还响"。
+         *   这里补一刀：只要 voice_emerg 还在报警，取消回答照样执行。 */
+        if (confirmed == 0 && voice_emerg_is_active()) {
+            printf("[Ask] 询问已超时，但报警仍在响（来源=%s）→ 直接取消报警\n", src);
+            alarm_clear();
+            voice_emerg_cancel(src);
+            ai_companion_ask_abort();
+            ui_post_ask_close();
+            ui_post_panel(2, NULL, NULL);   /* 撤红报警页 */
+            return;
+        }
+
         printf("[Ask] 没有待回答的询问（来源=%s，回答=%s），忽略\n",
                src, ask_answer_name(confirmed));
         return;
@@ -1536,7 +1559,7 @@ static void ambient_on_event(const ambient_listen_msg_t *msg, void *arg)
  * 而"同一时刻只允许一条开麦线程"必须是原子的查-改 —— 两条线程一起
  * audio_record_start()，第二条一定拿到 -EBUSY，而它那份失败收尾会把第一条刚
  * 占住的麦还掉。 */
-static pthread_mutex_t g_voice_audio_lock = PTHREAD_MUTEX_INITIALIZER;
+static sem_t g_voice_audio_lock = SEM_INITIALIZER(1);
 static bool g_voice_open_opening = false;
 
 /* "这一轮还想开麦吗"的令牌：LVGL 线程发号，开麦线程在动设备前比一次。
@@ -1555,21 +1578,21 @@ static bool voice_open_claim(void)
 {
     bool claimed = false;
 
-    pthread_mutex_lock(&g_voice_audio_lock);
+    nxsem_wait_uninterruptible(&g_voice_audio_lock);
     if (!g_voice_open_opening) {
         g_voice_open_opening = true;
         claimed = true;
     }
-    pthread_mutex_unlock(&g_voice_audio_lock);
+    nxsem_post(&g_voice_audio_lock);
 
     return claimed;
 }
 
 static void voice_open_finish(void)
 {
-    pthread_mutex_lock(&g_voice_audio_lock);
+    nxsem_wait_uninterruptible(&g_voice_audio_lock);
     g_voice_open_opening = false;
-    pthread_mutex_unlock(&g_voice_audio_lock);
+    nxsem_post(&g_voice_audio_lock);
 }
 
 /* 定义都在后面，开麦线程/自动提交要用 */
@@ -2211,13 +2234,13 @@ static void voice_submit_handler(void *user_data)
 
     /* 录音缓冲的所有权转移给任务（不做第二次 320 KB 拷贝；
      * 下一轮录音时再按需 malloc） */
-    pthread_mutex_lock(&g_voice_lock);
+    nxsem_wait_uninterruptible(&g_voice_lock);
     pcm = g_voice_pcm;
     pcm_len = g_voice_pcm_len;
     g_voice_pcm = NULL;
     g_voice_pcm_len = 0;
     g_voice_pcm_full = false;
-    pthread_mutex_unlock(&g_voice_lock);
+    nxsem_post(&g_voice_lock);
 
     if (pcm == NULL || pcm_len < VOICE_PCM_MIN_BYTES) {
         printf("[VoiceChat] 录音太短 (%zu 字节)，不提交\n", pcm_len);
@@ -2325,7 +2348,7 @@ static void voice_ptt_autosubmit_async(void *arg)
 
     /* 噪声门：VAD 只看 20ms 帧能量，短促的碰麦/敲击也能过；整段峰值太低
      * 就别浪费一次云端识别 —— 和 hello_app 主链路同口径（peak<300）。 */
-    pthread_mutex_lock(&g_voice_lock);
+    nxsem_wait_uninterruptible(&g_voice_lock);
     pcm = g_voice_pcm;
     pcm_len = g_voice_pcm_len;
     if (pcm != NULL) {
@@ -2344,7 +2367,7 @@ static void voice_ptt_autosubmit_async(void *arg)
             }
         }
     }
-    pthread_mutex_unlock(&g_voice_lock);
+    nxsem_post(&g_voice_lock);
 
     printf("[VoiceChat] VAD 自动提交：峰值检查 peak=%d\n", (int)peak);
 
@@ -2359,12 +2382,12 @@ static void voice_ptt_autosubmit_async(void *arg)
         voice_ui_idle();
         audio_vad_enable(&g_audio_ctx, vad_callback, NULL);   /* 槽位还原 */
 
-        pthread_mutex_lock(&g_voice_lock);
+        nxsem_wait_uninterruptible(&g_voice_lock);
         free(g_voice_pcm);
         g_voice_pcm = NULL;
         g_voice_pcm_len = 0;
         g_voice_pcm_full = false;
-        pthread_mutex_unlock(&g_voice_lock);
+        nxsem_post(&g_voice_lock);
 
         touch_ui_set_voice_status("我刚才没听清楚\n靠近一点，直接说话就行");
         touch_ui_voice_chat_round_done();
@@ -2444,14 +2467,14 @@ static void voice_cancel_handler(void *user_data)
 
     /* 缓冲还给堆（下次录音会重新分配）。audio_record_stop() 已经 join 过
      * 录音线程，这里不会和 voice_record_callback 抢缓冲，锁只是兜底。 */
-    pthread_mutex_lock(&g_voice_lock);
+    nxsem_wait_uninterruptible(&g_voice_lock);
     if (g_voice_pcm != NULL) {
         free(g_voice_pcm);
         g_voice_pcm = NULL;
     }
     g_voice_pcm_len = 0;
     g_voice_pcm_full = false;
-    pthread_mutex_unlock(&g_voice_lock);
+    nxsem_post(&g_voice_lock);
 
     /* 正在播的 TTS 不在这里打断：audio_play_stop() 要 join 播放线程，
      * 在 LVGL 线程里等会把界面卡住。让它把这句放完。 */
@@ -3200,10 +3223,10 @@ static void voice_chat_handler(void *user_data)
     robot_ui_set_face(ROBOT_FACE_THINKING);
 
     /* 新的一轮：丢掉上一轮没交出去的 PCM（缓冲本身留着复用，不反复 malloc） */
-    pthread_mutex_lock(&g_voice_lock);
+    nxsem_wait_uninterruptible(&g_voice_lock);
     g_voice_pcm_len = 0;
     g_voice_pcm_full = false;
-    pthread_mutex_unlock(&g_voice_lock);
+    nxsem_post(&g_voice_lock);
 
     if (!g_ai_initialized) {
         touch_ui_set_voice_status("AI 模块未就绪");
@@ -4201,7 +4224,7 @@ static int voice_add_reminder(const char *hhmm, const char *title)
  *   - 这几个标志都是"一置就不再改"的单向位，32 位对齐读写在这颗 Cortex-M 上
  *     是原子的，所以不逐位加锁（和 g_voice_pcm_full 一个路子）；
  *   - 只有"抢链条"这一件事必须原子，那一段用 g_fall_lock。 */
-static pthread_mutex_t g_fall_lock = PTHREAD_MUTEX_INITIALIZER;
+static sem_t g_fall_lock = SEM_INITIALIZER(1);
 static volatile bool   g_fall_active = false;         /* 链条在跑（幂等闸门） */
 static volatile int    g_fall_state = FALL_ALARM_IDLE;/* fall_alarm_state_t 快照 */
 static volatile bool   g_fall_answer_ready = false;   /* 回答已定（按钮或语音） */
@@ -4722,10 +4745,10 @@ static void *fall_chain_thread(void *arg)
     }
 
     /* 收尾：状态落定 + 放行下一次触发（下一个 fall_alarm_trigger 才能进来） */
-    pthread_mutex_lock(&g_fall_lock);
+    nxsem_wait_uninterruptible(&g_fall_lock);
     g_fall_state  = (answer == 0) ? FALL_ALARM_CANCELLED : FALL_ALARM_ALARMED;
     g_fall_active = false;
-    pthread_mutex_unlock(&g_fall_lock);
+    nxsem_post(&g_fall_lock);
 
     printf("[Fall] ===== 链条结束：%s =====\n",
            (answer == 0) ? "已取消警报" : "已正式报警（机主摔倒！）");
@@ -4750,10 +4773,10 @@ int fall_alarm_trigger(const char *source)
     }
 
     /* 幂等闸门：链条没跑完时重复触发一律忽略（不叠弹窗、不发第二条报警） */
-    pthread_mutex_lock(&g_fall_lock);
+    nxsem_wait_uninterruptible(&g_fall_lock);
 
     if (g_fall_active) {
-        pthread_mutex_unlock(&g_fall_lock);
+        nxsem_post(&g_fall_lock);
         printf("[Fall] 已在处理中，忽略本次触发（source=%s）\n",
                (source != NULL) ? source : "-");
         return FALL_ALARM_TRIGGER_BUSY;
@@ -4770,14 +4793,14 @@ int fall_alarm_trigger(const char *source)
     g_fall_speech_ended   = false;
     g_fall_pcm_full       = false;
 
-    pthread_mutex_unlock(&g_fall_lock);
+    nxsem_post(&g_fall_lock);
 
     copy = ui_strdup((source != NULL) ? source : "-");
     if (copy == NULL) {
-        pthread_mutex_lock(&g_fall_lock);
+        nxsem_wait_uninterruptible(&g_fall_lock);
         g_fall_active = false;
         g_fall_state  = FALL_ALARM_IDLE;
-        pthread_mutex_unlock(&g_fall_lock);
+        nxsem_post(&g_fall_lock);
         printf("[Fall] 内存不够，这次触发没跑起来\n");
         return FALL_ALARM_TRIGGER_ERROR;
     }
@@ -4795,10 +4818,10 @@ int fall_alarm_trigger(const char *source)
         pthread_attr_destroy(&attr);
         free(copy);
 
-        pthread_mutex_lock(&g_fall_lock);
+        nxsem_wait_uninterruptible(&g_fall_lock);
         g_fall_active = false;
         g_fall_state  = FALL_ALARM_IDLE;
-        pthread_mutex_unlock(&g_fall_lock);
+        nxsem_post(&g_fall_lock);
 
         printf("[Fall] 工作线程起不来，这次不跑（等下一次触发）\n");
         return FALL_ALARM_TRIGGER_ERROR;
@@ -4848,6 +4871,49 @@ static void *time_sync_thread(void *arg)
 
       sleep(60);
     }
+}
+
+/* ★ 2026-11-02：UI 看门狗。
+ *   主循环每圈刷新 g_ui_beat_ms；这条线程每 5 秒检查，超过 10 秒没刷新
+ *   就 dumpstack(UI 线程) —— 卡死时能直接看到卡在哪个函数，不用再猜。 */
+static volatile uint32_t g_ui_beat_ms;
+static volatile pid_t    g_ui_tid;
+
+/* ★ 2026-11-02：心跳改用**单调时钟**。原来用 time(NULL)*1000 —— 开机还没
+ *   校时的时候 time() 是 0，g_ui_beat_ms 也跟着是 0，看门狗的条件
+ *   `g_ui_beat_ms != 0` 直接把它关掉；之后校时一跳，秒级精度还会让
+ *   "停了几毫秒"算成"停了几千毫秒"。单调时钟没有这两个坑。 */
+static uint32_t ui_mono_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+}
+
+static void *ui_stall_watchdog(void *arg)
+{
+    (void)arg;
+
+    for (;;)
+    {
+        sleep(5);
+
+        {
+            uint32_t now   = ui_mono_ms();
+            uint32_t since = now - g_ui_beat_ms;
+            pid_t    tid   = (pid_t)g_ui_tid;
+
+            if (g_ui_beat_ms != 0 && tid > 0 && since > 10000)
+            {
+                printf("[UI] ★ UI 线程(tid=%d)已停 %u ms，打印调用栈：\n",
+                       (int)tid, since);
+                sched_dumpstack(tid);
+            }
+        }
+    }
+
+    return NULL;
 }
 
 int main(int argc, char *argv[])
@@ -5099,12 +5165,40 @@ int main(int argc, char *argv[])
 
     printf("ZhiAi Companion started!\n");
 
+    /* ★ 2026-11-02：启动 UI 看门狗 —— 主循环每圈刷新 g_ui_beat_ms，
+     * 独立线程检查；超过 10 秒没刷新就 dumpstack UI 线程，定位卡在哪。 */
+    {
+        pthread_attr_t a;
+        pthread_t      t;
+
+        g_ui_tid = nxsched_gettid();
+        g_ui_beat_ms = ui_mono_ms();
+
+        pthread_attr_init(&a);
+        pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+        pthread_attr_setstacksize(&a, 8192);
+        if (pthread_create(&t, &a, ui_stall_watchdog, NULL) != 0)
+          {
+            printf("[UI] 看门狗线程起不来（不影响功能）\n");
+          }
+        pthread_attr_destroy(&a);
+    }
+
     /* 主循环 */
     while (1) {
         static int  net_tick = 0;
         static bool net_ok   = false;
         static int  time_tick = 0;
         static int  reminder_tick = 0;
+        static int  alarm_page_tick = 0;    /* 报警页僵尸检测：~1 秒一拍 */
+        static int  alarm_page_stale = 0;   /* 连续多少拍“没有报警源” */
+
+        /* 看门狗心跳：这一行跑过 = UI 线程活着（单调时钟，见 ui_mono_ms） */
+        g_ui_beat_ms = ui_mono_ms();
+
+        /* 取走其他线程投递来的界面操作（ui_async.c 的队列）。必须在 LVGL
+         * 线程调（本循环就是）；泵在回调锁外执行，回调里再投递也安全。 */
+        ui_async_pump();
 
         /* 取走其他线程投递来的界面操作（ui_async.c 的队列）。必须在 LVGL
          * 线程调（本循环就是）；泵在回调锁外执行，回调里再投递也安全。 */
@@ -5124,6 +5218,38 @@ int main(int argc, char *argv[])
 #if UI_PERF_LOG
         ui_perf_frame_end();
 #endif
+
+        /* ★ 2026-11-03：**僵尸报警页自动收摊**。
+         *   真机：触摸 IC 偶发不应答后，红色报警页挡在主界面上面，人点不了
+         *   「返回」；而 UI 线程、MQTT 都活着（stop_alarm 能收到）。只要
+         *   报警源已经结束（alarm 未激活、voice_emerg 未激活），这个页就
+         *   不该继续挡着。连续 6 秒没有报警源 → 自动撤页并撤掉可能残留的
+         *   询问页。报警仍在响时（active=true）绝不会动它。 */
+        if (++alarm_page_tick >= 200)   /* 200 × ~5ms ≈ 1 秒 */
+        {
+            struct alarm_status_s st;
+            bool alarm_active;
+
+            alarm_page_tick = 0;
+            alarm_active = (alarm_get_status(&st) == OK) && st.active;
+
+            if (robot_ui_alarm_page_active() && !alarm_active &&
+                !voice_emerg_is_active())
+            {
+                if (++alarm_page_stale >= 6)
+                {
+                    printf("[UI] 报警源已结束，报警页自动撤下"
+                           "（防触摸失效卡页）\n");
+                    ui_post_ask_close();
+                    robot_ui_close_alarm();
+                    alarm_page_stale = 0;
+                }
+            }
+            else
+            {
+                alarm_page_stale = 0;
+            }
+        }
 
         /* 每 ~200ms 刷新一次状态栏上的网络状态。
          * LVGL 不是线程安全的，所以只在这个任务里改控件；network_task 那边

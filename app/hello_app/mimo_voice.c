@@ -2170,7 +2170,17 @@ static int mimo_asr_recognize(const unsigned char *pcm_data, size_t pcm_len,
       return -ENOMEM;
     }
 
+  /* ★ 2026-11-04：量一下 MiMo ASR 的**单次 HTTPS 请求**耗时。
+   *   用户要把 MiMo 和火山 e2e 对比：火山日志有 infer(0.5s) 与 e2e(6~10s)，
+   *   MiMo 是单个 POST，这个数就是它的端到端网络段。 */
+  struct timespec asr_t0, asr_t1;
+  clock_gettime(CLOCK_MONOTONIC, &asr_t0);
   status = mimo_post(body, resp, MIMO_ASR_RESP_CAP);
+  clock_gettime(CLOCK_MONOTONIC, &asr_t1);
+  syslog(LOG_INFO, "[%s] ASR: 请求耗时 %ld ms (HTTP %d)\n", TAG,
+         (long)((asr_t1.tv_sec - asr_t0.tv_sec) * 1000 +
+                (asr_t1.tv_nsec - asr_t0.tv_nsec) / 1000000),
+         status);
 
   /* body 是 16k*2*最长 15 秒 PCM 的 base64（~640 KB，见
    * ai_companion_main.c 的 SPEECH_BUF_MAX_FRAMES），请求一回来就还给堆 ——
@@ -2206,6 +2216,22 @@ static int mimo_asr_recognize(const unsigned char *pcm_data, size_t pcm_len,
 
   mimo_free_logged("asr.resp", resp, MIMO_ASR_RESP_CAP);
   return OK;
+}
+
+/****************************************************************************
+ * Name: mimo_asr_recognize_direct
+ *
+ * Description:
+ *   给 ai_companion 的「报警听窗兜底」用的直调入口：火山返回空结果时，
+ *   用 MiMo 再识别一遍同一段 PCM。不经过 voice_asr 的后端切换，避免
+ *   改全局 s_active（会把主链路临时切到 MiMo 再切回来）。
+ *
+ ****************************************************************************/
+
+int mimo_asr_recognize_direct(const unsigned char *pcm_data, size_t pcm_len,
+                              char *text_out, size_t text_cap)
+{
+  return mimo_asr_recognize(pcm_data, pcm_len, text_out, text_cap);
 }
 
 /****************************************************************************
