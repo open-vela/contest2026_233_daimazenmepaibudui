@@ -2458,6 +2458,55 @@ static void listen_supervise_tick(sm_context_t *ctx)
    * 的年龄 —— 就是 diag 里那个 wait。判据和理由（为什么 8 秒、为什么不带任何
    * 别人维护的豁免项）写在 LISTEN_SUPERVISE_RX_STALL_MS 头顶那一段。
    *
+   * 实锤是流水线 TTS 的首句→尾段空档（尾段还在"每 64 字一次 HTTPS"地合成）：
+   * 那段里半双工契约会把常开监听恢复起来，麦一开，VAD 就把状态机从"正在说"
+   * 切到"正在听"。record_hold 由播报轮在首句起播前置真、整轮收尾
+   * （play_complete_callback → audio_record_hold_end）才清。
+   *
+   * 这里必须挡：上面那条"扬声器在响就别抢"只看 audio_is_playing()，而空档里
+   * playing 已经是 false 了；再往下 want_mute（5 秒）就会把锁冲掉、直接开麦。
+   * 计时器一并清零 —— 让路期间的"听不见"不算断，锁一解除从头计。
+   *
+   * ★★ 但**不能整体早退**（2026-10-25 修）：原来这里 return 一行直接走人，
+   * 结果是"看门狗被它要看护的东西关掉了" —— 一轮若死在置锁之后、交还之前
+   * （三条清锁路径 audio_record_start / audio_play_stop / audio_record_hold_end
+   * 一条都没触发），麦永久锁死，而守护因为锁立着连查都不查，只能重启。
+   * 现在让路期间**只豁免其它判据，保留「查持锁截止」这一条**：锁立着且超过
+   * HOLD_MAX_MS 就当持有者已经死了，强制交还并大声留一行。
+   *
+   * 另外两条兜底不变：audio_record_start() / audio_play_stop() 都会主动清它
+   * （有人明确要动设备，锁就该让路），加上整轮收尾那条。 */
+
+  if (g_audio_ctx.record_hold)
+    {
+      g_listen_dead_since = 0;
+      g_listen_mute_since = 0;
+      g_listen_mute_logged = false;
+      g_listen_zombie_since = 0;
+      g_listen_zombie_logged = false;
+
+      /* 【唯一保留的判据】持锁超期 = 持有者没能把它交回来。 */
+      if (g_hold_deadline_ms != 0 &&
+          (int32_t)(main_now_ms() - g_hold_deadline_ms) >= 0)
+        {
+          printf("[音频] ★★ 让路锁超期（轮 %lu，超 %ld ms）强制交还麦克风"
+                 "—— 持锁那一轮死了没来收，这是「后面又不能对话」的形状\n",
+                 (unsigned long)g_hold_owner_round,
+                 (long)(main_now_ms() - g_hold_deadline_ms));
+          round_hold_give("守护：持锁超期强制交还");
+        }
+
+      return;
+    }
+
+  /* ---- 【2026-09-19 新加】"会话活着、设备读却再也不回来"那种永久聋 -------
+   *
+   * 真机形状（本轮定案）：录音标志全健康，但录音线程卡在 sf32lb52_audio_read()
+   * 里那次等待上再也出不来（内核定时等待的超时被 DMA 中断抢掉，之后这一次等待
+   * 彻底没有上界）。唯一看得见它的量是录音线程自己写下的 record_read_start_ms
+   * 的年龄 —— 就是 diag 里那个 wait。判据和理由（为什么 8 秒、为什么不带任何
+   * 别人维护的豁免项）写在 LISTEN_SUPERVISE_RX_STALL_MS 头顶那一段。
+   *
    * 会话真被停掉/正在停（record_stop 置位）时 read_start_ms 也会被下面那条
    * 早退挡掉：audio_record_is_active() 为假，判据不成立。 */
 
@@ -7471,6 +7520,8 @@ static void weather_tts_friendly(const char *in, char *out, size_t cap)
         {
           out[o++] = *p++;
         }
+
+      return 1;
     }
 
   out[o] = '\0';
@@ -7818,7 +7869,7 @@ static bool realtime_try(const char *text, sm_context_t *ctx)
   bool   hit = false;
   int    ret;
 
-  if (text == NULL || text[0] == '\0')
+  if (text == NULL)
     {
       return false;
     }
@@ -8119,6 +8170,8 @@ static bool intent_needs_tools(const char *text)
           printf("[LLM] 命中工具意图「%s」-> 走 velaclaw\n", kw[i]);
           return true;
         }
+
+      process_ai_dialogue(ctx);
     }
 
   return false;

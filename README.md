@@ -149,6 +149,9 @@ git -C vendor/sifli apply <仓库>/patches/vendor-sifli-working-tree.patch
 git -C packages/ai_agent apply <仓库>/patches/apps-ai-agent-working-tree.patch
 bash <仓库>/patches/verify_upstream_trees.sh   # 三绿才提交
 ```
+麦克风 ─ VAD/门控 ─ ASR(火山) ─ 轻意图/天气快路 ─ LLM(velaclaw/mimo_chat)
+                                                   │
+喇叭 ◄─ 流式 TTS(火山2.0, 逐块) ◄──────────────────┘
 
 ### 4.3 编译
 
@@ -295,7 +298,7 @@ hw_test lcdmirror uart          # RNDIS 挂了改走串口（PC 加 --serial COM
 
 ## 11. 项目地址
 
-- 仓库：https://github.com/open-vela/contest2026_233_daimazenmepaibudui
+- 仓库：https://github.com/gaoxiaoying0207/contest2026_233_daimazenmepaibudui
 - 开发板：SF32LB52-DevKit-LCD
 - 系统：OpenVela（NuttX RTOS）
 - 团队：代码怎么跑不队
