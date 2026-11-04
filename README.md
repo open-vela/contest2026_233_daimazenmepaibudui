@@ -272,7 +272,7 @@ contest2026_233_daimazenmepaibudui/
 
 ## 11. 项目地址
 
-- 仓库：https://github.com/openvela/contest2026_233_daimazenmepaibudui
+- 仓库：https://github.com/open-vela/contest2026_233_daimazenmepaibudui
 - 开发板：SF32LB52-DevKit-LCD
 - 系统：OpenVela（NuttX RTOS）
 - 团队：代码怎么跑不队
