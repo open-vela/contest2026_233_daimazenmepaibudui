@@ -233,6 +233,17 @@ contest2026_233_daimazenmepaibudui/
 4. **半双工播放期间麦是聋的** —— 报警确认窗用"响-停-听"循环，听窗 ≥ 3.6 秒。
 5. **凭据只在 ROMFS**、`.gitignore` 已挡。
 
+## 8.1 板级适配与驱动要点
+
+1. **芯片/架构**：SF32LB52 Cortex-M33（ARMv8-M），SiFli HAL；修正 M33 systick 配置名（`CONFIG_ARM_M_SYSTICK` → `CONFIG_ARM_SYSTICK`）。
+2. **内存/存储**：内部 SRAM 512 KB + 8 MB OPI-PSRAM（链接脚本 `psram @0x60000000, LENGTH=8M`）；16 MB NOR，`ftab.bin@0x12000000`、`nuttx.bin@0x12010000`；ASR/TTS 大缓冲放 PSRAM。
+3. **显示**：CO5300 AMOLED 390×450，QSPI 4 线 24 MHz（全屏约 29 ms），VADD_EN PA37、复位 PA00；亮度走面板 `0x51 WBRIGHT`；CO5300 不吃 MADCTL 换轴，横屏只能 flush 转置。
+4. **触摸**：FT6146 挂 I2C0，IRQ pin 31，复位 PA09；LCD 初始化完成后再初始化触摸；触摸 IC 偶发不应答时，PC 镜像的虚拟触摸兜底。
+5. **音频**：AUDCODEC（DAC/ADC 模拟）+ AUDPRC（TX0 播放 / RX0 录音 DMA）+ AW8155 功放（PA10）；固定 16 kHz / 单声道 / s16le；半双工（播放停 ADC、录音停 DAC）；录音单读者 `rx_owner_gen`；报警抢音频只走 `audio_play_stop()`；`write()` 原子串行化，TTS 与提醒/报警不再并发写坏共享等待。
+6. **USB/网络**：MUSB 设备控制器；RNDIS gadget（`584e:5342`，全速 12 Mbps，MAC `00:e0:4c:53:42:31`）+ CDC-ACM 串口；板侧 192.168.137.2，PC 侧 192.168.137.1；补丁解决 TXPKTRDY/FIFO flush、bulk OUT 双提交、RNDIS QUERY stall；warm reset 会卡数据通道，烧录后必须拔电冷启动。
+7. **RTC/报警/按键**：`/dev/rtc0` 的 `read()` 永远 EOF，只能用 `RTC_SET_ALARM` + 信号；板级单独 worker 设 alarm、收信号、回调；未开 `CONFIG_LIBC_LOCALTIME`，UTC+8 与日期进位在板级手算；板级报警 worker 优先级 115，每 50 ms 写一块 PCM，`alarm_trigger/clear` 非阻塞。
+8. **启动/ROMFS/交付**：`board_late_initialize` 初始化 RTC/ADC/audio/GPIO/PWM/buttons/I2C/SPI/LCD 异步任务/看门狗/MTD/CDC-ACM；挂载 tmpfs `/data`，把只读 ROMFS 的 `agent_config.json` 拷入；`task_create` 拉起 `robot_ui(110)`、`ai_agent(100)`、`hello_app(100)` 和 `hello_app_wd(110)`；改 `etc/` 必须删 ROMFS 三个产物再编；上游改动以三份 working-tree 补丁交付。
+
 ## 9. 已知限制
 
 - 本板无摄像头/IMU/独立 Wi-Fi。
