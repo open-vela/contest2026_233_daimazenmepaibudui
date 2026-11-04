@@ -172,3 +172,22 @@ D:/apply/claw/_audio_event/selfrecord/
 
 `pyserial`（本机 3.5）+ 标准库（`wave` / `array` / `re` / `time`）。
 **不装新包、不依赖 numpy/torch/scipy/librosa。**
+
+---
+
+## 9. 板上这版 4 类小模型（简要）
+
+- **类别**：`0=other 1=fall 2=knock 3=scream`；DSCNN-lite，**2372 个 float32 ≈ 9.5 KB**。
+- **前端**：16 kHz；帧长 400（25 ms）/ 帧跳 160（10 ms）；512 点 FFT；40 个 mel；窗口 64 帧（0.64 s），步长 20 帧（200 ms）；窗内 `(x-mean)/(std+1e-5)` 归一化。
+- **数据**：`record_guide.py` 用板子自录（建议 fall/knock/other 各 20 条、scream 15 条、每条 2 s）；`train.py` 按文件 75/25 切分，事件类丢掉最安静的 35% 窗，训练期做时间平移/频率遮挡/时间遮挡/加噪 + 类别权重。
+- **训练**：PyTorch CPU，默认 60 epochs、batch 32、Adam 1e-3、CosineAnnealingLR。
+- **导出**：`export_c.py` 把 BatchNorm 折进卷积，按固定顺序拼成 2372 个 float32，写 `app/hello_app/sound_event_model.h` 和 `.json`；导出后自检 numpy 前向 vs PyTorch 误差 < 1e-4。
+- **板端推理**：`app/hello_app/sound_event.c` 纯 C；手写 FFT/mel/归一化；卷积按行流水（静态约 52 KB）；3/4 窗口投票、阈值 0.55、撞击不应期 2 s、尖叫 8 s。
+- **效果**：6264 训练窗 / 2099 验证窗，窗口级准确率 **80.61%**；负样本窗口误报率 **6.8%**。
+- **注意**：板上这版的权威元数据是 `app/hello_app/sound_event_model.json`；`model_output/` 里是早期 8 类 ESC-50 实验（620,296 参数、56.76%），不要拿它当部署模型。
+
+```bash
+py -3.10 tools/audio_event/record_guide.py          # 1) 板端自录
+py -3.10 tools/audio_event/train.py --data <datasets> --epochs 60   # 2) 训练
+py -3.10 tools/audio_event/export_c.py --ckpt <best.pt>            # 3) 导出 C 头
+```

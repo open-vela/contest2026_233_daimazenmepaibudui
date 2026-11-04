@@ -126,6 +126,7 @@ CONFIG_RR_INTERVAL=10
 CONFIG_NET=y
 CONFIG_NET_SOCKOPTS=y
 CONFIG_NET_TCP=y
+CONFIG_NET_TCP_KEEPALIVE=y
 
 # TCP connection pool must be able to grow. With PREALLOC=8 and ALLOC=0 the
 # NuttX Kconfig help says that is the maximum number of connections available

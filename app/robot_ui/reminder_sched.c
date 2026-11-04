@@ -18,6 +18,8 @@
 #include <stdbool.h>
 #include <errno.h>
 #include <pthread.h>
+#include <semaphore.h>
+#include <nuttx/semaphore.h>
 
 #include "sf32lb52_rtc_alarm.h"   /* 板级日循环闹钟（board/contest_board/src） */
 #include "reminder_sched.h"
@@ -63,7 +65,7 @@ static int  g_last_tick_min = -1;
 static reminder_fire_cb_t g_fire_cb = NULL;
 static void          *g_fire_arg = NULL;
 
-static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+static sem_t g_lock = SEM_INITIALIZER(1);
 
 /* ==================== 内部工具 ==================== */
 
@@ -169,7 +171,7 @@ static void reminder_rtc_fired(FAR void *arg)
 
     (void)arg;
 
-    pthread_mutex_lock(&g_lock);
+    nxsem_wait_uninterruptible(&g_lock);
 
     fired_min = g_armed_min;
     g_armed_min = -1;
@@ -204,7 +206,7 @@ static void reminder_rtc_fired(FAR void *arg)
     cb     = g_fire_cb;
     cb_arg = g_fire_arg;
 
-    pthread_mutex_unlock(&g_lock);
+    nxsem_post(&g_lock);
 
     /* titles 空 = 这一分钟里已经没有启用的提醒了（刚被删掉 / 陈旧信号）：
      * 那就什么也不弹，只把下一条挂上。 */
@@ -233,7 +235,7 @@ static void reminder_rtc_fired(FAR void *arg)
 
 int reminder_sched_init(void)
 {
-    pthread_mutex_lock(&g_lock);
+    nxsem_wait_uninterruptible(&g_lock);
 
     memset(g_items, 0, sizeof(g_items));
     g_count = 0;
@@ -243,7 +245,7 @@ int reminder_sched_init(void)
     g_warned_no_time = false;
     g_last_tick_min = -1;
 
-    pthread_mutex_unlock(&g_lock);
+    nxsem_post(&g_lock);
 
     return 0;
 }
@@ -257,10 +259,10 @@ int reminder_sched_add(const char *title, int hour, int min)
         return -EINVAL;
     }
 
-    pthread_mutex_lock(&g_lock);
+    nxsem_wait_uninterruptible(&g_lock);
 
     if (g_count >= REMINDER_MAX_ITEMS) {
-        pthread_mutex_unlock(&g_lock);
+        nxsem_post(&g_lock);
         return -ENOSPC;
     }
 
@@ -271,7 +273,7 @@ int reminder_sched_add(const char *title, int hour, int min)
     g_items[index].min = min;
     g_items[index].enabled = true;
 
-    pthread_mutex_unlock(&g_lock);
+    nxsem_post(&g_lock);
 
     return index;
 }
@@ -282,10 +284,10 @@ int reminder_sched_remove(int index)
         return -EINVAL;
     }
 
-    pthread_mutex_lock(&g_lock);
+    nxsem_wait_uninterruptible(&g_lock);
 
     if (index >= g_count) {
-        pthread_mutex_unlock(&g_lock);
+        nxsem_post(&g_lock);
         return -EINVAL;
     }
 
@@ -297,29 +299,29 @@ int reminder_sched_remove(int index)
     g_count--;
     memset(&g_items[g_count], 0, sizeof(g_items[g_count]));
 
-    pthread_mutex_unlock(&g_lock);
+    nxsem_post(&g_lock);
 
     return 0;
 }
 
 void reminder_sched_clear(void)
 {
-    pthread_mutex_lock(&g_lock);
+    nxsem_wait_uninterruptible(&g_lock);
 
     memset(g_items, 0, sizeof(g_items));
     g_count = 0;
     g_cursor_min = -1;
 
-    pthread_mutex_unlock(&g_lock);
+    nxsem_post(&g_lock);
 }
 
 int reminder_sched_count(void)
 {
     int n;
 
-    pthread_mutex_lock(&g_lock);
+    nxsem_wait_uninterruptible(&g_lock);
     n = g_count;
-    pthread_mutex_unlock(&g_lock);
+    nxsem_post(&g_lock);
 
     return n;
 }
@@ -332,22 +334,22 @@ int reminder_sched_snapshot(reminder_item_t *out, int max)
         return 0;
     }
 
-    pthread_mutex_lock(&g_lock);
+    nxsem_wait_uninterruptible(&g_lock);
 
     n = (g_count < max) ? g_count : max;
     memcpy(out, g_items, sizeof(g_items[0]) * (size_t)n);
 
-    pthread_mutex_unlock(&g_lock);
+    nxsem_post(&g_lock);
 
     return n;
 }
 
 void reminder_sched_set_fire_cb(reminder_fire_cb_t cb, void *arg)
 {
-    pthread_mutex_lock(&g_lock);
+    nxsem_wait_uninterruptible(&g_lock);
     g_fire_cb = cb;
     g_fire_arg = arg;
-    pthread_mutex_unlock(&g_lock);
+    nxsem_post(&g_lock);
 }
 
 void reminder_sched_reload(void)
@@ -358,13 +360,13 @@ void reminder_sched_reload(void)
     int  utc_min;
     bool no_time;
 
-    pthread_mutex_lock(&g_lock);
+    nxsem_wait_uninterruptible(&g_lock);
 
     if (enabled_count_locked() == 0) {
         g_cursor_min = -1;
         g_armed_min = -1;
         g_waiting_time = false;
-        pthread_mutex_unlock(&g_lock);
+        nxsem_post(&g_lock);
 
         rtc_alarm_cancel();
         printf("[Reminder] 没有启用的提醒，已取消 RTC 闹钟\n");
@@ -379,13 +381,13 @@ void reminder_sched_reload(void)
         g_waiting_time = true;
         if (!g_warned_no_time) {
             g_warned_no_time = true;
-            pthread_mutex_unlock(&g_lock);
+            nxsem_post(&g_lock);
             printf("[Reminder] 系统时间还没对过（RTC 在 2000 年附近），提醒暂不生效；\n"
                    "           请先在 NSH 里 date -s \"Sep 13 15:30:00 2026\" "
                    "或让网络对时\n");
             return;
         }
-        pthread_mutex_unlock(&g_lock);
+        nxsem_post(&g_lock);
         return;
     }
 
@@ -424,7 +426,7 @@ void reminder_sched_reload(void)
     prev_armed = g_armed_min;
     g_armed_min = next;
 
-    pthread_mutex_unlock(&g_lock);
+    nxsem_post(&g_lock);
 
     if (next < 0) {
         /* enabled_count 已经过滤过一遍，理论上到不了这里 */
@@ -459,7 +461,7 @@ void reminder_sched_tick(void)
     int  now_min = now_local_min();
     bool need_reload = false;
 
-    pthread_mutex_lock(&g_lock);
+    nxsem_wait_uninterruptible(&g_lock);
 
     /* 两次 tick 之间"现在"跳了一大截（正常只走 0~1 分钟）→ 系统时间被网络
      * 对时或 NSH 的 date -s 改过了。之前那条"下一条"是按老时间算的（开机时
@@ -491,7 +493,7 @@ void reminder_sched_tick(void)
         need_reload = true;
     }
 
-    pthread_mutex_unlock(&g_lock);
+    nxsem_post(&g_lock);
 
     if (!need_reload) {
         return;

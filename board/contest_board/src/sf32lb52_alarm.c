@@ -127,7 +127,7 @@
 
 struct alarm_priv_s
 {
-  mutex_t               lock;        /* 保护 status / cb / 序号 */
+  sem_t                 lock;        /* 保护 status / cb / 序号（二值信号量，无持有者跟踪） */
   sem_t                 wake;        /* 触发/解除时唤醒工作线程 */
   struct wdog_s         wake_wdog;   /* 等一次新触发/解除那片等待的私有心跳 */
   volatile bool         wake_to;     /* 这次醒是心跳到点叫的（不是有人 post）*/
@@ -150,7 +150,7 @@ struct alarm_priv_s
 
 static struct alarm_priv_s g_alarm =
 {
-  .lock = NXMUTEX_INITIALIZER,
+  .lock = SEM_INITIALIZER(1),
   .wake = SEM_INITIALIZER(0),
 };
 
@@ -373,10 +373,10 @@ static void alarm_emit(enum alarm_event_e event,
   alarm_cb_t cb;
   FAR void  *arg;
 
-  nxmutex_lock(&g_alarm.lock);
+  nxsem_wait_uninterruptible(&g_alarm.lock);
   cb  = g_alarm.cb;
   arg = g_alarm.cb_arg;
-  nxmutex_unlock(&g_alarm.lock);
+  nxsem_post(&g_alarm.lock);
 
   if (cb != NULL)
     {
@@ -402,7 +402,7 @@ static int alarm_recheck(enum alarm_level_e cur_level)
   enum alarm_event_e    event = (enum alarm_event_e)0;
   int                   result = 0;
 
-  nxmutex_lock(&g_alarm.lock);
+  nxsem_wait_uninterruptible(&g_alarm.lock);
 
   if (g_alarm.status.active && g_alarm.seq != g_alarm.handled_seq)
     {
@@ -430,7 +430,7 @@ static int alarm_recheck(enum alarm_level_e cur_level)
       result = 1;
     }
 
-  nxmutex_unlock(&g_alarm.lock);
+  nxsem_post(&g_alarm.lock);
 
   if (event != (enum alarm_event_e)0)
     {
@@ -449,10 +449,10 @@ static int alarm_recheck(enum alarm_level_e cur_level)
 
 static void alarm_request_exit(enum alarm_event_e event)
 {
-  nxmutex_lock(&g_alarm.lock);
+  nxsem_wait_uninterruptible(&g_alarm.lock);
   g_alarm.status.active = false;
   g_alarm.exit_event    = event;
-  nxmutex_unlock(&g_alarm.lock);
+  nxsem_post(&g_alarm.lock);
 
   nxsem_post(&g_alarm.wake);
 }
@@ -593,11 +593,11 @@ static int alarm_worker(int argc, FAR char *argv[])
 
       alarm_recheck(ALARM_LEVEL_NONE);
 
-      nxmutex_lock(&g_alarm.lock);
+      nxsem_wait_uninterruptible(&g_alarm.lock);
       active    = g_alarm.status.active;
       level     = g_alarm.status.level;
       triggered = g_alarm.status.triggered_ms;
-      nxmutex_unlock(&g_alarm.lock);
+      nxsem_post(&g_alarm.lock);
 
       if (!active)
         {
@@ -673,9 +673,9 @@ static int alarm_worker(int argc, FAR char *argv[])
           continue;   /* 已解除 / 需按新级别重来 */
         }
 
-      nxmutex_lock(&g_alarm.lock);
+      nxsem_wait_uninterruptible(&g_alarm.lock);
       g_alarm.status.repeat_count++;
-      nxmutex_unlock(&g_alarm.lock);
+      nxsem_post(&g_alarm.lock);
 
       /* ---- 两轮之间 ---- */
 
@@ -714,23 +714,23 @@ int alarm_init(void)
 {
   pid_t pid;
 
-  nxmutex_lock(&g_alarm.lock);
+  nxsem_wait_uninterruptible(&g_alarm.lock);
   if (g_alarm.initialized)
     {
-      nxmutex_unlock(&g_alarm.lock);
+      nxsem_post(&g_alarm.lock);
       return OK;
     }
 
   g_alarm.initialized = true;
-  nxmutex_unlock(&g_alarm.lock);
+  nxsem_post(&g_alarm.lock);
 
   pid = task_create(ALARM_WORKER_NAME, ALARM_WORKER_PRIORITY,
                     ALARM_WORKER_STACK, (main_t)alarm_worker, NULL);
   if (pid < 0)
     {
-      nxmutex_lock(&g_alarm.lock);
+      nxsem_wait_uninterruptible(&g_alarm.lock);
       g_alarm.initialized = false;
-      nxmutex_unlock(&g_alarm.lock);
+      nxsem_post(&g_alarm.lock);
 
       syslog(LOG_ERR, "ALARM: task_create failed: %d\n", (int)pid);
       return (int)pid;
@@ -757,7 +757,7 @@ int alarm_trigger(enum alarm_level_e level, FAR const char *reason,
       return ret;
     }
 
-  nxmutex_lock(&g_alarm.lock);
+  nxsem_wait_uninterruptible(&g_alarm.lock);
 
   if (!g_alarm.status.active || level > g_alarm.status.level)
     {
@@ -777,7 +777,7 @@ int alarm_trigger(enum alarm_level_e level, FAR const char *reason,
                    text);
 
   g_alarm.seq++;
-  nxmutex_unlock(&g_alarm.lock);
+  nxsem_post(&g_alarm.lock);
 
   nxsem_post(&g_alarm.wake);
   return OK;
@@ -787,7 +787,7 @@ int alarm_clear(void)
 {
   bool was_active;
 
-  nxmutex_lock(&g_alarm.lock);
+  nxsem_wait_uninterruptible(&g_alarm.lock);
   was_active = g_alarm.status.active;
 
   if (was_active)
@@ -796,7 +796,7 @@ int alarm_clear(void)
       g_alarm.exit_event    = ALARM_EVENT_CLEARED;
     }
 
-  nxmutex_unlock(&g_alarm.lock);
+  nxsem_post(&g_alarm.lock);
 
   if (was_active)
     {
@@ -813,19 +813,19 @@ int alarm_get_status(FAR struct alarm_status_s *out)
       return -EINVAL;
     }
 
-  nxmutex_lock(&g_alarm.lock);
+  nxsem_wait_uninterruptible(&g_alarm.lock);
   *out = g_alarm.status;
-  nxmutex_unlock(&g_alarm.lock);
+  nxsem_post(&g_alarm.lock);
 
   return OK;
 }
 
 int alarm_set_callback(alarm_cb_t cb, FAR void *arg)
 {
-  nxmutex_lock(&g_alarm.lock);
+  nxsem_wait_uninterruptible(&g_alarm.lock);
   g_alarm.cb     = cb;
   g_alarm.cb_arg = arg;
-  nxmutex_unlock(&g_alarm.lock);
+  nxsem_post(&g_alarm.lock);
 
   return OK;
 }
