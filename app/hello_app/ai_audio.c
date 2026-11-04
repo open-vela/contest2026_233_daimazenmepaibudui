@@ -1712,7 +1712,12 @@ static void *audio_play_thread(void *arg)
    * 那种情况下设备和 ctx->play_fd 都已经归下一代了，我再 STOP/close 就是
    * 和它抢同一台设备、甚至双重 close 同一个 fd。静默交出去即可。 */
 
-  ctx->play_stage = PLAY_STAGE_CLOSE;  /* 诊断标记：进收尾（STOP/close） */
+  /* 诊断标记也要认代：被作废的上一代线程不能把新一代的 WRITE 阶段
+   * 改成 CLOSE（否则看门狗会对着错误的阶段做判断）。 */
+  if (pthread_equal(pthread_self(), ctx->play_thread))
+    {
+      ctx->play_stage = PLAY_STAGE_CLOSE;  /* 诊断标记：进收尾（STOP/close） */
+    }
 
   if (ctx->play_gen == my_gen)
     {
@@ -1808,9 +1813,8 @@ static void *audio_play_thread(void *arg)
   if (pthread_equal(pthread_self(), ctx->play_thread))
     {
       ctx->play_exited = true;
+      ctx->play_stage = PLAY_STAGE_DONE;   /* 诊断标记：走完了 */
     }
-
-  ctx->play_stage = PLAY_STAGE_DONE;   /* 诊断标记：走完了 */
 
   AUDIO_DEBUG("播放线程退出");
   return NULL;
@@ -2496,6 +2500,24 @@ void audio_play_watchdog_tick(audio_context_t *ctx)
   int idle;
 
   if (ctx == NULL || !ctx->playing)
+    {
+      return;
+    }
+
+  /* ★ 2026-11-03：**已收尾（DONE）不是卡死**。
+   *
+   *   真机（19:xx 连续 38 次）：每一块 TTS 都是「首句开始播放」→ 5 秒后
+   *   `播放卡死：阶段=已收尾/4` → 强制收摊。原因是播放线程已经把这一块
+   *   **全部写进设备并走完 close**（stage=DONE），而驱动的 DMA 缓冲里
+   *   还有尾音在放；`play_progress_ms` 只在 write 时盖章，于是 5 秒没有
+   *   新写入就被误判成“没有一块往前走”，直接把还在放的尾音掐掉——
+   *   听感就是“话说一半突然停了”。
+   *
+   *   DONE 表示软件侧已经交付完毕，剩下是设备把缓冲放完；这时看门狗
+   *   不该再按 write 的停滞标准判死。真正的 write / STOP 卡死仍会在
+   *   其它阶段被 5 秒判据抓住。 */
+
+  if (ctx->play_stage == PLAY_STAGE_DONE)
     {
       return;
     }

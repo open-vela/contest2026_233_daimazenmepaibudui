@@ -1678,7 +1678,7 @@ index 64d11f1..5ddc6d0 100644
      return OK;
  }
 diff --git a/src/infra/vela_tls.c b/src/infra/vela_tls.c
-index 0b36760..8742dd5 100644
+index 0b36760..5b76505 100644
 --- a/src/infra/vela_tls.c
 +++ b/src/infra/vela_tls.c
 @@ -31,9 +31,11 @@
@@ -2036,7 +2036,7 @@ index 0b36760..8742dd5 100644
      /* Force blocking mode and set socket-level read timeout.
       * This avoids using select()/poll() inside mbedtls_net_recv_timeout
       * which returns MBEDTLS_ERR_NET_POLL_FAILED (-0x0047) on NuttX/QEMU.
-@@ -306,6 +531,17 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
+@@ -306,6 +531,32 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
  #endif
          setsockopt(ctx->net.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
  
@@ -2051,10 +2051,25 @@ index 0b36760..8742dd5 100644
 +            setsockopt(ctx->net.fd, SOL_SOCKET, SO_SNDTIMEO, &stv, sizeof(stv));
 +        }
 +
++        /* ★ 2026-11-04：TCP keep-alive。连接池里的长连接如果对端悄悄消失
++         *   （NAT 超时/服务端回收），没有 keep-alive 时下一次复用会写到
++         *   半开连接上，只能等 RCVTIMEO 超时才重连。打开 SO_KEEPALIVE，
++         *   让内核定期探测并把死连接标记出来；不改变握手/复用语义。
++         *   需要 CONFIG_NET_TCP_KEEPALIVE=y（板级 defconfig 已开）。 */
++        {
++            int ka_on = 1;
++            if (setsockopt(ctx->net.fd, SOL_SOCKET, SO_KEEPALIVE,
++                           &ka_on, sizeof(ka_on)) == 0)
++              {
++                syslog(LOG_INFO, "[%s] keepalive on fd=%d\n",
++                       TAG, (int)ctx->net.fd);
++              }
++        }
++
  #ifdef CONFIG_AI_AGENT_NET_RPMSG
          {
              int timeout_sec = network_get_connect_timeout();
-@@ -378,9 +614,9 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
+@@ -378,9 +629,9 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
  #if defined(MBEDTLS_ERROR_C)
              char err_buf[128];
              mbedtls_strerror(ret, err_buf, sizeof(err_buf));
@@ -2066,7 +2081,7 @@ index 0b36760..8742dd5 100644
  #endif
              /* Log if it was a fatal alert */
              if (ret == MBEDTLS_ERR_SSL_FATAL_ALERT_MESSAGE) {
-@@ -396,6 +632,42 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
+@@ -396,6 +647,42 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
      return 0;
  }
  
@@ -2109,7 +2124,7 @@ index 0b36760..8742dd5 100644
  /* ── HTTP/1.1 framing ────────────────────────────────────────── */
  
  static int tls_write_request(tls_ctx_t* ctx,
-@@ -524,6 +796,37 @@ static void tls_raw_release(char* buf)
+@@ -524,6 +811,37 @@ static void tls_raw_release(char* buf)
      }
  }
  
@@ -2147,7 +2162,7 @@ index 0b36760..8742dd5 100644
  static int tls_read_response(tls_ctx_t* ctx, char* resp_buf, size_t resp_cap,
      size_t* out_body_len, bool* out_keep_alive)
  {
-@@ -618,6 +921,11 @@ static int tls_read_response(tls_ctx_t* ctx, char* resp_buf, size_t resp_cap,
+@@ -618,6 +936,11 @@ static int tls_read_response(tls_ctx_t* ctx, char* resp_buf, size_t resp_cap,
                  resp_cap - 1 - resp_pos);
              if (ret > 0) {
                  resp_pos += (size_t)ret;
@@ -2159,7 +2174,7 @@ index 0b36760..8742dd5 100644
              } else if (ret == 0 || ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
                  break;
              } else if (ret != MBEDTLS_ERR_SSL_WANT_READ) {
-@@ -641,9 +949,88 @@ static int tls_read_response(tls_ctx_t* ctx, char* resp_buf, size_t resp_cap,
+@@ -641,9 +964,88 @@ static int tls_read_response(tls_ctx_t* ctx, char* resp_buf, size_t resp_cap,
      return http_status;
  }
  
@@ -2249,7 +2264,7 @@ index 0b36760..8742dd5 100644
      const char* host,
      const char* port,
      const char* method,
-@@ -661,6 +1048,10 @@ int vela_https_request(
+@@ -661,6 +1063,10 @@ int vela_https_request(
      conn_slot_t* slot = pool_acquire(host, port);
  
      if (slot && slot->valid) {
@@ -2260,7 +2275,7 @@ index 0b36760..8742dd5 100644
          /* Drain any leftover data from previous response before reuse.
           * Without this, a partially-read response body (e.g. truncated
           * chunked data) would be misinterpreted as the next HTTP status. */
-@@ -673,18 +1064,46 @@ int vela_https_request(
+@@ -673,18 +1079,46 @@ int vela_https_request(
                  .tv_usec = 0 };
              setsockopt(slot->ctx.net.fd, SOL_SOCKET, SO_RCVTIMEO,
                  &tv_drain, sizeof(tv_drain));
@@ -2309,7 +2324,7 @@ index 0b36760..8742dd5 100644
  
          /* Reuse existing connection — skip TLS handshake */
          syslog(LOG_DEBUG, "[%s] Reusing pooled connection to %s:%s\n", TAG, host, port);
-@@ -696,12 +1115,44 @@ int vela_https_request(
+@@ -696,12 +1130,44 @@ int vela_https_request(
                  pool_release(slot, host, port, keep);
                  return ret;
              }
@@ -2354,7 +2369,7 @@ index 0b36760..8742dd5 100644
      }
  
      /* New connection */
-@@ -744,6 +1195,29 @@ int vela_https_request(
+@@ -744,6 +1210,29 @@ int vela_https_request(
      return ret;
  }
  
@@ -2384,7 +2399,7 @@ index 0b36760..8742dd5 100644
  int vela_https_get(const char* host, const char* port, const char* path,
      char* resp_buf, size_t resp_cap)
  {
-@@ -984,6 +1458,10 @@ int vela_http_post_json(const char* host, const char* port, const char* path,
+@@ -984,6 +1473,10 @@ int vela_http_post_json(const char* host, const char* port, const char* path,
              if (n <= 0)
                  break;
              resp_pos += (size_t)n;
@@ -2885,7 +2900,7 @@ index 1acc875..d1dd8f2 100644
      /* Normalise: remove trailing slash (except root "/") so path check works */
      strncpy(dir_buf, dir, sizeof(dir_buf) - 1);
 diff --git a/src/tools/tool_web_search.c b/src/tools/tool_web_search.c
-index 7499684..335a91d 100644
+index 7499684..99cc512 100644
 --- a/src/tools/tool_web_search.c
 +++ b/src/tools/tool_web_search.c
 @@ -26,10 +26,15 @@
@@ -2904,19 +2919,27 @@ index 7499684..335a91d 100644
  #include "cJSON.h"
  
  static const char *TAG = "web_search";
-@@ -38,6 +43,11 @@ static char s_serp_key[128]   = {0};
+@@ -38,8 +43,17 @@ static char s_serp_key[128]   = {0};
  static char s_exa_key[128]    = {0};
  static char s_news_key[128]   = {0};
  static char s_tavily_key[128] = {0};
+-
+-#define SEARCH_BUF_SIZE     (16 * 1024)
 +/* 和风天气：host + API KEY（见 AGENT_CFG_KEY_QWEATHER_* 那段）。两个都在
 + * 配置里才走和风，缺任一个 tool_get_weather_execute 自动退回 Open-Meteo。
 + * ★ 这两行是**凭据**，日志里一个字节都不打（只打"配了/没配"）。 */
 +static char s_qweather_host[128] = {0};
 +static char s_qweather_key[128]  = {0};
- 
- #define SEARCH_BUF_SIZE     (16 * 1024)
++
++/* ★ 2026-11-02：16 KB → **64 KB**。
++ *   Tavily 一次新闻搜索（topic=news, max_results=10）的真实响应实测 23 KB，
++ *   16 KB 缓冲会把 JSON 截断 → cJSON_Parse 失败 → 静默退回新浪（只给财经）。
++ *   这正是真机「问娱乐新闻却播财经」的根因。64 KB 留 2.5 倍余量。 */
++#define SEARCH_BUF_SIZE     (64 * 1024)
  #define SEARCH_RESULT_COUNT 5
-@@ -83,6 +93,115 @@ static int https_post_json(const char *host, const char *path,
+ 
+ /* ──────────────────────────────────────────────────────────────
+@@ -83,6 +97,115 @@ static int https_post_json(const char *host, const char *path,
                                hdrs, body, body ? strlen(body) : 0, buf, buf_cap, NULL);
  }
  
@@ -3032,7 +3055,7 @@ index 7499684..335a91d 100644
  /* ──────────────────────────────────────────────────────────────
   * Init
   * ──────────────────────────────────────────────────────────────*/
-@@ -108,6 +227,12 @@ int tool_web_search_init(void)
+@@ -108,6 +231,12 @@ int tool_web_search_init(void)
      memset(tmp, 0, sizeof(tmp));
      if (claw_config_get(AGENT_CFG_KEY_NEWS_KEY, tmp, sizeof(tmp)) == OK && tmp[0])
          strncpy(s_news_key, tmp, sizeof(s_news_key) - 1);
@@ -3045,7 +3068,7 @@ index 7499684..335a91d 100644
  
      if (s_tavily_key[0]) syslog(LOG_INFO, "[%s] Tavily key configured\n", TAG);
      if (s_serp_key[0])   syslog(LOG_INFO, "[%s] SerpAPI key configured\n", TAG);
-@@ -116,6 +241,17 @@ int tool_web_search_init(void)
+@@ -116,6 +245,17 @@ int tool_web_search_init(void)
      if (!s_tavily_key[0] && !s_serp_key[0])
          syslog(LOG_WARNING, "[%s] No search key. Use: set_tavily_key / set_search_key\n", TAG);
  
@@ -3063,7 +3086,7 @@ index 7499684..335a91d 100644
      return OK;
  }
  
-@@ -126,12 +262,26 @@ int tool_web_search_init(void)
+@@ -126,12 +266,26 @@ int tool_web_search_init(void)
   *   Response: { "results": [{ "title","url","content" }] }
   * ──────────────────────────────────────────────────────────────*/
  
@@ -3091,7 +3114,28 @@ index 7499684..335a91d 100644
      char *body_str = cJSON_PrintUnformatted(body_obj);
      cJSON_Delete(body_obj);
      if (!body_str) return ERROR;
-@@ -360,7 +510,7 @@ int tool_web_search_execute(const char *input_json, char *output, size_t output_
+@@ -153,9 +307,19 @@ static int tavily_search(const char *query, char *output, size_t output_size)
+         return ERROR;
+     }
+ 
++    /* ★ 2026-11-02：解析失败必须**说出来**。原来这里静默 return ERROR，
++     *   上层只打一行 "Tavily news failed"，看不出是截断、是网络、还是空结果。 */
++    size_t resp_len = strlen(buf);
+     cJSON *root = cJSON_Parse(buf);
++    if (!root)
++      {
++        syslog(LOG_ERR,
++               "[%s] Tavily JSON 解析失败（响应 %zu 字节 / 缓冲 %d，截断？）: %.160s\n",
++               TAG, resp_len, SEARCH_BUF_SIZE, buf);
++        free(buf);
++        return ERROR;
++      }
+     free(buf);
+-    if (!root) return ERROR;
+ 
+     cJSON *results = cJSON_GetObjectItem(root, "results");
+     if (!results || !cJSON_IsArray(results) || cJSON_GetArraySize(results) == 0) {
+@@ -360,7 +524,7 @@ int tool_web_search_execute(const char *input_json, char *output, size_t output_
      syslog(LOG_INFO, "[%s] Web search: %s\n", TAG, query);
  
      if (s_tavily_key[0]) {
@@ -3100,7 +3144,7 @@ index 7499684..335a91d 100644
          if (err == OK && output[0] && strncmp(output, "Error:", 6) != 0) {
              syslog(LOG_INFO, "[%s] Tavily OK: %d bytes\n", TAG, (int)strlen(output));
              return OK;
-@@ -390,6 +540,292 @@ int tool_web_search_execute(const char *input_json, char *output, size_t output_
+@@ -390,6 +554,292 @@ int tool_web_search_execute(const char *input_json, char *output, size_t output_
      return ERROR;
  }
  
@@ -3393,7 +3437,7 @@ index 7499684..335a91d 100644
  /* ──────────────────────────────────────────────────────────────
   * Backend 4: NewsAPI
   *   GET https://newsapi.org/v2/everything?q=...&pageSize=5&apiKey=...
-@@ -417,16 +853,31 @@ int tool_news_search_execute(const char *input_json, char *output, size_t output
+@@ -417,16 +867,31 @@ int tool_news_search_execute(const char *input_json, char *output, size_t output
  
      syslog(LOG_INFO, "[%s] News search: %s\n", TAG, query);
  
@@ -3428,7 +3472,7 @@ index 7499684..335a91d 100644
      /* Fallback: NewsAPI (may have routing issues on some networks) */
      if (s_news_key[0] == '\0') {
          snprintf(output, output_size,
-@@ -542,10 +993,1085 @@ int tool_web_search_set_news_key(const char *key)
+@@ -542,10 +1007,1085 @@ int tool_web_search_set_news_key(const char *key)
      return OK;
  }
  
@@ -4516,7 +4560,7 @@ index 7499684..335a91d 100644
   * ──────────────────────────────────────────────────────────────*/
  
  int tool_get_weather_execute(const char *input_json, char *output, size_t output_size)
-@@ -565,15 +2091,66 @@ int tool_get_weather_execute(const char *input_json, char *output, size_t output
+@@ -565,15 +2105,66 @@ int tool_get_weather_execute(const char *input_json, char *output, size_t output
  
      char location[256];
      strncpy(location, loc_item->valuestring, sizeof(location) - 1);
@@ -4585,7 +4629,7 @@ index 7499684..335a91d 100644
          if (err == OK && output[0] && strncmp(output, "Error:", 6) != 0) {
              syslog(LOG_INFO, "[%s] Weather via Tavily OK\n", TAG);
              return OK;
-@@ -589,8 +2166,12 @@ int tool_get_weather_execute(const char *input_json, char *output, size_t output
+@@ -589,8 +2180,12 @@ int tool_get_weather_execute(const char *input_json, char *output, size_t output
          }
      }
  

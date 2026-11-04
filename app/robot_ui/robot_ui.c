@@ -796,7 +796,10 @@ static void btn_event_handler(lv_event_t *e)
                 /* 报警界面 Back 按钮:关闭报警，返回主界面。
                  * ★ 2026-11-01：还要停 voice_emerg 的铃（原来只调
                  *   robot_ui_close_alarm 停板级警音，voice_emerg 的
-                 *   响-停-听循环还在跑，铃声不断、页面却没了）。 */
+                 *   响-停-听循环还在跑，铃声不断、页面却没了）。
+                 * ★ 2026-11-02：先打一行日志 —— 用户报"报警页卡了"时，
+                 *   有这一行就能分清是"触摸没进来"还是"处理里卡住"。 */
+                printf("[UI] 报警页「返回」按下：取消语音急救 + 停板级报警\n");
                 voice_emerg_cancel("手动停止");
                 robot_ui_close_alarm();
                 break;
@@ -1473,6 +1476,14 @@ void robot_ui_show_alarm(const char *content)
 }
 
 /* ==================== 关闭报警 ==================== */
+/* ★ 2026-11-03：报警页是不是当前最上层屏幕（给 main.c 的“僵尸报警页”
+ *   自动收摊用）。触摸 IC 偶发不应答时，人点不了「返回」；只要报警源
+ *   已经结束，这个页就不该继续挡着主界面。 */
+bool robot_ui_alarm_page_active(void)
+{
+    return (scr_alarm != NULL) && (lv_screen_active() == scr_alarm);
+}
+
 void robot_ui_close_alarm(void)
 {
     int ret;

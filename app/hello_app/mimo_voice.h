@@ -62,6 +62,12 @@
 int mimo_asr_register(void);
 int mimo_tts_register(void);
 
+/* ★ 2026-11-03：直调 MiMo ASR（不走 voice_asr 的后端切换）。
+ *   专用于报警听窗兜底：火山空结果时再识别一次同一段 PCM。
+ *   返回 OK / 负 errno；text_out 成功时为 UTF-8 文本。 */
+int mimo_asr_recognize_direct(const unsigned char *pcm_data, size_t pcm_len,
+                              char *text_out, size_t text_cap);
+
 /* ★ 2026-11-01：把火山「语音合成模型2.0」设为流式播报的首选后端。
  *   on != 0：mimo_tts_speak_head 先走 volcengine（seed-tts-2.0 + 2.0 音色），
  *            这一块失败再直连 MiMo 兜底；
@@ -327,7 +333,10 @@ int mimo_wav_load_16k(const char *path, unsigned char **pcm_out,
 #define MIMO_TTS_CHUNK_CHARS 32
 
 /* 首块上限：比后续块小，只为让第一声早点出来（"回复快"优先级高于"顺滑"）。 */
-#define MIMO_TTS_HEAD_CHUNK_CHARS 20
+/* ★ 2026-11-02：20 → **10** 字。
+ *   TTS 首块是"回复到手到出声"的最后一段阻塞。火山 TTS 合成 20 字约 5 秒，
+ *   10 字约 2~3 秒 —— 首声提前 2~3 秒，总延迟从 ~24s 降到 ~21s。 */
+#define MIMO_TTS_HEAD_CHUNK_CHARS 10
 
 /****************************************************************************
  * Name: mimo_tts_speak_head

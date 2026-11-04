@@ -107,19 +107,23 @@ audio: STOP 没停到硬件（status=5 nstate=5） / 会话[0] #N priv->state=5 
 ```
 
 
-### 3.3 新闻只说一句 / 念的是网站首页
+### 3.3 实时信息只说一句 / 念的是网站首页
 
 **指纹**
 
 ```
-[web_search] News via Tavily OK: 1023 bytes
-[新闻快路] …：1. 主页 - BBC News 中文
+[web_search] Tavily OK: 1023 bytes
+[实时] 取到结果…：1. 主页 - BBC News 中文
 ```
 
-**含义**：Tavily 走的是**通用网页搜索**，问「娱乐新闻」返回了网站首页标题。
-v27 起新闻调用带 `topic=news / days=7`，应返回新闻标题；新闻快路最多念 3 条。
-如果仍是首页，说明 Tavily 对该 query 没返回 news 结果 → 会退回新浪（财经要闻）
-或原 LLM 路径。
+**含义**：
+
+- `1023 bytes` 是**调用方缓冲只有 1024 字节**被截断（不是 Tavily 只返回一条）。
+  v42 起缓冲放大到 12 KB，串口应看到明显更大的字节数。
+- 如果标题是「XX网/首页」，说明 Tavily 对这句 query 只给了导航页。v42 起
+  实时信息不再按娱乐/体育/财经猜分类，而是把**用户原话**交给通用
+  `web_search`；仍不行会退 `news_search`（新浪财经免 key），再不行回落 LLM。
+- 版权/页脚行（`Copyright`/`版权所有`/`免责声明`…）已在提取时过滤，不再念出来。
 
 ## 4. 自己报警 / 误报
 
@@ -175,10 +179,20 @@ v27 起新闻调用带 `topic=news / days=7`，应返回新闻标题；新闻快
 ```
 
 - `D` = `TCP_CLOSED` 但仍占着 `tcp_conn` 槽位；`pool` 接近 128 或
-  `socket()` 返回 ENOMEM → 出站连接没回收；
-- 常见来源：ASR/LLM/TTS 超时后调用方还在等、velaclaw 挂死、ws/推送半开；
-- 观察：空闲 2 分钟后 `D` 数应回落；不回落就是泄漏。当前列为已知问题，
-  修法方向：给每条出站路径补 close/超时、在状态信标里周期打 `tcp_conn_probe`。
+  `socket()` 返回 ENOMEM → 出站连接没回收。
+- **根因（v42 已修，2026-11-02）**：`tcp_close_work` 先置 `TCP_CLOSE_DIRECT`，
+  执行时状态还是 `FIN_WAIT_2`，于是跳过 `tcp_free`，之后没人再回调；
+  2MSL 后 `tcp_timer` 置 `TCP_CLOSED` 并 `tcp_callback(TCP_TIMEDOUT)`，
+  但 close 回调已释放 → 条目永远挂在 active 链表上。修复：
+  - `net/tcp/tcp_timer.c`：TIME_WAIT 到期且 `crefs==0 && TCP_CLOSE_DIRECT`
+    时直接 `tcp_free`；
+  - `net/tcp/tcp_conn.c`：池满回收条件放宽，允许复用已跑过 close work 的
+    CLOSED 条目；并在 `tcp_alloc` 里**每新建一条连接主动回收一条**
+    `crefs==0 + CLOSED + TCP_CLOSE_DIRECT` 的僵尸条目（服务端 RST/短连接
+    会绕过 TIME_WAIT，仅靠定时器不够）。
+- 验证：修复后 45 分钟真机运行 `pool` 稳定在 `5~7`、`D` 为 `0~1`；
+  修复前同长度测试为 `pool 6→29 / D0→21`。仍单调上涨就把
+  `[TCP] pool` 行和 `[TLS-FD] open/close` 成对发出来。
 
 ## 9. 烧录 / 启动
 

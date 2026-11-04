@@ -64,25 +64,25 @@
   此时允许走原路径（慢但正确）；
 - 默认城市是济南（`MIMO_DEFAULT_CITY`）。
 
-## 2.1 新闻（快速通道）
+## 2.1 实时信息（Tavily 原话检索）
 
-**操作**：说「今天有什么国际新闻吗」。
+**操作**：说「今天有什么新闻」或「最近有什么最新消息」。
+
 **判据**：
 
 ```
 [AI] 识别结果: …新闻…
-[web_search] News via Tavily OK: N bytes
-[新闻快路] 取到头条，直接念（Tavily 优先 / 新浪兜底，跳过 LLM 汇总）：1. …
+[实时] Tavily 查询：今天有什么新闻
+[web_search] Tavily OK: N bytes
+[实时] 取到结果，直接念（Tavily 优先 / 新浪兜底，跳过 LLM 汇总）：1. …
 [volc_tts] TTS V3 request
 ```
 
-- Tavily 请求带 **topic=news / days=7**，返回新闻标题而不是网站首页；
-- 最多念 3 条编号头条；新浪只做免 key 兜底（只有财经要闻，不支持关键词）。
-
-- 直接念新浪头条，**不经过 LLM 汇总**（真机上"搜到了但 LLM 总结失败"会回
-  「网络不太稳」，快速通道绕开这一步）；
-- 新浪失败会自动回落原路径，日志 `[新闻快路] 新浪新闻没取到…回落到大模型`；
-- 这是新闻/头条类；普通搜索（非新闻）仍走 ai_agent 的 web_search。
+- 查询就是**用户原话**（只去掉 ASR 常带的开头「你好，」），不再按娱乐/体育/财经分类；
+- 先走通用 `web_search`（Tavily），没结果再退 `news_search`（新浪免 key 兜底）；
+- 最多念 3 条：标题（去掉 ` | 来源` 后缀）+ 第一段正文；版权/页脚/导航行会被过滤；
+- 输出缓冲 12 KB，串口应看到 `Tavily OK:` 字节数**大于 1024**（旧版 1024 字节上限会把 10 条截成 1 条）；
+- 已取消「第X条详细说说」专门路径，后续追问交给大模型。
 
 ## 3. 语音急救（关键词）
 
@@ -162,6 +162,55 @@
 - 报警页/确认页出现后，取消或到点应撤页回主屏（`ui_post_panel(2)`）；
 - AI 播报时屏幕文字随音频逐句推进（看 `[Bridge] AI 回复已上屏: …` 的前缀在变长）。
 
+## 8.1 屏幕镜像与虚拟触摸（lcd_mirror）
+
+用途：本板屏幕玻璃损坏、FT6146 触摸 IC 偶发不应答，PC 镜像用来实时看屏
+并用鼠标操作界面；触摸恢复前它是唯一可操作通道，也用于演示、录屏和截图。
+
+板端（默认 autostart，目标 192.168.137.1:5600）：
+
+```text
+hw_test lcdmirror status                 # 看传输方式/目标/已发帧/触摸事件
+hw_test lcdmirror stop / start           # 停/起（停掉连鼠标注入一起停）
+hw_test lcdmirror start 192.168.137.1 5600
+hw_test lcdmirror uart [dev]             # 切控制台串口（默认 /dev/console）
+hw_test lcdmirror tcp <ip> [port]        # 切回 TCP
+hw_test lcdtap <x> <y> <0|1>             # 串口模式下手动注入触摸
+```
+
+PC 端（Windows，Python 3.10 + Pillow；串口模式再加 pyserial）：
+
+```bash
+py -3.10 tools/lcd_mirror/lcd_mirror.py                 # TCP 5600
+py -3.10 tools/lcd_mirror/lcd_mirror.py --scale 1.5     # 放大窗口
+py -3.10 tools/lcd_mirror/lcd_mirror.py --serial COM4 --baud 1000000
+```
+
+操作：左键按下 = 触摸按下，拖动 = 滑动，松开 = 抬起；空格暂停显示，
+`t` 开关计时打印，Esc 退出。窗口 `fps` 应持续 >0，`#seq` 递增；板端
+`status` 的触摸事件数应随点击增加。
+
+其他脚本：
+
+- `lcd_mirror_dump.py`：无头收帧，按脏矩形拼成 PNG（截图归档）；
+- `mirror_tap.py`：脚本化点击一次（自动化测试）；
+- `mirror_latency.py`：量「点一下 → 画面变化」的端到端延迟；
+- `lcdmirror_serial_dump.py`：串口模式无头收帧；
+- `host_test/`：协议解析、坐标映射、串口重同步的主机侧测试。
+
+判据：
+
+- PC 窗口能看到 390×450 主屏，时钟走字，点击「菜单/设置」板端界面响应；
+- 板端 `hw_test lcdmirror status` 显示已连接（TCP 或 UART）、触摸事件递增；
+- 拔掉 RNDIS 后 TCP 断开，切 `hw_test lcdmirror uart` + PC `--serial` 仍能看/点。
+
+限制：
+
+- 只镜像走 LVGL 的刷屏；`hw_test lcdcolor` 这类直接写 `/dev/fb0` 的不进镜像；
+- 快速变化区域可能撕裂（下一帧自愈）；
+- 面板固定 390×450 竖屏（CO5300 不吃 MADCTL，横屏只能软件转置）；
+- TCP 依赖 RNDIS；RNDIS 挂死时用串口链路。
+
 ## 9. 稳定性回归（建议 30 分钟）
 
 | 观察项 | 正常 | 异常指纹 |
@@ -177,8 +226,7 @@
 - 普通问答首字仍需 ~20 秒（ASR/LLM 云端往返，未做 token 级流式）；
 - ASR 对长句/方言的延迟与准确率依赖云端；
 - 定时提醒是 RAM，掉电丢失；语音删/改提醒未实现；
-- 新闻已走快速通道（新浪免 key 直接念）；普通 web_search 仍可能在
-  "搜完再让 LLM 总结"这一步失败（日志 `[agent] LLM call failed`），
-  SerpAPI 兜底可能是空壳；
+- 实时信息只做 Tavily 原话检索，结果条数受中文索引限制（约 1~3 条）；
 - 音频链路 8 秒卡死已加 owner_gen 修复，仍需长时间真机验证；
-- TLS 出站连接偶发堆积（`D25` 类指纹），已列入排查。
+- TLS 出站连接堆积已在 NuttX 内核修复（TIME_WAIT 到期补 `tcp_free` + 池满回收
+  `TCP_CLOSE_DIRECT` 的 CLOSED 条目），修复已编译，尚需长时间真机回归。
